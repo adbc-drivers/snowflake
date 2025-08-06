@@ -12,20 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Dev
+name = "ADBC Driver for Snowflake"
+publisher = "ADBC Drivers Contributors"
+license = "Apache-2.0"
+version = "v0.1.0"
 
-on:
-  pull_request: {}
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  lint:
-    uses: adbc-drivers/dev/.github/workflows/dev.yaml@a6f47590144de8f0124bfb6be1f5bff33ecd769a
-    secrets:
-      pre_commit_ssh_private_key: ${{ secrets.DEV_DEPLOY_KEY }}
-      ssh_private_key: ${{ secrets.DRIVERBASE_DEPLOY_KEY }}
+[ADBC]
+version = "v1.1.0"

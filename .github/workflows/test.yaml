@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Dev
+name: Build & Test
 
 on:
   pull_request: {}
@@ -22,10 +22,17 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
-  lint:
-    uses: adbc-drivers/dev/.github/workflows/dev.yaml@a6f47590144de8f0124bfb6be1f5bff33ecd769a
+  test:
+    uses: adbc-drivers/dev/.github/workflows/test.yaml@fee4b8b7fd741c2e615f38f37612751104b65422
     secrets:
-      pre_commit_ssh_private_key: ${{ secrets.DEV_DEPLOY_KEY }}
-      ssh_private_key: ${{ secrets.DRIVERBASE_DEPLOY_KEY }}
+      dev_private_key: ${{ secrets.DEV_DEPLOY_KEY }}
+      driverbase_private_key: ${{ secrets.DRIVERBASE_DEPLOY_KEY }}
+      nightly_signing_private_key: ${{ secrets.NIGHTLY_SIGNING_PRIVATE_KEY }}
+      nightly_signing_private_key_id: ${{ secrets.NIGHTLY_SIGNING_PRIVATE_KEY_ID }}
+      nightly_signing_private_key_password: ${{ secrets.NIGHTLY_SIGNING_PRIVATE_KEY_PASSWORD }}
+    with:
+      driver: snowflake
+      subdir: .
