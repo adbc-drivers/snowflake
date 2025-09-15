@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name = "ADBC Driver for Snowflake"
+name = "ASF Snowflake Driver"
+description = "An ADBC driver for Snowflake developed under the Apache Software Foundation"
 publisher = "ADBC Drivers Contributors"
 license = "Apache-2.0"
 version = "v0.1.0"
