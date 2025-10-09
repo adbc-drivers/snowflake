@@ -1,3 +1,8 @@
+// Copyright (c) 2025 ADBC Drivers Contributors
+//
+// This file has been modified from its original version, which is
+// under the Apache License:
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -25,9 +30,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
-	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -84,8 +88,8 @@ func (st *statement) setQueryContext(ctx context.Context) context.Context {
 //
 // A statement instance should not be used after Close is called.
 func (st *statement) Close() (err error) {
-	_, span := internal.StartSpan(context.Background(), "statement.Close", st)
-	defer internal.EndSpan(span, err)
+	_, span := driverbase.StartSpan(context.Background(), "statement.Close", st)
+	defer driverbase.EndSpan(span, err)
 
 	if st.cnxn == nil {
 		err = adbc.Error{
@@ -479,10 +483,10 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 	nRows = -1
 
 	var span trace.Span
-	ctx, span = internal.StartSpan(ctx, "statement.ExecuteQuery", st)
+	ctx, span = driverbase.StartSpan(ctx, "statement.ExecuteQuery", st)
 	defer func() {
 		span.SetAttributes(semconv.DBResponseReturnedRowsKey.Int64(nRows))
-		internal.EndSpan(span, err)
+		driverbase.EndSpan(span, err)
 	}()
 
 	ctx = st.setQueryContext(ctx)
@@ -546,10 +550,10 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 // ExecuteUpdate executes a statement that does not generate a result
 // set. It returns the number of rows affected if known, otherwise -1.
 func (st *statement) ExecuteUpdate(ctx context.Context) (numRows int64, err error) {
-	ctx, span := internal.StartSpan(ctx, "statement.ExecuteUpdate", st)
+	ctx, span := driverbase.StartSpan(ctx, "statement.ExecuteUpdate", st)
 	defer func() {
 		span.SetAttributes(semconv.DBResponseReturnedRowsKey.Int64(numRows))
-		internal.EndSpan(span, err)
+		driverbase.EndSpan(span, err)
 	}()
 
 	ctx = st.setQueryContext(ctx)
@@ -621,8 +625,8 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (numRows int64, err erro
 
 // ExecuteSchema gets the schema of the result set of a query without executing it.
 func (st *statement) ExecuteSchema(ctx context.Context) (schema *arrow.Schema, err error) {
-	ctx, span := internal.StartSpan(ctx, "statement.ExecuteSchema", st)
-	defer internal.EndSpan(span, err)
+	ctx, span := driverbase.StartSpan(ctx, "statement.ExecuteSchema", st)
+	defer driverbase.EndSpan(span, err)
 
 	ctx = st.setQueryContext(ctx)
 

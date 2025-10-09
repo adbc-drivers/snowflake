@@ -1,3 +1,8 @@
+// Copyright (c) 2025 ADBC Drivers Contributors
+//
+// This file has been modified from its original version, which is
+// under the Apache License:
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -32,9 +37,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
-	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/snowflakedb/gosnowflake"
@@ -171,8 +175,8 @@ func isWildcardStr(ident string) bool {
 }
 
 func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog, dbSchema, tableName, columnName *string, tableType []string) (reader array.RecordReader, err error) {
-	ctx, span := internal.StartSpan(ctx, "connectionImpl.GetObjects", c)
-	defer internal.EndSpan(span, err)
+	ctx, span := driverbase.StartSpan(ctx, "connectionImpl.GetObjects", c)
+	defer driverbase.EndSpan(span, err)
 
 	var (
 		pkQueryID, fkQueryID, uniqueQueryID, terseDbQueryID string
@@ -357,7 +361,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 				for j, tab := range sch.DbSchemaTables {
 					for k, col := range tab.TableColumns {
 						field := c.toArrowField(col)
-						xdbcDataType := internal.ToXdbcDataType(field.Type)
+						xdbcDataType := driverbase.ToXdbcDataType(field.Type)
 
 						if field.Type != nil {
 							getObjectsCatalog.CatalogDbSchemas[i].DbSchemaTables[j].TableColumns[k].XdbcDataType = driverbase.Nullable(int16(field.Type.ID()))
@@ -645,8 +649,8 @@ func (c *connectionImpl) getStringQuery(query string) (value string, err error) 
 }
 
 func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (sc *arrow.Schema, err error) {
-	ctx, span := internal.StartSpan(ctx, "connectionImpl.GetTableSchema", c)
-	defer internal.EndSpan(span, err)
+	ctx, span := driverbase.StartSpan(ctx, "connectionImpl.GetTableSchema", c)
+	defer driverbase.EndSpan(span, err)
 
 	tblParts := make([]string, 0, 3)
 	if catalog != nil {
@@ -755,8 +759,8 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 
 // Close closes this connection and releases any associated resources.
 func (c *connectionImpl) Close() (err error) {
-	_, span := internal.StartSpan(context.Background(), "connectionImpl.Close", c)
-	defer internal.EndSpan(span, err)
+	_, span := driverbase.StartSpan(context.Background(), "connectionImpl.Close", c)
+	defer driverbase.EndSpan(span, err)
 
 	if c.cn == nil {
 		err = adbc.Error{Code: adbc.StatusInvalidState}

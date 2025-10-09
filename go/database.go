@@ -1,3 +1,8 @@
+// Copyright (c) 2025 ADBC Drivers Contributors
+//
+// This file has been modified from its original version, which is
+// under the Apache License:
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -31,9 +36,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
-	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
 	"github.com/snowflakedb/gosnowflake"
 	"github.com/youmark/pkcs8"
 )
@@ -513,8 +517,8 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 }
 
 func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection, err error) {
-	ctx, span := internal.StartSpan(ctx, "databaseImpl.Open", d)
-	defer internal.EndSpan(span, err)
+	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
+	defer driverbase.EndSpan(span, err)
 
 	connector := gosnowflake.NewConnector(drv, *d.cfg)
 
