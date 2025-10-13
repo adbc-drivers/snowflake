@@ -12,19 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Dev
+name = "ADBC Driver Foundry Driver for Snowflake"
+description = "An ADBC driver for Snowflake developed by the ADBC Driver Foundry"
+publisher = "ADBC Drivers Contributors"
+license = "Apache-2.0"
 
-on:
-  pull_request: {}
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  lint:
-    uses: adbc-drivers/dev/.github/workflows/dev.yaml@7d18be0bf4de7faa6fcaee579d577c830d8db054
-    secrets:
-      clone_pat: ${{ secrets.CLONE_PAT }}
+[ADBC]
+version = "v1.1.0"
