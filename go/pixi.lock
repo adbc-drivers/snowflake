@@ -34,7 +34,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/98/df/0a1755e750013a2081e863e7cd37e0cdd02664372c754e5560099eb7aa44/cffi-2.0.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/7e/95/42aa2156235cbc8fa61208aded06ef46111c4d3f0de233107b3f38631803/charset_normalizer-3.4.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/7e/e8/64c37fadfc2816a7701fa8a6ed8d87327c7d54eacfbfb6edab14a2f2be75/cloudpickle-3.1.1-py3-none-any.whl
-      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=d64a642595b11dda832aa0d1edf2400aa0cf24c7#d64a642595b11dda832aa0d1edf2400aa0cf24c7
+      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=97265f252a81e2f801becdddb1bff6c7f7c2ca47#97265f252a81e2f801becdddb1bff6c7f7c2ca47
       - pypi: https://files.pythonhosted.org/packages/44/83/a2960d2c975836daa629a73995134fd86520c101412578c57da3d2aa71ee/doit-0.36.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/17/fc/9b958751f0116d7b0406406b07fa6f5a10c22d699be27826d0b896f9bf51/duckdb-1.4.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl
@@ -86,7 +86,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/a9/f5/a2c23eb03b61a0b8747f211eb716446c826ad66818ddc7810cc2cc19b3f2/cffi-2.0.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/71/11/98a04c3c97dd34e49c7d247083af03645ca3730809a5509443f3c37f7c99/charset_normalizer-3.4.3-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/7e/e8/64c37fadfc2816a7701fa8a6ed8d87327c7d54eacfbfb6edab14a2f2be75/cloudpickle-3.1.1-py3-none-any.whl
-      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=d64a642595b11dda832aa0d1edf2400aa0cf24c7#d64a642595b11dda832aa0d1edf2400aa0cf24c7
+      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=97265f252a81e2f801becdddb1bff6c7f7c2ca47#97265f252a81e2f801becdddb1bff6c7f7c2ca47
       - pypi: https://files.pythonhosted.org/packages/44/83/a2960d2c975836daa629a73995134fd86520c101412578c57da3d2aa71ee/doit-0.36.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/15/7b/c4f272a40c36d82df20937d93a1780eb39ab0107fe42b62cba889151eab9/duckdb-1.4.1-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
       - pypi: https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl
@@ -134,7 +134,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/4a/d2/a6c0296814556c68ee32009d9c2ad4f85f2707cdecfd7727951ec228005d/cffi-2.0.0-cp313-cp313-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/65/ca/2135ac97709b400c7654b4b764daf5c5567c2da45a30cdd20f9eefe2d658/charset_normalizer-3.4.3-cp313-cp313-macosx_10_13_universal2.whl
       - pypi: https://files.pythonhosted.org/packages/7e/e8/64c37fadfc2816a7701fa8a6ed8d87327c7d54eacfbfb6edab14a2f2be75/cloudpickle-3.1.1-py3-none-any.whl
-      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=d64a642595b11dda832aa0d1edf2400aa0cf24c7#d64a642595b11dda832aa0d1edf2400aa0cf24c7
+      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=97265f252a81e2f801becdddb1bff6c7f7c2ca47#97265f252a81e2f801becdddb1bff6c7f7c2ca47
       - pypi: https://files.pythonhosted.org/packages/44/83/a2960d2c975836daa629a73995134fd86520c101412578c57da3d2aa71ee/doit-0.36.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/38/46/267f4a570a0ee3ae6871ddc03435f9942884284e22a7ba9b7cb252ee69b6/duckdb-1.4.1-cp313-cp313-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl
@@ -184,7 +184,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/9a/8f/ae790790c7b64f925e5c953b924aaa42a243fb778fed9e41f147b2a5715a/charset_normalizer-3.4.3-cp313-cp313-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/7e/e8/64c37fadfc2816a7701fa8a6ed8d87327c7d54eacfbfb6edab14a2f2be75/cloudpickle-3.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl
-      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=d64a642595b11dda832aa0d1edf2400aa0cf24c7#d64a642595b11dda832aa0d1edf2400aa0cf24c7
+      - pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=97265f252a81e2f801becdddb1bff6c7f7c2ca47#97265f252a81e2f801becdddb1bff6c7f7c2ca47
       - pypi: https://files.pythonhosted.org/packages/44/83/a2960d2c975836daa629a73995134fd86520c101412578c57da3d2aa71ee/doit-0.36.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/30/79/4f544d73fcc0513b71296cb3ebb28a227d22e80dec27204977039b9fa875/duckdb-1.4.1-cp313-cp313-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl
@@ -301,7 +301,7 @@ packages:
   - pyarrow>=14.0.1 ; extra == 'test'
   - pytest ; extra == 'test'
   requires_python: '>=3.9'
-- pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=d64a642595b11dda832aa0d1edf2400aa0cf24c7#d64a642595b11dda832aa0d1edf2400aa0cf24c7
+- pypi: git+ssh://git@github.com/adbc-drivers/dev?rev=97265f252a81e2f801becdddb1bff6c7f7c2ca47#97265f252a81e2f801becdddb1bff6c7f7c2ca47
   name: adbc-drivers-dev
   version: '0.1'
   requires_dist:

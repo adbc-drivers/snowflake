@@ -17,6 +17,7 @@ module github.com/adbc-drivers/snowflake/go
 go 1.25.0
 
 require (
+	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20251007013531-3732392004fd
 	github.com/apache/arrow-adbc/go/adbc v1.8.0
 	github.com/apache/arrow-go/v18 v18.4.1
 	github.com/google/uuid v1.6.0
@@ -35,7 +36,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.10.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.4.0 // indirect
 	github.com/BurntSushi/toml v1.4.0 // indirect
-	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20251007013531-3732392004fd // indirect
+	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20251010031731-265f4a81237c // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/apache/thrift v0.22.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.38.1 // indirect
@@ -92,12 +93,12 @@ require (
 	go.opentelemetry.io/otel/sdk v1.38.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.8.0 // indirect
 	golang.org/x/crypto v0.43.0 // indirect
-	golang.org/x/exp v0.0.0-20251002181428-27f1f14c8bb9 // indirect
+	golang.org/x/exp v0.0.0-20251009144603-d2f985daa21b // indirect
 	golang.org/x/mod v0.29.0 // indirect
 	golang.org/x/net v0.46.0 // indirect
 	golang.org/x/oauth2 v0.31.0 // indirect
 	golang.org/x/sys v0.37.0 // indirect
-	golang.org/x/telemetry v0.0.0-20251008203120-078029d740a8 // indirect
+	golang.org/x/telemetry v0.0.0-20251009181524-91c411e14f39 // indirect
 	golang.org/x/term v0.36.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
