@@ -49,8 +49,8 @@ $ pixi run make
 ```
 
 To run the validation suite, you will first need to build the shared library.
-You will also need to set up a BigQuery instance (see [the validation
-README](./validation/README.md)).  Finally, from the `go/` subdirectory:
+You will also need to set up a Snowflake instance (see [the validation
+README](./go/validation/README.md)).  Finally, from the `go/` subdirectory:
 
 ```shell
 $ pixi run validate
@@ -63,7 +63,7 @@ page (using MyST Markdown):
 $ pixi run gendocs --output generated/
 ```
 
-Then look at `./generated/bigquery.md`.
+Then look at `./generated/snowflake.md`.
 
 ## Opening a Pull Request
 

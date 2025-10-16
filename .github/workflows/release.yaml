@@ -20,7 +20,7 @@ name: Release
 on:
   push:
     tags:
-      - "bigquery/**"
+      - "go/v**"
   workflow_dispatch:
     inputs:
       dry_run_tag:
