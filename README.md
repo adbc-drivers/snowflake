@@ -28,6 +28,15 @@ Driver Manifests, such as [dbc](https://columnar.tech/dbc).
 
 See [Building](#building) if you would rather build the drivers yourself.
 
+## Usage
+
+See examples for:
+
+- [Go](https://github.com/columnar-tech/adbc-quickstarts/tree/main/go/snowflake)
+- [Python](https://github.com/columnar-tech/adbc-quickstarts/tree/main/python/snowflake)
+- [R](https://github.com/columnar-tech/adbc-quickstarts/tree/main/r/snowflake)
+- [Rust](https://github.com/columnar-tech/adbc-quickstarts/tree/main/rust/snowflake)
+
 ## Building
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
