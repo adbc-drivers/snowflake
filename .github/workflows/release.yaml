@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   test:
-    uses: adbc-drivers/dev/.github/workflows/test.yaml@19b7466f3177cf978db8c7a444f8710bd850e66c
+    uses: adbc-drivers/dev/.github/workflows/test.yaml@742df4896dbb58618cedc0a635f33bdcff3ffb5a
     secrets:
       clone_pat: ${{ secrets.CLONE_PAT }}
     with:
@@ -44,7 +44,7 @@ jobs:
       subdir: go
 
   validate:
-    uses: adbc-drivers/dev/.github/workflows/validate.yaml@19b7466f3177cf978db8c7a444f8710bd850e66c
+    uses: adbc-drivers/dev/.github/workflows/validate.yaml@742df4896dbb58618cedc0a635f33bdcff3ffb5a
     secrets:
       driver: snowflake
     with:
@@ -52,7 +52,7 @@ jobs:
       subdir: go
 
   release:
-    uses: adbc-drivers/dev/.github/workflows/release.yaml@19b7466f3177cf978db8c7a444f8710bd850e66c
+    uses: adbc-drivers/dev/.github/workflows/release.yaml@742df4896dbb58618cedc0a635f33bdcff3ffb5a
     needs:
       - test
       - validate
@@ -61,7 +61,7 @@ jobs:
       clone_pat: ${{ secrets.CLONE_PAT }}
 
   release-dry-run:
-    uses: adbc-drivers/dev/.github/workflows/release.yaml@19b7466f3177cf978db8c7a444f8710bd850e66c
+    uses: adbc-drivers/dev/.github/workflows/release.yaml@742df4896dbb58618cedc0a635f33bdcff3ffb5a
     needs:
       - test
       - validate
