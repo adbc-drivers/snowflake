@@ -46,8 +46,8 @@ import (
 	"time"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
-	driver "github.com/adbc-drivers/snowflake/go"
 	"github.com/apache/arrow-adbc/go/adbc"
+	driver "github.com/apache/arrow-adbc/go/adbc/driver/snowflake"
 	"github.com/apache/arrow-adbc/go/adbc/validation"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
