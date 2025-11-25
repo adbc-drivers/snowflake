@@ -2825,10 +2825,8 @@ func TestSnowflakeURIScheme(t *testing.T) {
 
 				if tc.expectedErrCode != 0 {
 					var sfError *gosnowflake.SnowflakeError
-					assert.ErrorAs(t, err, &sfError, "Expected a SnowflakeError type for code %d", tc.expectedErrCode)
-					if sfError != nil {
-						assert.Equal(t, tc.expectedErrCode, sfError.Number, "Expected specific error code")
-					}
+					require.ErrorAs(t, err, &sfError, "Expected a SnowflakeError type for code %d", tc.expectedErrCode)
+					assert.Equal(t, tc.expectedErrCode, sfError.Number, "Expected specific error code")
 				}
 			} else {
 				assert.NoError(t, err, "Transformed DSN should be valid: %q", uri)
