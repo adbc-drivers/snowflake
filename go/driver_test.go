@@ -2824,9 +2824,9 @@ func TestSnowflakeURIScheme(t *testing.T) {
 				require.Error(t, err, "Expected ParseDSN to fail for URI %q -> %q", tc.snowflakeURI, uri)
 
 				if tc.expectedErrCode != 0 {
-					sfError, ok := err.(*gosnowflake.SnowflakeError)
-					assert.True(t, ok, "Expected a SnowflakeError type for code %d", tc.expectedErrCode)
-					if ok {
+					var sfError *gosnowflake.SnowflakeError
+					assert.ErrorAs(t, err, &sfError, "Expected a SnowflakeError type for code %d", tc.expectedErrCode)
+					if sfError != nil {
 						assert.Equal(t, tc.expectedErrCode, sfError.Number, "Expected specific error code")
 					}
 				}
