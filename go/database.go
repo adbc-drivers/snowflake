@@ -189,6 +189,9 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 	uri, ok := cnOptions[adbc.OptionKeyURI]
 	if ok {
+		// Support snowflake:// scheme by stripping it before passing to gosnowflake
+		uri = strings.TrimPrefix(uri, "snowflake://")
+
 		cfg, err := gosnowflake.ParseDSN(uri)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInvalidArgument, err)
