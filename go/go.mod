@@ -19,7 +19,7 @@ go 1.25.0
 require (
 	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20251112003129-9ec138f8c4cb
 	github.com/apache/arrow-adbc/go/adbc v1.9.0
-	github.com/apache/arrow-go/v18 v18.4.1
+	github.com/apache/arrow-go/v18 v18.4.2-0.20251124222331-4b04248429bc
 	github.com/google/uuid v1.6.0
 	github.com/snowflakedb/gosnowflake v1.18.0
 	github.com/stretchr/testify v1.11.1
