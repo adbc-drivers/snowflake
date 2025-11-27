@@ -528,6 +528,11 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 	var cn driver.Conn
 	cn, err = connector.Connect(ctx)
 	if err != nil {
+		sfErr, ok := err.(*gosnowflake.SnowflakeError)
+		if ok && sfErr.SQLState == gosnowflake.SQLStateConnectionRejected {
+			err = errToAdbcErr(adbc.StatusUnauthorized, err)
+			return nil, err
+		}
 		err = errToAdbcErr(adbc.StatusIO, err)
 		return nil, err
 	}

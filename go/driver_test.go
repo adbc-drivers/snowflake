@@ -2172,7 +2172,10 @@ func TestJwtAuthenticationUnencryptedValue(t *testing.T) {
 		t.Skip("Cannot find the `SNOWFLAKE_TEST_PKCS8_VALUE` value")
 	}
 
-	ConnectWithJwt(t, uri, keyValue, "")
+	cfg, err := gosnowflake.ParseDSN(uri)
+	assert.NoError(t, err)
+
+	ConnectWithJwt(t, cfg, keyValue, "", true)
 }
 
 func TestJwtAuthenticationEncryptedValue(t *testing.T) {
@@ -2193,19 +2196,19 @@ func TestJwtAuthenticationEncryptedValue(t *testing.T) {
 		t.Skip("Cannot find the `SNOWFLAKE_TEST_PKCS8_PASS` value")
 	}
 
-	ConnectWithJwt(t, uri, keyValue, passcode)
+	cfg, err := gosnowflake.ParseDSN(uri)
+	assert.NoError(t, err)
+
+	ConnectWithJwt(t, cfg, keyValue, passcode, true)
 }
 
-func ConnectWithJwt(t *testing.T, uri, keyValue, passcode string) {
+func ConnectWithJwt(t *testing.T, cfg *gosnowflake.Config, keyValue, passcode string, isAuthorized bool) {
 
 	// Windows funkiness
 	if runtime.GOOS == "windows" {
 		keyValue = strings.ReplaceAll(keyValue, "\\r", "\r")
 		keyValue = strings.ReplaceAll(keyValue, "\\n", "\n")
 	}
-
-	cfg, err := gosnowflake.ParseDSN(uri)
-	assert.NoError(t, err)
 
 	opts := map[string]string{
 		driver.OptionAccount:                 cfg.Account,
@@ -2236,8 +2239,14 @@ func ConnectWithJwt(t *testing.T, uri, keyValue, passcode string) {
 	defer validation.CheckedClose(t, db)
 
 	cnxn, err := db.Open(context.Background())
-	assert.NoError(t, err)
-	defer validation.CheckedClose(t, cnxn)
+	if isAuthorized {
+		assert.NoError(t, err)
+		defer validation.CheckedClose(t, cnxn)
+	} else {
+		adbcErr, ok := err.(adbc.Error)
+		assert.True(t, ok)
+		assert.Equal(t, adbc.StatusUnauthorized, adbcErr.Code)
+	}
 }
 
 func (suite *SnowflakeTests) TestJwtPrivateKey() {
@@ -2718,4 +2727,63 @@ func (suite *SnowflakeTests) TestGetObjectsVector() {
 			}
 		}
 	}
+}
+
+func TestInvalidSnowflakeAuthentication(t *testing.T) {
+	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
+	if !ok {
+		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
+	}
+
+	cfg, err := gosnowflake.ParseDSN(uri)
+	assert.NoError(t, err)
+	opts := map[string]string{
+		driver.OptionAccount:   cfg.Account,
+		adbc.OptionKeyUsername: cfg.User,
+		adbc.OptionKeyPassword: "invalid_password",
+		driver.OptionDatabase:  cfg.Database,
+		driver.OptionSchema:    cfg.Schema,
+		driver.OptionAuthType:  driver.OptionValueAuthSnowflake,
+	}
+
+	if cfg.Warehouse != "" {
+		opts[driver.OptionWarehouse] = cfg.Warehouse
+	}
+
+	if cfg.Host != "" {
+		opts[driver.OptionHost] = cfg.Host
+	}
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	adbcDriver := driver.NewDriver(mem)
+	db, err := adbcDriver.NewDatabase(opts)
+	assert.NoError(t, err)
+	defer validation.CheckedClose(t, db)
+
+	cnxn, err := db.Open(context.Background())
+	assert.Error(t, err)
+	assert.Nil(t, cnxn)
+	adbcErr, ok := err.(adbc.Error)
+	assert.True(t, ok)
+	assert.Equal(t, adbc.StatusUnauthorized, adbcErr.Code)
+}
+
+func TestJwtAuthenticationUnencryptedValueUnauthorized(t *testing.T) {
+	// test doesn't participate in SnowflakeTests because
+	// JWT auth has a different behavior
+	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
+	if !ok {
+		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
+	}
+
+	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_VALUE")
+	if !ok {
+		t.Skip("Cannot find the `SNOWFLAKE_TEST_PKCS8_VALUE` value")
+	}
+
+	cfg, err := gosnowflake.ParseDSN(uri)
+	assert.NoError(t, err)
+	cfg.User = "non_existent_user"
+
+	ConnectWithJwt(t, cfg, keyValue, "", false)
 }
