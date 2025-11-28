@@ -15,7 +15,12 @@
 name: Dev
 
 on:
-  pull_request: {}
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
   push:
     branches:
       - main
@@ -26,5 +31,3 @@ permissions:
 jobs:
   lint:
     uses: adbc-drivers/dev/.github/workflows/dev.yaml@742df4896dbb58618cedc0a635f33bdcff3ffb5a
-    secrets:
-      clone_pat: ${{ secrets.CLONE_PAT }}
