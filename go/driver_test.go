@@ -2917,4 +2917,3 @@ func TestJwtAuthenticationUnencryptedValueUnauthorized(t *testing.T) {
 
 	ConnectWithJwt(t, cfg, keyValue, "", false)
 }
-
