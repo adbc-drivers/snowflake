@@ -140,7 +140,7 @@ func getArr(arr arrow.Array) interface{} {
 		return gosnowflake.Array(&v)
 	case *array.String:
 		v := make([]string, arr.Len())
-		for i := 0; i < arr.Len(); i++ {
+		for i := range arr.Len() {
 			if arr.IsNull(i) {
 				continue
 			}
@@ -162,11 +162,11 @@ func (s *SnowflakeQuirks) CreateSampleTable(tableName string, r arrow.RecordBatc
 	b.WriteString(quoteTblName(tableName))
 	b.WriteString(" (")
 
-	for i := 0; i < int(r.NumCols()); i++ {
+	for i := range r.NumCols() {
 		if i != 0 {
 			b.WriteString(", ")
 		}
-		f := r.Schema().Field(i)
+		f := r.Schema().Field(int(i))
 		b.WriteString(f.Name)
 		b.WriteByte(' ')
 		b.WriteString(s.getSqlTypeFromArrowType(f.Type))
@@ -1561,8 +1561,8 @@ func (suite *SnowflakeTests) TestMetadataGetObjectsColumnsXdbc() {
 		xdbcCharOctetLen  = make([]string, 0)
 		xdbcIsNullables   = make([]string, 0)
 	)
-	for row := 0; row < int(rec.NumRows()); row++ {
-		dbSchemaIdxStart, dbSchemaIdxEnd := catalogDbSchemasList.ValueOffsets(row)
+	for row := range rec.NumRows() {
+		dbSchemaIdxStart, dbSchemaIdxEnd := catalogDbSchemasList.ValueOffsets(int(row))
 		for dbSchemaIdx := dbSchemaIdxStart; dbSchemaIdx < dbSchemaIdxEnd; dbSchemaIdx++ {
 			schemaName := dbSchemaNames.Value(int(dbSchemaIdx))
 			tblIdxStart, tblIdxEnd := dbSchemaTablesList.ValueOffsets(int(dbSchemaIdx))
@@ -1766,9 +1766,9 @@ func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 
 	// Get column indexes
 	getColIdx := func(name string) int {
-		for i := 0; i < int(rec.NumCols()); i++ {
-			if rec.ColumnName(i) == name {
-				return i
+		for i := range rec.NumCols() {
+			if rec.ColumnName(int(i)) == name {
+				return int(i)
 			}
 		}
 		panic("Column not found: " + name)
@@ -1898,8 +1898,8 @@ func (suite *SnowflakeTests) getTimestamps(query string, maxTimestampPrecision s
 
 func (suite *SnowflakeTests) validateTimestamps(query string, rec arrow.RecordBatch, expected []arrow.Timestamp) {
 	if expected != nil {
-		for i := 0; i < int(rec.NumCols()); i++ {
-			col := rec.Column(i).(*array.Timestamp)
+		for i := range rec.NumCols() {
+			col := rec.Column(int(i)).(*array.Timestamp)
 			suite.EqualValues(1, col.Len())
 			actual := col.Value(0)
 			suite.Equal(expected[i], actual, "Mismatch in column %d for the query %d", i, query)
@@ -1948,8 +1948,8 @@ func (suite *SnowflakeTests) TestUseHighPrecision() {
 }
 
 func (suite *SnowflakeTests) TestDecimalHighPrecision() {
-	for sign := 0; sign <= 1; sign++ {
-		for scale := 0; scale <= 2; scale++ {
+	for sign := range 2 {
+		for scale := range 3 {
 			for precision := 3; precision <= 38; precision++ {
 				numberString := strings.Repeat("9", precision-scale) + "." + strings.Repeat("9", scale)
 				if sign == 1 {
@@ -1977,7 +1977,7 @@ func (suite *SnowflakeTests) TestDecimalHighPrecision() {
 }
 
 func (suite *SnowflakeTests) TestNonIntDecimalLowPrecision() {
-	for sign := 0; sign <= 1; sign++ {
+	for sign := range 2 {
 		for precision := 3; precision <= 38; precision++ {
 			scale := 2
 			numberString := strings.Repeat("9", precision-scale) + ".99"
@@ -2083,7 +2083,7 @@ func (suite *SnowflakeTests) TestSchemaWithLowPrecision() {
 }
 
 func (suite *SnowflakeTests) TestIntDecimalLowPrecision() {
-	for sign := 0; sign <= 1; sign++ {
+	for sign := range 2 {
 		for precision := 3; precision <= 38; precision++ {
 			scale := 0
 			numberString := strings.Repeat("9", precision-scale)
@@ -2143,16 +2143,16 @@ func (suite *SnowflakeTests) TestAdditionalDriverInfo() {
 		code := rec.Column(0).(*array.Uint32)
 		info := rec.Column(1).(*array.DenseUnion)
 
-		for i := 0; i < int(rec.NumRows()); i++ {
-			if code.Value(i) == uint32(adbc.InfoVendorSql) {
-				arr, ok := info.Field(info.ChildID(i)).(*array.Boolean)
+		for i := range rec.NumRows() {
+			if code.Value(int(i)) == uint32(adbc.InfoVendorSql) {
+				arr, ok := info.Field(info.ChildID(int(i))).(*array.Boolean)
 				suite.Require().True(ok)
-				suite.Require().Equal(true, arr.Value(i))
+				suite.Require().Equal(true, arr.Value(int(i)))
 			}
-			if code.Value(i) == uint32(adbc.InfoVendorSubstrait) {
-				arr, ok := info.Field(info.ChildID(i)).(*array.Boolean)
+			if code.Value(int(i)) == uint32(adbc.InfoVendorSubstrait) {
+				arr, ok := info.Field(info.ChildID(int(i))).(*array.Boolean)
 				suite.Require().True(ok)
-				suite.Require().Equal(false, arr.Value(i))
+				suite.Require().Equal(false, arr.Value(int(i)))
 			}
 		}
 	}

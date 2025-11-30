@@ -86,7 +86,6 @@ type databaseImpl struct {
 	defaultAppName        string
 }
 
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
 func (d *databaseImpl) GetOption(key string) (string, error) {
 	switch key {
 	case adbc.OptionKeyUsername:
@@ -207,7 +206,7 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 	}
 	// XXX(https://github.com/apache/arrow-adbc/issues/2792): Snowflake
 	// has a tendency to spam the log by default, so set the log level
-	//nolint:staticcheck // ignore snowflake deprecated warnings for now
+
 	d.cfg.Tracing = "fatal"
 
 	// set default application name to track
@@ -228,7 +227,7 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 //
 // cnOptions is nil if the option is being set post-initialiation.
 //
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
+
 func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[string]string) error {
 	var err error
 	var ok bool

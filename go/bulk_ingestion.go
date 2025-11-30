@@ -623,7 +623,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concu
 		}
 
 		maxRetries := 5 // maybe make configurable?
-		for attempt := 0; attempt < maxRetries+1; attempt++ {
+		for attempt := range maxRetries + 1 {
 			if attempt > 0 {
 				// backoff by 100ms, 200ms, 400ms, ...
 				factor := time.Duration(math.Pow(2, float64(attempt-1)))
