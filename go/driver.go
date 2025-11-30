@@ -190,8 +190,11 @@ func errToAdbcErr(code adbc.Status, err error) error {
 		var sqlstate [5]byte
 		copy(sqlstate[:], []byte(sferr.SQLState))
 
-		if sferr.SQLState == SQLStateTableOrViewNotFound {
+		switch sferr.SQLState {
+		case SQLStateTableOrViewNotFound:
 			code = adbc.StatusNotFound
+		case gosnowflake.SQLStateConnectionRejected:
+			code = adbc.StatusUnauthorized
 		}
 
 		return adbc.Error{
