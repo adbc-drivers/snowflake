@@ -1823,8 +1823,8 @@ func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 func (suite *SnowflakeTests) TestTimestampPrecision() {
 
 	query_ntz := "select TO_TIMESTAMP_NTZ('0001-01-01 00:00:00.000000000') as Jan01_0001, TO_TIMESTAMP_NTZ('2025-06-02 10:37:56.123456789') as June02_2025, TO_TIMESTAMP_NTZ('9999-12-31 23:59:59.999999999') As December31_9999"
-	query_ltz := "select TO_TIMESTAMP_LTZ('0001-01-01 00:00:00.000000000') as Jan01_0001, TO_TIMESTAMP_LTZ('2025-06-02 10:37:56.123456789') as June02_2025, TO_TIMESTAMP_LTZ('9999-12-31 23:59:59.999999999') As December31_9999"
-	query_tz := "select TO_TIMESTAMP_TZ('0001-01-01 00:00:00.000000000') as Jan01_0001, TO_TIMESTAMP_TZ('2025-06-02 10:37:56.123456789') as June02_2025, TO_TIMESTAMP_TZ('9999-12-31 23:59:59.999999999') As December31_9999"
+	// Use explicit UTC timezone offset to avoid session timezone dependency
+	query_tz := "select '0001-01-01 00:00:00.000000000 +0000'::TIMESTAMP_TZ as Jan01_0001, '2025-06-02 10:37:56.123456789 +0000'::TIMESTAMP_TZ as June02_2025, '9999-12-31 23:59:59.999999999 +0000'::TIMESTAMP_TZ As December31_9999"
 
 	v1, _ := arrow.TimestampFromTime(time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), arrow.Microsecond)
 	v2, _ := arrow.TimestampFromTime(time.Date(2025, 6, 2, 10, 37, 56, 123456789, time.UTC), arrow.Microsecond)
@@ -1846,7 +1846,6 @@ func (suite *SnowflakeTests) TestTimestampPrecision() {
 	}
 
 	suite.queryTimestamps(query_ntz, expectedMicrosecondsResults, expectedNanosecondResults)
-	suite.queryTimestamps(query_ltz, expectedMicrosecondsResults, expectedNanosecondResults)
 	suite.queryTimestamps(query_tz, expectedMicrosecondsResults, expectedNanosecondResults)
 }
 
