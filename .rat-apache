@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.github/pull_request_template.md
-.gitmodules
-*/go.sum
-*/pixi.lock
-*/*.csproj
-*/*.sln
-go/license.tpl
-go/validation/queries/*/*.json
-go/validation/queries/*/*.sql
+go/binding.go
+go/bulk_ingestion.go
+go/bulk_ingestion_test.go
+go/concat_reader.go
+go/connection.go
+go/database.go
+go/driver.go
+go/driver_test.go
+go/pkg/adbc.h
+go/pkg/driver.go
+go/pkg/utils.c
+go/pkg/utils.h
+go/queries/get_objects_all.sql
+go/queries/get_objects_dbschemas.sql
+go/queries/get_objects_tables.sql
+go/queries/get_objects_terse_catalogs.sql
+go/record_reader.go
+go/statement.go
