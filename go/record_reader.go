@@ -180,7 +180,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				structData := a.(*array.Struct)
 				epoch := structData.Field(0).(*array.Int64).Int64Values()
 				fraction := structData.Field(1).(*array.Int32).Int32Values()
-				for i := 0; i < a.Len(); i++ {
+				for i := range a.Len() {
 					if a.IsNull(i) {
 						tb.AppendNull()
 						continue
@@ -208,7 +208,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 					structData := a.(*array.Struct)
 					epoch := structData.Field(0).(*array.Int64).Int64Values()
 					fraction := structData.Field(1).(*array.Int32).Int32Values()
-					for i := 0; i < a.Len(); i++ {
+					for i := range a.Len() {
 						if a.IsNull(i) {
 							tb.AppendNull()
 							continue
@@ -248,7 +248,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				if structData.NumField() == 2 {
 					epoch := structData.Field(0).(*array.Int64).Int64Values()
 					tzoffset := structData.Field(1).(*array.Int32).Int32Values()
-					for i := 0; i < a.Len(); i++ {
+					for i := range a.Len() {
 						if a.IsNull(i) {
 							tb.AppendNull()
 							continue
@@ -280,7 +280,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 					epoch := structData.Field(0).(*array.Int64).Int64Values()
 					fraction := structData.Field(1).(*array.Int32).Int32Values()
 					tzoffset := structData.Field(2).(*array.Int32).Int32Values()
-					for i := 0; i < a.Len(); i++ {
+					for i := range a.Len() {
 						if a.IsNull(i) {
 							tb.AppendNull()
 							continue
@@ -617,7 +617,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 
 			// we grab the entire JSON message and create a bytes reader
 			offset, buf := int64(0), bytes.NewReader(data)
-			for i := 0; i < int(b.NumRows()); i++ {
+			for i := range b.NumRows() {
 				// we construct a decoder from the bytes.Reader to read the next JSON list
 				// of columns (one row) from the input
 				dec := json.NewDecoder(buf)

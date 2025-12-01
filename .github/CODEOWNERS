@@ -12,26 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-version = "2"
+* @lidavidm @zeroshade
+.github/* @lidavidm @zeroshade
 
-[formatters]
-enable = [
-  "gofmt",
-]
-
-[issues]
-max-issues-per-linter = 0
-max-same-issues = 0
-uniq-by-line = false
-
-[linters]
-enable = [
-  "errcheck",
-  "govet",
-  "ineffassign",
-  "intrange",
-  "mirror",
-  "nolintlint",
-  "staticcheck",
-  "unused",
-]
+go/* @lidavidm @zeroshade

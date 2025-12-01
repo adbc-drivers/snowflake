@@ -65,7 +65,7 @@ func TestIngestBatchedParquetWithFileLimit(t *testing.T) {
 	require.NoError(t, tempWriter.Close())
 
 	recs := make([]arrow.RecordBatch, nRecs)
-	for i := 0; i < nRecs; i++ {
+	for i := range nRecs {
 		recs[i] = rec
 	}
 
@@ -90,7 +90,7 @@ func TestIngestBatchedParquetWithFileLimit(t *testing.T) {
 
 func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
 	vals := make([]int8, nRows)
-	for val := 0; val < nRows; val++ {
+	for val := range nRows {
 		vals[val] = int8(val)
 	}
 
@@ -103,7 +103,7 @@ func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
 
 	fields := make([]arrow.Field, nCols)
 	cols := make([]arrow.Array, nCols)
-	for i := 0; i < nCols; i++ {
+	for i := range nCols {
 		fields[i] = arrow.Field{Name: fmt.Sprintf("field_%d", i), Type: arrow.PrimitiveTypes.Int8}
 		cols[i] = arr // array.NewRecordBatch will retain these
 	}
