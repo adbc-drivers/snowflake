@@ -2733,7 +2733,6 @@ func TestSnowflakeURIScheme(t *testing.T) {
 	testCases := []struct {
 		name                  string
 		snowflakeURI          string
-		expectedDSN           string
 		expectError           bool
 		expectedErrCode       int
 		expectedUser          string
@@ -2745,7 +2744,6 @@ func TestSnowflakeURIScheme(t *testing.T) {
 		{
 			name:                  "Standard URI with account identifier and full path",
 			snowflakeURI:          "snowflake://testuser:testpass@myorg-account1/testdb/testschema?warehouse=testwh",
-			expectedDSN:           "testuser:testpass@myorg-account1/testdb/testschema?warehouse=testwh",
 			expectError:           false,
 			expectedUser:          "testuser",
 			expectedPassword:      "testpass",
@@ -2755,7 +2753,6 @@ func TestSnowflakeURIScheme(t *testing.T) {
 		{
 			name:                  "Standard URI with account identifier (no schema)",
 			snowflakeURI:          "snowflake://testuser:testpass@myorg-account1/testdb?warehouse=testwh",
-			expectedDSN:           "testuser:testpass@myorg-account1/testdb?warehouse=testwh",
 			expectError:           false,
 			expectedUser:          "testuser",
 			expectedPassword:      "testpass",
@@ -2765,7 +2762,6 @@ func TestSnowflakeURIScheme(t *testing.T) {
 		{
 			name:             "Full hostname with required account parameter",
 			snowflakeURI:     "snowflake://testuser:testpass@private.network.com:443/testdb?account=myaccount&warehouse=testwh",
-			expectedDSN:      "testuser:testpass@private.network.com:443/testdb?account=myaccount&warehouse=testwh",
 			expectError:      false,
 			expectedUser:     "testuser",
 			expectedPassword: "testpass",
@@ -2775,20 +2771,17 @@ func TestSnowflakeURIScheme(t *testing.T) {
 		{
 			name:            "Full hostname without required account parameter (Expected 260000 Failure)",
 			snowflakeURI:    "snowflake://testuser:testpass@private.network.com:443/testdb?warehouse=testwh",
-			expectedDSN:     "testuser:testpass@private.network.com:443/testdb?warehouse=testwh",
 			expectError:     true,
 			expectedErrCode: gosnowflake.ErrCodeEmptyAccountCode,
 		},
 		{
 			name:         "Empty DSN after scheme (Expected Failure)",
 			snowflakeURI: "snowflake://",
-			expectedDSN:  "",
 			expectError:  true,
 		},
 		{
 			name:             "Full hostname/port/path with explicit account parameter",
 			snowflakeURI:     "snowflake://testuser:testpass@hostname.example.com:443/testdb/testschema?account=user_account&warehouse=testwh",
-			expectedDSN:      "testuser:testpass@hostname.example.com:443/testdb/testschema?account=user_account&warehouse=testwh",
 			expectError:      false,
 			expectedUser:     "testuser",
 			expectedPassword: "testpass",
@@ -2798,7 +2791,6 @@ func TestSnowflakeURIScheme(t *testing.T) {
 		{
 			name:             "Hostname only, valid with External Browser Authenticator (Expected Success)",
 			snowflakeURI:     "snowflake://private.network.com:443/testdb?account=myaccount&authenticator=externalbrowser",
-			expectedDSN:      "private.network.com:443/testdb?account=myaccount&authenticator=externalbrowser",
 			expectError:      false,
 			expectedUser:     "",
 			expectedPassword: "",
@@ -2808,14 +2800,12 @@ func TestSnowflakeURIScheme(t *testing.T) {
 		{
 			name:            "Missing user credentials with full path with default authentication (Expected 260001 Failure)",
 			snowflakeURI:    "snowflake://hostname.example.com:443/testdb/testschema?account=user_account&warehouse=testwh",
-			expectedDSN:     "hostname.example.com:443/testdb/testschema?account=user_account&warehouse=testwh",
 			expectError:     true,
 			expectedErrCode: gosnowflake.ErrCodeEmptyUsernameCode,
 		},
 		{
 			name:            "Missing Password (user:@host) (Expected 260002 Failure)",
 			snowflakeURI:    "snowflake://testuser:@host.com/db?account=testaccount",
-			expectedDSN:     "testuser:@host.com/db?account=testaccount",
 			expectError:     true,
 			expectedErrCode: gosnowflake.ErrCodeEmptyPasswordCode,
 		},
@@ -2823,14 +2813,10 @@ func TestSnowflakeURIScheme(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			uri := strings.TrimPrefix(tc.snowflakeURI, "snowflake://")
-
-			assert.Equal(t, tc.expectedDSN, uri, "URI transformation should match expected DSN")
-
-			cfg, err := gosnowflake.ParseDSN(uri)
+			cfg, err := driver.ParseSnowflakeURI(tc.snowflakeURI)
 
 			if tc.expectError {
-				require.Error(t, err, "Expected ParseDSN to fail for URI %q -> %q", tc.snowflakeURI, uri)
+				require.Error(t, err, "Expected ParseSnowflakeURI to fail for URI %q", tc.snowflakeURI)
 
 				if tc.expectedErrCode != 0 {
 					var sfError *gosnowflake.SnowflakeError
@@ -2838,7 +2824,7 @@ func TestSnowflakeURIScheme(t *testing.T) {
 					assert.Equal(t, tc.expectedErrCode, sfError.Number, "Expected specific error code")
 				}
 			} else {
-				assert.NoError(t, err, "Transformed DSN should be valid: %q", uri)
+				assert.NoError(t, err, "ParseSnowflakeURI should succeed for URI: %q", tc.snowflakeURI)
 				require.NotNil(t, cfg, "Config should not be nil")
 
 				if tc.expectedUser != "" {

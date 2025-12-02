@@ -187,13 +187,18 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 	return d.SetOptionInternal(key, value, nil)
 }
 
+// ParseSnowflakeURI parses a Snowflake URI with the snowflake:// scheme
+// and returns a gosnowflake.Config by stripping the scheme and parsing the DSN
+func ParseSnowflakeURI(uri string) (*gosnowflake.Config, error) {
+	// Support snowflake:// scheme by stripping it before passing to gosnowflake
+	uri = strings.TrimPrefix(uri, "snowflake://")
+	return gosnowflake.ParseDSN(uri)
+}
+
 func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 	uri, ok := cnOptions[adbc.OptionKeyURI]
 	if ok {
-		// Support snowflake:// scheme by stripping it before passing to gosnowflake
-		uri = strings.TrimPrefix(uri, "snowflake://")
-
-		cfg, err := gosnowflake.ParseDSN(uri)
+		cfg, err := ParseSnowflakeURI(uri)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInvalidArgument, err)
 		}
