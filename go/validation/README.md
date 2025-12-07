@@ -39,12 +39,6 @@ export SNOWFLAKE_DATABASE="testdb"
 export SNOWFLAKE_SCHEMA="public"
 ```
 
-## Skipped Tests
-
-Several tests are automatically skipped due to Snowflake driver limitations:
-- Timestamp parameter binding tests (timestamp, timestamp_us, timestamp_ms, timestamp_ns, timestamp_s, timestamptz, timestamptz_us)
-- Various data type parameter binding tests (decimal, fixed_size_binary, large_binary, string_view, time)
-
 ## Running Tests
 
 Once configured, run the validation suite with:
