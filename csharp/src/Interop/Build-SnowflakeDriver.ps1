@@ -31,8 +31,13 @@ if (-not (Test-Path env:IsPackagingPipeline)) {
 # Get the value of the IsPackagingPipeline environment variable
 $IsPackagingPipelineValue = $env:IsPackagingPipeline
 
-# Get the value of the IncludeGoSymbols environment variable
-$IncludeGoSymbolsValue = $env:IncludeGoSymbols
+# Get the value of the IncludeGoSymbols environment variable, default to false if not set
+if (-not (Test-Path env:IncludeGoSymbols)) {
+    Write-Host "IncludeGoSymbols environment variable does not exist. Defaulting to 'false'."
+    $IncludeGoSymbolsValue = "false"
+} else {
+    $IncludeGoSymbolsValue = $env:IncludeGoSymbols
+}
 
 # Check if the value is "true"
 if ($IsPackagingPipelineValue -ne "true") {
@@ -56,7 +61,7 @@ if ($IncludeGoSymbolsValue -ne "true") {
     pixi run make
 } else {
     Write-Host "Building with symbols"
-    go build -buildmode=c-shared -tags=driverlib -ldflags="-s=0 -w=0" -gcflags="all=-N -l" -o 'build\$file'
+    go build -buildmode=c-shared -tags=driverlib -o 'build\$file' -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" -gcflags="all=-N -l" ./pkg
 }
 
 cd build
