@@ -27,7 +27,6 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
-using AdbcDrivers.Snowflake.Interop;
 using Apache.Arrow.Adbc;
 using Apache.Arrow.Adbc.Tests;
 using Xunit;
