@@ -1,6 +1,9 @@
 ﻿/*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
+* This file has been modified from its original version, which is
+* under the Apache License:
+*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
 * distributed with this work for additional information
@@ -21,12 +24,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Apache.Arrow;
+using Apache.Arrow.Adbc;
+using Apache.Arrow.Adbc.Tests;
 using Apache.Arrow.Adbc.Tests.Metadata;
 using Apache.Arrow.Adbc.Tests.Xunit;
 using Apache.Arrow.Ipc;
 using Xunit;
 
-namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
+namespace AdbcDrivers.Snowflake.Interop.Tests
 {
     [TestCaseOrderer("Apache.Arrow.Adbc.Tests.Xunit.TestOrderer", "Apache.Arrow.Adbc.Tests")]
     public class ConstraintTests : IClassFixture<ConstraintTestsFixutre>
@@ -168,7 +174,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         public readonly string _tableName2;
         private bool _disposed = false;
 
-        private const string SNOWFLAKE_CONSTRAINTS_DATA_RESOURCE = "Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake.Resources.SnowflakeConstraints.sql";
+        private const string SNOWFLAKE_CONSTRAINTS_DATA_RESOURCE = "AdbcDrivers.Snowflake.Interop.Tests.Resources.SnowflakeConstraints.sql";
 
 
         public ConstraintTestsFixutre()

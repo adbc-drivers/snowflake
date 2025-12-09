@@ -1,6 +1,9 @@
 ﻿/*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
+* This file has been modified from its original version, which is
+* under the Apache License:
+*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
 * distributed with this work for additional information
@@ -21,10 +24,12 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Apache.Arrow.Adbc;
+using Apache.Arrow.Adbc.Tests;
 using Xunit;
 using Xunit.Abstractions;
 
-namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
+namespace AdbcDrivers.Snowflake.Interop.Tests
 {
     // TODO: When supported, use prepared statements instead of SQL string literals
     //      Which will better test how the driver handles values sent/received

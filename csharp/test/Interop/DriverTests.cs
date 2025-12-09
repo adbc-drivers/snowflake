@@ -1,6 +1,9 @@
 ﻿/*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
+* This file has been modified from its original version, which is
+* under the Apache License:
+*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
 * distributed with this work for additional information
@@ -21,13 +24,17 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Apache.Arrow;
+using Apache.Arrow.Adbc;
+using Apache.Arrow.Adbc.Tests;
 using Apache.Arrow.Adbc.Tests.Metadata;
 using Apache.Arrow.Adbc.Tests.Xunit;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using Xunit;
+using AdbcTests = Apache.Arrow.Adbc.Tests;
 
-namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
+namespace AdbcDrivers.Snowflake.Interop.Tests
 {
     /// <summary>
     /// Class for testing the Snowflake ADBC driver connection tests.
@@ -473,7 +480,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
 
             QueryResult queryResult = statement.ExecuteQuery();
 
-            Tests.DriverTests.CanExecuteQuery(queryResult, _testConfiguration.ExpectedResultsCount);
+            AdbcTests.DriverTests.CanExecuteQuery(queryResult, _testConfiguration.ExpectedResultsCount);
         }
 
         /// <summary>
@@ -491,7 +498,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
 
             QueryResult queryResult = statement.ExecuteQuery();
 
-            Tests.DriverTests.CanExecuteQuery(queryResult, 1);
+            AdbcTests.DriverTests.CanExecuteQuery(queryResult, 1);
         }
 
         [SkippableFact, Order(7)]

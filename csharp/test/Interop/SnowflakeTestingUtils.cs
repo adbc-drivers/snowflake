@@ -1,6 +1,9 @@
 /*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
+* This file has been modified from its original version, which is
+* under the Apache License:
+*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
 * distributed with this work for additional information
@@ -24,10 +27,12 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
-using Apache.Arrow.Adbc.Drivers.Interop.Snowflake;
+using AdbcDrivers.Snowflake.Interop;
+using Apache.Arrow.Adbc;
+using Apache.Arrow.Adbc.Tests;
 using Xunit;
 
-namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
+namespace AdbcDrivers.Snowflake.Interop.Tests
 {
     internal class SnowflakeParameters
     {
@@ -60,7 +65,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         private static readonly Assembly CurrentAssembly;
 
         internal const string SNOWFLAKE_TEST_CONFIG_VARIABLE = "SNOWFLAKE_TEST_CONFIG_FILE";
-        private const string SNOWFLAKE_DATA_RESOURCE = "Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake.Resources.SnowflakeData.sql";
+        private const string SNOWFLAKE_DATA_RESOURCE = "AdbcDrivers.Snowflake.Interop.Tests.Resources.SnowflakeData.sql";
 
         static SnowflakeTestingUtils()
         {

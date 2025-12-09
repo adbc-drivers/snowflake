@@ -1,6 +1,9 @@
 /*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
+* This file has been modified from its original version, which is
+* under the Apache License:
+*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
 * distributed with this work for additional information
@@ -23,12 +26,15 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Data.SqlTypes;
-using Apache.Arrow.Adbc.Client;
+using Apache.Arrow.Adbc;
+using Apache.Arrow.Adbc.Tests;
 using Apache.Arrow.Adbc.Tests.Xunit;
 using Apache.Arrow.Types;
 using Xunit;
+using AdbcClient = Apache.Arrow.Adbc.Client;
+using AdbcTests = Apache.Arrow.Adbc.Tests;
 
-namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
+namespace AdbcDrivers.Snowflake.Interop.Tests
 {
     /// <summary>
     /// Class for testing the ADBC Client using the Snowflake ADBC driver.
@@ -53,13 +59,13 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         {
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
                 string[] queries = SnowflakeTestingUtils.GetQueries(testConfiguration);
 
                 List<int> expectedResults = new List<int>() { -1, 1, 1 };
 
-                Tests.ClientTests.CanClientExecuteUpdate(adbcConnection, testConfiguration, queries, expectedResults);
+                AdbcTests.ClientTests.CanClientExecuteUpdate(adbcConnection, testConfiguration, queries, expectedResults);
             }
         }
 
@@ -71,7 +77,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         {
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
                 adbcConnection.Open();
 
@@ -82,10 +88,10 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
                 for (int i = 0; i < queries.Length; i++)
                 {
                     string query = queries[i];
-                    AdbcCommand adbcCommand = adbcConnection.CreateCommand();
+                    AdbcClient.AdbcCommand adbcCommand = adbcConnection.CreateCommand();
                     adbcCommand.CommandText = query;
 
-                    AdbcDataReader reader = adbcCommand.ExecuteReader(CommandBehavior.Default);
+                    AdbcClient.AdbcDataReader reader = adbcCommand.ExecuteReader(CommandBehavior.Default);
 
                     if (reader.Read())
                     {
@@ -107,9 +113,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         {
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
-                Tests.ClientTests.CanClientGetSchema(adbcConnection, testConfiguration);
+                AdbcTests.ClientTests.CanClientGetSchema(adbcConnection, testConfiguration);
             }
         }
 
@@ -122,9 +128,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         {
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
-                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
+                AdbcTests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
             }
         }
 
@@ -139,9 +145,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             testConfiguration.Query = "SELECT * WHERE 0=1";
             testConfiguration.ExpectedResultsCount = 0;
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
-                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
+                AdbcTests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
             }
         }
 
@@ -155,9 +161,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             testConfiguration.Query = "SELECT ? as A, ? as B, ? as C, * FROM (SELECT column1 FROM (VALUES (1), (2), (3))) WHERE column1 < ?";
             testConfiguration.ExpectedResultsCount = 1;
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
-                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration, command =>
+                AdbcTests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration, command =>
                 {
                     DbParameter CreateParameter(DbType dbType, object value)
                     {
@@ -188,9 +194,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             testConfiguration.ExpectedResultsCount = 0;
 
             // Throw exception Apache.Arrow.Adbc.AdbcException
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
-                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
+                AdbcTests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
             }
         }
 
@@ -206,9 +212,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             testConfiguration.ExpectedResultsCount = 0;
 
             // Throw exception Apache.Arrow.Adbc.AdbcException
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
-                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
+                AdbcTests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
             }
         }
 
@@ -223,9 +229,9 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
 
             Skip.If(testConfiguration.Authentication.SnowflakeJwt is null, "JWT authentication is not configured");
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration, SnowflakeAuthentication.AuthJwt))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration, SnowflakeAuthentication.AuthJwt))
             {
-                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
+                AdbcTests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration);
             }
         }
 
@@ -238,11 +244,11 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         {
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
                 SampleDataBuilder sampleDataBuilder = SnowflakeData.GetSampleData();
 
-                Tests.ClientTests.VerifyTypesAndValues(adbcConnection, sampleDataBuilder);
+                AdbcTests.ClientTests.VerifyTypesAndValues(adbcConnection, sampleDataBuilder);
             }
         }
 
@@ -291,7 +297,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
 
             string tempTable = "pk_" + Guid.NewGuid().ToString().Replace("-", "");
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
                 SampleDataBuilder sampleDataBuilder = new SampleDataBuilder();
                 sampleDataBuilder.Samples.Add(
@@ -341,7 +347,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
                         }
                     });
 
-                Tests.ClientTests.VerifyTypesAndValues(adbcConnection, sampleDataBuilder);
+                AdbcTests.ClientTests.VerifyTypesAndValues(adbcConnection, sampleDataBuilder);
             }
         }
 
@@ -351,7 +357,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
             testConfiguration.MaxTimestampPrecision = precision;
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
                 SampleDataBuilder sampleDataBuilder = new SampleDataBuilder();
                 sampleDataBuilder.Samples.Add(
@@ -361,7 +367,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
                        ExpectedValues = expectedValues
                    });
 
-                Tests.ClientTests.VerifyTypesAndValues(adbcConnection, sampleDataBuilder);
+                AdbcTests.ClientTests.VerifyTypesAndValues(adbcConnection, sampleDataBuilder);
             }
         }
 
@@ -370,7 +376,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         {
             SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
 
-            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            using (AdbcClient.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
             {
                 adbcConnection.Open();
 
@@ -409,7 +415,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             }
         }
 
-        private Adbc.Client.AdbcConnection GetSnowflakeAdbcConnectionUsingConnectionString(SnowflakeTestConfiguration testConfiguration, string? authType = null)
+        private AdbcClient.AdbcConnection GetSnowflakeAdbcConnectionUsingConnectionString(SnowflakeTestConfiguration testConfiguration, string? authType = null)
         {
             // see https://arrow.apache.org/adbc/0.5.1/driver/snowflake.html
 
@@ -449,7 +455,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
                 builder[SnowflakeParameters.PASSWORD] = testConfiguration.Authentication.Default.Password;
             }
             AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(testConfiguration);
-            return new Adbc.Client.AdbcConnection(builder.ConnectionString)
+            return new AdbcClient.AdbcConnection(builder.ConnectionString)
             {
                 AdbcDriver = snowflakeDriver
             };

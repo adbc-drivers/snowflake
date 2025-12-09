@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+csharp/src/Interop/Build-SnowflakeDriver.ps1
+csharp/src/Interop/SnowflakeDriverLoader.cs
+csharp/test/Interop/CastTests.cs
+csharp/test/Interop/ClientTests.cs
+csharp/test/Interop/ConstraintTests.cs
+csharp/test/Interop/DriverTests.cs
+csharp/test/Interop/ErrorHandlingTests.cs
+csharp/test/Interop/NumericOperatorTests.cs
+csharp/test/Interop/SnowflakeData.cs
+csharp/test/Interop/SnowflakeTestConfiguration.cs
+csharp/test/Interop/SnowflakeTestingUtils.cs
+csharp/test/Interop/ValueTests.cs
+
 go/binding.go
 go/bulk_ingestion.go
 go/bulk_ingestion_test.go

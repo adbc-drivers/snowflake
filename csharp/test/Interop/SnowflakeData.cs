@@ -1,6 +1,9 @@
 /*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
+* This file has been modified from its original version, which is
+* under the Apache License:
+*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
 * distributed with this work for additional information
@@ -22,9 +25,10 @@ using System;
 using System.Collections.Generic;
 using System.Data.SqlTypes;
 using System.Text;
+using Apache.Arrow.Adbc.Tests;
 using Apache.Arrow.Types;
 
-namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
+namespace AdbcDrivers.Snowflake.Interop.Tests
 {
     /// <summary>
     /// Gets the sample data from Snowflake.
