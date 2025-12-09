@@ -58,7 +58,7 @@ if ($IncludeGoSymbolsValue -ne "true") {
     pixi run make
 } else {
     Write-Host "Building with symbols"
-    go build -buildmode=c-shared -tags=driverlib -o 'build\$file' -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" -gcflags="all=-N -l" ./pkg
+    go build -buildmode=c-shared -tags=driverlib -o build\$file -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" -gcflags="all=-N -l" ./pkg
 }
 
 cd build
