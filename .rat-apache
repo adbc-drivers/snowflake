@@ -13,13 +13,18 @@
 # limitations under the License.
 
 csharp/src/Interop/Build-SnowflakeDriver.ps1
+csharp/src/Interop/copySnowflakeDriver.sh
 csharp/src/Interop/SnowflakeDriverLoader.cs
+csharp/src/Interop/readme.md
 csharp/test/Interop/CastTests.cs
 csharp/test/Interop/ClientTests.cs
 csharp/test/Interop/ConstraintTests.cs
 csharp/test/Interop/DriverTests.cs
 csharp/test/Interop/ErrorHandlingTests.cs
 csharp/test/Interop/NumericOperatorTests.cs
+csharp/test/Interop/readme.md
+csharp/test/Interop/Resources/SnowflakeConstraints.sql
+csharp/test/Interop/Resources/SnowflakeData.sql
 csharp/test/Interop/SnowflakeData.cs
 csharp/test/Interop/SnowflakeTestConfiguration.cs
 csharp/test/Interop/SnowflakeTestingUtils.cs
