@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.github/pull_request_template.md
-.gitmodules
-*/go.sum
-*/pixi.lock
-*/*.csproj
-*/*.sln
-go/license.tpl
-go/validation/queries/*/*.json
-go/validation/queries/*/*.sql
-csharp/test/Interop/Resources/snowflakeconfig.json
+.vs
+.vscode
+bin
+obj
+x64
+*.dll
+*.lib
+*.obj
+*.exe
+*.csproj.user
+*.pass
+
+artifacts/
+TestResults/
+packages/
