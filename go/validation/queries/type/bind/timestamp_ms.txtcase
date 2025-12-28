@@ -14,4 +14,3 @@
 
 // part: metadata
 skip = "timestamp_ms parameter binding not supported by Snowflake driver"
-

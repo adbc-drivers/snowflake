@@ -13,4 +13,3 @@
 # limitations under the License.
 
 skip = "timestamp parameter binding not supported by Snowflake driver"
-
