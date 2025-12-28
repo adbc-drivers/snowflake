@@ -255,6 +255,9 @@ type driverImpl struct {
 // NewDriver creates a new Snowflake driver using the given Arrow allocator.
 func NewDriver(alloc memory.Allocator) Driver {
 	info := driverbase.DefaultDriverInfo("Snowflake")
+	if err := info.RegisterInfoCode(adbc.InfoDriverName, "ADBC Driver Foundry Driver for Snowflake"); err != nil {
+		panic(err)
+	}
 	if infoVendorVersion != "" {
 		if err := info.RegisterInfoCode(adbc.InfoVendorVersion, infoVendorVersion); err != nil {
 			panic(err)

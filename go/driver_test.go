@@ -232,7 +232,7 @@ func (s *SnowflakeQuirks) DBSchema() string                            { return 
 func (s *SnowflakeQuirks) GetMetadata(code adbc.InfoCode) interface{} {
 	switch code {
 	case adbc.InfoDriverName:
-		return "ADBC Snowflake Driver - Go"
+		return "ADBC Driver Foundry Driver for Snowflake"
 	// runtime/debug.ReadBuildInfo doesn't currently work for tests
 	// github.com/golang/go/issues/33976
 	case adbc.InfoDriverVersion:

@@ -20,7 +20,7 @@ from adbc_drivers_validation import model
 class SnowflakeQuirks(model.DriverQuirks):
     name = "snowflake"
     driver = "adbc_driver_snowflake"
-    driver_name = "ADBC Snowflake Driver - Go"
+    driver_name = "ADBC Driver Foundry Driver for Snowflake"
     vendor_name = "Snowflake"
     vendor_version = "v1.18.0"
     short_version = "snowflake"
