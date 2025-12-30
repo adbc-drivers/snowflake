@@ -384,7 +384,15 @@ func (c *connectionImpl) PrepareDriverInfo(ctx context.Context, infoCodes []adbc
 	if err := c.DriverInfo.RegisterInfoCode(adbc.InfoVendorSql, true); err != nil {
 		return err
 	}
-	return c.DriverInfo.RegisterInfoCode(adbc.InfoVendorSubstrait, false)
+	if err := c.DriverInfo.RegisterInfoCode(adbc.InfoVendorSubstrait, false); err != nil {
+		return err
+	}
+
+	version, err := c.getStringQuery("SELECT CURRENT_VERSION()")
+	if err != nil {
+		return err
+	}
+	return c.DriverInfo.RegisterInfoCode(adbc.InfoVendorVersion, version)
 }
 
 // ListTableTypes implements driverbase.TableTypeLister.

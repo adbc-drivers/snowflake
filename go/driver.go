@@ -27,7 +27,6 @@ import (
 	"errors"
 	"maps"
 	"net/http"
-	"runtime/debug"
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -155,20 +154,7 @@ const (
 	SQLStateTableOrViewNotFound = "42S02"
 )
 
-var (
-	infoVendorVersion string
-)
-
 func init() {
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, dep := range info.Deps {
-			switch dep.Path {
-			case "github.com/snowflakedb/gosnowflake":
-				infoVendorVersion = dep.Version
-			}
-		}
-	}
-
 	// Disable some stray logs
 	// https://github.com/snowflakedb/gosnowflake/pull/1332
 	_ = gosnowflake.GetLogger().SetLogLevel("warn")
@@ -257,11 +243,6 @@ func NewDriver(alloc memory.Allocator) Driver {
 	info := driverbase.DefaultDriverInfo("Snowflake")
 	if err := info.RegisterInfoCode(adbc.InfoDriverName, "ADBC Driver Foundry Driver for Snowflake"); err != nil {
 		panic(err)
-	}
-	if infoVendorVersion != "" {
-		if err := info.RegisterInfoCode(adbc.InfoVendorVersion, infoVendorVersion); err != nil {
-			panic(err)
-		}
 	}
 	return &driverImpl{DriverImplBase: driverbase.NewDriverImplBase(info, alloc)}
 }

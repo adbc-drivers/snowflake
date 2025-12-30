@@ -22,7 +22,7 @@ class SnowflakeQuirks(model.DriverQuirks):
     driver = "adbc_driver_snowflake"
     driver_name = "ADBC Driver Foundry Driver for Snowflake"
     vendor_name = "Snowflake"
-    vendor_version = "v1.18.0"
+    vendor_version = "9.39.2"
     short_version = "snowflake"
     features = model.DriverFeatures(
         connection_get_table_schema=True,
