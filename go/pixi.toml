@@ -32,4 +32,4 @@ pytest-lazy-fixtures = ">=1.3.2,<2"
 
 [pypi-dependencies]
 adbc-drivers-dev = { git = "https://github.com/adbc-drivers/dev" }
-adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation", rev = "551046350f8225c5e115ecefec27f86f71e3a4aa" }
+adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation" }
