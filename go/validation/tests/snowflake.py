@@ -38,6 +38,7 @@ class SnowflakeQuirks(model.DriverQuirks):
         statement_execute_schema=True,
         statement_get_parameter_schema=False,
         statement_rows_affected=True,
+        statement_rows_affected_ddl=False,
         current_catalog=model.FromEnv("SNOWFLAKE_DATABASE"),
         current_schema=model.FromEnv("SNOWFLAKE_SCHEMA"),
         supported_xdbc_fields=[],
