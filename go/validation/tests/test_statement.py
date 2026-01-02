@@ -20,3 +20,7 @@ from . import snowflake
 
 def pytest_generate_tests(metafunc) -> None:
     return statement_tests.generate_tests(snowflake.QUIRKS, metafunc)
+
+
+class TestStatement(statement_tests.TestStatement):
+    pass
