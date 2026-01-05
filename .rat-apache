@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+.github/workflows/dev_issues.yaml
+
 csharp/src/Interop/Build-SnowflakeDriver.ps1
 csharp/src/Interop/copySnowflakeDriver.sh
 csharp/src/Interop/SnowflakeDriverLoader.cs
