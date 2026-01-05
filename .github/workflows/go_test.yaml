@@ -62,6 +62,7 @@ jobs:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: win, arch: amd64, runner: windows-latest }
+    environment: Snowflake CI
     permissions:
       contents: read
     steps:
@@ -159,6 +160,7 @@ jobs:
         include:
           # I think we only need to test one platform, but we can change that later
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
+    environment: Snowflake CI
     permissions:
       contents: read
     steps:
@@ -216,6 +218,10 @@ jobs:
 
       - name: Validate
         if: runner.os == 'Linux'
+        env:
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_URI: ${{ secrets.SNOWFLAKE_URI }}
         working-directory: go
         run: |
           set -a

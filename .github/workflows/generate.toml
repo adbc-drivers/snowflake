@@ -13,7 +13,13 @@
 # limitations under the License.
 
 driver = "snowflake"
+environment = "Snowflake CI"
 private = false
 
 [lang]
 go = true
+
+[secrets]
+SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["validate"] }
+SNOWFLAKE_SCHEMA = { secret = "SNOWFLAKE_SCHEMA", contexts = ["validate"] }
+SNOWFLAKE_URI = { secret = "SNOWFLAKE_URI", contexts = ["validate"] }
