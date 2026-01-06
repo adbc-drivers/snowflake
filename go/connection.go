@@ -108,9 +108,14 @@ func escapeSingleQuoteForLike(arg string) string {
 	}
 }
 
-func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext) (string, error) {
+func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string) (string, error) {
 	rows, err := driverConn.QueryContext(ctx, query, nil)
 	if err != nil {
+		var sfErr *gosnowflake.SnowflakeError
+		// No results. Generate a dummy result set instead
+		if emptyQuery != "" && errors.As(err, &sfErr) && sfErr.Number == 2043 {
+			return getQueryID(ctx, emptyQuery, driverConn, "")
+		}
 		return "", err
 	}
 
@@ -135,6 +140,7 @@ func addLike(query string, pattern *string) string {
 func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, catalog, dbSchema, tableName *string, outQueryID *string) {
 	grp.Go(func() error {
 		query := "SHOW TERSE /* ADBC:getObjects */ " + objType
+		emptyQuery := "SHOW TERSE /* ADBC:getObjects */ " + objType + " LIKE ''"
 		switch objType {
 		case objDatabases:
 			query = addLike(query, catalog)
@@ -165,7 +171,7 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 		}
 
 		var err error
-		*outQueryID, err = getQueryID(ctx, query, conn)
+		*outQueryID, err = getQueryID(ctx, query, conn, emptyQuery)
 		return err
 	})
 }
@@ -256,17 +262,17 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		// Detailed constraint info not available in information_schema
 		// Need to dispatch SHOW queries and use conn.Raw to extract the queryID for reuse in GetObjects query
 		gQueryIDs.Go(func() (err error) {
-			pkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */"+suffix, conn)
+			pkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */"+suffix, conn, "")
 			return err
 		})
 
 		gQueryIDs.Go(func() (err error) {
-			fkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */"+suffix, conn)
+			fkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */"+suffix, conn, "")
 			return err
 		})
 
 		gQueryIDs.Go(func() (err error) {
-			uniqueQueryID, err = getQueryID(gQueryIDsCtx, "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */"+suffix, conn)
+			uniqueQueryID, err = getQueryID(gQueryIDsCtx, "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */"+suffix, conn, "")
 			return err
 		})
 

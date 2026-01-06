@@ -37,7 +37,7 @@ WITH columns AS (
         	'xdbc_decimal_digits': numeric_scale,
         	'xdbc_num_prec_radix': numeric_precision_radix,
         	'xdbc_datetime_sub': datetime_precision
-        }) table_columns,
+        }) WITHIN GROUP (ORDER BY ordinal_position) table_columns,
     FROM information_schema.columns
     WHERE table_catalog ILIKE :CATALOG AND table_schema ILIKE :DB_SCHEMA AND table_name ILIKE :TABLE AND column_name ILIKE :COLUMN
     GROUP BY table_catalog, table_schema, table_name
