@@ -578,7 +578,7 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		scale, err := strconv.ParseInt(typ[comma+1:len(typ)-1], 10, 32)
 		if err != nil {
 			return field, adbc.Error{
-				Msg:  "could not parse Scale from type '" + typ + "'",
+				Msg:  "[snowflake] could not parse scale from type '" + typ + "'",
 				Code: adbc.StatusInvalidData,
 			}
 		}
@@ -591,24 +591,23 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		field.Type = arrow.FixedWidthTypes.Time64ns
 	case "DATETIME":
 		fallthrough
-	case "TIMESTAMP", "TIMESTAMP_NTZ":
-		if maxTimestampPrecision == Microseconds {
-			field.Type = &arrow.TimestampType{Unit: arrow.Microsecond}
-		} else {
-			field.Type = &arrow.TimestampType{Unit: arrow.Nanosecond}
+	case "TIMESTAMP", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ":
+		tz := ""
+		switch prefix {
+		case "TIMESTAMP_LTZ":
+			tz = loc.String()
+		case "TIMESTAMP_TZ":
+			tz = "UTC"
 		}
-	case "TIMESTAMP_LTZ":
-		if maxTimestampPrecision == Microseconds {
-			field.Type = &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: loc.String()}
-		} else {
-			field.Type = &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: loc.String()}
+		scale, err := strconv.ParseInt(typ[paren+1:len(typ)-1], 10, 32)
+		if err != nil {
+			return field, adbc.Error{
+				Msg:  "[snowflake] could not parse scale from type '" + typ + "'",
+				Code: adbc.StatusInvalidData,
+			}
 		}
-	case "TIMESTAMP_TZ":
-		if maxTimestampPrecision == Microseconds {
-			field.Type = arrow.FixedWidthTypes.Timestamp_us
-		} else {
-			field.Type = arrow.FixedWidthTypes.Timestamp_ns
-		}
+		unit := getArrowTimeUnit(scale, maxTimestampPrecision)
+		field.Type = &arrow.TimestampType{Unit: unit, TimeZone: tz}
 	default:
 		err = adbc.Error{
 			Msg:  fmt.Sprintf("Snowflake Data Type %s not implemented", typ),
