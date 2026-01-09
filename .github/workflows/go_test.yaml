@@ -39,8 +39,16 @@ on:
       - "go/**"
       - .github/workflows/go_test.yaml
 
-  workflow_dispatch: {}
-
+  workflow_call:
+    inputs:
+      repository:
+        description: "The repository to checkout"
+        required: true
+        type: string
+      commit:
+        description: "The commit to checkout"
+        required: true
+        type: string
 
 concurrency:
   # Must share concurrency group with release workflow since it also builds/tests
@@ -74,7 +82,17 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name != 'workflow_dispatch'
         with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "checkout remote"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -172,7 +190,17 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name != 'workflow_dispatch'
         with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "checkout remote"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -279,7 +307,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name != 'workflow_dispatch'
         with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "checkout remote"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -332,7 +370,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name != 'workflow_dispatch'
         with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "checkout remote"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -399,7 +447,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name != 'workflow_dispatch'
         with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "checkout remote"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
