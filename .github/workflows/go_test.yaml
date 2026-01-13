@@ -49,6 +49,13 @@ on:
         description: "The commit to checkout"
         required: true
         type: string
+    secrets:
+      SNOWFLAKE_DATABASE:
+        required: true
+      SNOWFLAKE_SCHEMA:
+        required: true
+      SNOWFLAKE_URI:
+        required: true
 
 concurrency:
   # Must share concurrency group with release workflow since it also builds/tests
