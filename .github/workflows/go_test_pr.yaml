@@ -62,13 +62,13 @@ jobs:
 
   test:
     uses: adbc-drivers/snowflake/.github/workflows/go_test.yaml@main
-    environment: Snowflake CI
     needs:
       - setup
     with:
       repository: ${{ needs.setup.outputs.repository }}
       commit: ${{ inputs.commit }}
     secrets:
+      # https://github.com/orgs/community/discussions/25238#discussioncomment-3247035
       SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
       SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
       SNOWFLAKE_URI: ${{ secrets.SNOWFLAKE_URI }}
