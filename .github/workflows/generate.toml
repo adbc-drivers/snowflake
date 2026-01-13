@@ -23,3 +23,7 @@ go = true
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["validate"] }
 SNOWFLAKE_SCHEMA = { secret = "SNOWFLAKE_SCHEMA", contexts = ["validate"] }
 SNOWFLAKE_URI = { secret = "SNOWFLAKE_URI", contexts = ["validate"] }
+
+[validation]
+[validation.extra-dependencies]
+pytest-lazy-fixtures = ">=1.3.2,<2"
