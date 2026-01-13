@@ -15,7 +15,7 @@
 import re
 from pathlib import Path
 
-from adbc_drivers_validation import model
+from adbc_drivers_validation import model, quirks
 
 
 class SnowflakeQuirks(model.DriverQuirks):
@@ -76,19 +76,7 @@ class SnowflakeQuirks(model.DriverQuirks):
         return f'"{identifier}"'
 
     def split_statement(self, statement: str) -> list[str]:
-        # Custom split logic to handle comments after semicolons
-        statements = []
-        current = []
-        for line in statement.split("\n"):
-            current.append(line)
-            # Check if line contains a semicolon (ignoring comments)
-            if ";" in line:
-                statements.append("\n".join(current))
-                current = []
-        if current:
-            statements.append("\n".join(current))
-
-        return statements
+        return quirks.split_statement(statement, dialect=self.name)
 
 
 QUIRKS = [SnowflakeQuirks()]
