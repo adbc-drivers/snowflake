@@ -1,18 +1,19 @@
-<!--
-  Copyright (c) 2025 ADBC Drivers Contributors
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-          http://www.apache.org/licenses/LICENSE-2.0
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
--->
+---
+# Copyright (c) 2025 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+{}
+---
 
 {{ cross_reference|safe }}
 # Snowflake Driver {{ version }}
@@ -35,7 +36,7 @@ Using the Snowflake driver requires a Snowflake account and authentication. See 
 
 ## Connecting
 
-To connect, replace the snowflake options below with the appropriate values for your situation and run the following:
+To connect, replace the Snowflake options below with the appropriate values for your situation and run the following:
 
 ```python
 from adbc_driver_manager import dbapi
@@ -62,11 +63,11 @@ conn = dbapi.connect(
 )
 ```
 
-Note: The example above is for Python using the [adbc-driver-manager](https://pypi.org/project/adbc-driver-manager) package but the process will be similar for other driver managers.
+Note: The example above is for Python using the [adbc-driver-manager](https://pypi.org/project/adbc-driver-manager) package but the process will be similar for other driver managers.  See [adbc-quickstarts](https://github.com/columnar-tech/adbc-quickstarts).
 
 The driver supports connecting with individual options or connection strings.
 
-## Connection String Format
+### Connection String Format
 
 Snowflake URI syntax:
 
@@ -105,5 +106,11 @@ Examples:
 {{ types|safe }}
 
 {{ footnotes|safe }}
+
+## Previous Versions
+
+To see documentation for previous versions of this driver, see the following:
+
+- [v1.10.0](./v1.10.0.md)
 
 [snowflake]: https://www.snowflake.com/
