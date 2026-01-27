@@ -23,11 +23,11 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: "The PR to test"
+        description: "The ID of the PR to test (e.g. 42)"
         required: true
         type: string
-      commit:
-        description: "The commit to checkout"
+      ref:
+        description: "The commit/ref to checkout"
         required: true
         type: string
 
@@ -42,6 +42,7 @@ defaults:
 permissions:
   contents: read
   packages: read
+  pull-requests: read
 
 jobs:
   setup:
@@ -60,7 +61,7 @@ jobs:
       - name: set job summary
         run: |
           echo "**PR:** https://github.com/${{ github.repository }}/pull/${{ inputs.pr }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Remote:** ${{ steps.get_repo.outputs.repository }}@${{ inputs.commit }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Remote:** ${{ steps.get_repo.outputs.repository }}@${{ inputs.ref }}" >> $GITHUB_STEP_SUMMARY
 
   test:
     uses: adbc-drivers/snowflake/.github/workflows/go_test.yaml@main
@@ -68,7 +69,7 @@ jobs:
       - setup
     with:
       repository: ${{ needs.setup.outputs.repository }}
-      commit: ${{ inputs.commit }}
+      ref: ${{ inputs.ref }}
     secrets:
       # https://github.com/orgs/community/discussions/25238#discussioncomment-3247035
       SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
@@ -83,6 +84,7 @@ jobs:
       - setup
       - test
     permissions:
+      actions: read
       pull-requests: write
     steps:
       - id: get_run
@@ -104,5 +106,5 @@ jobs:
               issue_number: ${{ inputs.pr }},
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '${{ steps.get_run.outputs.message }} ${{ needs.setup.outputs.repository }}@${{ inputs.commit }}\nWorkflow run: ${{ steps.get_run.outputs.workflow_run_url }}'
+              body: '${{ steps.get_run.outputs.message }} ${{ needs.setup.outputs.repository }}@${{ inputs.ref }}\nWorkflow run: ${{ steps.get_run.outputs.workflow_run_url }}'
             })
