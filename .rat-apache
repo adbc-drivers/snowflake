@@ -14,6 +14,7 @@
 
 .github/workflows/dev_issues.yaml
 
+csharp/Directory.Build.props
 csharp/src/Interop/Build-SnowflakeDriver.ps1
 csharp/src/Interop/copySnowflakeDriver.sh
 csharp/src/Interop/SnowflakeDriverLoader.cs
