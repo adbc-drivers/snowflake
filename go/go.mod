@@ -21,7 +21,7 @@ require (
 	github.com/apache/arrow-adbc/go/adbc v1.10.0
 	github.com/apache/arrow-go/v18 v18.5.1
 	github.com/google/uuid v1.6.0
-	github.com/snowflakedb/gosnowflake v1.18.1
+	github.com/snowflakedb/gosnowflake v1.19.0
 	github.com/stretchr/testify v1.11.1
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	go.opentelemetry.io/otel v1.39.0
