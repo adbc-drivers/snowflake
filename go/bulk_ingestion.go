@@ -47,7 +47,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -488,7 +488,7 @@ func uploadStream(ctx context.Context, cn snowflakeConn, r io.Reader, name strin
 	putQuery := fmt.Sprintf(putQueryTmpl, name)
 	putQuery = strings.ReplaceAll(putQuery, "\\", "\\\\") // Windows compatibility
 
-	_, err := cn.ExecContext(gosnowflake.WithFileStream(ctx, r), putQuery, nil)
+	_, err := cn.ExecContext(gosnowflake.WithFilePutStream(ctx, r), putQuery, nil)
 	if err != nil {
 		return err
 	}

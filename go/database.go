@@ -38,7 +38,7 @@ import (
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
 	"github.com/youmark/pkcs8"
 )
 
@@ -135,12 +135,13 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 	case OptionAuthOktaUrl:
 		return d.cfg.OktaURL.String(), nil
 	case OptionKeepSessionAlive:
-		if d.cfg.KeepSessionAlive {
+		if d.cfg.ServerSessionKeepAlive {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
 	case OptionDisableTelemetry:
-		if d.cfg.DisableTelemetry {
+		val, ok := d.cfg.Params["CLIENT_TELEMETRY_ENABLED"]
+		if ok && val != nil && *val == "false" {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
@@ -367,9 +368,9 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	case OptionKeepSessionAlive:
 		switch v {
 		case adbc.OptionValueEnabled:
-			d.cfg.KeepSessionAlive = true
+			d.cfg.ServerSessionKeepAlive = true
 		case adbc.OptionValueDisabled:
-			d.cfg.KeepSessionAlive = false
+			d.cfg.ServerSessionKeepAlive = false
 		default:
 			return adbc.Error{
 				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
@@ -379,9 +380,11 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	case OptionDisableTelemetry:
 		switch v {
 		case adbc.OptionValueEnabled:
-			d.cfg.DisableTelemetry = true
+			telemetryValue := "false"
+			d.cfg.Params["CLIENT_TELEMETRY_ENABLED"] = &telemetryValue
 		case adbc.OptionValueDisabled:
-			d.cfg.DisableTelemetry = false
+			telemetryValue := "true"
+			d.cfg.Params["CLIENT_TELEMETRY_ENABLED"] = &telemetryValue
 		default:
 			return adbc.Error{
 				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
@@ -535,8 +538,11 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 
 	connector := gosnowflake.NewConnector(drv, *d.cfg)
 
-	ctx = gosnowflake.WithArrowAllocator(
-		gosnowflake.WithArrowBatches(ctx), d.Alloc)
+	// Enable arrow batches by setting the context key directly
+	// The internal key is "ARROW_BATCHES"
+	type contextKey string
+	ctx = context.WithValue(ctx, contextKey("ARROW_BATCHES"), true)
+	ctx = gosnowflake.WithArrowAllocator(ctx, d.Alloc)
 
 	var cn driver.Conn
 	cn, err = connector.Connect(ctx)
