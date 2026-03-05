@@ -106,7 +106,7 @@ func (s *SnowflakeQuirks) getSqlTypeFromArrowType(dt arrow.DataType) string {
 	}
 }
 
-func getArr(arr arrow.Array) interface{} {
+func getArr(arr arrow.Array) any {
 	switch arr := arr.(type) {
 	case *array.Int8:
 		v := arr.Int8Values()
@@ -186,7 +186,7 @@ func (s *SnowflakeQuirks) CreateSampleTable(tableName string, r arrow.RecordBatc
 	bindings := strings.Repeat("?,", int(r.NumCols()))
 	insertQuery += bindings[:len(bindings)-1] + ")"
 
-	args := make([]interface{}, 0, r.NumCols())
+	args := make([]any, 0, r.NumCols())
 	for _, col := range r.Columns() {
 		args = append(args, getArr(col))
 	}
@@ -229,7 +229,7 @@ func (s *SnowflakeQuirks) SupportsDynamicParameterBinding() bool       { return 
 func (s *SnowflakeQuirks) SupportsErrorIngestIncompatibleSchema() bool { return false }
 func (s *SnowflakeQuirks) Catalog() string                             { return s.catalogName }
 func (s *SnowflakeQuirks) DBSchema() string                            { return s.schemaName }
-func (s *SnowflakeQuirks) GetMetadata(code adbc.InfoCode) interface{} {
+func (s *SnowflakeQuirks) GetMetadata(code adbc.InfoCode) any {
 	switch code {
 	case adbc.InfoDriverName:
 		return "ADBC Driver Foundry Driver for Snowflake"

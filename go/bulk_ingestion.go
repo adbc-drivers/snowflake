@@ -430,7 +430,7 @@ func runParallelParquetWriters(
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
-	done := make(chan interface{})
+	done := make(chan any)
 	finished := func() {
 		once.Do(func() { close(done) })
 	}
@@ -578,7 +578,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concu
 
 	done := make(chan struct{})
 	readyCh := make(chan struct{}, 1)
-	stopCh := make(chan interface{})
+	stopCh := make(chan any)
 
 	// Handler to signal that new data has been uploaded.
 	// Executing COPY will be a no-op if this has not been called since the last COPY was dispatched, so we wait for the signal.
@@ -700,7 +700,7 @@ func countRowsInTable(ctx context.Context, db snowflakeConn, tableName string) (
 // Extra space is preallocated so that the Parquet footer can be written after reaching target file size without growing the buffer
 func newBufferPool(size int) *bufferPool {
 	buffers := sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			extraSpace := 1 * megabyte // TODO(joellubi): Generally works, but can this be smarter?
 			buf := make([]byte, 0, size+extraSpace)
 			return bytes.NewBuffer(buf)

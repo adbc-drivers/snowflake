@@ -221,7 +221,6 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 	d.cfg.Application = d.defaultAppName
 
 	for k, v := range cnOptions {
-		v := v // copy into loop scope
 		err := d.SetOptionInternal(k, v, &cnOptions)
 		if err != nil {
 			return err
