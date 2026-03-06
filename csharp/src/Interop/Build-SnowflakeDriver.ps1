@@ -20,8 +20,8 @@
 # limitations under the License.
 
 Write-Host "Building the Snowflake ADBC Go driver"
-Write-Host "IsPackagingPipeline=$Env:IsPackagingPipeline"
-Write-Host "IncludeGoSymbols=$Env:IncludeGoSymbols"
+Write-Host "IsPackagingPipeline=$env:IsPackagingPipeline"
+Write-Host "IncludeGoSymbols=$env:IncludeGoSymbols"
 
 if (-not (Test-Path env:IsPackagingPipeline)) {
     Write-Host "IsPackagingPipeline environment variable does not exist."
@@ -58,10 +58,10 @@ cd ..\..\..\go\
 
 if ($IncludeGoSymbolsValue -ne "true") {
     Write-Host "Building without symbols"
-    pixi run make
+    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s -w -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg	
 } else {
     Write-Host "Building with symbols"
-    go build -buildmode=c-shared -tags=driverlib -o build\$file -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" -gcflags="all=-N -l" ./pkg
+    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg
 }
 
 cd build
