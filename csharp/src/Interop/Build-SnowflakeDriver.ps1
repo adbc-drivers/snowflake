@@ -58,7 +58,7 @@ cd ..\..\..\go\
 
 if ($IncludeGoSymbolsValue -ne "true") {
     Write-Host "Building without symbols"
-    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s -w -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg	
+    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s -w -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg
 } else {
     Write-Host "Building with symbols"
     go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg
