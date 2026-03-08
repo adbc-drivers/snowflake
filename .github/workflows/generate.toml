@@ -16,8 +16,8 @@ driver = "snowflake"
 environment = "Snowflake CI"
 private = false
 
-[lang]
-go = true
+[lang.go.build]
+additional-make-args = ["BUILD_TAGS=minicore_disabled"]
 
 [secrets]
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["validate"] }
