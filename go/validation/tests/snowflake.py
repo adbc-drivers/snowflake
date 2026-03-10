@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import re
 from pathlib import Path
 
@@ -82,4 +83,9 @@ class SnowflakeQuirks(model.DriverQuirks):
         return quirks.split_statement(statement, dialect=self.name)
 
 
-QUIRKS = [SnowflakeQuirks()]
+@functools.cache
+def get_quirks(version: str) -> SnowflakeQuirks:
+    quirks = SnowflakeQuirks()
+    if version != quirks.short_version:
+        raise ValueError(f"Unsupported Snowflake version: {version}")
+    return quirks

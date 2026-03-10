@@ -21,4 +21,5 @@ from . import snowflake
 
 
 def pytest_generate_tests(metafunc) -> None:
-    return generate_tests(snowflake.QUIRKS, metafunc)
+    quirks = [snowflake.get_quirks(metafunc.config.getoption("vendor_version"))]
+    return generate_tests(quirks, metafunc)

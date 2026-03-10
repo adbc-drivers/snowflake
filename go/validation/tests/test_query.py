@@ -105,7 +105,8 @@ model.query = _snowflake_query
 
 
 def pytest_generate_tests(metafunc) -> None:
-    return query_tests.generate_tests(snowflake.QUIRKS, metafunc)
+    quirks = [snowflake.get_quirks(metafunc.config.getoption("vendor_version"))]
+    return query_tests.generate_tests(quirks, metafunc)
 
 
 class TestQuery(query_tests.TestQuery):
