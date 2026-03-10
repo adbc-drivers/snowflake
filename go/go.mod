@@ -14,7 +14,7 @@
 
 module github.com/adbc-drivers/snowflake/go
 
-go 1.26.0
+go 1.26.1
 
 require (
 	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260309063034-5750fc215684
@@ -92,7 +92,7 @@ require (
 	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.42.0 // indirect
 	go.opentelemetry.io/otel/metric v1.42.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.42.0 // indirect
-	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
+	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
 	golang.org/x/mod v0.33.0 // indirect
