@@ -62,13 +62,13 @@ type statement struct {
 	useHighPrecision      bool
 	maxTimestampPrecision MaxTimestampPrecision
 
-	query           string
-	targetTable     string
-	targetCatalog   string
-	targetDbSchema  string
-	ingestMode      string
-	ingestOptions *ingestOptions
-	queryTag      string
+	query          string
+	targetTable    string
+	targetCatalog  string
+	targetDbSchema string
+	ingestMode     string
+	ingestOptions  *ingestOptions
+	queryTag       string
 
 	bound      arrow.RecordBatch
 	streamBind array.RecordReader
