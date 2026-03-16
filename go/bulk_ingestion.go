@@ -149,7 +149,7 @@ func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) 
 
 	var (
 		initialRows int64
-		target      = quoteTblName(st.targetTable)
+		target      = st.qualifiedTableName()
 	)
 
 	// Check final row count of target table to get definitive rows affected
@@ -233,7 +233,7 @@ func (st *statement) ingestStream(ctx context.Context) (nrows int64, err error) 
 
 	var (
 		initialRows int64
-		target      = quoteTblName(st.targetTable)
+		target      = st.qualifiedTableName()
 	)
 
 	// Check final row count of target table to get definitive rows affected

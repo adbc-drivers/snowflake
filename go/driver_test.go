@@ -2538,6 +2538,91 @@ func TestIngestCancelContext(t *testing.T) {
 	})
 }
 
+func TestIngestWithQualifiedTableName(t *testing.T) {
+	withQuirks(t, func(q *SnowflakeQuirks) {
+		ctx := context.Background()
+
+		drv := q.SetupDriver(t)
+		defer q.TearDownDriver(t, drv)
+
+		db, err := drv.NewDatabase(q.DatabaseOptions())
+		require.NoError(t, err)
+
+		cnxn, err := db.Open(ctx)
+		require.NoError(t, err)
+
+		sc := arrow.NewSchema([]arrow.Field{
+			{Name: "col_int64", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		}, nil)
+
+		bldr := array.NewRecordBuilder(q.Alloc(), sc)
+		defer bldr.Release()
+
+		bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2, 3}, nil)
+
+		rec := bldr.NewRecordBatch()
+		defer rec.Release()
+
+		// Test 2-part name: schema.table
+		t.Run("schema_qualified", func(t *testing.T) {
+			tblName := "bulk_ingest_schema_qualified"
+			require.NoError(t, q.DropTable(cnxn, tblName))
+
+			stmt, err := cnxn.NewStatement()
+			require.NoError(t, err)
+
+			require.NoError(t, stmt.Bind(ctx, rec))
+			require.NoError(t, stmt.SetOption(adbc.OptionKeyIngestTargetTable, tblName))
+			require.NoError(t, stmt.SetOption(adbc.OptionValueIngestTargetDBSchema, q.DBSchema()))
+
+			n, err := stmt.ExecuteUpdate(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 3, n)
+
+			require.NoError(t, stmt.SetSqlQuery(fmt.Sprintf(`SELECT * FROM "%s"."%s" ORDER BY "col_int64" ASC`, q.DBSchema(), tblName)))
+			rdr, _, err := stmt.ExecuteQuery(ctx)
+			require.NoError(t, err)
+			defer rdr.Release()
+			require.True(t, rdr.Next())
+			require.EqualValues(t, 3, rdr.RecordBatch().NumRows())
+
+			require.NoError(t, stmt.Close())
+			require.NoError(t, q.DropTable(cnxn, tblName))
+		})
+
+		// Test 3-part name: catalog.schema.table
+		t.Run("catalog_and_schema_qualified", func(t *testing.T) {
+			tblName := "bulk_ingest_fully_qualified"
+			require.NoError(t, q.DropTable(cnxn, tblName))
+
+			stmt, err := cnxn.NewStatement()
+			require.NoError(t, err)
+
+			require.NoError(t, stmt.Bind(ctx, rec))
+			require.NoError(t, stmt.SetOption(adbc.OptionKeyIngestTargetTable, tblName))
+			require.NoError(t, stmt.SetOption(adbc.OptionValueIngestTargetCatalog, q.Catalog()))
+			require.NoError(t, stmt.SetOption(adbc.OptionValueIngestTargetDBSchema, q.DBSchema()))
+
+			n, err := stmt.ExecuteUpdate(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 3, n)
+
+			require.NoError(t, stmt.SetSqlQuery(fmt.Sprintf(`SELECT * FROM "%s"."%s"."%s" ORDER BY "col_int64" ASC`, q.Catalog(), q.DBSchema(), tblName)))
+			rdr, _, err := stmt.ExecuteQuery(ctx)
+			require.NoError(t, err)
+			defer rdr.Release()
+			require.True(t, rdr.Next())
+			require.EqualValues(t, 3, rdr.RecordBatch().NumRows())
+
+			require.NoError(t, stmt.Close())
+			require.NoError(t, q.DropTable(cnxn, tblName))
+		})
+
+		require.NoError(t, cnxn.Close())
+		require.NoError(t, db.Close())
+	})
+}
+
 func (suite *SnowflakeTests) TestChangeDatabaseAndGetObjects() {
 	// this test demonstrates:
 	// 1. changing the database context

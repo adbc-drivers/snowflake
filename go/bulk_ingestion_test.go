@@ -88,6 +88,59 @@ func TestIngestBatchedParquetWithFileLimit(t *testing.T) {
 	require.ErrorIs(t, writeParquet(rdr.Schema(), &buf, records, -1, parquetProps, arrowProps), io.EOF)
 }
 
+func TestQualifiedTableName(t *testing.T) {
+	tests := []struct {
+		name           string
+		targetCatalog  string
+		targetDbSchema string
+		targetTable    string
+		expected       string
+	}{
+		{
+			name:        "table only",
+			targetTable: "my_table",
+			expected:    `"my_table"`,
+		},
+		{
+			name:           "schema and table (2-part)",
+			targetDbSchema: "my_schema",
+			targetTable:    "my_table",
+			expected:       `"my_schema"."my_table"`,
+		},
+		{
+			name:           "catalog, schema, and table (3-part)",
+			targetCatalog:  "my_catalog",
+			targetDbSchema: "my_schema",
+			targetTable:    "my_table",
+			expected:       `"my_catalog"."my_schema"."my_table"`,
+		},
+		{
+			name:          "catalog and table (no schema)",
+			targetCatalog: "my_catalog",
+			targetTable:   "my_table",
+			expected:      `"my_catalog"."my_table"`,
+		},
+		{
+			name:           "identifiers with special characters",
+			targetCatalog:  `my"catalog`,
+			targetDbSchema: `my"schema`,
+			targetTable:    `my"table`,
+			expected:       `"my""catalog"."my""schema"."my""table"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &statement{
+				targetCatalog:  tt.targetCatalog,
+				targetDbSchema: tt.targetDbSchema,
+				targetTable:    tt.targetTable,
+			}
+			assert.Equal(t, tt.expected, st.qualifiedTableName())
+		})
+	}
+}
+
 func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
 	vals := make([]int8, nRows)
 	for val := range nRows {

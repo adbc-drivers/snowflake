@@ -62,9 +62,11 @@ type statement struct {
 	useHighPrecision      bool
 	maxTimestampPrecision MaxTimestampPrecision
 
-	query         string
-	targetTable   string
-	ingestMode    string
+	query           string
+	targetTable     string
+	targetCatalog   string
+	targetDbSchema  string
+	ingestMode      string
 	ingestOptions *ingestOptions
 	queryTag      string
 
@@ -74,6 +76,20 @@ type statement struct {
 
 func (st *statement) Base() *driverbase.StatementImplBase {
 	return &st.StatementImplBase
+}
+
+// qualifiedTableName builds a fully-qualified table identifier from the
+// configured catalog, schema, and table name.
+func (st *statement) qualifiedTableName() string {
+	parts := make([]string, 0, 3)
+	if st.targetCatalog != "" {
+		parts = append(parts, quoteTblName(st.targetCatalog))
+	}
+	if st.targetDbSchema != "" {
+		parts = append(parts, quoteTblName(st.targetDbSchema))
+	}
+	parts = append(parts, quoteTblName(st.targetTable))
+	return strings.Join(parts, ".")
 }
 
 // setQueryContext applies the query tag if present.
@@ -148,6 +164,10 @@ func (st *statement) SetOption(key string, val string) error {
 	case adbc.OptionKeyIngestTargetTable:
 		st.query = ""
 		st.targetTable = val
+	case adbc.OptionValueIngestTargetCatalog:
+		st.targetCatalog = val
+	case adbc.OptionValueIngestTargetDBSchema:
+		st.targetDbSchema = val
 	case adbc.OptionKeyIngestMode:
 		switch val {
 		case adbc.OptionValueIngestModeAppend:
@@ -405,7 +425,7 @@ func (st *statement) initIngest(ctx context.Context) error {
 	if st.ingestMode == adbc.OptionValueIngestModeCreateAppend {
 		createBldr.WriteString(" IF NOT EXISTS ")
 	}
-	createBldr.WriteString(quoteTblName(st.targetTable))
+	createBldr.WriteString(st.qualifiedTableName())
 	createBldr.WriteString(" (")
 
 	var schema *arrow.Schema
@@ -442,7 +462,7 @@ func (st *statement) initIngest(ctx context.Context) error {
 	case adbc.OptionValueIngestModeAppend:
 		// Do nothing
 	case adbc.OptionValueIngestModeReplace:
-		replaceQuery := "DROP TABLE IF EXISTS " + quoteTblName(st.targetTable)
+		replaceQuery := "DROP TABLE IF EXISTS " + st.qualifiedTableName()
 		_, err := st.cnxn.cn.ExecContext(ctx, replaceQuery, nil)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInternal, err)
