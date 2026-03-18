@@ -35,8 +35,8 @@ class SnowflakeQuirks(model.DriverQuirks):
         get_objects_constraints_unique=False,
         statement_bind=True,
         statement_bulk_ingest=True,
-        statement_bulk_ingest_catalog=False,
-        statement_bulk_ingest_schema=False,
+        statement_bulk_ingest_catalog=True,
+        statement_bulk_ingest_schema=True,
         statement_bulk_ingest_temporary=False,
         statement_execute_schema=True,
         statement_get_parameter_schema=False,
@@ -45,6 +45,9 @@ class SnowflakeQuirks(model.DriverQuirks):
         statement_rows_affected_ddl=False,
         current_catalog=model.FromEnv("SNOWFLAKE_DATABASE"),
         current_schema=model.FromEnv("SNOWFLAKE_SCHEMA"),
+        secondary_schema=model.FromEnv("SNOWFLAKE_SCHEMA_SECONDARY"),
+        secondary_catalog=model.FromEnv("SNOWFLAKE_DATABASE_SECONDARY"),
+        secondary_catalog_schema=model.FromEnv("SNOWFLAKE_DATABASE_SECONDARY_SCHEMA"),
         supported_xdbc_fields=[],
     )
     setup = model.DriverSetup(

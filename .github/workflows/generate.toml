@@ -23,6 +23,9 @@ additional-make-args = ["BUILD_TAGS=minicore_disabled"]
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["validate"] }
 SNOWFLAKE_SCHEMA = { secret = "SNOWFLAKE_SCHEMA", contexts = ["validate"] }
 SNOWFLAKE_URI = { secret = "SNOWFLAKE_URI", contexts = ["validate"] }
+SNOWFLAKE_SCHEMA_SECONDARY = { secret = "SNOWFLAKE_SCHEMA_SECONDARY", contexts = ["validate"] }
+SNOWFLAKE_DATABASE_SECONDARY = { secret = "SNOWFLAKE_DATABASE_SECONDARY", contexts = ["validate"] }
+SNOWFLAKE_DATABASE_SECONDARY_SCHEMA = { secret = "SNOWFLAKE_DATABASE_SECONDARY_SCHEMA", contexts = ["validate"] }
 
 [validation]
 [validation.extra-dependencies]

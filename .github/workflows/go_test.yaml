@@ -55,6 +55,12 @@ on:
         required: true
       SNOWFLAKE_URI:
         required: true
+      SNOWFLAKE_SCHEMA_SECONDARY:
+        required: true
+      SNOWFLAKE_DATABASE_SECONDARY:
+        required: true
+      SNOWFLAKE_DATABASE_SECONDARY_SCHEMA:
+        required: true
 
 concurrency:
   # Must share concurrency group with release workflow since it also builds/tests
@@ -273,6 +279,9 @@ jobs:
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           SNOWFLAKE_URI: ${{ secrets.SNOWFLAKE_URI }}
+          SNOWFLAKE_SCHEMA_SECONDARY: ${{ secrets.SNOWFLAKE_SCHEMA_SECONDARY }}
+          SNOWFLAKE_DATABASE_SECONDARY: ${{ secrets.SNOWFLAKE_DATABASE_SECONDARY }}
+          SNOWFLAKE_DATABASE_SECONDARY_SCHEMA: ${{ secrets.SNOWFLAKE_DATABASE_SECONDARY_SCHEMA }}
         working-directory: go
         run: |
           set -a
