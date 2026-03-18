@@ -532,6 +532,22 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
 	defer driverbase.EndSpan(span, err)
 
+	// Set WKB output for geospatial columns so they arrive as binary WKB
+	// instead of GeoJSON strings. Geo column detection is done separately
+	// via DESCRIBE TABLE (catalog metadata is unaffected by output format).
+	// Note: Snowflake's REST API rowtype metadata reports "binary" instead of
+	// "geography"/"geometry" when WKB format is set — we've reported this to Snowflake.
+	if d.cfg.Params == nil {
+		d.cfg.Params = make(map[string]*string)
+	}
+	wkb := "WKB"
+	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
+		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &wkb
+	}
+	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
+		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &wkb
+	}
+
 	connector := gosnowflake.NewConnector(drv, *d.cfg)
 
 	ctx = gosnowflake.WithArrowAllocator(

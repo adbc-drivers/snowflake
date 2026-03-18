@@ -48,6 +48,15 @@ import (
 
 const MetadataKeySnowflakeType = "SNOWFLAKE_TYPE"
 
+// geoColumnType identifies the Snowflake geospatial type of a column.
+type geoColumnType int
+
+const (
+	geoColumnNone      geoColumnType = iota
+	geoColumnGeography               // GEOGRAPHY — always WGS84/SRID 4326
+	geoColumnGeometry                // GEOMETRY — SRID unknown without data inspection
+)
+
 func identCol(_ context.Context, a arrow.Array) (arrow.Array, error) {
 	a.Retain()
 	return a, nil
@@ -80,7 +89,7 @@ func getRecTransformer(sc *arrow.Schema, tr []colTransformer) recordTransformer 
 	}
 }
 
-func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (*arrow.Schema, recordTransformer) {
+func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnType) (*arrow.Schema, recordTransformer) {
 	loc, types := ld.Location(), ld.RowTypes()
 
 	fields := make([]arrow.Field, len(sc.Fields()))
@@ -88,6 +97,31 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 	for i, f := range sc.Fields() {
 		srcMeta := types[i]
 		originalArrowUnit := arrow.TimeUnit(srcMeta.Scale / 3)
+
+		// With GEOGRAPHY/GEOMETRY_OUTPUT_FORMAT=WKB, geo columns arrive as binary WKB
+		// but srcMeta.Type is "binary" (Snowflake REST API limitation). Use the geoCols
+		// map (from DESCRIBE TABLE) to identify them and tag with geoarrow.wkb metadata.
+		// Data is already WKB binary — no conversion needed, just pass through.
+		if geoType, ok := geoCols[f.Name]; ok && geoType != geoColumnNone {
+			f.Type = arrow.BinaryTypes.Binary
+			if geoType == geoColumnGeography {
+				f.Metadata = arrow.MetadataFrom(map[string]string{
+					"ARROW:extension:name":     "geoarrow.wkb",
+					"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+				})
+			} else {
+				// TODO: GEOMETRY SRID requires inspecting data or a separate query.
+				// Same cross-driver issue as adbc-drivers/redshift#2 and
+				// adbc-drivers/databricks#350.
+				f.Metadata = arrow.MetadataFrom(map[string]string{
+					"ARROW:extension:name": "geoarrow.wkb",
+				})
+			}
+			transformers[i] = identCol
+			fields[i] = f
+			continue
+		}
+
 		switch strings.ToUpper(srcMeta.Type) {
 		case "FIXED":
 			switch f.Type.ID() {
@@ -551,7 +585,7 @@ type reader struct {
 	done     chan struct{} // signals all producer goroutines have finished
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (array.RecordReader, error) {
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnType) (array.RecordReader, error) {
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
@@ -671,7 +705,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			done:     make(chan struct{}),
 		}
 		close(rdr.done) // No goroutines to wait for
-		rdr.schema, _ = getTransformer(schema, ld, useHighPrecision, maxTimestampPrecision)
+		rdr.schema, _ = getTransformer(schema, ld, useHighPrecision, maxTimestampPrecision, nil)
 		return rdr, nil
 	}
 
@@ -710,7 +744,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	}
 
 	var recTransform recordTransformer
-	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision)
+	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision, geoCols)
 
 	group.Go(func() (err error) {
 		defer rr.Release()

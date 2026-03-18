@@ -514,9 +514,21 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 			field.Type = arrow.FixedWidthTypes.Timestamp_ns
 		}
 	case "GEOGRAPHY":
-		fallthrough
+		// With GEOGRAPHY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
+		// GEOGRAPHY is always WGS84 (SRID 4326).
+		field.Type = arrow.BinaryTypes.Binary
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name":     "geoarrow.wkb",
+			"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+		})
 	case "GEOMETRY":
-		field.Type = arrow.BinaryTypes.String
+		// With GEOMETRY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
+		// TODO: SRID for GEOMETRY requires inspecting data or a separate query.
+		// Same cross-driver issue as adbc-drivers/redshift#2 and adbc-drivers/databricks#350.
+		field.Type = arrow.BinaryTypes.Binary
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name": "geoarrow.wkb",
+		})
 	case "VECTOR":
 		// despite the fact that Snowflake *does* support returning data
 		// for VECTOR typed columns as Arrow FixedSizeLists, there's no way
@@ -559,9 +571,16 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
 		case "GEOGRAPHY":
-			fallthrough
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name":     "geoarrow.wkb",
+				"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+			})
 		case "GEOMETRY":
-			field.Type = arrow.BinaryTypes.String
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
+			})
 		case "BOOLEAN":
 			field.Type = arrow.FixedWidthTypes.Boolean
 		default:
@@ -621,6 +640,68 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		}
 	}
 	return
+}
+
+// detectGeoColumnsFromQuery attempts to extract a table name from a SQL query
+// and runs DESCRIBE TABLE to identify GEOGRAPHY/GEOMETRY columns.
+// Returns nil if the table name can't be determined or no geo columns exist.
+// This works for table scans (SELECT ... FROM schema.table) which is the common
+// case for adbc_scan. Arbitrary queries return nil — data is correct but without
+// geoarrow metadata. TODO: Support arbitrary queries.
+func (c *connectionImpl) detectGeoColumnsFromQuery(ctx context.Context, query string) map[string]geoColumnType {
+	// Simple extraction: find "FROM <table>" in the query.
+	// Handles: SELECT ... FROM schema.table, SELECT ... FROM "schema"."table", etc.
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	fromIdx := strings.Index(upper, "FROM ")
+	if fromIdx == -1 {
+		return nil
+	}
+
+	// Extract table reference after FROM
+	rest := strings.TrimSpace(query[fromIdx+5:])
+	// Take until next SQL keyword or end
+	endIdx := len(rest)
+	for _, kw := range []string{" WHERE ", " ORDER ", " GROUP ", " HAVING ", " LIMIT ", " UNION ", " JOIN ", " LEFT ", " RIGHT ", " INNER ", " OUTER ", " CROSS "} {
+		if idx := strings.Index(strings.ToUpper(rest), kw); idx != -1 && idx < endIdx {
+			endIdx = idx
+		}
+	}
+	tableName := strings.TrimSpace(rest[:endIdx])
+	if tableName == "" {
+		return nil
+	}
+
+	// Run DESCRIBE TABLE to get original column types
+	rows, err := c.cn.QueryContext(ctx, "DESC TABLE "+tableName, nil)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	geoCols := make(map[string]geoColumnType)
+	dest := make([]driver.Value, len(rows.Columns()))
+	for {
+		if err := rows.Next(dest); err != nil {
+			break
+		}
+		if len(dest) < 2 {
+			continue
+		}
+		name, _ := dest[0].(string)
+		typ, _ := dest[1].(string)
+		typ = strings.ToUpper(typ)
+
+		if strings.HasPrefix(typ, "GEOGRAPHY") {
+			geoCols[name] = geoColumnGeography
+		} else if strings.HasPrefix(typ, "GEOMETRY") {
+			geoCols[name] = geoColumnGeometry
+		}
+	}
+
+	if len(geoCols) == 0 {
+		return nil
+	}
+	return geoCols
 }
 
 func (c *connectionImpl) getStringQuery(query string) (value string, err error) {
