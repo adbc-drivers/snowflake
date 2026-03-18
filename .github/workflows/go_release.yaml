@@ -284,7 +284,6 @@ jobs:
           - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: windows, arch: amd64, runner: windows-latest }
-    environment: Snowflake CI
     permissions:
       contents: read
       packages: read
@@ -420,7 +419,6 @@ jobs:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: windows, arch: amd64, runner: windows-latest }
-    environment: Snowflake CI
     steps:
       # for now, install dbc from main
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417  # v6.3.0
