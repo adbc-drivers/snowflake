@@ -175,6 +175,10 @@ impl Database {
     /// Parse a Snowflake URI and apply each component as an individual option.
     /// Format: snowflake://[user[:password]@]account[/database[/schema]][?param=value&...]
     /// Recognized query params: warehouse, role, host, port, protocol, authenticator
+    ///
+    /// Limitations: passwords containing `@` are not supported; use `set_option` for
+    /// Username/Password directly when credentials contain special characters.
+    /// Query parameter values are not URL-decoded.
     fn apply_uri(&mut self, uri: String) -> Result<()> {
         let stripped = uri
             .strip_prefix("snowflake://")
