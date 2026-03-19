@@ -12,3 +12,5 @@ pub use connection::Connection;
 
 mod statement;
 pub use statement::Statement;
+
+adbc_ffi::export_driver!(AdbcDriverSnowflakeInit, Driver);
