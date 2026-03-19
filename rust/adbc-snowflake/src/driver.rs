@@ -2,9 +2,9 @@
 use std::sync::Arc;
 
 use adbc_core::{
+    Optionable,
     error::{Error, Result, Status},
     options::{OptionDatabase, OptionValue},
-    Optionable,
 };
 use sf_core::apis::database_driver_v1::DatabaseDriverV1;
 use tokio::runtime::Runtime;

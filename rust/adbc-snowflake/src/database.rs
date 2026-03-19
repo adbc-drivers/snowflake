@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::{
+    Optionable,
     error::{Error, Result, Status},
     options::{OptionConnection, OptionDatabase, OptionValue},
-    Optionable,
 };
 use sf_core::apis::database_driver_v1::Handle;
 use sf_core::config::settings::Setting;
@@ -26,7 +26,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
             return Err(Error::with_message_and_status(
                 "unsupported option value type",
                 Status::InvalidArguments,
-            ))
+            ));
         }
     };
 
@@ -43,9 +43,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
         "adbc.snowflake.sql.auth_type" => "authenticator".to_string(),
         "adbc.snowflake.sql.client_option.auth_token" => "token".to_string(),
         "adbc.snowflake.sql.client_option.jwt_private_key" => "private_key_file".to_string(),
-        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => {
-            "private_key".to_string()
-        }
+        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => "private_key".to_string(),
         "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password" => {
             "private_key_password".to_string()
         }
@@ -62,7 +60,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
                     return Err(Error::with_message_and_status(
                         "port must be a string or int",
                         Status::InvalidArguments,
-                    ))
+                    ));
                 }
             };
             return Ok(Some(("port".to_string(), Setting::Int(port))));
@@ -106,11 +104,11 @@ impl Optionable for Database {
             self.sf_settings.insert(param.clone(), setting.clone());
             self.inner
                 .runtime
-                .block_on(self.inner.sf.database_set_option(
-                    self.db_handle,
-                    param,
-                    setting,
-                ))
+                .block_on(
+                    self.inner
+                        .sf
+                        .database_set_option(self.db_handle, param, setting),
+                )
                 .map_err(crate::error::api_error_to_adbc_error)?;
         }
         Ok(())
@@ -120,10 +118,9 @@ impl Optionable for Database {
         let key_str = key.as_ref();
         if let Ok(Some((param, _))) =
             adbc_db_opt_to_sf(key_str, &OptionValue::String(String::new()))
+            && let Some(Setting::String(s)) = self.sf_settings.get(&param)
         {
-            if let Some(Setting::String(s)) = self.sf_settings.get(&param) {
-                return Ok(s.clone());
-            }
+            return Ok(s.clone());
         }
         Err(Error::with_message_and_status(
             format!("option not found: {key_str}"),
@@ -133,10 +130,10 @@ impl Optionable for Database {
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
         let key_str = key.as_ref();
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Bytes(vec![])) {
-            if let Some(Setting::Bytes(b)) = self.sf_settings.get(&param) {
-                return Ok(b.clone());
-            }
+        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Bytes(vec![]))
+            && let Some(Setting::Bytes(b)) = self.sf_settings.get(&param)
+        {
+            return Ok(b.clone());
         }
         Err(Error::with_message_and_status(
             format!("option not found: {key_str}"),
@@ -146,10 +143,10 @@ impl Optionable for Database {
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
         let key_str = key.as_ref();
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Int(0)) {
-            if let Some(Setting::Int(i)) = self.sf_settings.get(&param) {
-                return Ok(*i);
-            }
+        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Int(0))
+            && let Some(Setting::Int(i)) = self.sf_settings.get(&param)
+        {
+            return Ok(*i);
         }
         Err(Error::with_message_and_status(
             format!("option not found: {key_str}"),
@@ -159,10 +156,10 @@ impl Optionable for Database {
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
         let key_str = key.as_ref();
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Double(0.0)) {
-            if let Some(Setting::Double(d)) = self.sf_settings.get(&param) {
-                return Ok(*d);
-            }
+        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Double(0.0))
+            && let Some(Setting::Double(d)) = self.sf_settings.get(&param)
+        {
+            return Ok(*d);
         }
         Err(Error::with_message_and_status(
             format!("option not found: {key_str}"),
@@ -180,10 +177,7 @@ impl Database {
     /// Username/Password directly when credentials contain special characters.
     /// Query parameter values are not URL-decoded.
     fn apply_uri(&mut self, uri: String) -> Result<()> {
-        let stripped = uri
-            .strip_prefix("snowflake://")
-            .unwrap_or(&uri)
-            .to_string();
+        let stripped = uri.strip_prefix("snowflake://").unwrap_or(&uri).to_string();
 
         let (user_info, rest) = if let Some(at) = stripped.find('@') {
             (
@@ -320,7 +314,7 @@ impl adbc_core::Database for Database {
                             return Err(Error::with_message_and_status(
                                 "unsupported option value type",
                                 Status::InvalidArguments,
-                            ))
+                            ));
                         }
                     };
                     self.inner
@@ -353,16 +347,10 @@ impl adbc_core::Database for Database {
             conn.set_autocommit(ac)?;
         }
         if let Some(cat) = post_catalog {
-            conn.execute_simple(&format!(
-                r#"USE DATABASE "{}""#,
-                cat.replace('"', "\"\"")
-            ))?;
+            conn.execute_simple(&format!(r#"USE DATABASE "{}""#, cat.replace('"', "\"\"")))?;
         }
         if let Some(sch) = post_schema {
-            conn.execute_simple(&format!(
-                r#"USE SCHEMA "{}""#,
-                sch.replace('"', "\"\"")
-            ))?;
+            conn.execute_simple(&format!(r#"USE SCHEMA "{}""#, sch.replace('"', "\"\"")))?;
         }
 
         Ok(conn)
@@ -372,7 +360,10 @@ impl adbc_core::Database for Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adbc_core::{options::{OptionDatabase, OptionValue}, Driver as _};
+    use adbc_core::{
+        Driver as _,
+        options::{OptionDatabase, OptionValue},
+    };
 
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
@@ -388,10 +379,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            db.get_option_string(OptionDatabase::Other(
-                "adbc.snowflake.sql.account".into()
-            ))
-            .unwrap(),
+            db.get_option_string(OptionDatabase::Other("adbc.snowflake.sql.account".into()))
+                .unwrap(),
             "myaccount"
         );
     }
@@ -411,8 +400,11 @@ mod tests {
     #[test]
     fn username_maps_to_user_param() {
         let mut db = make_db();
-        db.set_option(OptionDatabase::Username, OptionValue::String("alice".into()))
-            .unwrap();
+        db.set_option(
+            OptionDatabase::Username,
+            OptionValue::String("alice".into()),
+        )
+        .unwrap();
         let setting = db.sf_settings.get("user").unwrap();
         assert_eq!(
             *setting,

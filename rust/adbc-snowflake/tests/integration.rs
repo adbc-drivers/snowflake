@@ -1,7 +1,7 @@
 // tests/integration.rs
 use adbc_core::{
-    options::{OptionDatabase, OptionValue},
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
+    options::{OptionDatabase, OptionValue},
 };
 use adbc_snowflake::Driver;
 
@@ -19,7 +19,8 @@ fn make_connection() -> Option<adbc_snowflake::Connection> {
     db.set_option(
         OptionDatabase::Other("adbc.snowflake.sql.account".into()),
         OptionValue::String(account),
-    ).expect("set account");
+    )
+    .expect("set account");
     db.set_option(OptionDatabase::Username, OptionValue::String(user))
         .expect("set user");
     db.set_option(OptionDatabase::Password, OptionValue::String(password))
@@ -29,19 +30,22 @@ fn make_connection() -> Option<adbc_snowflake::Connection> {
         db.set_option(
             OptionDatabase::Other("adbc.snowflake.sql.warehouse".into()),
             OptionValue::String(wh),
-        ).expect("set warehouse");
+        )
+        .expect("set warehouse");
     }
     if let Some(db_name) = get_env("SNOWFLAKE_TEST_DATABASE") {
         db.set_option(
             OptionDatabase::Other("adbc.snowflake.sql.db".into()),
             OptionValue::String(db_name),
-        ).expect("set database");
+        )
+        .expect("set database");
     }
     if let Some(schema) = get_env("SNOWFLAKE_TEST_SCHEMA") {
         db.set_option(
             OptionDatabase::Other("adbc.snowflake.sql.schema".into()),
             OptionValue::String(schema),
-        ).expect("set schema");
+        )
+        .expect("set schema");
     }
 
     Some(db.new_connection().expect("new_connection"))
@@ -70,8 +74,12 @@ fn test_get_table_types() {
     use arrow_array::cast::AsArray;
     let mut reader = conn.get_table_types().expect("get_table_types");
     let batch = reader.next().expect("no batch").expect("batch error");
-    let types: Vec<&str> = batch.column(0).as_string::<i32>().iter()
-        .filter_map(|v| v).collect();
+    let types: Vec<&str> = batch
+        .column(0)
+        .as_string::<i32>()
+        .iter()
+        .filter_map(|v| v)
+        .collect();
     assert!(types.contains(&"TABLE"));
     assert!(types.contains(&"VIEW"));
 }
@@ -96,13 +104,15 @@ fn test_execute_ddl_and_dml() {
 
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query("CREATE OR REPLACE TEMP TABLE adbc_rust_test (id INTEGER, name TEXT)").unwrap();
+        stmt.set_sql_query("CREATE OR REPLACE TEMP TABLE adbc_rust_test (id INTEGER, name TEXT)")
+            .unwrap();
         stmt.execute_update().expect("create table");
     }
 
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query("INSERT INTO adbc_rust_test VALUES (1, 'hello')").unwrap();
+        stmt.set_sql_query("INSERT INTO adbc_rust_test VALUES (1, 'hello')")
+            .unwrap();
         let rows = stmt.execute_update().expect("insert");
         assert_eq!(rows, Some(1));
     }
@@ -117,7 +127,8 @@ fn test_execute_ddl_and_dml() {
 
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_test").unwrap();
+        stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_test")
+            .unwrap();
         stmt.execute_update().expect("drop table");
     }
 }

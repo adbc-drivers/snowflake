@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use adbc_core::{
-    constants,
+    Optionable, constants,
     error::{Error, Result, Status},
     options::{InfoCode, ObjectDepth, OptionConnection, OptionValue},
-    schemas, Optionable,
+    schemas,
 };
 use arrow_array::{
     ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
@@ -40,7 +40,10 @@ struct SingleBatchReader {
 impl SingleBatchReader {
     fn new(batch: RecordBatch) -> Self {
         let schema = batch.schema();
-        Self { batch: Some(batch), schema }
+        Self {
+            batch: Some(batch),
+            schema,
+        }
     }
 }
 
@@ -112,17 +115,14 @@ impl Optionable for Connection {
                         return Err(Error::with_message_and_status(
                             "autocommit value must be a string",
                             Status::InvalidArguments,
-                        ))
+                        ));
                     }
                 };
                 self.set_autocommit(enabled)
             }
             OptionConnection::CurrentCatalog => {
                 if let OptionValue::String(s) = &value {
-                    self.execute_simple(&format!(
-                        r#"USE DATABASE "{}""#,
-                        s.replace('"', "\"\"")
-                    ))
+                    self.execute_simple(&format!(r#"USE DATABASE "{}""#, s.replace('"', "\"\"")))
                 } else {
                     Err(Error::with_message_and_status(
                         "current_catalog value must be a string",
@@ -132,10 +132,7 @@ impl Optionable for Connection {
             }
             OptionConnection::CurrentSchema => {
                 if let OptionValue::String(s) = &value {
-                    self.execute_simple(&format!(
-                        r#"USE SCHEMA "{}""#,
-                        s.replace('"', "\"\"")
-                    ))
+                    self.execute_simple(&format!(r#"USE SCHEMA "{}""#, s.replace('"', "\"\"")))
                 } else {
                     Err(Error::with_message_and_status(
                         "current_schema value must be a string",
@@ -203,6 +200,7 @@ impl adbc_core::Connection for Connection {
         Err(crate::error::not_implemented("cancel"))
     }
 
+    #[allow(refining_impl_trait)]
     fn get_info(
         &self,
         codes: Option<HashSet<InfoCode>>,
@@ -230,10 +228,7 @@ impl adbc_core::Connection for Connection {
             return Ok(Box::new(SingleBatchReader::new(batch)));
         }
 
-        let name_vals: Vec<u32> = selected
-            .iter()
-            .map(|(c, _, _)| u32::from(c))
-            .collect();
+        let name_vals: Vec<u32> = selected.iter().map(|(c, _, _)| u32::from(c)).collect();
         let type_ids: Vec<i8> = selected.iter().map(|(_, t, _)| *t).collect();
         let offsets: Vec<i32> = selected.iter().map(|(_, _, o)| *o).collect();
 
@@ -247,8 +242,7 @@ impl adbc_core::Connection for Connection {
         let bool_values = Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef;
         let int64_values =
             Arc::new(Int64Array::from(vec![constants::ADBC_VERSION_1_1_0 as i64])) as ArrayRef;
-        let int32_values =
-            Arc::new(arrow_array::Int32Array::from(vec![0i32])) as ArrayRef;
+        let int32_values = Arc::new(arrow_array::Int32Array::from(vec![0i32])) as ArrayRef;
         let list_values = Arc::new(arrow_array::ListArray::new_null(
             Arc::new(Field::new("item", DataType::Utf8, true)),
             0,
@@ -304,6 +298,7 @@ impl adbc_core::Connection for Connection {
         Ok(Box::new(SingleBatchReader::new(batch)))
     }
 
+    #[allow(refining_impl_trait)]
     fn get_objects(
         &self,
         _depth: ObjectDepth,
@@ -353,13 +348,13 @@ impl adbc_core::Connection for Connection {
         // Safety: exec_result.stream is a valid FFI stream from sf_core. We take ownership
         // via Box::into_raw and transfer it to ArrowArrayStreamReader. The C ABI layout is
         // stable across arrow versions per the Arrow C Data Interface specification.
-        let raw = Box::into_raw(exec_result.stream)
-            as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-        let mut reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+        let raw =
+            Box::into_raw(exec_result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
             .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
 
         let mut fields: Vec<Field> = Vec::new();
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             let batch =
                 batch.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
             if batch.num_columns() < 4 {
@@ -381,20 +376,20 @@ impl adbc_core::Connection for Connection {
         Ok(Schema::new(fields))
     }
 
+    #[allow(refining_impl_trait)]
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let array = Arc::new(StringArray::from(vec!["TABLE", "VIEW"]));
-        let batch =
-            RecordBatch::try_new(schemas::GET_TABLE_TYPES_SCHEMA.clone(), vec![array])
-                .map_err(|e| {
-                    Error::with_message_and_status(e.to_string(), Status::Internal)
-                })?;
+        let batch = RecordBatch::try_new(schemas::GET_TABLE_TYPES_SCHEMA.clone(), vec![array])
+            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
         Ok(Box::new(SingleBatchReader::new(batch)))
     }
 
+    #[allow(refining_impl_trait)]
     fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         Err(crate::error::not_implemented("get_statistic_names"))
     }
 
+    #[allow(refining_impl_trait)]
     fn get_statistics(
         &self,
         _catalog: Option<&str>,
@@ -423,6 +418,7 @@ impl adbc_core::Connection for Connection {
         Ok(())
     }
 
+    #[allow(refining_impl_trait)]
     fn read_partition(
         &self,
         _partition: impl AsRef<[u8]>,
