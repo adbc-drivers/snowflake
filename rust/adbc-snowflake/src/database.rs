@@ -8,6 +8,7 @@ use adbc_core::{
     options::{OptionConnection, OptionDatabase, OptionValue},
 };
 use sf_core::apis::database_driver_v1::Handle;
+use sf_core::config::param_registry::param_names;
 use sf_core::config::settings::Setting;
 
 use crate::connection::Connection;
@@ -31,21 +32,23 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
     };
 
     let param: String = match key {
-        "username" => "user".to_string(),
-        "password" => "password".to_string(),
-        "adbc.snowflake.sql.account" => "account".to_string(),
-        "adbc.snowflake.sql.db" => "database".to_string(),
-        "adbc.snowflake.sql.schema" => "schema".to_string(),
-        "adbc.snowflake.sql.warehouse" => "warehouse".to_string(),
-        "adbc.snowflake.sql.role" => "role".to_string(),
-        "adbc.snowflake.sql.uri.host" => "host".to_string(),
-        "adbc.snowflake.sql.uri.protocol" => "protocol".to_string(),
-        "adbc.snowflake.sql.auth_type" => "authenticator".to_string(),
-        "adbc.snowflake.sql.client_option.auth_token" => "token".to_string(),
-        "adbc.snowflake.sql.client_option.jwt_private_key" => "private_key_file".to_string(),
-        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => "private_key".to_string(),
+        "username" => param_names::USER.into(),
+        "password" => param_names::PASSWORD.into(),
+        "adbc.snowflake.sql.account" => param_names::ACCOUNT.into(),
+        "adbc.snowflake.sql.db" => param_names::DATABASE.into(),
+        "adbc.snowflake.sql.schema" => param_names::SCHEMA.into(),
+        "adbc.snowflake.sql.warehouse" => param_names::WAREHOUSE.into(),
+        "adbc.snowflake.sql.role" => param_names::ROLE.into(),
+        "adbc.snowflake.sql.uri.host" => param_names::HOST.into(),
+        "adbc.snowflake.sql.uri.protocol" => param_names::PROTOCOL.into(),
+        "adbc.snowflake.sql.auth_type" => param_names::AUTHENTICATOR.into(),
+        "adbc.snowflake.sql.client_option.auth_token" => param_names::TOKEN.into(),
+        "adbc.snowflake.sql.client_option.jwt_private_key" => param_names::PRIVATE_KEY_FILE.into(),
+        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => {
+            param_names::PRIVATE_KEY.into()
+        }
         "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password" => {
-            "private_key_password".to_string()
+            param_names::PRIVATE_KEY_PASSWORD.into()
         }
         "adbc.snowflake.sql.uri.port" => {
             let port = match value {
@@ -63,7 +66,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
                     ));
                 }
             };
-            return Ok(Some(("port".to_string(), Setting::Int(port))));
+            return Ok(Some((param_names::PORT.into(), Setting::Int(port))));
         }
         "uri" => return Ok(None),
         other => other.to_string(),
@@ -364,6 +367,7 @@ mod tests {
         Driver as _,
         options::{OptionDatabase, OptionValue},
     };
+    use sf_core::config::param_registry::param_names;
 
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
@@ -393,7 +397,7 @@ mod tests {
             OptionValue::String("443".into()),
         )
         .unwrap();
-        let setting = db.sf_settings.get("port").unwrap();
+        let setting = db.sf_settings.get(param_names::PORT.as_str()).unwrap();
         assert_eq!(*setting, sf_core::config::settings::Setting::Int(443));
     }
 
@@ -405,7 +409,7 @@ mod tests {
             OptionValue::String("alice".into()),
         )
         .unwrap();
-        let setting = db.sf_settings.get("user").unwrap();
+        let setting = db.sf_settings.get(param_names::USER.as_str()).unwrap();
         assert_eq!(
             *setting,
             sf_core::config::settings::Setting::String("alice".into())
@@ -421,15 +425,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            db.sf_settings.get("account").unwrap(),
+            db.sf_settings.get(param_names::ACCOUNT.as_str()).unwrap(),
             &sf_core::config::settings::Setting::String("myaccount".into())
         );
         assert_eq!(
-            db.sf_settings.get("user").unwrap(),
+            db.sf_settings.get(param_names::USER.as_str()).unwrap(),
             &sf_core::config::settings::Setting::String("alice".into())
         );
         assert_eq!(
-            db.sf_settings.get("database").unwrap(),
+            db.sf_settings.get(param_names::DATABASE.as_str()).unwrap(),
             &sf_core::config::settings::Setting::String("mydb".into())
         );
     }
