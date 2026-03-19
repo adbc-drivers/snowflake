@@ -9,6 +9,7 @@ dependencies = [
  "adbc_core",
  "adbc_ffi",
  "arrow-array 57.3.0",
+ "arrow-buffer 57.3.0",
  "arrow-schema 57.3.0",
  "sf_core",
  "tokio",
@@ -1479,7 +1480,7 @@ dependencies = [
 [[package]]
 name = "error_trace"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
 dependencies = [
  "error_trace_derive",
  "snafu 0.8.9",
@@ -1488,7 +1489,7 @@ dependencies = [
 [[package]]
 name = "error_trace_derive"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -3066,7 +3067,7 @@ dependencies = [
 [[package]]
 name = "proto_generator"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
 dependencies = [
  "clap",
  "env_logger",
@@ -3083,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "proto_utils"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
 
 [[package]]
 name = "quinn"
@@ -3623,7 +3624,7 @@ dependencies = [
 [[package]]
 name = "sf_core"
 version = "0.0.0"
-source = "git+https://github.com/snowflakedb/universal-driver#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
 dependencies = [
  "arrow",
  "arrow-ipc",
