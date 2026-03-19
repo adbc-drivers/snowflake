@@ -78,7 +78,7 @@ fn test_get_table_types() {
         .column(0)
         .as_string::<i32>()
         .iter()
-        .filter_map(|v| v)
+        .flatten()
         .collect();
     assert!(types.contains(&"TABLE"));
     assert!(types.contains(&"VIEW"));
