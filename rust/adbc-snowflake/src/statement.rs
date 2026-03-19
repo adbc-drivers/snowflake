@@ -2,9 +2,9 @@
 use std::sync::Arc;
 
 use adbc_core::{
+    Optionable, PartitionedResult,
     error::{Error, Result, Status},
     options::{OptionStatement, OptionValue},
-    Optionable, PartitionedResult,
 };
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
@@ -39,7 +39,10 @@ impl Optionable for Statement {
                     self.target_table = Some(s);
                     Ok(())
                 } else {
-                    Err(Error::with_message_and_status("target_table must be a string", Status::InvalidArguments))
+                    Err(Error::with_message_and_status(
+                        "target_table must be a string",
+                        Status::InvalidArguments,
+                    ))
                 }
             }
             OptionStatement::IngestMode => {
@@ -47,7 +50,10 @@ impl Optionable for Statement {
                     self.ingest_mode = Some(s);
                     Ok(())
                 } else {
-                    Err(Error::with_message_and_status("ingest_mode must be a string", Status::InvalidArguments))
+                    Err(Error::with_message_and_status(
+                        "ingest_mode must be a string",
+                        Status::InvalidArguments,
+                    ))
                 }
             }
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
@@ -55,7 +61,10 @@ impl Optionable for Statement {
                     self.query_tag = Some(s);
                     Ok(())
                 } else {
-                    Err(Error::with_message_and_status("query_tag must be a string", Status::InvalidArguments))
+                    Err(Error::with_message_and_status(
+                        "query_tag must be a string",
+                        Status::InvalidArguments,
+                    ))
                 }
             }
             _ => Err(Error::with_message_and_status(
@@ -78,15 +87,24 @@ impl Optionable for Statement {
     }
 
     fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
-        Err(Error::with_message_and_status("option not found", Status::NotFound))
+        Err(Error::with_message_and_status(
+            "option not found",
+            Status::NotFound,
+        ))
     }
 
     fn get_option_int(&self, _key: Self::Option) -> Result<i64> {
-        Err(Error::with_message_and_status("option not found", Status::NotFound))
+        Err(Error::with_message_and_status(
+            "option not found",
+            Status::NotFound,
+        ))
     }
 
     fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
-        Err(Error::with_message_and_status("option not found", Status::NotFound))
+        Err(Error::with_message_and_status(
+            "option not found",
+            Status::NotFound,
+        ))
     }
 }
 
@@ -99,6 +117,7 @@ impl adbc_core::Statement for Statement {
         Err(crate::error::not_implemented("bind_stream"))
     }
 
+    #[allow(refining_impl_trait)]
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.target_table.is_some() {
             return Err(crate::error::not_implemented(
@@ -113,24 +132,44 @@ impl adbc_core::Statement for Statement {
         if let Some(ref tag) = self.query_tag {
             let escaped = tag.replace('\'', "''");
             let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
-            let tmp_handle = self.inner.sf.statement_new(self.conn_handle)
+            let tmp_handle = self
+                .inner
+                .sf
+                .statement_new(self.conn_handle)
                 .map_err(crate::error::api_error_to_adbc_error)?;
             let set_result = self.inner.runtime.block_on(async {
-                self.inner.sf.statement_set_sql_query(tmp_handle, set_sql).await?;
-                self.inner.sf.statement_execute_query(tmp_handle, None).await
+                self.inner
+                    .sf
+                    .statement_set_sql_query(tmp_handle, set_sql)
+                    .await?;
+                self.inner
+                    .sf
+                    .statement_execute_query(tmp_handle, None)
+                    .await
             });
             let _ = self.inner.sf.statement_release(tmp_handle);
             set_result.map_err(crate::error::api_error_to_adbc_error)?;
         }
 
-        let result = self.inner.runtime.block_on(async {
-            self.inner.sf.statement_set_sql_query(self.stmt_handle, query).await?;
-            self.inner.sf.statement_execute_query(self.stmt_handle, None).await
-        }).map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self
+            .inner
+            .runtime
+            .block_on(async {
+                self.inner
+                    .sf
+                    .statement_set_sql_query(self.stmt_handle, query)
+                    .await?;
+                self.inner
+                    .sf
+                    .statement_execute_query(self.stmt_handle, None)
+                    .await
+            })
+            .map_err(crate::error::api_error_to_adbc_error)?;
 
         // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
         // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
-        let raw = Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        let raw =
+            Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
             .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
         Ok(Box::new(reader))
@@ -150,20 +189,39 @@ impl adbc_core::Statement for Statement {
         if let Some(ref tag) = self.query_tag {
             let escaped = tag.replace('\'', "''");
             let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
-            let tmp_handle = self.inner.sf.statement_new(self.conn_handle)
+            let tmp_handle = self
+                .inner
+                .sf
+                .statement_new(self.conn_handle)
                 .map_err(crate::error::api_error_to_adbc_error)?;
             let set_result = self.inner.runtime.block_on(async {
-                self.inner.sf.statement_set_sql_query(tmp_handle, set_sql).await?;
-                self.inner.sf.statement_execute_query(tmp_handle, None).await
+                self.inner
+                    .sf
+                    .statement_set_sql_query(tmp_handle, set_sql)
+                    .await?;
+                self.inner
+                    .sf
+                    .statement_execute_query(tmp_handle, None)
+                    .await
             });
             let _ = self.inner.sf.statement_release(tmp_handle);
             set_result.map_err(crate::error::api_error_to_adbc_error)?;
         }
 
-        let result = self.inner.runtime.block_on(async {
-            self.inner.sf.statement_set_sql_query(self.stmt_handle, query).await?;
-            self.inner.sf.statement_execute_query(self.stmt_handle, None).await
-        }).map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self
+            .inner
+            .runtime
+            .block_on(async {
+                self.inner
+                    .sf
+                    .statement_set_sql_query(self.stmt_handle, query)
+                    .await?;
+                self.inner
+                    .sf
+                    .statement_execute_query(self.stmt_handle, None)
+                    .await
+            })
+            .map_err(crate::error::api_error_to_adbc_error)?;
 
         Ok(result.rows_affected)
     }
@@ -197,7 +255,9 @@ impl adbc_core::Statement for Statement {
     }
 
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
-        Err(crate::error::not_implemented("Snowflake does not support Substrait plans"))
+        Err(crate::error::not_implemented(
+            "Snowflake does not support Substrait plans",
+        ))
     }
 
     fn cancel(&mut self) -> Result<()> {
@@ -290,17 +350,23 @@ mod tests {
     #[test]
     fn set_target_table_option() {
         let mut stmt = make_stmt();
-        stmt.set_option(OptionStatement::TargetTable, OptionValue::String("mytable".into())).unwrap();
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("mytable".into()),
+        )
+        .unwrap();
         assert_eq!(stmt.target_table.as_deref(), Some("mytable"));
     }
 
     #[test]
     fn unknown_option_returns_not_found() {
         let mut stmt = make_stmt();
-        let err = stmt.set_option(
-            OptionStatement::Other("unknown.option".into()),
-            OptionValue::String("val".into()),
-        ).unwrap_err();
+        let err = stmt
+            .set_option(
+                OptionStatement::Other("unknown.option".into()),
+                OptionValue::String("val".into()),
+            )
+            .unwrap_err();
         assert_eq!(err.status, adbc_core::error::Status::NotFound);
     }
 
@@ -310,9 +376,13 @@ mod tests {
         stmt.set_option(
             OptionStatement::Other("adbc.snowflake.statement.query_tag".into()),
             OptionValue::String("my_tag".into()),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
-            stmt.get_option_string(OptionStatement::Other("adbc.snowflake.statement.query_tag".into())).unwrap(),
+            stmt.get_option_string(OptionStatement::Other(
+                "adbc.snowflake.statement.query_tag".into()
+            ))
+            .unwrap(),
             "my_tag"
         );
         // Verify conn_handle is present on the struct (compile-time check)
