@@ -10,6 +10,6 @@ crate-type = ["cdylib", "rlib"]
 adbc_core = "0.22.0"
 adbc_ffi  = "0.22.0"
 sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core" }
-arrow-array  = { version = ">=53.1.0, <59", default-features = false, features = ["ffi"] }
-arrow-schema = { version = ">=53.1.0, <59", default-features = false }
+arrow-array  = { version = ">=57.0.0, <58", default-features = false, features = ["ffi"] }
+arrow-schema = { version = ">=57.0.0, <58", default-features = false }
 tokio        = { version = "1", features = ["rt-multi-thread"] }
