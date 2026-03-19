@@ -256,3 +256,6 @@ __marimo__/
 .doit.db
 go/vendor/
 validation-report.xml
+
+# Git worktrees
+.worktrees/
