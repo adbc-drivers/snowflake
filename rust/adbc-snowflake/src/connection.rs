@@ -438,6 +438,7 @@ impl adbc_core::Connection for Connection {
 
     fn commit(&mut self) -> Result<()> {
         self.execute_simple("COMMIT")?;
+        self.active_transaction = false;
         if !self.autocommit {
             self.execute_simple("BEGIN")?;
             self.active_transaction = true;
@@ -447,6 +448,7 @@ impl adbc_core::Connection for Connection {
 
     fn rollback(&mut self) -> Result<()> {
         self.execute_simple("ROLLBACK")?;
+        self.active_transaction = false;
         if !self.autocommit {
             self.execute_simple("BEGIN")?;
             self.active_transaction = true;

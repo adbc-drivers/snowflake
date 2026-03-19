@@ -108,27 +108,8 @@ impl Optionable for Statement {
     }
 }
 
-impl adbc_core::Statement for Statement {
-    fn bind(&mut self, _batch: RecordBatch) -> Result<()> {
-        Err(crate::error::not_implemented("bind"))
-    }
-
-    fn bind_stream(&mut self, _reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
-        Err(crate::error::not_implemented("bind_stream"))
-    }
-
-    #[allow(refining_impl_trait)]
-    fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        if self.target_table.is_some() {
-            return Err(crate::error::not_implemented(
-                "bulk ingestion (target_table) is not yet implemented",
-            ));
-        }
-        let query = self.query.clone().ok_or_else(|| {
-            Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
-        })?;
-
-        // Set QUERY_TAG session parameter if configured
+impl Statement {
+    fn apply_query_tag(&self) -> Result<()> {
         if let Some(ref tag) = self.query_tag {
             let escaped = tag.replace('\'', "''");
             let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
@@ -150,6 +131,31 @@ impl adbc_core::Statement for Statement {
             let _ = self.inner.sf.statement_release(tmp_handle);
             set_result.map_err(crate::error::api_error_to_adbc_error)?;
         }
+        Ok(())
+    }
+}
+
+impl adbc_core::Statement for Statement {
+    fn bind(&mut self, _batch: RecordBatch) -> Result<()> {
+        Err(crate::error::not_implemented("bind"))
+    }
+
+    fn bind_stream(&mut self, _reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
+        Err(crate::error::not_implemented("bind_stream"))
+    }
+
+    #[allow(refining_impl_trait)]
+    fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        if self.target_table.is_some() {
+            return Err(crate::error::not_implemented(
+                "bulk ingestion (target_table) is not yet implemented",
+            ));
+        }
+        let query = self.query.clone().ok_or_else(|| {
+            Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
+        })?;
+
+        self.apply_query_tag()?;
 
         let result = self
             .inner
@@ -185,28 +191,7 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        // Set QUERY_TAG session parameter if configured
-        if let Some(ref tag) = self.query_tag {
-            let escaped = tag.replace('\'', "''");
-            let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
-            let tmp_handle = self
-                .inner
-                .sf
-                .statement_new(self.conn_handle)
-                .map_err(crate::error::api_error_to_adbc_error)?;
-            let set_result = self.inner.runtime.block_on(async {
-                self.inner
-                    .sf
-                    .statement_set_sql_query(tmp_handle, set_sql)
-                    .await?;
-                self.inner
-                    .sf
-                    .statement_execute_query(tmp_handle, None)
-                    .await
-            });
-            let _ = self.inner.sf.statement_release(tmp_handle);
-            set_result.map_err(crate::error::api_error_to_adbc_error)?;
-        }
+        self.apply_query_tag()?;
 
         let result = self
             .inner
