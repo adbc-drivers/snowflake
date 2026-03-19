@@ -191,6 +191,7 @@ impl adbc_core::Connection for Connection {
         Ok(Statement {
             inner: self.inner.clone(),
             stmt_handle,
+            conn_handle: self.conn_handle,
             query: None,
             target_table: None,
             ingest_mode: None,

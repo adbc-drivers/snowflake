@@ -15,6 +15,7 @@ use crate::driver::Inner;
 pub struct Statement {
     pub(crate) inner: Arc<Inner>,
     pub(crate) stmt_handle: Handle,
+    pub(crate) conn_handle: Handle,
     pub(crate) query: Option<String>,
     pub(crate) target_table: Option<String>,
     pub(crate) ingest_mode: Option<String>,
@@ -108,7 +109,19 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        // NOTE: query_tag SET not yet implemented — conn_handle added in Task 8
+        // Set QUERY_TAG session parameter if configured
+        if let Some(ref tag) = self.query_tag {
+            let escaped = tag.replace('\'', "''");
+            let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
+            let tmp_handle = self.inner.sf.statement_new(self.conn_handle)
+                .map_err(crate::error::api_error_to_adbc_error)?;
+            let set_result = self.inner.runtime.block_on(async {
+                self.inner.sf.statement_set_sql_query(tmp_handle, set_sql).await?;
+                self.inner.sf.statement_execute_query(tmp_handle, None).await
+            });
+            let _ = self.inner.sf.statement_release(tmp_handle);
+            set_result.map_err(crate::error::api_error_to_adbc_error)?;
+        }
 
         let result = self.inner.runtime.block_on(async {
             self.inner.sf.statement_set_sql_query(self.stmt_handle, query).await?;
@@ -133,7 +146,19 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        // NOTE: query_tag SET not yet implemented — conn_handle added in Task 8
+        // Set QUERY_TAG session parameter if configured
+        if let Some(ref tag) = self.query_tag {
+            let escaped = tag.replace('\'', "''");
+            let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
+            let tmp_handle = self.inner.sf.statement_new(self.conn_handle)
+                .map_err(crate::error::api_error_to_adbc_error)?;
+            let set_result = self.inner.runtime.block_on(async {
+                self.inner.sf.statement_set_sql_query(tmp_handle, set_sql).await?;
+                self.inner.sf.statement_execute_query(tmp_handle, None).await
+            });
+            let _ = self.inner.sf.statement_release(tmp_handle);
+            set_result.map_err(crate::error::api_error_to_adbc_error)?;
+        }
 
         let result = self.inner.runtime.block_on(async {
             self.inner.sf.statement_set_sql_query(self.stmt_handle, query).await?;
@@ -190,6 +215,7 @@ mod tests {
         Statement {
             inner: driver.inner.clone(),
             stmt_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
+            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             query: None,
             target_table: None,
             ingest_mode: None,
@@ -219,6 +245,7 @@ mod tests {
         let mut stmt = Statement {
             inner: driver.inner.clone(),
             stmt_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
+            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             query: None,
             target_table: Some("mytable".into()),
             ingest_mode: None,
@@ -236,6 +263,7 @@ mod tests {
         let mut stmt = Statement {
             inner: driver.inner.clone(),
             stmt_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
+            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             query: None,
             target_table: Some("mytable".into()),
             ingest_mode: None,
@@ -274,5 +302,20 @@ mod tests {
             OptionValue::String("val".into()),
         ).unwrap_err();
         assert_eq!(err.status, adbc_core::error::Status::NotFound);
+    }
+
+    #[test]
+    fn set_query_tag_stored_and_readable() {
+        let mut stmt = make_stmt();
+        stmt.set_option(
+            OptionStatement::Other("adbc.snowflake.statement.query_tag".into()),
+            OptionValue::String("my_tag".into()),
+        ).unwrap();
+        assert_eq!(
+            stmt.get_option_string(OptionStatement::Other("adbc.snowflake.statement.query_tag".into())).unwrap(),
+            "my_tag"
+        );
+        // Verify conn_handle is present on the struct (compile-time check)
+        let _ = stmt.conn_handle;
     }
 }
