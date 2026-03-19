@@ -247,10 +247,43 @@ impl adbc_core::Connection for Connection {
             Arc::new(Field::new("item", DataType::Utf8, true)),
             0,
         )) as ArrayRef;
-        let map_values = Arc::new(arrow_array::ListArray::new_null(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            0,
-        )) as ArrayRef;
+        // arm 5: int32_to_int32_list_map — proper empty MapArray to satisfy schema type check
+        // (This arm is never selected, but must have the right type for RecordBatch::try_new)
+        let empty_int32_list_inner = arrow_array::Int32Array::from(Vec::<i32>::new());
+        let empty_int32_list = arrow_array::ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32])),
+            Arc::new(empty_int32_list_inner),
+            None,
+        );
+        let empty_entries = arrow_array::StructArray::new(
+            arrow_schema::Fields::from(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new_list("value", Field::new_list_field(DataType::Int32, true), true),
+            ]),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(Vec::<i32>::new())) as ArrayRef,
+                Arc::new(empty_int32_list) as ArrayRef,
+            ],
+            None,
+        );
+        let map_values = Arc::new(
+            arrow_array::MapArray::try_new(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Field::new("key", DataType::Int32, false),
+                        Field::new_list("value", Field::new_list_field(DataType::Int32, true), true),
+                    ],
+                    false,
+                )),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32])),
+                empty_entries,
+                None,
+                false,
+            )
+            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?,
+        ) as ArrayRef;
 
         let union_array = UnionArray::try_new(
             #[allow(deprecated)]
@@ -266,9 +299,12 @@ impl adbc_core::Connection for Connection {
                         Field::new_list_field(DataType::Utf8, true),
                         true,
                     ),
-                    Field::new_list(
+                    Field::new_map(
                         "int32_to_int32_list_map",
-                        Field::new_list_field(DataType::Int32, true),
+                        "entries",
+                        Field::new("key", DataType::Int32, false),
+                        Field::new_list("value", Field::new_list_field(DataType::Int32, true), true),
+                        false,
                         true,
                     ),
                 ],
