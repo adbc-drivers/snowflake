@@ -1,0 +1,4 @@
+# Disable dynamic linking to avoid linker errors from sf_core's dylib crate-type
+# when building test binaries on Linux.
+[build]
+rustflags = ["-C", "prefer-dynamic=no"]

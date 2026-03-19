@@ -35,12 +35,11 @@ mod tests {
 
     #[test]
     fn invalid_argument_maps_to_invalid_arguments() {
-        use sf_core::apis::database_driver_v1::ApiError;
-        // Build an InvalidArgument error via the snafu builder pattern
-        let err: ApiError = sf_core::apis::database_driver_v1::error::InvalidArgumentSnafu {
-            argument: "test".to_string(),
-        }
-        .build();
+        use sf_core::apis::database_driver_v1::{DatabaseDriverV1, Handle};
+        // Releasing a non-existent handle produces an InvalidArgument error
+        let driver = DatabaseDriverV1::new();
+        let bogus_handle = Handle { id: 999, magic: 0 };
+        let err = driver.database_init(bogus_handle).unwrap_err();
         let adbc_err = api_error_to_adbc_error(err);
         assert_eq!(adbc_err.status, Status::InvalidArguments);
     }
