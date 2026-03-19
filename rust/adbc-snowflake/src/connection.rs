@@ -532,7 +532,7 @@ mod tests {
             .column(0)
             .as_string::<i32>()
             .iter()
-            .filter_map(|v| v)
+            .flatten()
             .collect();
         assert_eq!(types, vec!["TABLE", "VIEW"]);
     }
