@@ -24,6 +24,16 @@ impl Optionable for Connection {
     fn get_option_double(&self, _key: Self::Option) -> Result<f64> { todo!() }
 }
 
+impl Connection {
+    pub(crate) fn set_autocommit(&mut self, _enabled: bool) -> adbc_core::error::Result<()> {
+        Ok(()) // stub — full impl in Task 5
+    }
+
+    pub(crate) fn execute_simple(&self, _sql: &str) -> adbc_core::error::Result<()> {
+        Ok(()) // stub — full impl in Task 5
+    }
+}
+
 impl adbc_core::Connection for Connection {
     type StatementType = Statement;
     fn new_statement(&mut self) -> Result<Self::StatementType> { todo!() }
