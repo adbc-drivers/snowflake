@@ -349,6 +349,9 @@ impl adbc_core::Connection for Connection {
         let _ = self.inner.sf.statement_release(stmt_handle);
         let exec_result = result.map_err(crate::error::api_error_to_adbc_error)?;
 
+        // Safety: exec_result.stream is a valid FFI stream from sf_core. We take ownership
+        // via Box::into_raw and transfer it to ArrowArrayStreamReader. The C ABI layout is
+        // stable across arrow versions per the Arrow C Data Interface specification.
         let raw = Box::into_raw(exec_result.stream)
             as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let mut reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
@@ -403,12 +406,20 @@ impl adbc_core::Connection for Connection {
 
     fn commit(&mut self) -> Result<()> {
         self.execute_simple("COMMIT")?;
-        self.execute_simple("BEGIN")
+        if !self.autocommit {
+            self.execute_simple("BEGIN")?;
+            self.active_transaction = true;
+        }
+        Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {
         self.execute_simple("ROLLBACK")?;
-        self.execute_simple("BEGIN")
+        if !self.autocommit {
+            self.execute_simple("BEGIN")?;
+            self.active_transaction = true;
+        }
+        Ok(())
     }
 
     fn read_partition(
