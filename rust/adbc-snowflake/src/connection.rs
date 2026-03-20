@@ -273,7 +273,7 @@ impl adbc_core::Connection for Connection {
         codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let need_vendor_version =
-            codes.as_ref().map_or(true, |s| s.contains(&InfoCode::VendorVersion));
+            codes.as_ref().is_none_or(|s| s.contains(&InfoCode::VendorVersion));
         let vendor_version = if need_vendor_version {
             self.query_scalar("SELECT CURRENT_VERSION()")?
         } else {
@@ -495,10 +495,10 @@ impl adbc_core::Connection for Connection {
                 if let Some(pk) = &primary_keys {
                     md.insert("PRIMARY_KEY".to_string(), pk.value(i).to_string());
                 }
-                if let Some(cm) = &comments {
-                    if !cm.is_null(i) {
-                        md.insert("COMMENT".to_string(), cm.value(i).to_string());
-                    }
+                if let Some(cm) = &comments
+                    && !cm.is_null(i)
+                {
+                    md.insert("COMMENT".to_string(), cm.value(i).to_string());
                 }
                 fields.push(
                     Field::new(names.value(i), arrow_type, nullables.value(i) == "Y")

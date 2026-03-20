@@ -402,20 +402,18 @@ impl adbc_core::Database for Database {
         // If neither host nor server_url was provided, derive host from account.
         if !self.sf_settings.contains_key(param_names::HOST.as_str())
             && !self.sf_settings.contains_key(param_names::SERVER_URL.as_str())
-        {
-            if let Some(Setting::String(account)) =
+            && let Some(Setting::String(account)) =
                 self.sf_settings.get(param_names::ACCOUNT.as_str())
-            {
-                let host = format!("{}.snowflakecomputing.com", account);
-                self.inner
-                    .runtime
-                    .block_on(self.inner.sf.connection_set_option(
-                        conn_handle,
-                        param_names::HOST.into(),
-                        Setting::String(host),
-                    ))
-                    .map_err(crate::error::api_error_to_adbc_error)?;
-            }
+        {
+            let host = format!("{}.snowflakecomputing.com", account);
+            self.inner
+                .runtime
+                .block_on(self.inner.sf.connection_set_option(
+                    conn_handle,
+                    param_names::HOST.into(),
+                    Setting::String(host),
+                ))
+                .map_err(crate::error::api_error_to_adbc_error)?;
         }
 
         // Authenticate
