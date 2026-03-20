@@ -25,14 +25,17 @@ use adbc_core::{
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
     options::{OptionConnection, OptionDatabase, OptionValue},
 };
-use adbc_snowflake::Driver;
+use adbc_snowflake::{Database, Driver};
 use arrow_array::cast::AsArray;
+use arrow_schema::{DataType, TimeUnit};
 
 fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-fn make_connection() -> Option<adbc_snowflake::Connection> {
+/// Build a configured Database without opening a connection.
+/// Callers can set extra options before calling `.new_connection()`.
+fn make_db() -> Option<Database> {
     let uri = get_env("SNOWFLAKE_URI")?;
     let mut driver = Driver::default();
     let mut db = driver.new_database().expect("new_database");
@@ -52,7 +55,11 @@ fn make_connection() -> Option<adbc_snowflake::Connection> {
         )
         .expect("set schema");
     }
-    Some(db.new_connection().expect("new_connection"))
+    Some(db)
+}
+
+fn make_connection() -> Option<adbc_snowflake::Connection> {
+    Some(make_db()?.new_connection().expect("new_connection"))
 }
 
 #[test]
@@ -221,5 +228,230 @@ fn test_execute_ddl_and_dml() {
         stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_test")
             .unwrap();
         stmt.execute_update().expect("drop table");
+    }
+}
+
+// ── precision option tests ────────────────────────────────────────────────────
+
+/// Verify that the precision options round-trip correctly on Database
+/// (no live query required — purely option set/get).
+#[test]
+fn test_precision_options_defaults_and_round_trip() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    // Defaults
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.use_high_precision".into()
+        ))
+        .unwrap(),
+        "enabled"
+    );
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "nanoseconds"
+    );
+
+    // Round-trip: disable high precision
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.use_high_precision".into()),
+        OptionValue::String("disabled".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.use_high_precision".into()
+        ))
+        .unwrap(),
+        "disabled"
+    );
+
+    // Round-trip: microsecond timestamps
+    db.set_option(
+        OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
+        ),
+        OptionValue::String("microseconds".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "microseconds"
+    );
+
+    // Round-trip: nanoseconds_error_on_overflow
+    db.set_option(
+        OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
+        ),
+        OptionValue::String("nanoseconds_error_on_overflow".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "nanoseconds_error_on_overflow"
+    );
+}
+
+/// Mirrors Go's TestUseHighPrecision / TestSchemaWithLowPrecision.
+///
+/// With high precision (default): NUMBER(10,0) → Int64, NUMBER(15,2) → Decimal128(15,2).
+/// With high precision disabled:  NUMBER(10,0) → Int64, NUMBER(15,2) → Float64.
+#[test]
+fn test_high_precision_get_table_schema() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    // Create a permanent table so a second connection can also DESC it.
+    {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query(
+            "CREATE OR REPLACE TABLE adbc_rust_precision_test \
+             (INT_COL NUMBER(10,0), DEC_COL NUMBER(15,2))",
+        )
+        .unwrap();
+        stmt.execute_update().expect("create precision test table");
+    }
+
+    // Snowflake folds unquoted identifiers to uppercase.
+    // ── high precision (default: enabled) ────────────────────────────────────
+    let schema_hp = conn
+        .get_table_schema(None, None, "ADBC_RUST_PRECISION_TEST")
+        .expect("get_table_schema high precision");
+
+    assert_eq!(
+        schema_hp.field_with_name("INT_COL").unwrap().data_type(),
+        &DataType::Int64,
+        "INT_COL: expected Int64 (scale=0)"
+    );
+    assert_eq!(
+        schema_hp.field_with_name("DEC_COL").unwrap().data_type(),
+        &DataType::Decimal128(15, 2),
+        "DEC_COL: expected Decimal128(15,2) with high precision"
+    );
+
+    // ── low precision (disabled) ──────────────────────────────────────────────
+    let Some(mut db_lp) = make_db() else { return };
+    db_lp
+        .set_option(
+            OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.use_high_precision".into(),
+            ),
+            OptionValue::String("disabled".into()),
+        )
+        .unwrap();
+    let conn_lp = db_lp.new_connection().expect("low-precision connection");
+
+    let schema_lp = conn_lp
+        .get_table_schema(None, None, "ADBC_RUST_PRECISION_TEST")
+        .expect("get_table_schema low precision");
+
+    assert_eq!(
+        schema_lp.field_with_name("INT_COL").unwrap().data_type(),
+        &DataType::Int64,
+        "INT_COL: expected Int64 (scale=0)"
+    );
+    assert_eq!(
+        schema_lp.field_with_name("DEC_COL").unwrap().data_type(),
+        &DataType::Float64,
+        "DEC_COL: expected Float64 with low precision"
+    );
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_precision_test")
+            .unwrap();
+        stmt.execute_update().expect("drop precision test table");
+    }
+}
+
+/// Mirrors Go's TestTimestampPrecision.
+///
+/// With nanoseconds (default): TIMESTAMP_NTZ → Timestamp(Nanosecond, None),
+///                              TIMESTAMP_TZ  → Timestamp(Nanosecond, UTC).
+/// With microseconds:           TIMESTAMP_NTZ → Timestamp(Microsecond, None),
+///                              TIMESTAMP_TZ  → Timestamp(Microsecond, UTC).
+#[test]
+fn test_timestamp_precision_get_table_schema() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query(
+            "CREATE OR REPLACE TABLE adbc_rust_ts_precision_test \
+             (NTZ_COL TIMESTAMP_NTZ, TZ_COL TIMESTAMP_TZ)",
+        )
+        .unwrap();
+        stmt.execute_update().expect("create ts precision test table");
+    }
+
+    // Snowflake folds unquoted identifiers to uppercase.
+    // ── nanoseconds (default) ─────────────────────────────────────────────────
+    let schema_ns = conn
+        .get_table_schema(None, None, "ADBC_RUST_TS_PRECISION_TEST")
+        .expect("get_table_schema nanoseconds");
+
+    assert_eq!(
+        schema_ns.field_with_name("NTZ_COL").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "NTZ_COL: expected Timestamp(Nanosecond, None)"
+    );
+    assert_eq!(
+        schema_ns.field_with_name("TZ_COL").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        "TZ_COL: expected Timestamp(Nanosecond, UTC)"
+    );
+
+    // ── microseconds ──────────────────────────────────────────────────────────
+    let Some(mut db_us) = make_db() else { return };
+    db_us
+        .set_option(
+            OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
+            ),
+            OptionValue::String("microseconds".into()),
+        )
+        .unwrap();
+    let conn_us = db_us.new_connection().expect("microsecond connection");
+
+    let schema_us = conn_us
+        .get_table_schema(None, None, "ADBC_RUST_TS_PRECISION_TEST")
+        .expect("get_table_schema microseconds");
+
+    assert_eq!(
+        schema_us.field_with_name("NTZ_COL").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+        "NTZ_COL: expected Timestamp(Microsecond, None)"
+    );
+    assert_eq!(
+        schema_us.field_with_name("TZ_COL").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        "TZ_COL: expected Timestamp(Microsecond, UTC)"
+    );
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_ts_precision_test")
+            .unwrap();
+        stmt.execute_update().expect("drop ts precision test table");
     }
 }
