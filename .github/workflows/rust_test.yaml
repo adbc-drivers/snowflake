@@ -107,7 +107,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          workspaces: rust/adbc-snowflake
+          workspaces: rust
 
       - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e  # v0.9.4
         with:
@@ -115,7 +115,7 @@ jobs:
           run-install: false
 
       - name: Build
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           if [[ -f ci/scripts/pre-build.sh ]]; then
             echo "Loading pre-build"
@@ -134,7 +134,7 @@ jobs:
         # Can't use Docker on macOS AArch64 runners, and Windows containers
         # work but often the container doesn't support Windows
         if: runner.os == 'Linux'
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           if [[ -f compose.yaml ]]; then
             if ! docker compose up --detach --wait test-service; then
@@ -146,7 +146,7 @@ jobs:
           fi
 
       - name: Test
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         env:
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
@@ -180,7 +180,7 @@ jobs:
 
       - name: Lint
         if: runner.os == 'Linux'
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           cargo fmt --check
           cargo clippy -- -D warnings
@@ -230,7 +230,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          workspaces: rust/adbc-snowflake
+          workspaces: rust
 
       - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e  # v0.9.4
         with:
@@ -245,7 +245,7 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Build Library
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           if [[ -f ci/scripts/pre-build.sh ]]; then
             ./ci/scripts/pre-build.sh test ${{ matrix.platform }} ${{ matrix.arch }}
@@ -265,7 +265,7 @@ jobs:
         # Can't use Docker on macOS AArch64 runners, and windows containers
         # work but often the container doesn't support Windows
         if: runner.os == 'Linux'
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           if [[ -f compose.yaml ]]; then
             if ! docker compose up --detach --wait test-service; then
@@ -285,7 +285,7 @@ jobs:
           SNOWFLAKE_SCHEMA_SECONDARY: ${{ secrets.SNOWFLAKE_SCHEMA_SECONDARY }}
           SNOWFLAKE_DATABASE_SECONDARY: ${{ secrets.SNOWFLAKE_DATABASE_SECONDARY }}
           SNOWFLAKE_DATABASE_SECONDARY_SCHEMA: ${{ secrets.SNOWFLAKE_DATABASE_SECONDARY_SCHEMA }}
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           set -a
           if [[ -f .env ]]; then
@@ -314,18 +314,18 @@ jobs:
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
         with:
           name: validation-report
-          path: "rust/adbc-snowflake/validation-report.xml"
+          path: "rust/validation-report.xml"
           retention-days: 7
 
       - name: Generate docs
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           pixi run gendocs --output generated
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
         with:
           name: docs
-          path: "rust/adbc-snowflake/generated/snowflake.md"
+          path: "rust/generated/snowflake.md"
           retention-days: 2
 
   build:
@@ -369,7 +369,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          workspaces: rust/adbc-snowflake
+          workspaces: rust
 
       - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e  # v0.9.4
         with:
@@ -377,7 +377,7 @@ jobs:
           run-install: false
 
       - name: Install dev tools
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           pixi install
 
@@ -386,10 +386,10 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Build Library
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           if [[ -f ci/scripts/pre-build.sh ]]; then
             ./ci/scripts/pre-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
@@ -408,7 +408,7 @@ jobs:
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
         with:
           name: drivers-${{ matrix.platform }}-${{ matrix.arch }}
-          path: rust/adbc-snowflake/target/release/libadbc_snowflake.*            
+          path: rust/target/release/libadbc_snowflake.*
           retention-days: 2
 
   package:
@@ -442,7 +442,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          workspaces: rust/adbc-snowflake
+          workspaces: rust
 
       - uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e  # v0.9.4
         with:
@@ -455,7 +455,7 @@ jobs:
           path: "~/drivers"
 
       - name: Generate packages
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           pixi install
 
@@ -529,7 +529,7 @@ jobs:
           persist-credentials: false
           submodules: 'recursive'
       - name: load package
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           if [[ -f ci/scripts/pre-build.sh ]]; then
             echo "Loading pre-build"
@@ -592,7 +592,7 @@ jobs:
       - name: Release (dry-run)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: rust/adbc-snowflake
+        working-directory: rust
         run: |
           git tag go/v1000.0.0
           tag=go/v1000.0.0
