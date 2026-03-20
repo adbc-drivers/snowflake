@@ -308,9 +308,7 @@ impl Database {
                         "port" => "adbc.snowflake.sql.uri.port",
                         "protocol" => "adbc.snowflake.sql.uri.protocol",
                         "authenticator" => "adbc.snowflake.sql.auth_type",
-                        "private_key_file" => {
-                            "adbc.snowflake.sql.client_option.jwt_private_key"
-                        }
+                        "private_key_file" => "adbc.snowflake.sql.client_option.jwt_private_key",
                         "private_key" => {
                             "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value"
                         }
@@ -401,7 +399,9 @@ impl adbc_core::Database for Database {
 
         // If neither host nor server_url was provided, derive host from account.
         if !self.sf_settings.contains_key(param_names::HOST.as_str())
-            && !self.sf_settings.contains_key(param_names::SERVER_URL.as_str())
+            && !self
+                .sf_settings
+                .contains_key(param_names::SERVER_URL.as_str())
             && let Some(Setting::String(account)) =
                 self.sf_settings.get(param_names::ACCOUNT.as_str())
         {

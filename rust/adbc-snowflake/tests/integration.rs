@@ -77,9 +77,18 @@ fn test_private_key_simple_query() {
 
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.num_columns(), 3);
-    assert!(!batch.column(0).as_string::<i32>().value(0).is_empty(), "CURRENT_USER() is empty");
-    assert!(!batch.column(1).as_string::<i32>().value(0).is_empty(), "CURRENT_WAREHOUSE() is empty");
-    assert!(!batch.column(2).as_string::<i32>().value(0).is_empty(), "CURRENT_ROLE() is empty");
+    assert!(
+        !batch.column(0).as_string::<i32>().value(0).is_empty(),
+        "CURRENT_USER() is empty"
+    );
+    assert!(
+        !batch.column(1).as_string::<i32>().value(0).is_empty(),
+        "CURRENT_WAREHOUSE() is empty"
+    );
+    assert!(
+        !batch.column(2).as_string::<i32>().value(0).is_empty(),
+        "CURRENT_ROLE() is empty"
+    );
 }
 
 #[test]
@@ -143,13 +152,24 @@ fn test_get_info_vendor_version() {
 
     // VendorVersion is a string value — type_id 0 in the union
     use arrow_array::cast::AsArray;
-    let type_ids = batch.column(1).as_any().downcast_ref::<arrow_array::UnionArray>().unwrap();
-    assert_eq!(type_ids.type_id(0), 0, "VendorVersion should be a string union arm");
+    let type_ids = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::UnionArray>()
+        .unwrap();
+    assert_eq!(
+        type_ids.type_id(0),
+        0,
+        "VendorVersion should be a string union arm"
+    );
     let version_str = type_ids.value(0);
     let v = version_str.as_string::<i32>().value(0);
     assert!(!v.is_empty(), "VendorVersion should not be empty");
     // Snowflake versions look like "8.x.x" — just check it contains a dot
-    assert!(v.contains('.'), "VendorVersion should look like a version string, got: {v}");
+    assert!(
+        v.contains('.'),
+        "VendorVersion should look like a version string, got: {v}"
+    );
 }
 
 #[test]
@@ -274,9 +294,7 @@ fn test_precision_options_defaults_and_round_trip() {
 
     // Round-trip: microsecond timestamps
     db.set_option(
-        OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
-        ),
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.max_timestamp_precision".into()),
         OptionValue::String("microseconds".into()),
     )
     .unwrap();
@@ -290,9 +308,7 @@ fn test_precision_options_defaults_and_round_trip() {
 
     // Round-trip: nanoseconds_error_on_overflow
     db.set_option(
-        OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
-        ),
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.max_timestamp_precision".into()),
         OptionValue::String("nanoseconds_error_on_overflow".into()),
     )
     .unwrap();
@@ -348,9 +364,7 @@ fn test_high_precision_get_table_schema() {
     let Some(mut db_lp) = make_db() else { return };
     db_lp
         .set_option(
-            OptionDatabase::Other(
-                "adbc.snowflake.sql.client_option.use_high_precision".into(),
-            ),
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.use_high_precision".into()),
             OptionValue::String("disabled".into()),
         )
         .unwrap();
@@ -400,7 +414,8 @@ fn test_timestamp_precision_get_table_schema() {
              (NTZ_COL TIMESTAMP_NTZ, TZ_COL TIMESTAMP_TZ)",
         )
         .unwrap();
-        stmt.execute_update().expect("create ts precision test table");
+        stmt.execute_update()
+            .expect("create ts precision test table");
     }
 
     // Snowflake folds unquoted identifiers to uppercase.
