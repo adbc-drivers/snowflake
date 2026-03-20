@@ -31,8 +31,8 @@ use adbc_core::{
     schemas,
 };
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
-    UnionArray,
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray,
+    UInt32Array, UnionArray,
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema};
@@ -477,17 +477,33 @@ impl adbc_core::Connection for Connection {
             let names = batch.column(0).as_string::<i32>();
             let types = batch.column(1).as_string::<i32>();
             let nullables = batch.column(3).as_string::<i32>();
+            // primary_key is column 5; comment is column 9 — present only when
+            // the result has enough columns (older Snowflake editions may omit them).
+            let primary_keys = (batch.num_columns() > 5)
+                .then(|| batch.column(5).as_string::<i32>());
+            let comments = (batch.num_columns() > 9)
+                .then(|| batch.column(9).as_string::<i32>());
             for i in 0..batch.num_rows() {
+                let type_str = types.value(i);
                 let arrow_type = snowflake_type_to_arrow(
-                    types.value(i),
+                    type_str,
                     self.use_high_precision,
                     self.timestamp_precision.time_unit(),
                 );
-                fields.push(Field::new(
-                    names.value(i),
-                    arrow_type,
-                    nullables.value(i) == "Y",
-                ));
+                let mut md = std::collections::HashMap::new();
+                md.insert("DATA_TYPE".to_string(), type_str.to_string());
+                if let Some(pk) = &primary_keys {
+                    md.insert("PRIMARY_KEY".to_string(), pk.value(i).to_string());
+                }
+                if let Some(cm) = &comments {
+                    if !cm.is_null(i) {
+                        md.insert("COMMENT".to_string(), cm.value(i).to_string());
+                    }
+                }
+                fields.push(
+                    Field::new(names.value(i), arrow_type, nullables.value(i) == "Y")
+                        .with_metadata(md),
+                );
             }
         }
         Ok(Schema::new(fields))
