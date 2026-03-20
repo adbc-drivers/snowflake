@@ -470,3 +470,127 @@ fn test_timestamp_precision_get_table_schema() {
         stmt.execute_update().expect("drop ts precision test table");
     }
 }
+
+// ── missing database options ──────────────────────────────────────────────────
+
+/// Verify simple 1:1 option round-trips through the public Database API.
+/// No live connection required — make_db() only needs SNOWFLAKE_URI for the env
+/// var check; no actual network call is made until new_connection().
+#[test]
+fn test_database_options_round_trip() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    let cases: &[(&str, &str)] = &[
+        ("adbc.snowflake.sql.region", "us-east-1"),
+        ("adbc.snowflake.sql.client_option.login_timeout", "30s"),
+        ("adbc.snowflake.sql.client_option.request_timeout", "60s"),
+        ("adbc.snowflake.sql.client_option.jwt_expire_timeout", "90s"),
+        ("adbc.snowflake.sql.client_option.client_timeout", "120s"),
+        (
+            "adbc.snowflake.sql.client_option.keep_session_alive",
+            "enabled",
+        ),
+        ("adbc.snowflake.sql.client_option.disable_telemetry", "enabled"),
+        ("adbc.snowflake.sql.client_option.cache_mfa_token", "enabled"),
+        ("adbc.snowflake.sql.client_option.store_temp_creds", "enabled"),
+        ("adbc.snowflake.sql.client_option.tracing", "debug"),
+        (
+            "adbc.snowflake.sql.client_option.identity_provider",
+            "azure",
+        ),
+    ];
+
+    for (key, val) in cases {
+        db.set_option(
+            OptionDatabase::Other((*key).into()),
+            OptionValue::String((*val).into()),
+        )
+        .unwrap_or_else(|e| panic!("set_option({key}) failed: {e}"));
+
+        let got = db
+            .get_option_string(OptionDatabase::Other((*key).into()))
+            .unwrap_or_else(|e| panic!("get_option_string({key}) failed: {e}"));
+
+        assert_eq!(got, *val, "round-trip mismatch for {key}");
+    }
+}
+
+/// Verify tls_skip_verify round-trips and that the compound TLS flags are
+/// readable back through their own option keys.
+#[test]
+fn test_tls_skip_verify_option() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    // enabled → skip verification
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+        OptionValue::String("enabled".into()),
+    )
+    .expect("set tls_skip_verify enabled");
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.tls_skip_verify".into()
+        ))
+        .unwrap(),
+        "enabled"
+    );
+
+    // disabled → restore verification
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+        OptionValue::String("disabled".into()),
+    )
+    .expect("set tls_skip_verify disabled");
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.tls_skip_verify".into()
+        ))
+        .unwrap(),
+        "disabled"
+    );
+}
+
+/// Verify ocsp_fail_open_mode round-trips correctly.
+#[test]
+fn test_ocsp_fail_open_mode_option() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    db.set_option(
+        OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
+        ),
+        OptionValue::String("enabled".into()),
+    )
+    .expect("set ocsp_fail_open_mode enabled");
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()
+        ))
+        .unwrap(),
+        "enabled"
+    );
+
+    db.set_option(
+        OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
+        ),
+        OptionValue::String("disabled".into()),
+    )
+    .expect("set ocsp_fail_open_mode disabled");
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()
+        ))
+        .unwrap(),
+        "disabled"
+    );
+}
