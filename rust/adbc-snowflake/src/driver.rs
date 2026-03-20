@@ -28,10 +28,32 @@ use adbc_core::{
     error::{Error, Result, Status},
     options::{OptionDatabase, OptionValue},
 };
+use arrow_schema::TimeUnit;
 use sf_core::apis::database_driver_v1::DatabaseDriverV1;
 use tokio::runtime::Runtime;
 
 use crate::database::Database;
+
+/// Controls the Arrow time unit used for Snowflake TIMESTAMP columns.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum TimestampPrecision {
+    /// Nanosecond precision (default). May overflow for dates outside 1677–2262.
+    #[default]
+    Nanoseconds,
+    /// Microsecond precision. Safe for all Snowflake-representable dates.
+    Microseconds,
+    /// Nanosecond precision; returns an error when a value would overflow.
+    NanosecondsErrorOnOverflow,
+}
+
+impl TimestampPrecision {
+    pub(crate) fn time_unit(self) -> TimeUnit {
+        match self {
+            Self::Microseconds => TimeUnit::Microsecond,
+            _ => TimeUnit::Nanosecond,
+        }
+    }
+}
 
 pub(crate) struct Inner {
     pub runtime: Runtime,
@@ -90,6 +112,8 @@ impl adbc_core::Driver for Driver {
             inner: self.inner.clone(),
             db_handle,
             sf_settings,
+            use_high_precision: true,
+            timestamp_precision: TimestampPrecision::default(),
         };
         for (key, value) in opts {
             db.set_option(key, value)?;

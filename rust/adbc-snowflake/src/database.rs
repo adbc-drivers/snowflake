@@ -34,7 +34,7 @@ use sf_core::config::param_registry::param_names;
 use sf_core::config::settings::Setting;
 
 use crate::connection::Connection;
-use crate::driver::Inner;
+use crate::driver::{Inner, TimestampPrecision};
 
 /// Convert an ADBC OptionDatabase key + OptionValue into an sf_core (param_name, Setting) pair.
 /// Returns None for the "uri" key (handled by apply_uri separately).
@@ -104,6 +104,10 @@ pub struct Database {
     /// Local copy of sf_core settings keyed by canonical param name.
     /// Propagated to each new connection before connection_init.
     pub(crate) sf_settings: HashMap<String, Setting>,
+    /// Map NUMBER(p,s) with s>0 to Decimal128 instead of Float64.
+    pub(crate) use_high_precision: bool,
+    /// Arrow time unit used for TIMESTAMP columns.
+    pub(crate) timestamp_precision: TimestampPrecision,
 }
 
 impl Drop for Database {
@@ -126,6 +130,24 @@ impl Optionable for Database {
                 Status::InvalidArguments,
             ));
         }
+        if key_str == "adbc.snowflake.sql.client_option.use_high_precision" {
+            if let OptionValue::String(s) = &value {
+                self.use_high_precision = s == "enabled" || s == "true";
+            }
+            return Ok(());
+        }
+        if key_str == "adbc.snowflake.sql.client_option.max_timestamp_precision" {
+            if let OptionValue::String(s) = &value {
+                self.timestamp_precision = match s.as_str() {
+                    "microseconds" => TimestampPrecision::Microseconds,
+                    "nanoseconds_error_on_overflow" => {
+                        TimestampPrecision::NanosecondsErrorOnOverflow
+                    }
+                    _ => TimestampPrecision::Nanoseconds,
+                };
+            }
+            return Ok(());
+        }
         if let Some((param, setting)) = adbc_db_opt_to_sf(key_str, &value)? {
             self.sf_settings.insert(param.clone(), setting.clone());
             self.inner
@@ -142,6 +164,21 @@ impl Optionable for Database {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let key_str = key.as_ref();
+        if key_str == "adbc.snowflake.sql.client_option.use_high_precision" {
+            return Ok(if self.use_high_precision {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            });
+        }
+        if key_str == "adbc.snowflake.sql.client_option.max_timestamp_precision" {
+            return Ok(match self.timestamp_precision {
+                TimestampPrecision::Microseconds => "microseconds",
+                TimestampPrecision::NanosecondsErrorOnOverflow => "nanoseconds_error_on_overflow",
+                TimestampPrecision::Nanoseconds => "nanoseconds",
+            }
+            .to_string());
+        }
         if let Ok(Some((param, _))) =
             adbc_db_opt_to_sf(key_str, &OptionValue::String(String::new()))
             && let Some(Setting::String(s)) = self.sf_settings.get(&param)
@@ -392,6 +429,8 @@ impl adbc_core::Database for Database {
             conn_handle,
             autocommit: true,
             active_transaction: false,
+            use_high_precision: self.use_high_precision,
+            timestamp_precision: self.timestamp_precision,
         };
 
         if let Some(ac) = post_autocommit {
