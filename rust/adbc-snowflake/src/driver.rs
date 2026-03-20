@@ -56,10 +56,18 @@ impl adbc_core::Driver for Driver {
         opts: impl IntoIterator<Item = (OptionDatabase, OptionValue)>,
     ) -> Result<Self::DatabaseType> {
         let db_handle = self.inner.sf.database_new();
+        let mut sf_settings: std::collections::HashMap<String, sf_core::config::settings::Setting> =
+            Default::default();
+        sf_settings.insert(
+            "client_app_id".to_string(),
+            sf_core::config::settings::Setting::String(
+                concat!("[ADBC][Rust] Snowflake Driver/", env!("CARGO_PKG_VERSION")).to_string(),
+            ),
+        );
         let mut db = Database {
             inner: self.inner.clone(),
             db_handle,
-            sf_settings: Default::default(),
+            sf_settings,
         };
         for (key, value) in opts {
             db.set_option(key, value)?;

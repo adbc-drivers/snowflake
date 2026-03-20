@@ -4,6 +4,7 @@ use adbc_core::{
     options::{OptionDatabase, OptionValue},
 };
 use adbc_snowflake::Driver;
+use arrow_array::cast::AsArray;
 
 fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
@@ -11,8 +12,7 @@ fn get_env(key: &str) -> Option<String> {
 
 fn make_connection() -> Option<adbc_snowflake::Connection> {
     let account = get_env("SNOWFLAKE_TEST_ACCOUNT")?;
-    let user = get_env("SNOWFLAKE_TEST_USER")?;
-    let password = get_env("SNOWFLAKE_TEST_PASSWORD")?;
+    let user = get_env("SNOWFLAKE_TEST_USER")?;    
 
     let mut driver = Driver::default();
     let mut db = driver.new_database().expect("new_database");
@@ -22,9 +22,7 @@ fn make_connection() -> Option<adbc_snowflake::Connection> {
     )
     .expect("set account");
     db.set_option(OptionDatabase::Username, OptionValue::String(user))
-        .expect("set user");
-    db.set_option(OptionDatabase::Password, OptionValue::String(password))
-        .expect("set password");
+        .expect("set user");    
 
     if let Some(wh) = get_env("SNOWFLAKE_TEST_WAREHOUSE") {
         db.set_option(
@@ -51,9 +49,97 @@ fn make_connection() -> Option<adbc_snowflake::Connection> {
     Some(db.new_connection().expect("new_connection"))
 }
 
+fn make_private_key_connection() -> Option<adbc_snowflake::Connection> {
+    let account = get_env("SNOWFLAKE_TEST_ACCOUNT")?;
+    let user = get_env("SNOWFLAKE_TEST_USER")?;
+    let private_key_file = get_env("SNOWFLAKE_TEST_PRIVATE_KEY_FILE")?;
+
+    let mut driver = Driver::default();
+    let mut db = driver.new_database().expect("new_database");
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+        OptionValue::String(account),
+    )
+    .expect("set account");
+    db.set_option(OptionDatabase::Username, OptionValue::String(user))
+        .expect("set user");
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.auth_type".into()),
+        OptionValue::String("SNOWFLAKE_JWT".into()),
+    )
+    .expect("set auth_type");
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.jwt_private_key".into()),
+        OptionValue::String(private_key_file),
+    )
+    .expect("set private_key_file");
+    if let Some(wh) = get_env("SNOWFLAKE_TEST_WAREHOUSE") {
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.warehouse".into()),
+            OptionValue::String(wh),
+        )
+        .expect("set warehouse");
+    }
+    if let Some(role) = get_env("SNOWFLAKE_TEST_ROLE") {
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.role".into()),
+            OptionValue::String(role),
+        )
+        .expect("set role");
+    }
+
+    Some(db.new_connection().expect("new_connection"))
+}
+
+#[test]
+fn test_private_key_simple_query() {
+    let Some(mut conn) = make_private_key_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PRIVATE_KEY_FILE not set");
+        return;
+    };
+
+    let expected_user = get_env("SNOWFLAKE_TEST_USER").unwrap();
+    let expected_warehouse = get_env("SNOWFLAKE_TEST_WAREHOUSE");
+    let expected_role = get_env("SNOWFLAKE_TEST_ROLE");
+
+    let mut stmt = conn.new_statement().expect("new_statement");
+    stmt.set_sql_query("SELECT CURRENT_USER(), CURRENT_WAREHOUSE(), CURRENT_ROLE()")
+        .expect("set_sql_query");
+    let mut reader = stmt.execute().expect("execute");
+    let batch = reader.next().expect("no batch").expect("batch error");
+
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.num_columns(), 3);
+
+    let actual_user = batch.column(0).as_string::<i32>().value(0);
+    assert_eq!(
+        actual_user.to_uppercase(),
+        expected_user.to_uppercase(),
+        "CURRENT_USER() mismatch"
+    );
+
+    if let Some(wh) = expected_warehouse {
+        let actual_wh = batch.column(1).as_string::<i32>().value(0);
+        assert_eq!(
+            actual_wh.to_uppercase(),
+            wh.to_uppercase(),
+            "CURRENT_WAREHOUSE() mismatch"
+        );
+    }
+
+    if let Some(role) = expected_role {
+        let actual_role = batch.column(2).as_string::<i32>().value(0);
+        assert_eq!(
+            actual_role.to_uppercase(),
+            role.to_uppercase(),
+            "CURRENT_ROLE() mismatch"
+        );
+    }
+}
+
 #[test]
 fn test_select_one() {
-    let Some(mut conn) = make_connection() else {
+    let Some(mut conn) = make_private_key_connection() else {
         eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PASSWORD not set");
         return;
     };
@@ -71,7 +157,6 @@ fn test_get_table_types() {
         eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PASSWORD not set");
         return;
     };
-    use arrow_array::cast::AsArray;
     let mut reader = conn.get_table_types().expect("get_table_types");
     let batch = reader.next().expect("no batch").expect("batch error");
     let types: Vec<&str> = batch
