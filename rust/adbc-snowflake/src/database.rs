@@ -73,6 +73,34 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
         "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password" => {
             param_names::PRIVATE_KEY_PASSWORD.into()
         }
+        // Account geography
+        "adbc.snowflake.sql.region" => "region".to_string(),
+        // Auth extras
+        // The Okta authenticator URL is the authenticator value in sf_core.
+        "adbc.snowflake.sql.client_option.okta_url" => param_names::AUTHENTICATOR.into(),
+        "adbc.snowflake.sql.client_option.identity_provider" => "identity_provider".to_string(),
+        // Connection timeouts (stored as-is; sf_core will use them once supported)
+        "adbc.snowflake.sql.client_option.login_timeout" => "login_timeout".to_string(),
+        "adbc.snowflake.sql.client_option.request_timeout" => "request_timeout".to_string(),
+        "adbc.snowflake.sql.client_option.jwt_expire_timeout" => "jwt_expire_timeout".to_string(),
+        "adbc.snowflake.sql.client_option.client_timeout" => "client_timeout".to_string(),
+        // TLS — tls_skip_verify compound effect is applied separately in set_option
+        "adbc.snowflake.sql.client_option.tls_skip_verify" => "tls_skip_verify".to_string(),
+        "adbc.snowflake.sql.client_option.tls_root_cert" => {
+            param_names::CUSTOM_ROOT_STORE_PATH.into()
+        }
+        // OCSP — ocsp_fail_open_mode compound effect is applied separately in set_option
+        "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" => {
+            "ocsp_fail_open_mode".to_string()
+        }
+        // Session behaviour
+        "adbc.snowflake.sql.client_option.keep_session_alive" => "keep_session_alive".to_string(),
+        "adbc.snowflake.sql.client_option.disable_telemetry" => "disable_telemetry".to_string(),
+        "adbc.snowflake.sql.client_option.cache_mfa_token" => "cache_mfa_token".to_string(),
+        "adbc.snowflake.sql.client_option.store_temp_creds" => "store_temp_creds".to_string(),
+        // Config / logging
+        "adbc.snowflake.sql.client_option.config_file" => "config_file".to_string(),
+        "adbc.snowflake.sql.client_option.tracing" => "log_level".to_string(),
         "adbc.snowflake.sql.uri.port" => {
             let port = match value {
                 OptionValue::String(s) => s.parse::<i64>().map_err(|_| {
@@ -159,6 +187,59 @@ impl Optionable for Database {
                 )
                 .map_err(crate::error::api_error_to_adbc_error)?;
         }
+
+        // tls_skip_verify: also drive the underlying verify_certificates / verify_hostname
+        // params so sf_core skips certificate and hostname checks when enabled.
+        if key_str == "adbc.snowflake.sql.client_option.tls_skip_verify" {
+            let skip = matches!(&value, OptionValue::String(s) if s == "enabled");
+            let verify = Setting::Bool(!skip);
+            self.sf_settings.insert(
+                param_names::VERIFY_CERTIFICATES.as_str().to_string(),
+                verify.clone(),
+            );
+            self.sf_settings
+                .insert(param_names::VERIFY_HOSTNAME.as_str().to_string(), verify.clone());
+            self.inner
+                .runtime
+                .block_on(async {
+                    self.inner
+                        .sf
+                        .database_set_option(
+                            self.db_handle,
+                            param_names::VERIFY_CERTIFICATES.into(),
+                            verify.clone(),
+                        )
+                        .await?;
+                    self.inner
+                        .sf
+                        .database_set_option(
+                            self.db_handle,
+                            param_names::VERIFY_HOSTNAME.into(),
+                            verify,
+                        )
+                        .await
+                })
+                .map_err(crate::error::api_error_to_adbc_error)?;
+        }
+
+        // ocsp_fail_open_mode: map to sf_core's crl_check_mode
+        // enabled (fail-open / advisory) → ADVISORY; disabled (strict) → ENABLED.
+        if key_str == "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" {
+            let fail_open = matches!(&value, OptionValue::String(s) if s == "enabled");
+            let mode =
+                Setting::String(if fail_open { "ADVISORY" } else { "ENABLED" }.to_string());
+            self.sf_settings
+                .insert(param_names::CRL_CHECK_MODE.as_str().to_string(), mode.clone());
+            self.inner
+                .runtime
+                .block_on(self.inner.sf.database_set_option(
+                    self.db_handle,
+                    param_names::CRL_CHECK_MODE.into(),
+                    mode,
+                ))
+                .map_err(crate::error::api_error_to_adbc_error)?;
+        }
+
         Ok(())
     }
 
@@ -499,6 +580,153 @@ mod tests {
             *setting,
             sf_core::config::settings::Setting::String("alice".into())
         );
+    }
+
+    #[test]
+    fn tls_skip_verify_enabled_clears_verify_flags() {
+        use sf_core::config::settings::Setting;
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+            OptionValue::String("enabled".into()),
+        )
+        .unwrap();
+        // Round-trip
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.tls_skip_verify".into()
+            ))
+            .unwrap(),
+            "enabled"
+        );
+        // Compound: verify_certificates and verify_hostname must be false
+        assert_eq!(
+            db.sf_settings.get(param_names::VERIFY_CERTIFICATES.as_str()),
+            Some(&Setting::Bool(false))
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::VERIFY_HOSTNAME.as_str()),
+            Some(&Setting::Bool(false))
+        );
+    }
+
+    #[test]
+    fn tls_skip_verify_disabled_restores_verify_flags() {
+        use sf_core::config::settings::Setting;
+        let mut db = make_db();
+        // First enable, then disable
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+            OptionValue::String("enabled".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+            OptionValue::String("disabled".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.tls_skip_verify".into()
+            ))
+            .unwrap(),
+            "disabled"
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::VERIFY_CERTIFICATES.as_str()),
+            Some(&Setting::Bool(true))
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::VERIFY_HOSTNAME.as_str()),
+            Some(&Setting::Bool(true))
+        );
+    }
+
+    #[test]
+    fn ocsp_fail_open_mode_enabled_maps_to_crl_advisory() {
+        use sf_core::config::settings::Setting;
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
+            ),
+            OptionValue::String("enabled".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()
+            ))
+            .unwrap(),
+            "enabled"
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::CRL_CHECK_MODE.as_str()),
+            Some(&Setting::String("ADVISORY".into()))
+        );
+    }
+
+    #[test]
+    fn ocsp_fail_open_mode_disabled_maps_to_crl_enabled() {
+        use sf_core::config::settings::Setting;
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Other(
+                "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
+            ),
+            OptionValue::String("disabled".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::CRL_CHECK_MODE.as_str()),
+            Some(&Setting::String("ENABLED".into()))
+        );
+    }
+
+    #[test]
+    fn simple_option_round_trips() {
+        let mut db = make_db();
+        let cases = [
+            (
+                "adbc.snowflake.sql.region",
+                "us-east-1",
+            ),
+            (
+                "adbc.snowflake.sql.client_option.login_timeout",
+                "30s",
+            ),
+            (
+                "adbc.snowflake.sql.client_option.request_timeout",
+                "60s",
+            ),
+            (
+                "adbc.snowflake.sql.client_option.keep_session_alive",
+                "enabled",
+            ),
+            (
+                "adbc.snowflake.sql.client_option.disable_telemetry",
+                "enabled",
+            ),
+            (
+                "adbc.snowflake.sql.client_option.tracing",
+                "debug",
+            ),
+            (
+                "adbc.snowflake.sql.client_option.config_file",
+                "/home/user/.snowflake/config.toml",
+            ),
+        ];
+        for (key, val) in cases {
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String(val.into()),
+            )
+            .unwrap_or_else(|e| panic!("set_option({key}) failed: {e}"));
+            let got = db
+                .get_option_string(OptionDatabase::Other(key.into()))
+                .unwrap_or_else(|e| panic!("get_option_string({key}) failed: {e}"));
+            assert_eq!(got, val, "round-trip failed for {key}");
+        }
     }
 
     #[test]
