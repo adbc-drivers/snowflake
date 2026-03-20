@@ -126,8 +126,8 @@ impl Connection {
         let _ = self.inner.sf.statement_release(stmt_handle);
         let exec_result = result.map_err(crate::error::api_error_to_adbc_error)?;
 
-        let raw = Box::into_raw(exec_result.stream)
-            as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        let raw =
+            Box::into_raw(exec_result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let mut reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
             .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
 
@@ -272,8 +272,9 @@ impl adbc_core::Connection for Connection {
         &self,
         codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let need_vendor_version =
-            codes.as_ref().is_none_or(|s| s.contains(&InfoCode::VendorVersion));
+        let need_vendor_version = codes
+            .as_ref()
+            .is_none_or(|s| s.contains(&InfoCode::VendorVersion));
         let vendor_version = if need_vendor_version {
             self.query_scalar("SELECT CURRENT_VERSION()")?
         } else {
@@ -350,7 +351,11 @@ impl adbc_core::Connection for Connection {
                     "entries",
                     vec![
                         Field::new("key", DataType::Int32, false),
-                        Field::new_list("value", Field::new_list_field(DataType::Int32, true), true),
+                        Field::new_list(
+                            "value",
+                            Field::new_list_field(DataType::Int32, true),
+                            true,
+                        ),
                     ],
                     false,
                 )),
@@ -380,7 +385,11 @@ impl adbc_core::Connection for Connection {
                         "int32_to_int32_list_map",
                         "entries",
                         Field::new("key", DataType::Int32, false),
-                        Field::new_list("value", Field::new_list_field(DataType::Int32, true), true),
+                        Field::new_list(
+                            "value",
+                            Field::new_list_field(DataType::Int32, true),
+                            true,
+                        ),
                         false,
                         true,
                     ),
@@ -479,10 +488,9 @@ impl adbc_core::Connection for Connection {
             let nullables = batch.column(3).as_string::<i32>();
             // primary_key is column 5; comment is column 9 — present only when
             // the result has enough columns (older Snowflake editions may omit them).
-            let primary_keys = (batch.num_columns() > 5)
-                .then(|| batch.column(5).as_string::<i32>());
-            let comments = (batch.num_columns() > 9)
-                .then(|| batch.column(9).as_string::<i32>());
+            let primary_keys =
+                (batch.num_columns() > 5).then(|| batch.column(5).as_string::<i32>());
+            let comments = (batch.num_columns() > 9).then(|| batch.column(9).as_string::<i32>());
             for i in 0..batch.num_rows() {
                 let type_str = types.value(i);
                 let arrow_type = snowflake_type_to_arrow(
@@ -605,9 +613,7 @@ fn snowflake_type_to_arrow(
             }
         }
         "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => DataType::Timestamp(ts_unit, None),
-        "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
-            DataType::Timestamp(ts_unit, Some("UTC".into()))
-        }
+        "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => DataType::Timestamp(ts_unit, Some("UTC".into())),
         _ => DataType::Utf8,
     }
 }
@@ -662,7 +668,11 @@ mod tests {
             DataType::Utf8
         );
         assert_eq!(
-            snowflake_type_to_arrow("VARCHAR(16777216)", true, arrow_schema::TimeUnit::Nanosecond),
+            snowflake_type_to_arrow(
+                "VARCHAR(16777216)",
+                true,
+                arrow_schema::TimeUnit::Nanosecond
+            ),
             DataType::Utf8
         );
     }
@@ -678,11 +688,7 @@ mod tests {
     #[test]
     fn snowflake_type_timestamp_ntz_nanosecond() {
         assert_eq!(
-            snowflake_type_to_arrow(
-                "TIMESTAMP_NTZ(9)",
-                true,
-                arrow_schema::TimeUnit::Nanosecond
-            ),
+            snowflake_type_to_arrow("TIMESTAMP_NTZ(9)", true, arrow_schema::TimeUnit::Nanosecond),
             DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
         );
     }
