@@ -21,7 +21,7 @@
 # under the License.
 
 [package]
-name = "adbc-snowflake"
+name = "adbc-driver-snowflake"
 version = "0.1.0"
 edition = "2024"
 
@@ -32,7 +32,7 @@ crate-type = ["cdylib", "rlib"]
 adbc_core = "0.22.0"
 adbc_ffi  = "0.22.0"
 sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core", rev = "080422e05fbd727f68d7c494e564ec625e1375d6" }
-arrow-array  = { version = ">=53.1.0, <59", default-features = false, features = ["ffi"] }
-arrow-buffer = { version = ">=53.1.0, <59", default-features = false }
-arrow-schema = { version = ">=53.1.0, <59", default-features = false }
+arrow-array  = { version = "57.3.0", default-features = false, features = ["ffi"] }
+arrow-buffer = { version = "57.3.0", default-features = false }
+arrow-schema = { version = "57.3.0", default-features = false }
 tokio        = { version = "1", features = ["rt-multi-thread"] }

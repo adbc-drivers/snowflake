@@ -25,7 +25,7 @@ use adbc_core::{
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
     options::{OptionConnection, OptionDatabase, OptionValue},
 };
-use adbc_snowflake::{Database, Driver};
+use adbc_driver_snowflake::{Database, Driver};
 use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, TimeUnit};
 
@@ -58,7 +58,7 @@ fn make_db() -> Option<Database> {
     Some(db)
 }
 
-fn make_connection() -> Option<adbc_snowflake::Connection> {
+fn make_connection() -> Option<adbc_driver_snowflake::Connection> {
     Some(make_db()?.new_connection().expect("new_connection"))
 }
 
