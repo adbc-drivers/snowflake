@@ -38,7 +38,7 @@ use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use sf_core::apis::database_driver_v1::Handle;
 
-use crate::driver::Inner;
+use crate::driver::{Inner, TimestampPrecision};
 use crate::statement::Statement;
 
 pub struct Connection {
@@ -46,6 +46,8 @@ pub struct Connection {
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
     pub(crate) active_transaction: bool,
+    pub(crate) use_high_precision: bool,
+    pub(crate) timestamp_precision: TimestampPrecision,
 }
 
 impl Drop for Connection {
@@ -256,6 +258,8 @@ impl adbc_core::Connection for Connection {
             target_table: None,
             ingest_mode: None,
             query_tag: None,
+            use_high_precision: self.use_high_precision,
+            timestamp_precision: self.timestamp_precision,
         })
     }
 
@@ -474,7 +478,11 @@ impl adbc_core::Connection for Connection {
             let types = batch.column(1).as_string::<i32>();
             let nullables = batch.column(3).as_string::<i32>();
             for i in 0..batch.num_rows() {
-                let arrow_type = snowflake_type_to_arrow(types.value(i));
+                let arrow_type = snowflake_type_to_arrow(
+                    types.value(i),
+                    self.use_high_precision,
+                    self.timestamp_precision.time_unit(),
+                );
                 fields.push(Field::new(
                     names.value(i),
                     arrow_type,
@@ -538,7 +546,11 @@ impl adbc_core::Connection for Connection {
     }
 }
 
-fn snowflake_type_to_arrow(type_str: &str) -> DataType {
+fn snowflake_type_to_arrow(
+    type_str: &str,
+    high_precision: bool,
+    ts_unit: arrow_schema::TimeUnit,
+) -> DataType {
     let upper = type_str.to_uppercase();
     let base = upper.split('(').next().unwrap_or(&upper).trim();
     match base {
@@ -556,13 +568,19 @@ fn snowflake_type_to_arrow(type_str: &str) -> DataType {
                 .find('(')
                 .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
             {
-                let scale = inner
-                    .split(',')
-                    .nth(1)
-                    .and_then(|s| s.trim().parse::<i32>().ok())
+                let mut parts = inner.split(',');
+                let precision = parts
+                    .next()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+                    .unwrap_or(38);
+                let scale = parts
+                    .next()
+                    .and_then(|s| s.trim().parse::<i8>().ok())
                     .unwrap_or(0);
                 if scale == 0 {
                     DataType::Int64
+                } else if high_precision {
+                    DataType::Decimal128(precision, scale)
                 } else {
                     DataType::Float64
                 }
@@ -570,11 +588,9 @@ fn snowflake_type_to_arrow(type_str: &str) -> DataType {
                 DataType::Int64
             }
         }
-        "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => {
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
-        }
+        "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => DataType::Timestamp(ts_unit, None),
         "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
+            DataType::Timestamp(ts_unit, Some("UTC".into()))
         }
         _ => DataType::Utf8,
     }
@@ -592,6 +608,8 @@ mod tests {
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             autocommit: true,
             active_transaction: false,
+            use_high_precision: true,
+            timestamp_precision: TimestampPrecision::Nanoseconds,
         };
         let result = conn.get_option_string(OptionConnection::Other("unknown".into()));
         assert_eq!(result.unwrap_err().status, Status::NotFound);
@@ -599,30 +617,69 @@ mod tests {
 
     #[test]
     fn snowflake_type_number_no_scale_is_int64() {
-        assert_eq!(snowflake_type_to_arrow("NUMBER(38,0)"), DataType::Int64);
+        assert_eq!(
+            snowflake_type_to_arrow("NUMBER(38,0)", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Int64
+        );
     }
 
     #[test]
-    fn snowflake_type_number_with_scale_is_float64() {
-        assert_eq!(snowflake_type_to_arrow("NUMBER(10,2)"), DataType::Float64);
+    fn snowflake_type_number_with_scale_high_precision_is_decimal128() {
+        assert_eq!(
+            snowflake_type_to_arrow("NUMBER(10,2)", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Decimal128(10, 2)
+        );
+    }
+
+    #[test]
+    fn snowflake_type_number_with_scale_low_precision_is_float64() {
+        assert_eq!(
+            snowflake_type_to_arrow("NUMBER(10,2)", false, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Float64
+        );
     }
 
     #[test]
     fn snowflake_type_text_is_utf8() {
-        assert_eq!(snowflake_type_to_arrow("TEXT"), DataType::Utf8);
-        assert_eq!(snowflake_type_to_arrow("VARCHAR(16777216)"), DataType::Utf8);
+        assert_eq!(
+            snowflake_type_to_arrow("TEXT", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Utf8
+        );
+        assert_eq!(
+            snowflake_type_to_arrow("VARCHAR(16777216)", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Utf8
+        );
     }
 
     #[test]
     fn snowflake_type_boolean_is_boolean() {
-        assert_eq!(snowflake_type_to_arrow("BOOLEAN"), DataType::Boolean);
+        assert_eq!(
+            snowflake_type_to_arrow("BOOLEAN", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Boolean
+        );
     }
 
     #[test]
-    fn snowflake_type_timestamp_ntz_is_nanosecond() {
+    fn snowflake_type_timestamp_ntz_nanosecond() {
         assert_eq!(
-            snowflake_type_to_arrow("TIMESTAMP_NTZ(9)"),
+            snowflake_type_to_arrow(
+                "TIMESTAMP_NTZ(9)",
+                true,
+                arrow_schema::TimeUnit::Nanosecond
+            ),
             DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+        );
+    }
+
+    #[test]
+    fn snowflake_type_timestamp_ntz_microsecond() {
+        assert_eq!(
+            snowflake_type_to_arrow(
+                "TIMESTAMP_NTZ(6)",
+                true,
+                arrow_schema::TimeUnit::Microsecond
+            ),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
         );
     }
 
@@ -636,6 +693,8 @@ mod tests {
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             autocommit: true,
             active_transaction: false,
+            use_high_precision: true,
+            timestamp_precision: TimestampPrecision::Nanoseconds,
         };
         let mut reader = conn.get_table_types().unwrap();
         let batch = reader.next().unwrap().unwrap();
