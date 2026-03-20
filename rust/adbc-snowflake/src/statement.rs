@@ -32,7 +32,7 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 use sf_core::apis::database_driver_v1::Handle;
 
-use crate::driver::Inner;
+use crate::driver::{Inner, TimestampPrecision};
 
 pub struct Statement {
     pub(crate) inner: Arc<Inner>,
@@ -42,6 +42,8 @@ pub struct Statement {
     pub(crate) target_table: Option<String>,
     pub(crate) ingest_mode: Option<String>,
     pub(crate) query_tag: Option<String>,
+    pub(crate) use_high_precision: bool,
+    pub(crate) timestamp_precision: TimestampPrecision,
 }
 
 impl Drop for Statement {
@@ -77,6 +79,28 @@ impl Optionable for Statement {
                         Status::InvalidArguments,
                     ))
                 }
+            }
+            OptionStatement::Other(ref k)
+                if k == "adbc.snowflake.sql.client_option.use_high_precision" =>
+            {
+                if let OptionValue::String(s) = value {
+                    self.use_high_precision = s == "enabled" || s == "true";
+                }
+                Ok(())
+            }
+            OptionStatement::Other(ref k)
+                if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
+            {
+                if let OptionValue::String(s) = value {
+                    self.timestamp_precision = match s.as_str() {
+                        "microseconds" => TimestampPrecision::Microseconds,
+                        "nanoseconds_error_on_overflow" => {
+                            TimestampPrecision::NanosecondsErrorOnOverflow
+                        }
+                        _ => TimestampPrecision::Nanoseconds,
+                    };
+                }
+                Ok(())
             }
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
                 if let OptionValue::String(s) = value {
@@ -287,6 +311,8 @@ mod tests {
             target_table: None,
             ingest_mode: None,
             query_tag: None,
+            use_high_precision: true,
+            timestamp_precision: TimestampPrecision::Nanoseconds,
         }
     }
 
@@ -317,6 +343,8 @@ mod tests {
             target_table: Some("mytable".into()),
             ingest_mode: None,
             query_tag: None,
+            use_high_precision: true,
+            timestamp_precision: TimestampPrecision::Nanoseconds,
         };
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::NotImplemented),
@@ -335,6 +363,8 @@ mod tests {
             target_table: Some("mytable".into()),
             ingest_mode: None,
             query_tag: None,
+            use_high_precision: true,
+            timestamp_precision: TimestampPrecision::Nanoseconds,
         };
         stmt.set_sql_query("SELECT 1").unwrap();
         assert!(stmt.target_table.is_none());
