@@ -105,6 +105,40 @@ impl Connection {
             .map_err(crate::error::api_error_to_adbc_error)
     }
 
+    fn query_scalar(&self, sql: &str) -> Result<String> {
+        let stmt_handle = self
+            .inner
+            .sf
+            .statement_new(self.conn_handle)
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self.inner.runtime.block_on(async {
+            self.inner
+                .sf
+                .statement_set_sql_query(stmt_handle, sql.to_string())
+                .await?;
+            self.inner
+                .sf
+                .statement_execute_query(stmt_handle, None)
+                .await
+        });
+        let _ = self.inner.sf.statement_release(stmt_handle);
+        let exec_result = result.map_err(crate::error::api_error_to_adbc_error)?;
+
+        let raw = Box::into_raw(exec_result.stream)
+            as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        let mut reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+
+        use arrow_array::cast::AsArray;
+        let batch = reader
+            .next()
+            .ok_or_else(|| {
+                Error::with_message_and_status("empty result from scalar query", Status::IO)
+            })?
+            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+        Ok(batch.column(0).as_string::<i32>().value(0).to_string())
+    }
+
     pub(crate) fn set_autocommit(&mut self, enabled: bool) -> Result<()> {
         if enabled {
             if self.active_transaction {
@@ -170,10 +204,17 @@ impl Optionable for Connection {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        Err(Error::with_message_and_status(
-            format!("option not found: {}", key.as_ref()),
-            Status::NotFound,
-        ))
+        match key {
+            OptionConnection::AutoCommit => {
+                Ok(if self.autocommit { "true" } else { "false" }.to_string())
+            }
+            OptionConnection::CurrentCatalog => self.query_scalar("SELECT CURRENT_DATABASE()"),
+            OptionConnection::CurrentSchema => self.query_scalar("SELECT CURRENT_SCHEMA()"),
+            _ => Err(Error::with_message_and_status(
+                format!("option not found: {}", key.as_ref()),
+                Status::NotFound,
+            )),
+        }
     }
 
     fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
@@ -227,6 +268,14 @@ impl adbc_core::Connection for Connection {
         &self,
         codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let need_vendor_version =
+            codes.as_ref().map_or(true, |s| s.contains(&InfoCode::VendorVersion));
+        let vendor_version = if need_vendor_version {
+            self.query_scalar("SELECT CURRENT_VERSION()")?
+        } else {
+            String::new()
+        };
+
         // (InfoCode, type_id, offset_within_arm_array)
         let all_entries: &[(InfoCode, i8, i32)] = &[
             (InfoCode::VendorName, 0, 0),
@@ -235,6 +284,7 @@ impl adbc_core::Connection for Connection {
             (InfoCode::DriverName, 0, 1),
             (InfoCode::DriverVersion, 0, 2),
             (InfoCode::DriverAdbcVersion, 2, 0),
+            (InfoCode::VendorVersion, 0, 3),
         ];
 
         let selected: Vec<_> = match &codes {
@@ -260,6 +310,7 @@ impl adbc_core::Connection for Connection {
             "Snowflake",
             "ADBC Snowflake Driver (Rust)",
             env!("CARGO_PKG_VERSION"),
+            vendor_version.as_str(),
         ])) as ArrayRef;
         let bool_values = Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef;
         let int64_values =

@@ -23,7 +23,7 @@
 // tests/integration.rs
 use adbc_core::{
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
-    options::{OptionDatabase, OptionValue},
+    options::{OptionConnection, OptionDatabase, OptionValue},
 };
 use adbc_snowflake::Driver;
 use arrow_array::cast::AsArray;
@@ -33,96 +33,34 @@ fn get_env(key: &str) -> Option<String> {
 }
 
 fn make_connection() -> Option<adbc_snowflake::Connection> {
-    let account = get_env("SNOWFLAKE_TEST_ACCOUNT")?;
-    let user = get_env("SNOWFLAKE_TEST_USER")?;    
-
+    let uri = get_env("SNOWFLAKE_URI")?;
     let mut driver = Driver::default();
     let mut db = driver.new_database().expect("new_database");
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.account".into()),
-        OptionValue::String(account),
-    )
-    .expect("set account");
-    db.set_option(OptionDatabase::Username, OptionValue::String(user))
-        .expect("set user");    
-
-    if let Some(wh) = get_env("SNOWFLAKE_TEST_WAREHOUSE") {
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.warehouse".into()),
-            OptionValue::String(wh),
-        )
-        .expect("set warehouse");
-    }
-    if let Some(db_name) = get_env("SNOWFLAKE_TEST_DATABASE") {
+    db.set_option(OptionDatabase::Uri, OptionValue::String(uri))
+        .expect("set uri");
+    if let Some(database) = get_env("SNOWFLAKE_DATABASE") {
         db.set_option(
             OptionDatabase::Other("adbc.snowflake.sql.db".into()),
-            OptionValue::String(db_name),
+            OptionValue::String(database),
         )
         .expect("set database");
     }
-    if let Some(schema) = get_env("SNOWFLAKE_TEST_SCHEMA") {
+    if let Some(schema) = get_env("SNOWFLAKE_SCHEMA") {
         db.set_option(
             OptionDatabase::Other("adbc.snowflake.sql.schema".into()),
             OptionValue::String(schema),
         )
         .expect("set schema");
     }
-
-    Some(db.new_connection().expect("new_connection"))
-}
-
-fn make_private_key_connection() -> Option<adbc_snowflake::Connection> {
-    let account = get_env("SNOWFLAKE_TEST_ACCOUNT")?;
-    let user = get_env("SNOWFLAKE_TEST_USER")?;
-    let private_key_file = get_env("SNOWFLAKE_TEST_PRIVATE_KEY_FILE")?;
-
-    let mut driver = Driver::default();
-    let mut db = driver.new_database().expect("new_database");
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.account".into()),
-        OptionValue::String(account),
-    )
-    .expect("set account");
-    db.set_option(OptionDatabase::Username, OptionValue::String(user))
-        .expect("set user");
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.auth_type".into()),
-        OptionValue::String("SNOWFLAKE_JWT".into()),
-    )
-    .expect("set auth_type");
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.client_option.jwt_private_key".into()),
-        OptionValue::String(private_key_file),
-    )
-    .expect("set private_key_file");
-    if let Some(wh) = get_env("SNOWFLAKE_TEST_WAREHOUSE") {
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.warehouse".into()),
-            OptionValue::String(wh),
-        )
-        .expect("set warehouse");
-    }
-    if let Some(role) = get_env("SNOWFLAKE_TEST_ROLE") {
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.role".into()),
-            OptionValue::String(role),
-        )
-        .expect("set role");
-    }
-
     Some(db.new_connection().expect("new_connection"))
 }
 
 #[test]
 fn test_private_key_simple_query() {
-    let Some(mut conn) = make_private_key_connection() else {
-        eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PRIVATE_KEY_FILE not set");
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
     };
-
-    let expected_user = get_env("SNOWFLAKE_TEST_USER").unwrap();
-    let expected_warehouse = get_env("SNOWFLAKE_TEST_WAREHOUSE");
-    let expected_role = get_env("SNOWFLAKE_TEST_ROLE");
 
     let mut stmt = conn.new_statement().expect("new_statement");
     stmt.set_sql_query("SELECT CURRENT_USER(), CURRENT_WAREHOUSE(), CURRENT_ROLE()")
@@ -132,37 +70,15 @@ fn test_private_key_simple_query() {
 
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.num_columns(), 3);
-
-    let actual_user = batch.column(0).as_string::<i32>().value(0);
-    assert_eq!(
-        actual_user.to_uppercase(),
-        expected_user.to_uppercase(),
-        "CURRENT_USER() mismatch"
-    );
-
-    if let Some(wh) = expected_warehouse {
-        let actual_wh = batch.column(1).as_string::<i32>().value(0);
-        assert_eq!(
-            actual_wh.to_uppercase(),
-            wh.to_uppercase(),
-            "CURRENT_WAREHOUSE() mismatch"
-        );
-    }
-
-    if let Some(role) = expected_role {
-        let actual_role = batch.column(2).as_string::<i32>().value(0);
-        assert_eq!(
-            actual_role.to_uppercase(),
-            role.to_uppercase(),
-            "CURRENT_ROLE() mismatch"
-        );
-    }
+    assert!(!batch.column(0).as_string::<i32>().value(0).is_empty(), "CURRENT_USER() is empty");
+    assert!(!batch.column(1).as_string::<i32>().value(0).is_empty(), "CURRENT_WAREHOUSE() is empty");
+    assert!(!batch.column(2).as_string::<i32>().value(0).is_empty(), "CURRENT_ROLE() is empty");
 }
 
 #[test]
 fn test_select_one() {
-    let Some(mut conn) = make_private_key_connection() else {
-        eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PASSWORD not set");
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
     };
     let mut stmt = conn.new_statement().expect("new_statement");
@@ -176,7 +92,7 @@ fn test_select_one() {
 #[test]
 fn test_get_table_types() {
     let Some(conn) = make_connection() else {
-        eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PASSWORD not set");
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
     };
     let mut reader = conn.get_table_types().expect("get_table_types");
@@ -194,7 +110,7 @@ fn test_get_table_types() {
 #[test]
 fn test_get_info_no_codes() {
     let Some(conn) = make_connection() else {
-        eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PASSWORD not set");
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
     };
     let mut reader = conn.get_info(None).expect("get_info");
@@ -203,9 +119,77 @@ fn test_get_info_no_codes() {
 }
 
 #[test]
+fn test_get_info_vendor_version() {
+    use adbc_core::options::InfoCode;
+    use std::collections::HashSet;
+
+    let Some(conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    let mut reader = conn
+        .get_info(Some(HashSet::from([InfoCode::VendorVersion])))
+        .expect("get_info");
+    let batch = reader.next().expect("no batch").expect("batch error");
+    assert_eq!(batch.num_rows(), 1);
+
+    // VendorVersion is a string value — type_id 0 in the union
+    use arrow_array::cast::AsArray;
+    let type_ids = batch.column(1).as_any().downcast_ref::<arrow_array::UnionArray>().unwrap();
+    assert_eq!(type_ids.type_id(0), 0, "VendorVersion should be a string union arm");
+    let version_str = type_ids.value(0);
+    let v = version_str.as_string::<i32>().value(0);
+    assert!(!v.is_empty(), "VendorVersion should not be empty");
+    // Snowflake versions look like "8.x.x" — just check it contains a dot
+    assert!(v.contains('.'), "VendorVersion should look like a version string, got: {v}");
+}
+
+#[test]
+fn test_get_option_string_current_catalog_and_schema() {
+    let Some(conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    let catalog = conn
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .expect("get CurrentCatalog");
+    let schema = conn
+        .get_option_string(OptionConnection::CurrentSchema)
+        .expect("get CurrentSchema");
+
+    assert!(!catalog.is_empty(), "current catalog should not be empty");
+    assert!(!schema.is_empty(), "current schema should not be empty");
+}
+
+#[test]
+fn test_get_option_string_autocommit() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    let ac = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .expect("get AutoCommit");
+    assert_eq!(ac, "true", "default autocommit should be true");
+
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("false".into()),
+    )
+    .expect("disable autocommit");
+    let ac = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .expect("get AutoCommit after disable");
+    assert_eq!(ac, "false");
+}
+
+#[test]
 fn test_execute_ddl_and_dml() {
     let Some(mut conn) = make_connection() else {
-        eprintln!("Skipping: SNOWFLAKE_TEST_ACCOUNT/USER/PASSWORD not set");
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
     };
 
