@@ -271,6 +271,12 @@ impl Database {
                         "port" => "adbc.snowflake.sql.uri.port",
                         "protocol" => "adbc.snowflake.sql.uri.protocol",
                         "authenticator" => "adbc.snowflake.sql.auth_type",
+                        "private_key_file" => {
+                            "adbc.snowflake.sql.client_option.jwt_private_key"
+                        }
+                        "private_key" => {
+                            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value"
+                        }
                         _ => continue,
                     };
                     self.set_option(
