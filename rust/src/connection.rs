@@ -512,11 +512,11 @@ impl adbc_core::Connection for Connection {
                     .position(|f| f.name().eq_ignore_ascii_case(name))
                     .unwrap_or(fallback)
             };
-            let name_col    = find("name",        0);
-            let type_col    = find("type",        1);
-            let null_col    = find("null?",       3);
-            let pk_col      = find("primary key", 5);
-            let comment_col = find("comment",     9);
+            let name_col = find("name", 0);
+            let type_col = find("type", 1);
+            let null_col = find("null?", 3);
+            let pk_col = find("primary key", 5);
+            let comment_col = find("comment", 9);
 
             if batch.num_columns() <= name_col
                 || batch.num_columns() <= type_col
@@ -524,8 +524,8 @@ impl adbc_core::Connection for Connection {
             {
                 continue;
             }
-            let names    = batch.column(name_col).as_string::<i32>();
-            let types    = batch.column(type_col).as_string::<i32>();
+            let names = batch.column(name_col).as_string::<i32>();
+            let types = batch.column(type_col).as_string::<i32>();
             let nullables = batch.column(null_col).as_string::<i32>();
             // primary_key and comment are present only when the result has enough columns.
             let primary_keys =

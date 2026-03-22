@@ -29,7 +29,7 @@ use adbc_core::{
     options::{OptionStatement, OptionValue},
 };
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{Schema};
 use sf_core::apis::database_driver_v1::Handle;
 
 use crate::driver::{Inner, TimestampPrecision};
@@ -179,10 +179,7 @@ impl Statement {
     /// Parameter values are substituted directly as SQL literals — this avoids
     /// relying on sf_core's JSON binding path and works with all Snowflake
     /// server versions without session configuration.
-    fn execute_bound(
-        &self,
-        query: String,
-    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    fn execute_bound(&self, query: String) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let mut all_batches: Vec<RecordBatch> = Vec::new();
         let mut result_schema: Option<Arc<Schema>> = None;
 
@@ -210,17 +207,14 @@ impl Statement {
                     as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
                 let reader =
                     unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-                        .map_err(|e| {
-                            Error::with_message_and_status(e.to_string(), Status::IO)
-                        })?;
+                        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
 
                 if result_schema.is_none() {
                     result_schema = Some(reader.schema());
                 }
                 for batch in reader {
-                    let batch = batch.map_err(|e| {
-                        Error::with_message_and_status(e.to_string(), Status::IO)
-                    })?;
+                    let batch = batch
+                        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
                     all_batches.push(batch);
                 }
             }
@@ -281,9 +275,8 @@ impl adbc_core::Statement for Statement {
         if self.target_table.is_some() {
             // Ingest via execute() — run the ingest and return an empty reader.
             crate::ingest::execute_ingest(self)?;
-            let batch = arrow_array::RecordBatch::new_empty(Arc::new(
-                arrow_schema::Schema::empty(),
-            ));
+            let batch =
+                arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
             return Ok(Box::new(crate::connection::SingleBatchReader::new(batch)));
         }
         let query = self.query.clone().ok_or_else(|| {
@@ -558,7 +551,7 @@ fn arrow_value_to_sql_literal(arr: &dyn Array, row: usize) -> Result<String> {
         return Ok("NULL".to_string());
     }
     use arrow_array::{
-        BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        BooleanArray, Date32Array, Int16Array, Int32Array, Int64Array,
         LargeStringArray, StringArray,
     };
     macro_rules! num_lit {

@@ -437,12 +437,6 @@ fn build_batch(entries: &[CatalogEntry], depth: &ObjectDepth) -> Result<RecordBa
         .flat_map(|c| &c.schemas)
         .map(|s| s.tables.len())
         .sum();
-    let n_cols: usize = entries
-        .iter()
-        .flat_map(|c| &c.schemas)
-        .flat_map(|s| &s.tables)
-        .map(|t| t.columns.len())
-        .sum();
 
     // ── columns ───────────────────────────────────────────────────────────────
     let all_cols: Vec<&ColEntry> = entries
