@@ -279,9 +279,12 @@ impl adbc_core::Statement for Statement {
     #[allow(refining_impl_trait)]
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.target_table.is_some() {
-            return Err(crate::error::not_implemented(
-                "bulk ingestion (target_table) is not yet implemented",
+            // Ingest via execute() — run the ingest and return an empty reader.
+            crate::ingest::execute_ingest(self)?;
+            let batch = arrow_array::RecordBatch::new_empty(Arc::new(
+                arrow_schema::Schema::empty(),
             ));
+            return Ok(Box::new(crate::connection::SingleBatchReader::new(batch)));
         }
         let query = self.query.clone().ok_or_else(|| {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
@@ -320,15 +323,41 @@ impl adbc_core::Statement for Statement {
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
         if self.target_table.is_some() {
-            return Err(crate::error::not_implemented(
-                "bulk ingestion (target_table) is not yet implemented",
-            ));
+            return crate::ingest::execute_ingest(self);
         }
         let query = self.query.clone().ok_or_else(|| {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
         self.apply_query_tag()?;
+
+        // Parameterised DML: execute once per bound row and sum row counts.
+        if !self.bound_batches.is_empty() {
+            let mut total: i64 = 0;
+            for bound_batch in &self.bound_batches {
+                for row_idx in 0..bound_batch.num_rows() {
+                    let sql = substitute_params(&query, bound_batch, row_idx)?;
+                    let result = self
+                        .inner
+                        .runtime
+                        .block_on(async {
+                            self.inner
+                                .sf
+                                .statement_set_sql_query(self.stmt_handle, sql)
+                                .await?;
+                            self.inner
+                                .sf
+                                .statement_execute_query(self.stmt_handle, None)
+                                .await
+                        })
+                        .map_err(crate::error::api_error_to_adbc_error)?;
+                    // Release the stream; we only care about rows_affected.
+                    drop(result.stream);
+                    total += result.rows_affected.unwrap_or(0);
+                }
+            }
+            return Ok(if is_ddl(&query) { None } else { Some(total) });
+        }
 
         let result = self
             .inner
@@ -447,19 +476,76 @@ impl RecordBatchReader for ConcatReader {
 // ── Parameter substitution ────────────────────────────────────────────────────
 
 /// Replaces each `?` placeholder in `query` with the SQL literal value of the
-/// corresponding column (1-indexed) in `batch` at `row_idx`.
+/// corresponding bound column at `row_idx`.
+///
+/// Skips `?` inside SQL string literals (`'…'`), line comments (`--…`), and
+/// block comments (`/*…*/`) so only true parameter markers are substituted.
+/// Returns `InvalidArguments` if there are more `?` markers than bound columns.
 fn substitute_params(query: &str, batch: &RecordBatch, row_idx: usize) -> Result<String> {
     let mut result = String::with_capacity(query.len() * 2);
     let mut param_idx = 0usize;
     let mut chars = query.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '?' {
-            let col = batch.column(param_idx);
-            result.push_str(&arrow_value_to_sql_literal(col.as_ref(), row_idx)?);
-            param_idx += 1;
-        } else {
-            result.push(ch);
+        match ch {
+            // SQL string literal — copy verbatim; '' is an escaped quote (stay in string)
+            '\'' => {
+                result.push('\'');
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\'') => {
+                            result.push('\'');
+                            if chars.peek() == Some(&'\'') {
+                                result.push(chars.next().unwrap()); // escaped ''
+                            } else {
+                                break; // end of string
+                            }
+                        }
+                        Some(c) => result.push(c),
+                    }
+                }
+            }
+            // Line comment -- copy until end of line
+            '-' if chars.peek() == Some(&'-') => {
+                result.push('-');
+                result.push(chars.next().unwrap());
+                for c in chars.by_ref() {
+                    result.push(c);
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            // Block comment /* … */ — copy verbatim
+            '/' if chars.peek() == Some(&'*') => {
+                result.push('/');
+                result.push(chars.next().unwrap());
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    result.push(c);
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            // Parameter placeholder
+            '?' => {
+                if param_idx >= batch.num_columns() {
+                    return Err(Error::with_message_and_status(
+                        format!(
+                            "query has more '?' placeholders than bound columns (have {})",
+                            batch.num_columns()
+                        ),
+                        Status::InvalidArguments,
+                    ));
+                }
+                let col = batch.column(param_idx);
+                result.push_str(&arrow_value_to_sql_literal(col.as_ref(), row_idx)?);
+                param_idx += 1;
+            }
+            c => result.push(c),
         }
     }
     Ok(result)
@@ -482,8 +568,25 @@ fn arrow_value_to_sql_literal(arr: &dyn Array, row: usize) -> Result<String> {
             }
         };
     }
-    num_lit!(Float64Array);
-    num_lit!(Float32Array);
+    // Floats need {:?} format which always emits a decimal point or exponent
+    // (e.g. "3.14", "1.7976931348623157e308"). The {} Display format may produce
+    // a huge integer string (e.g. "179769300...") that Snowflake rejects.
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Float64Array>() {
+        let v = a.value(row);
+        return if v.is_finite() {
+            Ok(format!("{v:?}"))
+        } else {
+            Ok("NULL".to_string())
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Float32Array>() {
+        let v = a.value(row);
+        return if v.is_finite() {
+            Ok(format!("{:?}", v as f64))
+        } else {
+            Ok("NULL".to_string())
+        };
+    }
     num_lit!(Int64Array);
     num_lit!(Int32Array);
     num_lit!(Int16Array);
@@ -508,9 +611,12 @@ fn arrow_value_to_sql_literal(arr: &dyn Array, row: usize) -> Result<String> {
     ))
 }
 
-/// Wraps `s` in single quotes, escaping internal single quotes by doubling them.
+/// Wraps `s` in single quotes.
+/// Backslashes are doubled first (some Snowflake sessions treat `\'` as an escape
+/// sequence, which would prematurely close the literal), then single quotes are
+/// doubled per ANSI SQL.
 fn sql_str_lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// Converts days since Unix epoch (1970-01-01) to a YYYY-MM-DD string.
@@ -529,8 +635,28 @@ fn days_since_epoch_to_date_str(days: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
+/// Strips leading SQL whitespace, line comments (`--…`), and block
+/// comments (`/*…*/`) from `query`, returning the remaining slice.
+fn strip_sql_comments(query: &str) -> &str {
+    let mut s = query.trim_start();
+    loop {
+        if s.starts_with("--") {
+            s = s[s.find('\n').map(|i| i + 1).unwrap_or(s.len())..].trim_start();
+        } else if s.starts_with("/*") {
+            if let Some(end) = s.find("*/") {
+                s = s[end + 2..].trim_start();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 fn is_ddl(query: &str) -> bool {
-    let upper = query.trim_start().to_uppercase();
+    let upper = strip_sql_comments(query).to_uppercase();
     upper.starts_with("CREATE ")
         || upper.starts_with("DROP ")
         || upper.starts_with("ALTER ")
@@ -588,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_with_target_table_returns_not_implemented() {
+    fn execute_with_target_table_no_data_returns_invalid_state() {
         let driver = crate::driver::Driver::default();
         let mut stmt = Statement {
             inner: driver.inner.clone(),
@@ -605,7 +731,7 @@ mod tests {
             bound_batches: vec![],
         };
         match stmt.execute() {
-            Err(err) => assert_eq!(err.status, adbc_core::error::Status::NotImplemented),
+            Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
             Ok(_) => panic!("execute should have returned an error"),
         }
     }

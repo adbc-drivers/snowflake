@@ -33,6 +33,7 @@ mod connection;
 pub use connection::Connection;
 
 mod get_objects;
+mod ingest;
 
 mod statement;
 pub use statement::Statement;
