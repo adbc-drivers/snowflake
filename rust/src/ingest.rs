@@ -54,7 +54,10 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         stmt.ingest_schema.as_deref(),
     );
 
-    let mode = stmt.ingest_mode.as_deref().unwrap_or("adbc.ingest.mode.create");
+    let mode = stmt
+        .ingest_mode
+        .as_deref()
+        .unwrap_or("adbc.ingest.mode.create");
     let schema = stmt.bound_batches[0].schema();
 
     match mode {
@@ -118,7 +121,10 @@ fn build_create_sql(qname: &str, schema: &Schema, if_not_exists: bool) -> Result
         ));
     }
     let exists = if if_not_exists { " IF NOT EXISTS" } else { "" };
-    Ok(format!("CREATE TABLE{exists} {qname} ({})", cols.join(", ")))
+    Ok(format!(
+        "CREATE TABLE{exists} {qname} ({})",
+        cols.join(", ")
+    ))
 }
 
 /// Maps an Arrow DataType to its Snowflake DDL type string.
@@ -175,7 +181,7 @@ fn to_sf_ddl(dt: &DataType) -> Result<String> {
             return Err(Error::with_message_and_status(
                 format!("unsupported ingest type: {other:?}"),
                 Status::NotImplemented,
-            ))
+            ));
         }
     })
 }
@@ -191,7 +197,12 @@ fn time_unit_prec(u: &TimeUnit) -> u8 {
 
 // ── INSERT helpers ────────────────────────────────────────────────────────────
 
-fn insert_batch(inner: &Arc<Inner>, conn: sf_core::handle_manager::Handle, qname: &str, batch: &RecordBatch) -> Result<i64> {
+fn insert_batch(
+    inner: &Arc<Inner>,
+    conn: sf_core::handle_manager::Handle,
+    qname: &str,
+    batch: &RecordBatch,
+) -> Result<i64> {
     if batch.num_rows() == 0 {
         return Ok(0);
     }
@@ -214,7 +225,11 @@ fn insert_batch(inner: &Arc<Inner>, conn: sf_core::handle_manager::Handle, qname
         for r in row..end {
             let mut vals = Vec::with_capacity(schema.fields().len());
             for (c, field) in schema.fields().iter().enumerate() {
-                vals.push(value_to_sql(batch.column(c).as_ref(), r, field.data_type())?);
+                vals.push(value_to_sql(
+                    batch.column(c).as_ref(),
+                    r,
+                    field.data_type(),
+                )?);
             }
             rows_sql.push(format!("({})", vals.join(", ")));
         }
@@ -261,11 +276,11 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
 
     use arrow_array::{
         BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-        Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        LargeBinaryArray, LargeStringArray, StringArray, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
-        TimestampMillisecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     };
 
     macro_rules! num {
@@ -287,11 +302,19 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
     // Floats: use {:?} to always emit a decimal or exponent (avoids huge integer strings).
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
         let v = a.value(row);
-        return if v.is_finite() { Ok(format!("{:?}", v as f64)) } else { Ok("NULL".to_string()) };
+        return if v.is_finite() {
+            Ok(format!("{:?}", v as f64))
+        } else {
+            Ok("NULL".to_string())
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
         let v = a.value(row);
-        return if v.is_finite() { Ok(format!("{v:?}")) } else { Ok("NULL".to_string()) };
+        return if v.is_finite() {
+            Ok(format!("{v:?}"))
+        } else {
+            Ok("NULL".to_string())
+        };
     }
 
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
