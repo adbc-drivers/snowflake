@@ -22,21 +22,23 @@ from adbc_drivers_validation import model, quirks
 class SnowflakeQuirks(model.DriverQuirks):
     name = "snowflake"
     driver = "adbc_driver_snowflake"
-    driver_name = "ADBC Driver Foundry Driver for Snowflake"
+    driver_name = "ADBC Snowflake Driver (Rust)"
     vendor_name = "Snowflake"
-    vendor_version = re.compile(r"10\.[0-9]+\.[0-9]+")
+    vendor_version = re.compile(r"\d+\.[0-9]+\.[0-9]+")
     short_version = "10"
     features = model.DriverFeatures(
         connection_get_table_schema=True,
+        connection_set_current_catalog=True,
+        connection_set_current_schema=True,
         connection_transactions=True,
         get_objects=True,
         get_objects_constraints_foreign=False,
         get_objects_constraints_primary=False,
         get_objects_constraints_unique=False,
         statement_bind=True,
-        statement_bulk_ingest=True,
-        statement_bulk_ingest_catalog=True,
-        statement_bulk_ingest_schema=True,
+        statement_bulk_ingest=False,
+        statement_bulk_ingest_catalog=False,
+        statement_bulk_ingest_schema=False,
         statement_bulk_ingest_temporary=False,
         statement_execute_schema=True,
         statement_get_parameter_schema=False,
@@ -53,7 +55,10 @@ class SnowflakeQuirks(model.DriverQuirks):
     setup = model.DriverSetup(
         database={
             "uri": model.FromEnv("SNOWFLAKE_URI"),
+            "adbc.snowflake.sql.db": model.FromEnv("SNOWFLAKE_DATABASE"),
+            "adbc.snowflake.sql.schema": model.FromEnv("SNOWFLAKE_SCHEMA"),
             "adbc.snowflake.sql.client_option.use_high_precision": "false",
+            "adbc.snowflake.sql.client_option.max_timestamp_precision": "microseconds",
             "timezone": "UTC",
         },
         connection={},
