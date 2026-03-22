@@ -493,9 +493,18 @@ fn test_database_options_round_trip() {
             "adbc.snowflake.sql.client_option.keep_session_alive",
             "enabled",
         ),
-        ("adbc.snowflake.sql.client_option.disable_telemetry", "enabled"),
-        ("adbc.snowflake.sql.client_option.cache_mfa_token", "enabled"),
-        ("adbc.snowflake.sql.client_option.store_temp_creds", "enabled"),
+        (
+            "adbc.snowflake.sql.client_option.disable_telemetry",
+            "enabled",
+        ),
+        (
+            "adbc.snowflake.sql.client_option.cache_mfa_token",
+            "enabled",
+        ),
+        (
+            "adbc.snowflake.sql.client_option.store_temp_creds",
+            "enabled",
+        ),
         ("adbc.snowflake.sql.client_option.tracing", "debug"),
         (
             "adbc.snowflake.sql.client_option.identity_provider",
@@ -565,9 +574,7 @@ fn test_ocsp_fail_open_mode_option() {
     };
 
     db.set_option(
-        OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
-        ),
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
         OptionValue::String("enabled".into()),
     )
     .expect("set ocsp_fail_open_mode enabled");
@@ -580,9 +587,7 @@ fn test_ocsp_fail_open_mode_option() {
     );
 
     db.set_option(
-        OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
-        ),
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
         OptionValue::String("disabled".into()),
     )
     .expect("set ocsp_fail_open_mode disabled");
@@ -593,4 +598,49 @@ fn test_ocsp_fail_open_mode_option() {
         .unwrap(),
         "disabled"
     );
+}
+
+#[test]
+fn test_execute_schema() {
+    use arrow_schema::{DataType, TimeUnit};
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+
+    // Schema from a plain SELECT
+    {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query("SELECT 1::INTEGER AS n, 'hello'::VARCHAR AS s")
+            .unwrap();
+        let schema = stmt.execute_schema().expect("execute_schema");
+        assert_eq!(schema.fields().len(), 2);
+    }
+
+    // Schema from a table select matches the table definition
+    {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query(
+            "CREATE OR REPLACE TEMP TABLE adbc_rust_schema_test \
+             (id NUMBER(10,0), val VARCHAR, ts TIMESTAMP_NTZ)",
+        )
+        .unwrap();
+        stmt.execute_update().expect("create table");
+
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query("SELECT * FROM ADBC_RUST_SCHEMA_TEST")
+            .unwrap();
+        let schema = stmt.execute_schema().expect("execute_schema on table");
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "ID");
+        assert_eq!(schema.field(1).name(), "VAL");
+        assert_eq!(schema.field(2).name(), "TS");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
 }

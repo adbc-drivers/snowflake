@@ -90,9 +90,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
             param_names::CUSTOM_ROOT_STORE_PATH.into()
         }
         // OCSP — ocsp_fail_open_mode compound effect is applied separately in set_option
-        "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" => {
-            "ocsp_fail_open_mode".to_string()
-        }
+        "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" => "ocsp_fail_open_mode".to_string(),
         // Session behaviour
         "adbc.snowflake.sql.client_option.keep_session_alive" => "keep_session_alive".to_string(),
         "adbc.snowflake.sql.client_option.disable_telemetry" => "disable_telemetry".to_string(),
@@ -197,8 +195,10 @@ impl Optionable for Database {
                 param_names::VERIFY_CERTIFICATES.as_str().to_string(),
                 verify.clone(),
             );
-            self.sf_settings
-                .insert(param_names::VERIFY_HOSTNAME.as_str().to_string(), verify.clone());
+            self.sf_settings.insert(
+                param_names::VERIFY_HOSTNAME.as_str().to_string(),
+                verify.clone(),
+            );
             self.inner
                 .runtime
                 .block_on(async {
@@ -226,10 +226,11 @@ impl Optionable for Database {
         // enabled (fail-open / advisory) → ADVISORY; disabled (strict) → ENABLED.
         if key_str == "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" {
             let fail_open = matches!(&value, OptionValue::String(s) if s == "enabled");
-            let mode =
-                Setting::String(if fail_open { "ADVISORY" } else { "ENABLED" }.to_string());
-            self.sf_settings
-                .insert(param_names::CRL_CHECK_MODE.as_str().to_string(), mode.clone());
+            let mode = Setting::String(if fail_open { "ADVISORY" } else { "ENABLED" }.to_string());
+            self.sf_settings.insert(
+                param_names::CRL_CHECK_MODE.as_str().to_string(),
+                mode.clone(),
+            );
             self.inner
                 .runtime
                 .block_on(self.inner.sf.database_set_option(
@@ -601,7 +602,8 @@ mod tests {
         );
         // Compound: verify_certificates and verify_hostname must be false
         assert_eq!(
-            db.sf_settings.get(param_names::VERIFY_CERTIFICATES.as_str()),
+            db.sf_settings
+                .get(param_names::VERIFY_CERTIFICATES.as_str()),
             Some(&Setting::Bool(false))
         );
         assert_eq!(
@@ -633,7 +635,8 @@ mod tests {
             "disabled"
         );
         assert_eq!(
-            db.sf_settings.get(param_names::VERIFY_CERTIFICATES.as_str()),
+            db.sf_settings
+                .get(param_names::VERIFY_CERTIFICATES.as_str()),
             Some(&Setting::Bool(true))
         );
         assert_eq!(
@@ -647,9 +650,7 @@ mod tests {
         use sf_core::config::settings::Setting;
         let mut db = make_db();
         db.set_option(
-            OptionDatabase::Other(
-                "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
-            ),
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
             OptionValue::String("enabled".into()),
         )
         .unwrap();
@@ -671,9 +672,7 @@ mod tests {
         use sf_core::config::settings::Setting;
         let mut db = make_db();
         db.set_option(
-            OptionDatabase::Other(
-                "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into(),
-            ),
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
             OptionValue::String("disabled".into()),
         )
         .unwrap();
@@ -687,18 +686,9 @@ mod tests {
     fn simple_option_round_trips() {
         let mut db = make_db();
         let cases = [
-            (
-                "adbc.snowflake.sql.region",
-                "us-east-1",
-            ),
-            (
-                "adbc.snowflake.sql.client_option.login_timeout",
-                "30s",
-            ),
-            (
-                "adbc.snowflake.sql.client_option.request_timeout",
-                "60s",
-            ),
+            ("adbc.snowflake.sql.region", "us-east-1"),
+            ("adbc.snowflake.sql.client_option.login_timeout", "30s"),
+            ("adbc.snowflake.sql.client_option.request_timeout", "60s"),
             (
                 "adbc.snowflake.sql.client_option.keep_session_alive",
                 "enabled",
@@ -707,10 +697,7 @@ mod tests {
                 "adbc.snowflake.sql.client_option.disable_telemetry",
                 "enabled",
             ),
-            (
-                "adbc.snowflake.sql.client_option.tracing",
-                "debug",
-            ),
+            ("adbc.snowflake.sql.client_option.tracing", "debug"),
             (
                 "adbc.snowflake.sql.client_option.config_file",
                 "/home/user/.snowflake/config.toml",
