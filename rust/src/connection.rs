@@ -56,13 +56,13 @@ impl Drop for Connection {
     }
 }
 
-struct SingleBatchReader {
+pub(crate) struct SingleBatchReader {
     batch: Option<RecordBatch>,
     schema: std::sync::Arc<Schema>,
 }
 
 impl SingleBatchReader {
-    fn new(batch: RecordBatch) -> Self {
+    pub(crate) fn new(batch: RecordBatch) -> Self {
         let schema = batch.schema();
         Self {
             batch: Some(batch),
@@ -256,10 +256,13 @@ impl adbc_core::Connection for Connection {
             conn_handle: self.conn_handle,
             query: None,
             target_table: None,
+            ingest_catalog: None,
+            ingest_schema: None,
             ingest_mode: None,
             query_tag: None,
             use_high_precision: self.use_high_precision,
             timestamp_precision: self.timestamp_precision,
+            bound_batches: vec![],
         })
     }
 
@@ -290,6 +293,7 @@ impl adbc_core::Connection for Connection {
             (InfoCode::DriverVersion, 0, 2),
             (InfoCode::DriverAdbcVersion, 2, 0),
             (InfoCode::VendorVersion, 0, 3),
+            (InfoCode::DriverArrowVersion, 0, 4),
         ];
 
         let selected: Vec<_> = match &codes {
@@ -316,6 +320,7 @@ impl adbc_core::Connection for Connection {
             "ADBC Snowflake Driver (Rust)",
             env!("CARGO_PKG_VERSION"),
             vendor_version.as_str(),
+            "v57.3.0",
         ])) as ArrayRef;
         let bool_values = Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef;
         let int64_values =
@@ -423,14 +428,22 @@ impl adbc_core::Connection for Connection {
     #[allow(refining_impl_trait)]
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
+        depth: ObjectDepth,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        table_type: Option<Vec<&str>>,
+        column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(crate::error::not_implemented("get_objects"))
+        crate::get_objects::execute_get_objects(
+            self,
+            &depth,
+            catalog,
+            db_schema,
+            table_name,
+            table_type,
+            column_name,
+        )
     }
 
     fn get_table_schema(
@@ -542,22 +555,30 @@ impl adbc_core::Connection for Connection {
     }
 
     fn commit(&mut self) -> Result<()> {
+        if self.autocommit {
+            return Err(Error::with_message_and_status(
+                "cannot commit: autocommit is enabled",
+                Status::InvalidState,
+            ));
+        }
         self.execute_simple("COMMIT")?;
         self.active_transaction = false;
-        if !self.autocommit {
-            self.execute_simple("BEGIN")?;
-            self.active_transaction = true;
-        }
+        self.execute_simple("BEGIN")?;
+        self.active_transaction = true;
         Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {
+        if self.autocommit {
+            return Err(Error::with_message_and_status(
+                "cannot rollback: autocommit is enabled",
+                Status::InvalidState,
+            ));
+        }
         self.execute_simple("ROLLBACK")?;
         self.active_transaction = false;
-        if !self.autocommit {
-            self.execute_simple("BEGIN")?;
-            self.active_transaction = true;
-        }
+        self.execute_simple("BEGIN")?;
+        self.active_transaction = true;
         Ok(())
     }
 

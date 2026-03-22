@@ -32,6 +32,8 @@ pub use database::Database;
 mod connection;
 pub use connection::Connection;
 
+mod get_objects;
+
 mod statement;
 pub use statement::Statement;
 
