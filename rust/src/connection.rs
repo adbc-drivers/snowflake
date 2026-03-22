@@ -21,6 +21,11 @@
 // under the License.
 
 // src/connection.rs
+
+/// Arrow library version reported via get_info(DriverArrowVersion).
+/// Must be kept in sync with the `arrow-array` dependency version in Cargo.toml.
+const ARROW_VERSION: &str = "v57.3.0";
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -320,7 +325,7 @@ impl adbc_core::Connection for Connection {
             "ADBC Snowflake Driver (Rust)",
             env!("CARGO_PKG_VERSION"),
             vendor_version.as_str(),
-            "v57.3.0",
+            ARROW_VERSION,
         ])) as ArrayRef;
         let bool_values = Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef;
         let int64_values =
@@ -492,18 +497,41 @@ impl adbc_core::Connection for Connection {
         for batch in reader {
             let batch =
                 batch.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
-            if batch.num_columns() < 4 {
+            use arrow_array::cast::AsArray;
+
+            // Resolve column indices by name (case-insensitive) so a future
+            // reordering of DESC TABLE columns doesn't silently shift the mapping.
+            // Known positional defaults from the current Snowflake DESC TABLE schema:
+            //   0=name, 1=type, 2=kind, 3=null?, 4=default, 5=primary key,
+            //   6=unique key, 7=check, 8=expression, 9=comment, …
+            let schema = batch.schema();
+            let find = |name: &str, fallback: usize| {
+                schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().eq_ignore_ascii_case(name))
+                    .unwrap_or(fallback)
+            };
+            let name_col    = find("name",        0);
+            let type_col    = find("type",        1);
+            let null_col    = find("null?",       3);
+            let pk_col      = find("primary key", 5);
+            let comment_col = find("comment",     9);
+
+            if batch.num_columns() <= name_col
+                || batch.num_columns() <= type_col
+                || batch.num_columns() <= null_col
+            {
                 continue;
             }
-            use arrow_array::cast::AsArray;
-            let names = batch.column(0).as_string::<i32>();
-            let types = batch.column(1).as_string::<i32>();
-            let nullables = batch.column(3).as_string::<i32>();
-            // primary_key is column 5; comment is column 9 — present only when
-            // the result has enough columns (older Snowflake editions may omit them).
+            let names    = batch.column(name_col).as_string::<i32>();
+            let types    = batch.column(type_col).as_string::<i32>();
+            let nullables = batch.column(null_col).as_string::<i32>();
+            // primary_key and comment are present only when the result has enough columns.
             let primary_keys =
-                (batch.num_columns() > 5).then(|| batch.column(5).as_string::<i32>());
-            let comments = (batch.num_columns() > 9).then(|| batch.column(9).as_string::<i32>());
+                (batch.num_columns() > pk_col).then(|| batch.column(pk_col).as_string::<i32>());
+            let comments = (batch.num_columns() > comment_col)
+                .then(|| batch.column(comment_col).as_string::<i32>());
             for i in 0..batch.num_rows() {
                 let type_str = types.value(i);
                 let arrow_type = snowflake_type_to_arrow(

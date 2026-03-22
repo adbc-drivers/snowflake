@@ -57,7 +57,7 @@ fn ilike(p: Option<&str>) -> String {
 fn info_prefix(catalog_filter: Option<&str>) -> String {
     match catalog_filter {
         Some(c) if !c.is_empty() && !c.contains('%') && !c.contains('_') => {
-            format!("\"{}\".information_schema.", sql_esc(c))
+            format!("\"{}\".information_schema.", c.replace('"', "\"\""))
         }
         _ => "information_schema.".to_string(),
     }
@@ -128,11 +128,33 @@ fn cell_to_string(arr: &dyn Array, i: usize) -> Option<String> {
     if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
         return Some(s.value(i).to_string());
     }
+    if let Some(s) = arr.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+        return Some(s.value(i).to_string());
+    }
     if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
         return Some(n.value(i).to_string());
     }
     if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int32Array>() {
         return Some(n.value(i).to_string());
+    }
+    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int16Array>() {
+        return Some(n.value(i).to_string());
+    }
+    // Snowflake NUMBER(p,0) columns (like ordinal_position) arrive as Decimal128
+    // when sf_core applies high-precision type mapping.  Extract the integer part
+    // by dividing by 10^scale (scale is typically 0 for integer metadata columns).
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>() {
+        let scale = match a.data_type() {
+            DataType::Decimal128(_, s) => *s,
+            _ => 0i8,
+        };
+        let raw = a.value(i);
+        let value = if scale > 0 {
+            raw / 10i128.pow(scale as u32)
+        } else {
+            raw
+        };
+        return Some(value.to_string());
     }
     None
 }
