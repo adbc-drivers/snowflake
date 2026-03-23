@@ -140,6 +140,14 @@ fn cell_to_string(arr: &dyn Array, i: usize) -> Option<String> {
     if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int16Array>() {
         return Some(n.value(i).to_string());
     }
+    // Some NUMBER(p,0) columns (like ordinal_position) arrive as Float64 in the
+    // sf_core Arrow stream for metadata queries; truncate to integer string.
+    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Float64Array>() {
+        return Some((n.value(i) as i64).to_string());
+    }
+    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Float32Array>() {
+        return Some((n.value(i) as i64).to_string());
+    }
     // Snowflake NUMBER(p,0) columns (like ordinal_position) arrive as Decimal128
     // when sf_core applies high-precision type mapping.  Extract the integer part
     // by dividing by 10^scale (scale is typically 0 for integer metadata columns).
@@ -149,9 +157,11 @@ fn cell_to_string(arr: &dyn Array, i: usize) -> Option<String> {
             _ => 0i8,
         };
         let raw = a.value(i);
-        let value = if scale > 0 {
+        let value = if scale > 0 && scale <= 38 {
             raw / 10i128.pow(scale as u32)
         } else {
+            // scale == 0: no adjustment; scale > 38: i128 exponent would overflow,
+            // return the raw representation rather than panicking.
             raw
         };
         return Some(value.to_string());
@@ -355,6 +365,13 @@ fn collect(
         ),
     )?;
 
+    // Track 1-based column position per (catalog, schema, table).
+    // The query is already sorted by ordinal_position so the rows arrive in
+    // column order; we count them ourselves rather than trusting the database
+    // value, which varies across Snowflake environments.
+    let mut col_counter: std::collections::HashMap<(String, String, String), i32> =
+        Default::default();
+
     for row in &col_rows {
         if row.len() < 13 {
             continue;
@@ -375,10 +392,15 @@ fn collect(
                         0
                     }
                 });
-                let ordinal = row[4]
-                    .as_deref()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
+                // Compute 1-based ordinal from insertion order (SQL is ordered by
+                // ordinal_position so this matches the database's sort order).
+                let ordinal = {
+                    let c = col_counter
+                        .entry((cat.clone(), sch.clone(), tbl.clone()))
+                        .or_insert(0);
+                    *c += 1;
+                    *c
+                };
                 table.columns.push(ColEntry {
                     name: col_name.clone(),
                     ordinal_position: ordinal,
