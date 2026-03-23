@@ -344,8 +344,15 @@ impl adbc_core::Statement for Statement {
                                 .await
                         })
                         .map_err(crate::error::api_error_to_adbc_error)?;
-                    // Release the stream; we only care about rows_affected.
-                    drop(result.stream);
+                    // Drain the stream via ArrowArrayStreamReader so sf_core's
+                    // release callback fires before the handle is reused.
+                    let raw = Box::into_raw(result.stream)
+                        as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+                    if let Ok(reader) =
+                        unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+                    {
+                        for _ in reader {} // consume all batches to trigger release
+                    }
                     total += result.rows_affected.unwrap_or(0);
                 }
             }
@@ -613,7 +620,7 @@ fn sql_str_lit(s: &str) -> String {
 }
 
 /// Converts days since Unix epoch (1970-01-01) to a YYYY-MM-DD string.
-fn days_since_epoch_to_date_str(days: i64) -> String {
+pub(crate) fn days_since_epoch_to_date_str(days: i64) -> String {
     // Algorithm: civil date from days (Gregorian proleptic)
     let z = days + 719468;
     let era = z.div_euclid(146097);

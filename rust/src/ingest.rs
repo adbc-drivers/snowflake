@@ -47,7 +47,9 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         ));
     }
 
-    let table = stmt.target_table.as_deref().unwrap();
+    let table = stmt.target_table.as_deref().ok_or_else(|| {
+        Error::with_message_and_status("target_table not set", Status::InvalidState)
+    })?;
     let qname = qualified_name(
         table,
         stmt.ingest_catalog.as_deref(),
@@ -172,10 +174,19 @@ fn to_sf_ddl(dt: &DataType) -> Result<String> {
             }
         }
 
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-            "array".to_string()
+        // List/Struct/Map are intentionally excluded: DDL generation would succeed
+        // but value_to_sql has no handler for these types, causing every data row
+        // to fail.  Return NotImplemented so callers get a clear error up-front.
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Struct(_)
+        | DataType::Map(_, _) => {
+            return Err(Error::with_message_and_status(
+                format!("ingest of nested type {dt:?} is not yet supported"),
+                Status::NotImplemented,
+            ))
         }
-        DataType::Struct(_) | DataType::Map(_, _) => "object".to_string(),
 
         other => {
             return Err(Error::with_message_and_status(
@@ -300,6 +311,8 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
     num!(UInt32Array);
     num!(UInt64Array);
     // Floats: use {:?} to always emit a decimal or exponent (avoids huge integer strings).
+    // NaN and ±Inf cannot be represented in SQL; they are mapped to NULL, which is a
+    // deliberate lossy conversion — callers should avoid ingesting non-finite values.
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
         let v = a.value(row);
         return if v.is_finite() {
@@ -340,6 +353,11 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
 
     if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
         let days = a.value(row) as i64;
+        return Ok(format!("'{}'::DATE", days_to_date(days)));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Date64Array>() {
+        // Date64 stores milliseconds since epoch; divide to get days.
+        let days = a.value(row) / 86_400_000;
         return Ok(format!("'{}'::DATE", days_to_date(days)));
     }
 
@@ -412,19 +430,9 @@ fn sql_binary(b: &[u8]) -> String {
     format!("TO_BINARY('{hex}', 'HEX')")
 }
 
+/// Thin wrapper so ingest.rs shares the single implementation in statement.rs.
 fn days_to_date(days: i64) -> String {
-    // Civil date algorithm (same as statement.rs)
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
+    crate::statement::days_since_epoch_to_date_str(days)
 }
 
 fn ns_to_time(ns: i64) -> String {
