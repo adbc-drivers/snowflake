@@ -280,6 +280,7 @@ impl adbc_core::Statement for Statement {
         if self.target_table.is_some() {
             // Ingest via execute() — run the ingest and return an empty reader.
             crate::ingest::execute_ingest(self)?;
+            self.bound_batches.clear();
             let batch =
                 arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
             return Ok(Box::new(crate::connection::SingleBatchReader::new(batch)));
@@ -321,7 +322,9 @@ impl adbc_core::Statement for Statement {
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
         if self.target_table.is_some() {
-            return crate::ingest::execute_ingest(self);
+            let result = crate::ingest::execute_ingest(self);
+            self.bound_batches.clear();
+            return result;
         }
         let query = self.query.clone().ok_or_else(|| {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
@@ -444,6 +447,7 @@ impl adbc_core::Statement for Statement {
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.query = Some(query.as_ref().to_string());
         self.target_table = None;
+        self.bound_batches.clear();
         Ok(())
     }
 
@@ -701,10 +705,19 @@ fn convert_timestamp_ntz(
     tz_str: Option<Arc<str>>,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
     let unit = timestamp_target_unit(scale, ts_unit);
-    let target = DataType::Timestamp(unit, tz_str);
+    let target = DataType::Timestamp(unit, tz_str.clone());
 
     match col.data_type() {
-        DataType::Int64 => arrow_cast::cast(col.as_ref(), &target),
+        DataType::Int64 => {
+            let natural_unit = scale_to_time_unit(scale as u32);
+            if natural_unit == unit {
+                arrow_cast::cast(col.as_ref(), &target)
+            } else {
+                let natural_target = DataType::Timestamp(natural_unit, tz_str);
+                let intermediate = arrow_cast::cast(col.as_ref(), &natural_target)?;
+                arrow_cast::cast(intermediate.as_ref(), &target)
+            }
+        }
         DataType::Struct(_) => {
             use arrow_array::{Int32Array, Int64Array, StructArray};
             let struct_arr = col
