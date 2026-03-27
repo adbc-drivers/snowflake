@@ -316,7 +316,7 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
         let v = a.value(row);
         return if v.is_finite() {
-            Ok(format!("{:?}", v as f64))
+            Ok(format!("{v:?}"))
         } else {
             Ok("NULL".to_string())
         };
