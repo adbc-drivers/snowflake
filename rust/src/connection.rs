@@ -661,8 +661,36 @@ fn snowflake_type_to_arrow(
                 DataType::Int64
             }
         }
-        "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => DataType::Timestamp(ts_unit, None),
-        "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => DataType::Timestamp(ts_unit, Some("UTC".into())),
+        "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => {
+            let scale = type_str
+                .find('(')
+                .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(9);
+            let natural = match scale / 3 {
+                0 => arrow_schema::TimeUnit::Second,
+                1 => arrow_schema::TimeUnit::Millisecond,
+                2 => arrow_schema::TimeUnit::Microsecond,
+                _ => arrow_schema::TimeUnit::Nanosecond,
+            };
+            let unit = if (natural as u32) <= (ts_unit as u32) { natural } else { ts_unit };
+            DataType::Timestamp(unit, None)
+        }
+        "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
+            let scale = type_str
+                .find('(')
+                .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(9);
+            let natural = match scale / 3 {
+                0 => arrow_schema::TimeUnit::Second,
+                1 => arrow_schema::TimeUnit::Millisecond,
+                2 => arrow_schema::TimeUnit::Microsecond,
+                _ => arrow_schema::TimeUnit::Nanosecond,
+            };
+            let unit = if (natural as u32) <= (ts_unit as u32) { natural } else { ts_unit };
+            DataType::Timestamp(unit, Some("UTC".into()))
+        }
         _ => DataType::Utf8,
     }
 }
@@ -751,6 +779,42 @@ mod tests {
                 arrow_schema::TimeUnit::Microsecond
             ),
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn snowflake_type_timestamp_ntz_scale6_with_ns_unit_returns_us() {
+        assert_eq!(
+            snowflake_type_to_arrow(
+                "TIMESTAMP_NTZ(6)",
+                true,
+                arrow_schema::TimeUnit::Nanosecond
+            ),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn snowflake_type_timestamp_ntz_scale9_capped_by_us_unit() {
+        assert_eq!(
+            snowflake_type_to_arrow(
+                "TIMESTAMP_NTZ(9)",
+                true,
+                arrow_schema::TimeUnit::Microsecond
+            ),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn snowflake_type_timestamp_ltz_scale6_with_ns_unit_returns_us() {
+        assert_eq!(
+            snowflake_type_to_arrow(
+                "TIMESTAMP_LTZ(6)",
+                true,
+                arrow_schema::TimeUnit::Nanosecond
+            ),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
         );
     }
 
