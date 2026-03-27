@@ -24,9 +24,9 @@
 use std::sync::Arc;
 
 use adbc_core::{
-    Optionable,
     error::{Error, Result, Status},
     options::{OptionDatabase, OptionValue},
+    Optionable,
 };
 use arrow_schema::TimeUnit;
 use sf_core::apis::database_driver_v1::DatabaseDriverV1;
@@ -100,14 +100,8 @@ impl adbc_core::Driver for Driver {
         opts: impl IntoIterator<Item = (OptionDatabase, OptionValue)>,
     ) -> Result<Self::DatabaseType> {
         let db_handle = self.inner.sf.database_new();
-        let mut sf_settings: std::collections::HashMap<String, sf_core::config::settings::Setting> =
+        let sf_settings: std::collections::HashMap<String, sf_core::config::settings::Setting> =
             Default::default();
-        sf_settings.insert(
-            "client_app_id".to_string(),
-            sf_core::config::settings::Setting::String(
-                concat!("[ADBC][Rust] Snowflake Driver/", env!("CARGO_PKG_VERSION")).to_string(),
-            ),
-        );
         let mut db = Database {
             inner: self.inner.clone(),
             db_handle,

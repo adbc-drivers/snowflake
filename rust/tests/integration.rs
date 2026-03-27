@@ -22,11 +22,12 @@
 
 // tests/integration.rs
 use adbc_core::{
-    Connection as _, Database as _, Driver as _, Optionable, Statement as _,
     options::{OptionConnection, OptionDatabase, OptionValue},
+    Connection as _, Database as _, Driver as _, Optionable, Statement as _,
 };
 use adbc_driver_snowflake::{Database, Driver};
 use arrow_array::cast::AsArray;
+use arrow_array::Array;
 use arrow_schema::{DataType, TimeUnit};
 
 fn get_env(key: &str) -> Option<String> {
@@ -643,4 +644,50 @@ fn test_execute_schema() {
             &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
+}
+
+#[test]
+fn test_float64_select_precision() {
+    let Some(mut conn) = make_connection() else {
+        return;
+    };
+    let mut stmt = conn.new_statement().expect("new_statement");
+
+    stmt.set_sql_query(
+        "SELECT 3.14159265358979::FLOAT as pi, \
+         0.0::FLOAT as zero, \
+         -1.7976931348623157e308::FLOAT as neg_max, \
+         1.7976931348623157e308::FLOAT as pos_max, \
+         2.2250738585072014e-308::FLOAT as min_pos, \
+         NULL::FLOAT as null_val",
+    )
+    .expect("set_sql_query");
+
+    let mut reader = stmt.execute().expect("execute");
+    let batch = reader.next().expect("batch").expect("ok");
+
+    let check = |col_idx: usize, name: &str, expected_bits: u64| {
+        let arr = batch
+            .column(col_idx)
+            .as_primitive::<arrow_array::types::Float64Type>();
+        let v = arr.value(0);
+        assert_eq!(
+            v.to_bits(),
+            expected_bits,
+            "{name}: got {v} (bits={:#018x}), expected bits={:#018x}",
+            v.to_bits(),
+            expected_bits
+        );
+    };
+
+    check(0, "pi", 0x400921fb54442d11);
+    check(1, "zero", 0x0000000000000000);
+    check(2, "neg_max", 0xffefffffffffffff);
+    check(3, "pos_max", 0x7fefffffffffffff);
+    check(4, "min_pos", 0x0010000000000000);
+
+    let null_arr = batch
+        .column(5)
+        .as_primitive::<arrow_array::types::Float64Type>();
+    assert!(null_arr.is_null(0), "null_val should be null");
 }
