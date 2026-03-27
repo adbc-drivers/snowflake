@@ -221,7 +221,7 @@ pub(crate) fn execute_get_objects(
         table_type_filter,
         column_name_filter,
     )?;
-    let batch = build_batch(&entries, &depth)?;
+    let batch = build_batch(&entries, depth)?;
     Ok(Box::new(SingleBatchReader::new(batch)))
 }
 
@@ -382,8 +382,8 @@ fn collect(
             continue;
         };
         let key = (cat.clone(), sch.clone());
-        if let Some(tables) = tables_by_key.get_mut(&key) {
-            if let Some(table) = tables.iter_mut().find(|t| &t.name == tbl) {
+        if let Some(tables) = tables_by_key.get_mut(&key)
+            && let Some(table) = tables.iter_mut().find(|t| &t.name == tbl) {
                 let nullable_str = row[7].clone();
                 let nullable_int = nullable_str.as_deref().map(|s| {
                     if s.eq_ignore_ascii_case("YES") {
@@ -392,8 +392,6 @@ fn collect(
                         0
                     }
                 });
-                // Compute 1-based ordinal from insertion order (SQL is ordered by
-                // ordinal_position so this matches the database's sort order).
                 let ordinal = {
                     let c = col_counter
                         .entry((cat.clone(), sch.clone(), tbl.clone()))
@@ -415,7 +413,6 @@ fn collect(
                     xdbc_datetime_sub: row[12].as_deref().and_then(|s| s.parse().ok()),
                 });
             }
-        }
     }
 
     Ok(assemble(catalog_names, schemas_by_cat, tables_by_key))
