@@ -555,10 +555,17 @@ fn compute_target_type(field: &Field, use_high_precision: bool, ts_unit: TimeUni
         .get("scale")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let precision: u8 = field
+        .metadata()
+        .get("precision")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(38);
 
     match logical_type {
         "FIXED" => {
-            if scale == 0 || use_high_precision {
+            if use_high_precision && scale > 0 {
+                DataType::Decimal128(precision, scale as i8)
+            } else if scale == 0 {
                 DataType::Int64
             } else {
                 DataType::Float64
@@ -670,22 +677,47 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                         _ => arrow_cast::cast(col.as_ref(), &DataType::Int64),
                     }
                 } else if use_high_precision {
-                    arrow_cast::cast(col.as_ref(), &DataType::Int64)
+                    match col.data_type() {
+                        // Source is already Decimal128 — pass through as identity
+                        DataType::Decimal128(_, _) => Ok(col.clone()),
+                        // Source is Int64 (scaled integer) — convert to Decimal128(precision, scale)
+                        // following Go's integerToDecimal128: cast Int64 → Decimal128(20,0),
+                        // then reinterpret as Decimal128(precision, scale).
+                        _ => {
+                            let intermediate = arrow_cast::cast(
+                                col.as_ref(),
+                                &DataType::Decimal128(20, 0),
+                            )?;
+                            let data = intermediate.to_data();
+                            let retyped = unsafe {
+                                data.into_builder()
+                                    .data_type(target_type.clone())
+                                    .build_unchecked()
+                            };
+                            Ok(arrow_array::make_array(retyped))
+                        }
+                    }
                 } else {
-                    // Cast to Float64, then divide by 10^scale to restore decimal value
-                    let casted = arrow_cast::cast(col.as_ref(), &DataType::Float64)?;
-                    let divisor = 10f64.powi(scale as i32);
-                    let float_arr = casted
-                        .as_any()
-                        .downcast_ref::<arrow_array::Float64Array>()
-                        .ok_or_else(|| {
-                            arrow_schema::ArrowError::CastError(
-                                "expected Float64Array after cast".into(),
-                            )
-                        })?;
-                    let divided: arrow_array::Float64Array =
-                        float_arr.iter().map(|v| v.map(|x| x / divisor)).collect();
-                    Ok(Arc::new(divided) as ArrayRef)
+                    match col.data_type() {
+                        DataType::Decimal128(_, _) => {
+                            arrow_cast::cast(col.as_ref(), &DataType::Float64)
+                        }
+                        _ => {
+                            let casted = arrow_cast::cast(col.as_ref(), &DataType::Float64)?;
+                            let divisor = 10f64.powi(scale as i32);
+                            let float_arr = casted
+                                .as_any()
+                                .downcast_ref::<arrow_array::Float64Array>()
+                                .ok_or_else(|| {
+                                    arrow_schema::ArrowError::CastError(
+                                        "expected Float64Array after cast".into(),
+                                    )
+                                })?;
+                            let divided: arrow_array::Float64Array =
+                                float_arr.iter().map(|v| v.map(|x| x / divisor)).collect();
+                            Ok(Arc::new(divided) as ArrayRef)
+                        }
+                    }
                 }
             }
             "TIME" => arrow_cast::cast(col.as_ref(), target_type),
@@ -1521,9 +1553,20 @@ mod tests {
         assert_eq!(col2.values(), &[100i64, 200]);
     }
     fn make_field_with_meta(name: &str, dt: DataType, logical_type: &str, scale: &str) -> Field {
+        make_field_with_precision(name, dt, logical_type, scale, "38")
+    }
+
+    fn make_field_with_precision(
+        name: &str,
+        dt: DataType,
+        logical_type: &str,
+        scale: &str,
+        precision: &str,
+    ) -> Field {
         let mut md = std::collections::HashMap::new();
         md.insert("logicalType".to_string(), logical_type.to_string());
         md.insert("scale".to_string(), scale.to_string());
+        md.insert("precision".to_string(), precision.to_string());
         Field::new(name, dt, true).with_metadata(md)
     }
 
@@ -1552,11 +1595,11 @@ mod tests {
     }
 
     #[test]
-    fn test_adjust_schema_fixed_scale2_high_precision_stays_int64() {
-        let f = make_field_with_meta("x", DataType::Int64, "FIXED", "2");
+    fn test_adjust_schema_fixed_scale2_high_precision_is_decimal128() {
+        let f = make_field_with_precision("x", DataType::Int64, "FIXED", "2", "10");
         let schema = Schema::new(vec![f]);
         let result = adjust_schema(&schema, true, TimeUnit::Nanosecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Int64);
+        assert_eq!(result.field(0).data_type(), &DataType::Decimal128(10, 2));
     }
 
     #[test]
@@ -1594,6 +1637,84 @@ mod tests {
         let col = out.column(0).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
         assert!((col.value(0) - 123.45).abs() < 1e-9);
         assert!((col.value(1) - 2.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_converting_reader_fixed_scale2_high_precision_produces_decimal128() {
+        let f = make_field_with_precision("x", DataType::Int64, "FIXED", "2", "10");
+        let schema = Arc::new(Schema::new(vec![f]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![12345i64, -255]))],
+        )
+        .unwrap();
+        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let out = cr.next().unwrap().unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Decimal128(10, 2));
+        let col = out.column(0).as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        // 12345 with scale 2 = 123.45
+        assert_eq!(col.value(0), 12345i128);
+        // -255 with scale 2 = -2.55
+        assert_eq!(col.value(1), -255i128);
+    }
+
+    #[test]
+    fn test_converting_reader_fixed_scale0_high_precision_stays_int64() {
+        let f = make_field_with_precision("x", DataType::Int64, "FIXED", "0", "10");
+        let schema = Arc::new(Schema::new(vec![f]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![42i64]))],
+        )
+        .unwrap();
+        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let out = cr.next().unwrap().unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn test_converting_reader_decimal128_source_high_precision_identity() {
+        let f = make_field_with_precision("x", DataType::Decimal128(10, 2), "FIXED", "2", "10");
+        let schema = Arc::new(Schema::new(vec![f]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                arrow_array::Decimal128Array::from(vec![12345i128, -255])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let out = cr.next().unwrap().unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Decimal128(10, 2));
+        let col = out.column(0).as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(col.value(0), 12345i128);
+        assert_eq!(col.value(1), -255i128);
+    }
+
+    #[test]
+    fn test_converting_reader_decimal128_source_no_high_precision_casts_to_float64() {
+        let f = make_field_with_precision("x", DataType::Decimal128(10, 2), "FIXED", "2", "10");
+        let schema = Arc::new(Schema::new(vec![f]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                arrow_array::Decimal128Array::from(vec![12345i128])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
+        let out = cr.next().unwrap().unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
+        let col = out.column(0).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
+        assert!((col.value(0) - 123.45).abs() < 1e-9);
     }
 
     #[test]
