@@ -32,7 +32,7 @@ crate-type = ["cdylib", "rlib"]
 adbc_core = "0.22.0"
 adbc_ffi  = "0.22.0"
 sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core", rev = "66a816ec1d1adda899bd2607f5c83e7dd5838ad5" }
-arrow-array  = { version = "57.3.0", default-features = false, features = ["ffi"] }
+arrow-array  = { version = "57.3.0", default-features = false, features = ["ffi", "chrono-tz"] }
 arrow-buffer = { version = "57.3.0", default-features = false }
 arrow-schema = { version = "57.3.0", default-features = false }
 arrow-cast   = { version = "57.3.0", default-features = false }
