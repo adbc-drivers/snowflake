@@ -641,7 +641,7 @@ fn test_execute_schema() {
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
         assert_eq!(
             schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
     }
 }
