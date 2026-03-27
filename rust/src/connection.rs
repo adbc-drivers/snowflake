@@ -619,6 +619,26 @@ impl adbc_core::Connection for Connection {
     }
 }
 
+fn ts_scale_to_unit(scale: u32) -> arrow_schema::TimeUnit {
+    match scale {
+        0 => arrow_schema::TimeUnit::Second,
+        1..=3 => arrow_schema::TimeUnit::Millisecond,
+        4..=6 => arrow_schema::TimeUnit::Microsecond,
+        _ => arrow_schema::TimeUnit::Nanosecond,
+    }
+}
+
+fn min_time_unit(a: arrow_schema::TimeUnit, b: arrow_schema::TimeUnit) -> arrow_schema::TimeUnit {
+    use arrow_schema::TimeUnit::*;
+    let rank = |u| match u {
+        Second => 0u8,
+        Millisecond => 1,
+        Microsecond => 2,
+        Nanosecond => 3,
+    };
+    if rank(a) <= rank(b) { a } else { b }
+}
+
 fn snowflake_type_to_arrow(
     type_str: &str,
     high_precision: bool,
@@ -667,13 +687,8 @@ fn snowflake_type_to_arrow(
                 .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(9);
-            let natural = match scale / 3 {
-                0 => arrow_schema::TimeUnit::Second,
-                1 => arrow_schema::TimeUnit::Millisecond,
-                2 => arrow_schema::TimeUnit::Microsecond,
-                _ => arrow_schema::TimeUnit::Nanosecond,
-            };
-            let unit = if (natural as u32) <= (ts_unit as u32) { natural } else { ts_unit };
+            let natural = ts_scale_to_unit(scale);
+            let unit = min_time_unit(natural, ts_unit);
             DataType::Timestamp(unit, None)
         }
         "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
@@ -682,13 +697,8 @@ fn snowflake_type_to_arrow(
                 .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(9);
-            let natural = match scale / 3 {
-                0 => arrow_schema::TimeUnit::Second,
-                1 => arrow_schema::TimeUnit::Millisecond,
-                2 => arrow_schema::TimeUnit::Microsecond,
-                _ => arrow_schema::TimeUnit::Nanosecond,
-            };
-            let unit = if (natural as u32) <= (ts_unit as u32) { natural } else { ts_unit };
+            let natural = ts_scale_to_unit(scale);
+            let unit = min_time_unit(natural, ts_unit);
             DataType::Timestamp(unit, Some("UTC".into()))
         }
         _ => DataType::Utf8,
@@ -840,5 +850,21 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(types, vec!["TABLE", "VIEW"]);
+    }
+
+    #[test]
+    fn snowflake_type_timestamp_tz_scale6_with_ns_unit_returns_us() {
+        assert_eq!(
+            snowflake_type_to_arrow("TIMESTAMP_TZ(6)", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn snowflake_type_timestamp_ntz_no_parens_defaults_to_ns() {
+        assert_eq!(
+            snowflake_type_to_arrow("TIMESTAMP_NTZ", true, arrow_schema::TimeUnit::Nanosecond),
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+        );
     }
 }

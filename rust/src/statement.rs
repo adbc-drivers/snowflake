@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use adbc_core::{
-
     Optionable, PartitionedResult,
     error::{Error, Result, Status},
     options::{OptionStatement, OptionValue},
@@ -208,7 +207,10 @@ impl Statement {
                     as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
                 let reader =
                     unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-                        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+                        .map_err(|e| {
+                            drop(unsafe { Box::from_raw(raw) });
+                            Error::with_message_and_status(e.to_string(), Status::IO)
+                        })?;
 
                 if result_schema.is_none() {
                     result_schema = Some(reader.schema());
@@ -279,8 +281,9 @@ impl adbc_core::Statement for Statement {
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.target_table.is_some() {
             // Ingest via execute() — run the ingest and return an empty reader.
-            crate::ingest::execute_ingest(self)?;
+            let result = crate::ingest::execute_ingest(self);
             self.bound_batches.clear();
+            result?;
             let batch =
                 arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
             return Ok(Box::new(crate::connection::SingleBatchReader::new(batch)));
@@ -316,7 +319,10 @@ impl adbc_core::Statement for Statement {
         let raw =
             Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
          let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-             .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+             .map_err(|e| {
+                 drop(unsafe { Box::from_raw(raw) });
+                 Error::with_message_and_status(e.to_string(), Status::IO)
+             })?;
          Ok(Box::new(ConvertingReader::new(reader, self.use_high_precision, self.timestamp_precision.time_unit())))
     }
 
@@ -485,10 +491,10 @@ impl RecordBatchReader for ConcatReader {
 // ── Schema adjustment and type conversions ────────────────────────────────
 
 fn scale_to_time_unit(scale: u32) -> TimeUnit {
-    match scale / 3 {
+    match scale {
         0 => TimeUnit::Second,
-        1 => TimeUnit::Millisecond,
-        2 => TimeUnit::Microsecond,
+        1..=3 => TimeUnit::Millisecond,
+        4..=6 => TimeUnit::Microsecond,
         _ => TimeUnit::Nanosecond,
     }
 }
@@ -658,7 +664,7 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                         _ => arrow_cast::cast(col.as_ref(), &DataType::Int64),
                     }
                 } else if use_high_precision {
-                    Ok(col.clone())
+                    arrow_cast::cast(col.as_ref(), &DataType::Int64)
                 } else {
                     // Cast to Float64, then divide by 10^scale to restore decimal value
                     let casted = arrow_cast::cast(col.as_ref(), &DataType::Float64)?;
@@ -709,7 +715,7 @@ fn convert_timestamp_ntz(
 
     match col.data_type() {
         DataType::Int64 => {
-            let natural_unit = scale_to_time_unit(scale as u32);
+            let natural_unit = scale_to_time_unit(scale.max(0) as u32);
             if natural_unit == unit {
                 arrow_cast::cast(col.as_ref(), &target)
             } else {
@@ -739,7 +745,7 @@ fn convert_timestamp_ntz(
                     arrow_schema::ArrowError::CastError("expected Int32 fraction".into())
                 })?;
 
-            build_timestamp_from_epoch_fraction(epoch, fraction, struct_arr, scale, unit, check_overflow, target)
+            build_timestamp_from_epoch_fraction(epoch, fraction, struct_arr, scale, check_overflow, target)
         }
         _ => arrow_cast::cast(col.as_ref(), &target),
     }
@@ -775,7 +781,7 @@ fn convert_timestamp_tz(
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| arrow_schema::ArrowError::CastError("expected Int32 timezone".into()))?;
 
-        build_timestamp_tz_2field(epoch, tzoffset, struct_arr, scale, unit, check_overflow, target)
+        build_timestamp_tz_2field(epoch, tzoffset, struct_arr, scale, check_overflow, target)
     } else {
         let fraction = struct_arr
             .column(1)
@@ -788,19 +794,8 @@ fn convert_timestamp_tz(
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| arrow_schema::ArrowError::CastError("expected Int32 timezone".into()))?;
 
-        build_timestamp_tz_3field(epoch, fraction, tzoffset, struct_arr, scale, unit, check_overflow, target)
+        build_timestamp_tz_3field(epoch, fraction, tzoffset, struct_arr, scale, check_overflow, target)
     }
-}
-
-#[allow(dead_code)]
-fn ns_to_unit(ns: i128, unit: TimeUnit) -> i64 {
-    let divisor: i128 = match unit {
-        TimeUnit::Second => 1_000_000_000,
-        TimeUnit::Millisecond => 1_000_000,
-        TimeUnit::Microsecond => 1_000,
-        TimeUnit::Nanosecond => 1,
-    };
-    (ns / divisor) as i64
 }
 
 fn check_ns_overflow(ns: i128) -> std::result::Result<(), arrow_schema::ArrowError> {
@@ -813,17 +808,28 @@ fn check_ns_overflow(ns: i128) -> std::result::Result<(), arrow_schema::ArrowErr
     }
 }
 
+fn ns_to_unit(ns: i128, unit: TimeUnit) -> i64 {
+    let val = match unit {
+        TimeUnit::Second => ns / 1_000_000_000,
+        TimeUnit::Millisecond => ns / 1_000_000,
+        TimeUnit::Microsecond => ns / 1_000,
+        TimeUnit::Nanosecond => ns,
+    };
+    val as i64
+}
+
 fn build_timestamp_from_epoch_fraction(
     epoch: &arrow_array::Int64Array,
     fraction: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
-    _unit: TimeUnit,
     check_overflow: bool,
     target: DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
-    use arrow_array::builder::PrimitiveBuilder;
-    use arrow_array::types::TimestampNanosecondType;
+    let unit = match &target {
+        DataType::Timestamp(u, _) => *u,
+        _ => unreachable!("target must be Timestamp"),
+    };
 
     let len = epoch.len();
     let frac_to_ns: i128 = if scale <= 9 {
@@ -832,10 +838,10 @@ fn build_timestamp_from_epoch_fraction(
         1
     };
 
-    let mut builder = PrimitiveBuilder::<TimestampNanosecondType>::with_capacity(len);
+    let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
     for i in 0..len {
         if struct_arr.is_null(i) {
-            builder.append_null();
+            values.push(None);
         } else {
             let ns: i128 = if epoch.value(i) >= 0 {
                 epoch.value(i) as i128 * 1_000_000_000
@@ -847,12 +853,18 @@ fn build_timestamp_from_epoch_fraction(
             if check_overflow {
                 check_ns_overflow(ns)?;
             }
-            builder.append_value(ns as i64);
+            values.push(Some(ns_to_unit(ns, unit)));
         }
     }
-    let ns_arr = builder.finish();
-    let intermediate: Arc<dyn Array> = Arc::new(ns_arr);
-    arrow_cast::cast(intermediate.as_ref(), &target)
+    let int_arr = arrow_array::Int64Array::from(values);
+    let data = unsafe {
+        int_arr
+            .into_data()
+            .into_builder()
+            .data_type(target.clone())
+            .build_unchecked()
+    };
+    Ok(Arc::new(arrow_array::make_array(data)) as ArrayRef)
 }
 
 fn build_timestamp_tz_2field(
@@ -860,41 +872,42 @@ fn build_timestamp_tz_2field(
     tzoffset: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
-    _unit: TimeUnit,
     check_overflow: bool,
     target: DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
-    use arrow_array::builder::PrimitiveBuilder;
-    use arrow_array::types::TimestampNanosecondType;
+    let unit = match &target {
+        DataType::Timestamp(u, _) => *u,
+        _ => unreachable!("target must be Timestamp"),
+    };
 
     let len = epoch.len();
-    let mut builder = PrimitiveBuilder::<TimestampNanosecondType>::with_capacity(len);
+    let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
 
     for i in 0..len {
         if struct_arr.is_null(i) {
-            builder.append_null();
+            values.push(None);
         } else {
             let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
             let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
 
-            let epoch_ns: i128 = match scale {
-                0..=2 => epoch.value(i) as i128 * 1_000_000_000,
-                3..=5 => epoch.value(i) as i128 * 1_000_000,
-                6..=8 => epoch.value(i) as i128 * 1_000,
-                9 => epoch.value(i) as i128,
-                _ => epoch.value(i) as i128 * 1_000_000_000,
-            };
+            let epoch_ns: i128 = epoch.value(i) as i128 * 10i128.pow((9u32).saturating_sub(scale.clamp(0, 9) as u32));
 
             let utc_ns = epoch_ns - tz_offset_ns;
             if check_overflow {
                 check_ns_overflow(utc_ns)?;
             }
-            builder.append_value(utc_ns as i64);
+            values.push(Some(ns_to_unit(utc_ns, unit)));
         }
     }
-    let ns_arr = builder.finish();
-    let intermediate: Arc<dyn Array> = Arc::new(ns_arr);
-    arrow_cast::cast(intermediate.as_ref(), &target)
+    let int_arr = arrow_array::Int64Array::from(values);
+    let data = unsafe {
+        int_arr
+            .into_data()
+            .into_builder()
+            .data_type(target.clone())
+            .build_unchecked()
+    };
+    Ok(Arc::new(arrow_array::make_array(data)) as ArrayRef)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -904,12 +917,13 @@ fn build_timestamp_tz_3field(
     tzoffset: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
-    _unit: TimeUnit,
     check_overflow: bool,
     target: DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
-    use arrow_array::builder::PrimitiveBuilder;
-    use arrow_array::types::TimestampNanosecondType;
+    let unit = match &target {
+        DataType::Timestamp(u, _) => *u,
+        _ => unreachable!("target must be Timestamp"),
+    };
 
     let len = epoch.len();
     let frac_to_ns: i128 = if scale <= 9 {
@@ -917,11 +931,11 @@ fn build_timestamp_tz_3field(
     } else {
         1
     };
-    let mut builder = PrimitiveBuilder::<TimestampNanosecondType>::with_capacity(len);
+    let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
 
     for i in 0..len {
         if struct_arr.is_null(i) {
-            builder.append_null();
+            values.push(None);
         } else {
             let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
             let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
@@ -938,12 +952,18 @@ fn build_timestamp_tz_3field(
             if check_overflow {
                 check_ns_overflow(utc_ns)?;
             }
-            builder.append_value(utc_ns as i64);
+            values.push(Some(ns_to_unit(utc_ns, unit)));
         }
     }
-    let ns_arr = builder.finish();
-    let intermediate: Arc<dyn Array> = Arc::new(ns_arr);
-    arrow_cast::cast(intermediate.as_ref(), &target)
+    let int_arr = arrow_array::Int64Array::from(values);
+    let data = unsafe {
+        int_arr
+            .into_data()
+            .into_builder()
+            .data_type(target.clone())
+            .build_unchecked()
+    };
+    Ok(Arc::new(arrow_array::make_array(data)) as ArrayRef)
 }
 
 impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
@@ -955,6 +975,9 @@ impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
             Err(e) => return Some(Err(e)),
         };
 
+        // check_overflow is intentionally false: overflow truncation is accepted
+        // for far-future/far-past timestamps at nanosecond precision. Callers
+        // that need strict overflow detection should use a separate validation step.
         let check_overflow = false;
 
         let adjusted_columns: std::result::Result<Vec<ArrayRef>, arrow_schema::ArrowError> = batch
