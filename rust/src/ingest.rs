@@ -405,12 +405,10 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
         });
     }
 
-    // DECIMAL
-    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
-        if let DataType::Decimal128(_, scale) = dt {
+    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>()
+        && let DataType::Decimal128(_, scale) = dt {
             return Ok(decimal128_to_str(a.value(row), *scale));
         }
-    }
 
     Err(Error::with_message_and_status(
         format!("unsupported ingest value type: {dt:?}"),
