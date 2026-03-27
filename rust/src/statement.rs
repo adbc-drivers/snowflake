@@ -852,13 +852,8 @@ fn build_timestamp_from_epoch_fraction(
         if struct_arr.is_null(i) {
             values.push(None);
         } else {
-            let ns: i128 = if epoch.value(i) >= 0 {
-                epoch.value(i) as i128 * 1_000_000_000
-                    + fraction.value(i) as i128 * frac_to_ns
-            } else {
-                epoch.value(i) as i128 * 1_000_000_000
-                    - fraction.value(i) as i128 * frac_to_ns
-            };
+            let ns: i128 = epoch.value(i) as i128 * 1_000_000_000
+                + fraction.value(i) as i128 * frac_to_ns;
             if check_overflow {
                 check_ns_overflow(ns)?;
             }
@@ -950,13 +945,8 @@ fn build_timestamp_tz_3field(
             let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
             let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
 
-            let epoch_ns: i128 = if epoch.value(i) >= 0 {
-                epoch.value(i) as i128 * 1_000_000_000
-                    + fraction.value(i) as i128 * frac_to_ns
-            } else {
-                epoch.value(i) as i128 * 1_000_000_000
-                    - fraction.value(i) as i128 * frac_to_ns
-            };
+            let epoch_ns: i128 = epoch.value(i) as i128 * 1_000_000_000
+                + fraction.value(i) as i128 * frac_to_ns;
 
             let utc_ns = epoch_ns - tz_offset_ns;
             if check_overflow {
@@ -1135,7 +1125,7 @@ fn arrow_value_to_sql_literal(arr: &dyn Array, row: usize) -> Result<String> {
     if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Float32Array>() {
         let v = a.value(row);
         return if v.is_finite() {
-            Ok(format!("{:?}", v as f64))
+            Ok(format!("{v:?}"))
         } else {
             Ok("NULL".to_string())
         };
