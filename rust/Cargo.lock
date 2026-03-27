@@ -10,6 +10,7 @@ dependencies = [
  "adbc_ffi",
  "arrow-array 57.3.0",
  "arrow-buffer 57.3.0",
+ "arrow-cast 57.3.0",
  "arrow-schema 57.3.0",
  "sf_core",
  "tokio",
@@ -82,27 +83,12 @@ dependencies = [
 
 [[package]]
 name = "anstream"
-version = "0.6.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a"
-dependencies = [
- "anstyle",
- "anstyle-parse 0.2.7",
- "anstyle-query",
- "anstyle-wincon",
- "colorchoice",
- "is_terminal_polyfill",
- "utf8parse",
-]
-
-[[package]]
-name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
 dependencies = [
  "anstyle",
- "anstyle-parse 1.0.0",
+ "anstyle-parse",
  "anstyle-query",
  "anstyle-wincon",
  "colorchoice",
@@ -115,15 +101,6 @@ name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
-
-[[package]]
-name = "anstyle-parse"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7644824f0aa2c7b9384579234ef10eb7efb6a0deb83f9630a49594dd9c15c2"
-dependencies = [
- "utf8parse",
-]
 
 [[package]]
 name = "anstyle-parse"
@@ -169,15 +146,15 @@ dependencies = [
  "arrow-arith",
  "arrow-array 56.2.0",
  "arrow-buffer 56.2.0",
- "arrow-cast",
+ "arrow-cast 56.2.0",
  "arrow-csv",
  "arrow-data 56.2.0",
  "arrow-ipc",
  "arrow-json",
- "arrow-ord",
+ "arrow-ord 56.2.0",
  "arrow-row",
  "arrow-schema 56.2.0",
- "arrow-select",
+ "arrow-select 56.2.0",
  "arrow-string",
 ]
 
@@ -262,7 +239,7 @@ dependencies = [
  "arrow-buffer 56.2.0",
  "arrow-data 56.2.0",
  "arrow-schema 56.2.0",
- "arrow-select",
+ "arrow-select 56.2.0",
  "atoi",
  "base64 0.22.1",
  "chrono",
@@ -273,13 +250,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-cast"
+version = "57.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "646bbb821e86fd57189c10b4fcdaa941deaf4181924917b0daa92735baa6ada5"
+dependencies = [
+ "arrow-array 57.3.0",
+ "arrow-buffer 57.3.0",
+ "arrow-data 57.3.0",
+ "arrow-ord 57.3.0",
+ "arrow-schema 57.3.0",
+ "arrow-select 57.3.0",
+ "atoi",
+ "base64 0.22.1",
+ "chrono",
+ "half",
+ "lexical-core",
+ "num-traits",
+ "ryu",
+]
+
+[[package]]
 name = "arrow-csv"
 version = "56.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa9bf02705b5cf762b6f764c65f04ae9082c7cfc4e96e0c33548ee3f67012eb"
 dependencies = [
  "arrow-array 56.2.0",
- "arrow-cast",
+ "arrow-cast 56.2.0",
  "arrow-schema 56.2.0",
  "chrono",
  "csv",
@@ -322,7 +320,7 @@ dependencies = [
  "arrow-buffer 56.2.0",
  "arrow-data 56.2.0",
  "arrow-schema 56.2.0",
- "arrow-select",
+ "arrow-select 56.2.0",
  "flatbuffers",
 ]
 
@@ -334,7 +332,7 @@ checksum = "88cf36502b64a127dc659e3b305f1d993a544eab0d48cce704424e62074dc04b"
 dependencies = [
  "arrow-array 56.2.0",
  "arrow-buffer 56.2.0",
- "arrow-cast",
+ "arrow-cast 56.2.0",
  "arrow-data 56.2.0",
  "arrow-schema 56.2.0",
  "chrono",
@@ -358,7 +356,20 @@ dependencies = [
  "arrow-buffer 56.2.0",
  "arrow-data 56.2.0",
  "arrow-schema 56.2.0",
- "arrow-select",
+ "arrow-select 56.2.0",
+]
+
+[[package]]
+name = "arrow-ord"
+version = "57.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7d8f1870e03d4cbed632959498bcc84083b5a24bded52905ae1695bd29da45b"
+dependencies = [
+ "arrow-array 57.3.0",
+ "arrow-buffer 57.3.0",
+ "arrow-data 57.3.0",
+ "arrow-schema 57.3.0",
+ "arrow-select 57.3.0",
 ]
 
 [[package]]
@@ -407,6 +418,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-select"
+version = "57.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68bf3e3efbd1278f770d67e5dc410257300b161b93baedb3aae836144edcaf4b"
+dependencies = [
+ "ahash",
+ "arrow-array 57.3.0",
+ "arrow-buffer 57.3.0",
+ "arrow-data 57.3.0",
+ "arrow-schema 57.3.0",
+ "num-traits",
+]
+
+[[package]]
 name = "arrow-string"
 version = "56.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -416,7 +441,7 @@ dependencies = [
  "arrow-buffer 56.2.0",
  "arrow-data 56.2.0",
  "arrow-schema 56.2.0",
- "arrow-select",
+ "arrow-select 56.2.0",
  "memchr",
  "num",
  "regex",
@@ -1079,7 +1104,7 @@ version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
 dependencies = [
- "anstream 1.0.0",
+ "anstream",
  "anstyle",
  "clap_lex",
  "strsim",
@@ -1105,9 +1130,9 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cmake"
-version = "0.1.57"
+version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
@@ -1441,9 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "env_filter"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a1c3cc8e57274ec99de65301228b537f1e4eedc1b8e0f9411c6caac8ae7308f"
+checksum = "32e90c2accc4b07a8456ea0debdc2e7587bdd890680d71173a15d4ae604f6eef"
 dependencies = [
  "log",
  "regex",
@@ -1451,11 +1476,11 @@ dependencies = [
 
 [[package]]
 name = "env_logger"
-version = "0.11.9"
+version = "0.11.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
+checksum = "0621c04f2196ac3f488dd583365b9c09be011a4ab8b9f37248ffcc8f6198b56a"
 dependencies = [
- "anstream 0.6.21",
+ "anstream",
  "anstyle",
  "env_filter",
  "jiff",
@@ -1481,7 +1506,7 @@ dependencies = [
 [[package]]
 name = "error_trace"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=66a816ec1d1adda899bd2607f5c83e7dd5838ad5#66a816ec1d1adda899bd2607f5c83e7dd5838ad5"
 dependencies = [
  "error_trace_derive",
  "snafu 0.8.9",
@@ -1490,7 +1515,7 @@ dependencies = [
 [[package]]
 name = "error_trace_derive"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=66a816ec1d1adda899bd2607f5c83e7dd5838ad5#66a816ec1d1adda899bd2607f5c83e7dd5838ad5"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -1599,6 +1624,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
+name = "futures"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1660,6 +1700,7 @@ version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -2193,9 +2234,9 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iri-string"
-version = "0.7.10"
+version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c91338f0783edbd6195decb37bae672fd3b165faffb89bf7b9e6942f8b1a731a"
+checksum = "d8e7418f59cc01c88316161279a7f665217ae316b388e58a0d10e29f54f1e5eb"
 dependencies = [
  "memchr",
  "serde",
@@ -2389,18 +2430,18 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
+checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "linux-keyutils"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "761e49ec5fd8a5a463f9b84e877c373d888935b71c6be78f3767fe2ae6bed18e"
+checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
 dependencies = [
  "bitflags",
  "libc",
@@ -2592,9 +2633,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "num-integer"
@@ -3068,7 +3109,7 @@ dependencies = [
 [[package]]
 name = "proto_generator"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=66a816ec1d1adda899bd2607f5c83e7dd5838ad5#66a816ec1d1adda899bd2607f5c83e7dd5838ad5"
 dependencies = [
  "clap",
  "env_logger",
@@ -3085,7 +3126,7 @@ dependencies = [
 [[package]]
 name = "proto_utils"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=66a816ec1d1adda899bd2607f5c83e7dd5838ad5#66a816ec1d1adda899bd2607f5c83e7dd5838ad5"
 
 [[package]]
 name = "quinn"
@@ -3387,7 +3428,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.9",
+ "rustls-webpki 0.103.10",
  "subtle",
  "zeroize",
 ]
@@ -3446,9 +3487,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3625,7 +3666,7 @@ dependencies = [
 [[package]]
 name = "sf_core"
 version = "0.0.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=080422e05fbd727f68d7c494e564ec625e1375d6#080422e05fbd727f68d7c494e564ec625e1375d6"
+source = "git+https://github.com/snowflakedb/universal-driver?rev=66a816ec1d1adda899bd2607f5c83e7dd5838ad5#66a816ec1d1adda899bd2607f5c83e7dd5838ad5"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3642,6 +3683,7 @@ dependencies = [
  "dirs",
  "error_trace",
  "flate2",
+ "futures",
  "glob",
  "hex",
  "html-escape",
