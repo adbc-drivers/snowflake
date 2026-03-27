@@ -143,10 +143,20 @@ fn cell_to_string(arr: &dyn Array, i: usize) -> Option<String> {
     // Some NUMBER(p,0) columns (like ordinal_position) arrive as Float64 in the
     // sf_core Arrow stream for metadata queries; truncate to integer string.
     if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Float64Array>() {
-        return Some((n.value(i) as i64).to_string());
+        let v = n.value(i);
+        return if v.is_finite() {
+            Some((v as i64).to_string())
+        } else {
+            None
+        };
     }
     if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Float32Array>() {
-        return Some((n.value(i) as i64).to_string());
+        let v = n.value(i);
+        return if v.is_finite() {
+            Some((v as i64).to_string())
+        } else {
+            None
+        };
     }
     // Snowflake NUMBER(p,0) columns (like ordinal_position) arrive as Decimal128
     // when sf_core applies high-precision type mapping.  Extract the integer part

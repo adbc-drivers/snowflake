@@ -357,7 +357,7 @@ fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
     }
     if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Date64Array>() {
         // Date64 stores milliseconds since epoch; divide to get days.
-        let days = a.value(row) / 86_400_000;
+        let days = a.value(row).div_euclid(86_400_000);
         return Ok(format!("'{}'::DATE", days_to_date(days)));
     }
 
