@@ -792,6 +792,7 @@ fn convert_timestamp_tz(
     }
 }
 
+#[allow(dead_code)]
 fn ns_to_unit(ns: i128, unit: TimeUnit) -> i64 {
     let divisor: i128 = match unit {
         TimeUnit::Second => 1_000_000_000,
@@ -817,7 +818,7 @@ fn build_timestamp_from_epoch_fraction(
     fraction: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
-    unit: TimeUnit,
+    _unit: TimeUnit,
     check_overflow: bool,
     target: DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
@@ -846,8 +847,7 @@ fn build_timestamp_from_epoch_fraction(
             if check_overflow {
                 check_ns_overflow(ns)?;
             }
-            let val = ns_to_unit(ns, unit);
-            builder.append_value(val);
+            builder.append_value(ns as i64);
         }
     }
     let ns_arr = builder.finish();
@@ -860,7 +860,7 @@ fn build_timestamp_tz_2field(
     tzoffset: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
-    unit: TimeUnit,
+    _unit: TimeUnit,
     check_overflow: bool,
     target: DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
@@ -889,7 +889,7 @@ fn build_timestamp_tz_2field(
             if check_overflow {
                 check_ns_overflow(utc_ns)?;
             }
-            builder.append_value(ns_to_unit(utc_ns, unit));
+            builder.append_value(utc_ns as i64);
         }
     }
     let ns_arr = builder.finish();
@@ -904,7 +904,7 @@ fn build_timestamp_tz_3field(
     tzoffset: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
-    unit: TimeUnit,
+    _unit: TimeUnit,
     check_overflow: bool,
     target: DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
@@ -938,7 +938,7 @@ fn build_timestamp_tz_3field(
             if check_overflow {
                 check_ns_overflow(utc_ns)?;
             }
-            builder.append_value(ns_to_unit(utc_ns, unit));
+            builder.append_value(utc_ns as i64);
         }
     }
     let ns_arr = builder.finish();
