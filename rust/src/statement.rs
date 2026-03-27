@@ -208,6 +208,9 @@ impl Statement {
                 let reader =
                     unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
                         .map_err(|e| {
+                            // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                            // does NOT call the stream's release callback, so reconstructing the
+                            // Box here is the only release path — no double-free risk.
                             drop(unsafe { Box::from_raw(raw) });
                             Error::with_message_and_status(e.to_string(), Status::IO)
                         })?;
@@ -320,6 +323,9 @@ impl adbc_core::Statement for Statement {
             Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
          let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
              .map_err(|e| {
+                 // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                 // does NOT call the stream's release callback, so reconstructing the
+                 // Box here is the only release path — no double-free risk.
                  drop(unsafe { Box::from_raw(raw) });
                  Error::with_message_and_status(e.to_string(), Status::IO)
              })?;
@@ -813,6 +819,8 @@ fn ns_to_unit(ns: i128, unit: TimeUnit) -> i64 {
         TimeUnit::Second => ns / 1_000_000_000,
         TimeUnit::Millisecond => ns / 1_000_000,
         TimeUnit::Microsecond => ns / 1_000,
+        // Intentional truncation: ns timestamps outside i64 range silently wrap.
+        // Callers that need strict overflow detection should pass check_overflow=true.
         TimeUnit::Nanosecond => ns,
     };
     val as i64
@@ -832,6 +840,7 @@ fn build_timestamp_from_epoch_fraction(
     };
 
     let len = epoch.len();
+    let scale = scale.clamp(0, 9);
     let frac_to_ns: i128 = if scale <= 9 {
         10i128.pow((9 - scale) as u32)
     } else {
@@ -926,6 +935,7 @@ fn build_timestamp_tz_3field(
     };
 
     let len = epoch.len();
+    let scale = scale.clamp(0, 9);
     let frac_to_ns: i128 = if scale <= 9 {
         10i128.pow((9 - scale) as u32)
     } else {
@@ -1627,6 +1637,40 @@ mod tests {
         let schema = Schema::new(vec![f]);
         let result = adjust_schema(&schema, false, TimeUnit::Microsecond);
         assert_eq!(result.field(0).data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+
+    #[test]
+    fn test_build_timestamp_tz_2field_year9999() {
+        use arrow_array::{Int64Array, Int32Array, StructArray};
+        use arrow_schema::Field as SchemaField;
+
+        let epoch_us: i64 = 253402300799000000; // 9999-12-31T23:59:59Z in microseconds
+        let epoch_arr = Int64Array::from(vec![epoch_us]);
+        let tz_arr = Int32Array::from(vec![1440i32]); // UTC
+
+        let fields = vec![
+            Arc::new(SchemaField::new("epoch", DataType::Int64, false)),
+            Arc::new(SchemaField::new("tz", DataType::Int32, false)),
+        ];
+        let struct_arr = StructArray::try_new(
+            fields.into(),
+            vec![Arc::new(epoch_arr) as ArrayRef, Arc::new(tz_arr) as ArrayRef],
+            None,
+        ).unwrap();
+
+        let epoch_col = struct_arr.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let tz_col = struct_arr.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+
+        let result = build_timestamp_tz_2field(
+            epoch_col, tz_col, &struct_arr, 6, false,
+            DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+        ).unwrap();
+
+        let ts = result
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), epoch_us, "year 9999 should round-trip as microseconds");
     }
 
 }
