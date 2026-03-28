@@ -368,11 +368,15 @@ impl adbc_core::Statement for Statement {
                     // release callback fires before the handle is reused.
                     let raw = Box::into_raw(result.stream)
                         as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-                    if let Ok(reader) =
-                        unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-                    {
-                        for _ in reader {} // consume all batches to trigger release
-                    }
+                    let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+                        .map_err(|e| {
+                            // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                            // does NOT call the stream's release callback, so reconstructing the
+                            // Box here is the only release path — no double-free risk.
+                            drop(unsafe { Box::from_raw(raw) });
+                            Error::with_message_and_status(e.to_string(), Status::IO)
+                        })?;
+                    for _ in reader {} // consume all batches to trigger release
                     total += result.rows_affected.unwrap_or(0);
                 }
             }
@@ -432,7 +436,13 @@ impl adbc_core::Statement for Statement {
         let raw =
             Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+            .map_err(|e| {
+                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                // does NOT call the stream's release callback, so reconstructing the
+                // Box here is the only release path — no double-free risk.
+                drop(unsafe { Box::from_raw(raw) });
+                Error::with_message_and_status(e.to_string(), Status::IO)
+            })?;
          // .schema() calls get_schema on the FFI stream without consuming any record batches.
          // Dropping the reader invokes the stream's release callback.
          Ok(adjust_schema(&reader.schema(), self.use_high_precision, self.timestamp_precision.time_unit()).as_ref().clone())
@@ -559,7 +569,8 @@ fn compute_target_type(field: &Field, use_high_precision: bool, ts_unit: TimeUni
         .metadata()
         .get("precision")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(38);
+        .unwrap_or(38)
+        .min(38);
 
     match logical_type {
         "FIXED" => {
@@ -678,8 +689,8 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                     }
                 } else if use_high_precision {
                     match col.data_type() {
-                        // Source is already Decimal128 — pass through as identity
-                        DataType::Decimal128(_, _) => Ok(col.clone()),
+                        // Source is already Decimal128 — cast to ensure target_type metadata is applied exactly
+                        DataType::Decimal128(_, _) => arrow_cast::cast(col.as_ref(), target_type),
                         // Source is Int64 (scaled integer) — convert to Decimal128(precision, scale)
                         // following Go's integerToDecimal128: cast Int64 → Decimal128(20,0),
                         // then reinterpret as Decimal128(precision, scale).
@@ -689,6 +700,10 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                                 &DataType::Decimal128(20, 0),
                             )?;
                             let data = intermediate.to_data();
+                            // Safety: Decimal128 and Decimal128(20,0) share identical 128-bit
+                            // buffer layouts, so this reinterpret is memory-safe.
+                            // Values that exceed target_type's precision are not validated here
+                            // and will silently overflow the declared precision.
                             let retyped = unsafe {
                                 data.into_builder()
                                     .data_type(target_type.clone())
@@ -851,8 +866,7 @@ fn ns_to_unit(ns: i128, unit: TimeUnit) -> i64 {
         TimeUnit::Second => ns / 1_000_000_000,
         TimeUnit::Millisecond => ns / 1_000_000,
         TimeUnit::Microsecond => ns / 1_000,
-        // Intentional truncation: ns timestamps outside i64 range silently wrap.
-        // Callers that need strict overflow detection should pass check_overflow=true.
+        // Intentional truncation: ns outside i64::MIN..=i64::MAX wraps. Use check_overflow=true in the caller to reject out-of-range values *before* this cast is reached.
         TimeUnit::Nanosecond => ns,
     };
     val as i64
@@ -873,11 +887,7 @@ fn build_timestamp_from_epoch_fraction(
 
     let len = epoch.len();
     let scale = scale.clamp(0, 9);
-    let frac_to_ns: i128 = if scale <= 9 {
-        10i128.pow((9 - scale) as u32)
-    } else {
-        1
-    };
+    let frac_to_ns: i128 = 10i128.pow((9 - scale) as u32);
 
     let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
     for i in 0..len {
@@ -963,11 +973,7 @@ fn build_timestamp_tz_3field(
 
     let len = epoch.len();
     let scale = scale.clamp(0, 9);
-    let frac_to_ns: i128 = if scale <= 9 {
-        10i128.pow((9 - scale) as u32)
-    } else {
-        1
-    };
+    let frac_to_ns: i128 = 10i128.pow((9 - scale) as u32);
     let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
 
     for i in 0..len {
@@ -1782,6 +1788,88 @@ mod tests {
             .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), epoch_us, "year 9999 should round-trip as microseconds");
+    }
+
+    #[test]
+    fn test_build_timestamp_from_epoch_fraction_negative_scale_clamps() {
+        let epoch = arrow_array::Int64Array::from(vec![0i64]);
+        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let fields = vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+        ];
+        let struct_arr = arrow_array::StructArray::from(vec![
+            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
+            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
+        ]);
+        let result = build_timestamp_from_epoch_fraction(
+            &epoch, &fraction, &struct_arr, -1, false,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        );
+        assert!(result.is_ok(), "scale=-1 should not panic");
+    }
+
+    #[test]
+    fn test_build_timestamp_from_epoch_fraction_oversized_scale_clamps() {
+        let epoch = arrow_array::Int64Array::from(vec![0i64]);
+        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let fields = vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+        ];
+        let struct_arr = arrow_array::StructArray::from(vec![
+            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
+            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
+        ]);
+        let result = build_timestamp_from_epoch_fraction(
+            &epoch, &fraction, &struct_arr, 10, false,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        );
+        assert!(result.is_ok(), "scale=10 should not panic");
+    }
+
+    #[test]
+    fn test_build_timestamp_tz_3field_negative_scale_clamps() {
+        let epoch = arrow_array::Int64Array::from(vec![0i64]);
+        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
+        let fields = vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+            Field::new("tzoffset", DataType::Int32, true),
+        ];
+        let struct_arr = arrow_array::StructArray::from(vec![
+            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
+            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
+            (Arc::new(fields[2].clone()), Arc::new(tzoffset.clone()) as ArrayRef),
+        ]);
+        let result = build_timestamp_tz_3field(
+            &epoch, &fraction, &tzoffset, &struct_arr, -1, false,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        );
+        assert!(result.is_ok(), "scale=-1 should not panic");
+    }
+
+    #[test]
+    fn test_build_timestamp_tz_3field_oversized_scale_clamps() {
+        let epoch = arrow_array::Int64Array::from(vec![0i64]);
+        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
+        let fields = vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+            Field::new("tzoffset", DataType::Int32, true),
+        ];
+        let struct_arr = arrow_array::StructArray::from(vec![
+            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
+            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
+            (Arc::new(fields[2].clone()), Arc::new(tzoffset.clone()) as ArrayRef),
+        ]);
+        let result = build_timestamp_tz_3field(
+            &epoch, &fraction, &tzoffset, &struct_arr, 10, false,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        );
+        assert!(result.is_ok(), "scale=10 should not panic");
     }
 
 }
