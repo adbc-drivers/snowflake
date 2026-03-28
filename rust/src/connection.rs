@@ -134,7 +134,13 @@ impl Connection {
         let raw =
             Box::into_raw(exec_result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let mut reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+            .map_err(|e| {
+                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                // does NOT call the stream's release callback, so reconstructing the
+                // Box here is the only release path — no double-free risk.
+                drop(unsafe { Box::from_raw(raw) });
+                Error::with_message_and_status(e.to_string(), Status::IO)
+            })?;
 
         use arrow_array::cast::AsArray;
         let batch = reader
@@ -491,7 +497,13 @@ impl adbc_core::Connection for Connection {
         let raw =
             Box::into_raw(exec_result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+            .map_err(|e| {
+                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                // does NOT call the stream's release callback, so reconstructing the
+                // Box here is the only release path — no double-free risk.
+                drop(unsafe { Box::from_raw(raw) });
+                Error::with_message_and_status(e.to_string(), Status::IO)
+            })?;
 
         let mut fields: Vec<Field> = Vec::new();
         for batch in reader {

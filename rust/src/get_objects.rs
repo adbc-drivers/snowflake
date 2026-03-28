@@ -104,7 +104,13 @@ fn run_query(conn: &Connection, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
 
     let raw = Box::into_raw(exec.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
     let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
+        .map_err(|e| {
+            // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+            // does NOT call the stream's release callback, so reconstructing the
+            // Box here is the only release path — no double-free risk.
+            drop(unsafe { Box::from_raw(raw) });
+            Error::with_message_and_status(e.to_string(), Status::IO)
+        })?;
 
     let mut rows = Vec::new();
     for batch_res in reader {
