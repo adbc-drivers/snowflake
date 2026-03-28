@@ -368,15 +368,19 @@ impl adbc_core::Statement for Statement {
                     // release callback fires before the handle is reused.
                     let raw = Box::into_raw(result.stream)
                         as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-                    let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-                        .map_err(|e| {
+                    match unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) } {
+                        Ok(reader) => {
+                            for _ in reader {} // consume all batches to trigger release
+                        }
+                        Err(e) => {
                             // Safety: Arrow's C Data Interface specifies that on failure, from_raw
                             // does NOT call the stream's release callback, so reconstructing the
                             // Box here is the only release path — no double-free risk.
                             drop(unsafe { Box::from_raw(raw) });
-                            Error::with_message_and_status(e.to_string(), Status::IO)
-                        })?;
-                    for _ in reader {} // consume all batches to trigger release
+                            // Log the error but continue the loop to drain remaining streams
+                            eprintln!("Warning: failed to initialize FFI reader for draining: {}", e);
+                        }
+                    }
                     total += result.rows_affected.unwrap_or(0);
                 }
             }
@@ -1792,8 +1796,8 @@ mod tests {
 
     #[test]
     fn test_build_timestamp_from_epoch_fraction_negative_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![0i64]);
-        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let epoch = arrow_array::Int64Array::from(vec![1i64]);
+        let fraction = arrow_array::Int32Array::from(vec![5i32]);
         let fields = vec![
             Field::new("epoch", DataType::Int64, true),
             Field::new("fraction", DataType::Int32, true),
@@ -1805,14 +1809,17 @@ mod tests {
         let result = build_timestamp_from_epoch_fraction(
             &epoch, &fraction, &struct_arr, -1, false,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
-        );
-        assert!(result.is_ok(), "scale=-1 should not panic");
+        ).expect("should not panic");
+        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        // scale -1 clamps to 0. frac_to_ns = 10^9.
+        // ns = 1 * 10^9 + 5 * 10^9 = 6000000000.
+        assert_eq!(ts.value(0), 6_000_000_000);
     }
 
     #[test]
     fn test_build_timestamp_from_epoch_fraction_oversized_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![0i64]);
-        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let epoch = arrow_array::Int64Array::from(vec![1i64]);
+        let fraction = arrow_array::Int32Array::from(vec![5i32]);
         let fields = vec![
             Field::new("epoch", DataType::Int64, true),
             Field::new("fraction", DataType::Int32, true),
@@ -1824,14 +1831,17 @@ mod tests {
         let result = build_timestamp_from_epoch_fraction(
             &epoch, &fraction, &struct_arr, 10, false,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
-        );
-        assert!(result.is_ok(), "scale=10 should not panic");
+        ).expect("should not panic");
+        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        // scale 10 clamps to 9. frac_to_ns = 10^0 = 1.
+        // ns = 1 * 10^9 + 5 * 1 = 1000000005.
+        assert_eq!(ts.value(0), 1_000_000_005);
     }
 
     #[test]
     fn test_build_timestamp_tz_3field_negative_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![0i64]);
-        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let epoch = arrow_array::Int64Array::from(vec![1i64]);
+        let fraction = arrow_array::Int32Array::from(vec![5i32]);
         let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
         let fields = vec![
             Field::new("epoch", DataType::Int64, true),
@@ -1846,14 +1856,15 @@ mod tests {
         let result = build_timestamp_tz_3field(
             &epoch, &fraction, &tzoffset, &struct_arr, -1, false,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-        );
-        assert!(result.is_ok(), "scale=-1 should not panic");
+        ).expect("should not panic");
+        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        assert_eq!(ts.value(0), 6_000_000_000);
     }
 
     #[test]
     fn test_build_timestamp_tz_3field_oversized_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![0i64]);
-        let fraction = arrow_array::Int32Array::from(vec![0i32]);
+        let epoch = arrow_array::Int64Array::from(vec![1i64]);
+        let fraction = arrow_array::Int32Array::from(vec![5i32]);
         let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
         let fields = vec![
             Field::new("epoch", DataType::Int64, true),
@@ -1868,8 +1879,9 @@ mod tests {
         let result = build_timestamp_tz_3field(
             &epoch, &fraction, &tzoffset, &struct_arr, 10, false,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-        );
-        assert!(result.is_ok(), "scale=10 should not panic");
+        ).expect("should not panic");
+        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        assert_eq!(ts.value(0), 1_000_000_005);
     }
 
 }
