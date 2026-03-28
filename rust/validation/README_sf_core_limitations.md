@@ -30,7 +30,7 @@ This document serves as a reference for future improvements that should ideally 
 ## 4. Scaled Integers (`FIXED` type)
 **Issue:** `sf_core` returns `FIXED` (e.g., `NUMBER(10,3)`) columns as raw `Int64` buffers representing the scaled integer (e.g., `12345` for `12.345`). The Arrow FFI stream schema only reports `Int64` with custom metadata (`logicalType: "FIXED"`, `scale: "3"`).
 **Impact:** The ADBC driver has to implement a complex `ConvertingReader` to interpret this metadata and manually cast `Int64` to `Float64` (dividing by `10^scale`) or `Decimal128`.
-**Workaround in Driver:** We intercept the Arrow FFI stream, read the metadata, and perform a secondary pass using `arrow_cast::cast` + manual division (for `Float64`) or unsafe metadata rewriting (`build_unchecked`) for `Decimal128`.
+**Workaround in Driver:** We intercept the Arrow FFI stream, read the metadata, and perform a secondary pass using `arrow_cast::cast` + manual division (for `Float64`) or unchecked precision reinterpretation via `build_unchecked` (values that exceed `target_type`'s precision are not rejected) for `Decimal128`.
 **Ideal Fix:**
 - **sf_core:** Automatically apply the scale. If `sf_core` detects a `FIXED` type with `scale > 0`, it should export the FFI stream as `Decimal128` natively. Arrow already supports `Decimal128Type`, which perfectly represents Snowflake's scaled integers without needing consumer-side interpretation.
 
