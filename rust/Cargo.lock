@@ -12,6 +12,7 @@ dependencies = [
  "arrow-buffer 57.3.0",
  "arrow-cast 57.3.0",
  "arrow-schema 57.3.0",
+ "log",
  "sf_core",
  "tokio",
 ]
