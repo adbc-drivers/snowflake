@@ -378,7 +378,7 @@ impl adbc_core::Statement for Statement {
                             // Box here is the only release path — no double-free risk.
                             drop(unsafe { Box::from_raw(raw) });
                             // Log the error but continue the loop to drain remaining streams
-                            eprintln!("Warning: failed to initialize FFI reader for draining: {}", e);
+                            log::warn!("failed to initialize FFI reader for draining: {}", e);
                         }
                     }
                     total += result.rows_affected.unwrap_or(0);
