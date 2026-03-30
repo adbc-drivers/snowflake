@@ -65,7 +65,7 @@ jobs:
     name: "Test/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
@@ -189,7 +189,7 @@ jobs:
     name: "Validate/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           # I think we only need to test one platform, but we can change that later
@@ -333,7 +333,7 @@ jobs:
     needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
