@@ -1,0 +1,41 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0"
+]
+
+[error_trace.clarify]
+license = "Apache-2.0"
+[[error_trace.clarify.files]]
+path = "../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[error_trace_derive.clarify]
+license = "Apache-2.0"
+[[error_trace_derive.clarify.files]]
+path = "../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[proto_generator.clarify]
+license = "Apache-2.0"
+[[proto_generator.clarify.files]]
+path = "../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[proto_utils.clarify]
+license = "Apache-2.0"
+[[proto_utils.clarify.files]]
+path = "../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[sf_core.clarify]
+license = "Apache-2.0"
+[[sf_core.clarify.files]]
+path = "../LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
