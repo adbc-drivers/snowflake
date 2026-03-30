@@ -70,6 +70,7 @@ jobs:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }          
+          # Disabled temporarily due to openssl-sys build failures on Windows
           # - { platform: windows, arch: amd64, runner: windows-latest }
     environment: Snowflake CI
     env:
@@ -339,6 +340,7 @@ jobs:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }          
           - { platform: macos, arch: arm64, runner: macos-latest }
+          # Disabled temporarily due to openssl-sys build failures on Windows
           # - { platform: windows, arch: amd64, runner: windows-latest }
     permissions:
       contents: read
@@ -486,6 +488,7 @@ jobs:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }
+          # Disabled temporarily due to openssl-sys build failures on Windows
           # - { platform: windows, arch: amd64, runner: windows-latest }
     steps:
       # for now, install dbc from main
