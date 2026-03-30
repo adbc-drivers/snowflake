@@ -36,6 +36,8 @@ use sf_core::config::settings::Setting;
 use crate::connection::Connection;
 use crate::driver::{Inner, TimestampPrecision};
 
+use percent_encoding::percent_decode_str;
+
 /// Convert an ADBC OptionDatabase key + OptionValue into an sf_core (param_name, Setting) pair.
 /// Returns None for the "uri" key (handled by apply_uri separately).
 /// Returns Err for keys with invalid values (e.g. non-numeric port).
@@ -335,20 +337,24 @@ impl Database {
 
         if let Some(info) = user_info {
             if let Some(colon) = info.find(':') {
-                let user = &info[..colon];
-                let pass = &info[colon + 1..];
+                let user = percent_decode_str(&info[..colon]).decode_utf8_lossy();
+                let pass = percent_decode_str(&info[colon + 1..]).decode_utf8_lossy();
                 if !user.is_empty() {
                     self.set_option(
                         OptionDatabase::Username,
-                        OptionValue::String(user.to_string()),
+                        OptionValue::String(user.into_owned()),
                     )?;
                 }
                 self.set_option(
                     OptionDatabase::Password,
-                    OptionValue::String(pass.to_string()),
+                    OptionValue::String(pass.into_owned()),
                 )?;
             } else if !info.is_empty() {
-                self.set_option(OptionDatabase::Username, OptionValue::String(info))?;
+                let user = percent_decode_str(&info).decode_utf8_lossy();
+                self.set_option(
+                    OptionDatabase::Username, 
+                    OptionValue::String(user.into_owned())
+                )?;
             }
         }
 
