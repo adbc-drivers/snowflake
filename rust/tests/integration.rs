@@ -328,6 +328,14 @@ fn test_precision_options_defaults_and_round_trip() {
 /// With high precision disabled:  NUMBER(10,0) → Int64, NUMBER(15,2) → Float64.
 #[test]
 fn test_high_precision_get_table_schema() {
+    let table_name = format!(
+        "ADBC_RUST_PRECISION_TEST_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
     let Some(mut conn) = make_connection() else {
         eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
@@ -336,10 +344,10 @@ fn test_high_precision_get_table_schema() {
     // Create a permanent table so a second connection can also DESC it.
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query(
-            "CREATE OR REPLACE TABLE adbc_rust_precision_test \
-             (INT_COL NUMBER(10,0), DEC_COL NUMBER(15,2))",
-        )
+        stmt.set_sql_query(&format!(
+            "CREATE OR REPLACE TABLE {} (INT_COL NUMBER(10,0), DEC_COL NUMBER(15,2))",
+            table_name
+        ))
         .unwrap();
         stmt.execute_update().expect("create precision test table");
     }
@@ -347,7 +355,7 @@ fn test_high_precision_get_table_schema() {
     // Snowflake folds unquoted identifiers to uppercase.
     // ── high precision (default: enabled) ────────────────────────────────────
     let schema_hp = conn
-        .get_table_schema(None, None, "ADBC_RUST_PRECISION_TEST")
+        .get_table_schema(None, None, &table_name)
         .expect("get_table_schema high precision");
 
     assert_eq!(
@@ -372,7 +380,7 @@ fn test_high_precision_get_table_schema() {
     let conn_lp = db_lp.new_connection().expect("low-precision connection");
 
     let schema_lp = conn_lp
-        .get_table_schema(None, None, "ADBC_RUST_PRECISION_TEST")
+        .get_table_schema(None, None, &table_name)
         .expect("get_table_schema low precision");
 
     assert_eq!(
@@ -389,7 +397,7 @@ fn test_high_precision_get_table_schema() {
     // Cleanup
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_precision_test")
+        stmt.set_sql_query(&format!("DROP TABLE IF EXISTS {}", table_name))
             .unwrap();
         stmt.execute_update().expect("drop precision test table");
     }
@@ -403,6 +411,14 @@ fn test_high_precision_get_table_schema() {
 ///                              TIMESTAMP_TZ  → Timestamp(Microsecond, UTC).
 #[test]
 fn test_timestamp_precision_get_table_schema() {
+    let table_name = format!(
+        "ADBC_RUST_TS_PRECISION_TEST_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
     let Some(mut conn) = make_connection() else {
         eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
@@ -422,7 +438,7 @@ fn test_timestamp_precision_get_table_schema() {
     // Snowflake folds unquoted identifiers to uppercase.
     // ── nanoseconds (default) ─────────────────────────────────────────────────
     let schema_ns = conn
-        .get_table_schema(None, None, "ADBC_RUST_TS_PRECISION_TEST")
+        .get_table_schema(None, None, &table_name)
         .expect("get_table_schema nanoseconds");
 
     assert_eq!(
@@ -449,7 +465,7 @@ fn test_timestamp_precision_get_table_schema() {
     let conn_us = db_us.new_connection().expect("microsecond connection");
 
     let schema_us = conn_us
-        .get_table_schema(None, None, "ADBC_RUST_TS_PRECISION_TEST")
+        .get_table_schema(None, None, &table_name)
         .expect("get_table_schema microseconds");
 
     assert_eq!(
@@ -466,7 +482,7 @@ fn test_timestamp_precision_get_table_schema() {
     // Cleanup
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_ts_precision_test")
+        stmt.set_sql_query(&format!("DROP TABLE IF EXISTS {}", table_name))
             .unwrap();
         stmt.execute_update().expect("drop ts precision test table");
     }

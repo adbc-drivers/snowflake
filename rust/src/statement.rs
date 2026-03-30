@@ -410,6 +410,19 @@ impl adbc_core::Statement for Statement {
         // DDL statements (CREATE, DROP, ALTER, TRUNCATE) return a non-meaningful row
         // count from Snowflake (typically 1 for "success"). Per the ADBC convention,
         // return None (-1 in Python) for DDL so callers can distinguish it from DML.
+        let raw =
+            Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+
+        match unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) } {
+            Ok(reader) => for _ in reader {},
+
+            Err(e) => {
+                drop(unsafe { Box::from_raw(raw) });
+
+                log::warn!("failed to initialize FFI reader for draining: {}", e);
+            }
+        }
+
         let rows = if is_ddl(self.query.as_deref().unwrap_or("")) {
             None
         } else {
