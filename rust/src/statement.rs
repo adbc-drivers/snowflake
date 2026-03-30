@@ -226,15 +226,15 @@ impl Statement {
             }
         }
 
-         let schema = result_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
-         Ok(Box::new(ConvertingReader::new(
-             ConcatReader {
-                 batches: all_batches.into_iter(),
-                 schema,
-             },
-             self.use_high_precision,
-             self.timestamp_precision.time_unit(),
-         )))
+        let schema = result_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+        Ok(Box::new(ConvertingReader::new(
+            ConcatReader {
+                batches: all_batches.into_iter(),
+                schema,
+            },
+            self.use_high_precision,
+            self.timestamp_precision.time_unit(),
+        )))
     }
 
     fn apply_query_tag(&self) -> Result<()> {
@@ -321,15 +321,19 @@ impl adbc_core::Statement for Statement {
         // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
         let raw =
             Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-             .map_err(|e| {
-                 // Safety: Arrow's C Data Interface specifies that on failure, from_raw
-                 // does NOT call the stream's release callback, so reconstructing the
-                 // Box here is the only release path — no double-free risk.
-                 drop(unsafe { Box::from_raw(raw) });
-                 Error::with_message_and_status(e.to_string(), Status::IO)
-             })?;
-         Ok(Box::new(ConvertingReader::new(reader, self.use_high_precision, self.timestamp_precision.time_unit())))
+        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+            .map_err(|e| {
+                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
+                // does NOT call the stream's release callback, so reconstructing the
+                // Box here is the only release path — no double-free risk.
+                drop(unsafe { Box::from_raw(raw) });
+                Error::with_message_and_status(e.to_string(), Status::IO)
+            })?;
+        Ok(Box::new(ConvertingReader::new(
+            reader,
+            self.use_high_precision,
+            self.timestamp_precision.time_unit(),
+        )))
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -368,7 +372,8 @@ impl adbc_core::Statement for Statement {
                     // release callback fires before the handle is reused.
                     let raw = Box::into_raw(result.stream)
                         as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-                    match unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) } {
+                    match unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+                    {
                         Ok(reader) => {
                             for _ in reader {} // consume all batches to trigger release
                         }
@@ -447,9 +452,15 @@ impl adbc_core::Statement for Statement {
                 drop(unsafe { Box::from_raw(raw) });
                 Error::with_message_and_status(e.to_string(), Status::IO)
             })?;
-         // .schema() calls get_schema on the FFI stream without consuming any record batches.
-         // Dropping the reader invokes the stream's release callback.
-         Ok(adjust_schema(&reader.schema(), self.use_high_precision, self.timestamp_precision.time_unit()).as_ref().clone())
+        // .schema() calls get_schema on the FFI stream without consuming any record batches.
+        // Dropping the reader invokes the stream's release callback.
+        Ok(adjust_schema(
+            &reader.schema(),
+            self.use_high_precision,
+            self.timestamp_precision.time_unit(),
+        )
+        .as_ref()
+        .clone())
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -647,12 +658,7 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
         let logical_types: Vec<String> = orig_schema
             .fields()
             .iter()
-            .map(|f| {
-                f.metadata()
-                    .get("logicalType")
-                    .cloned()
-                    .unwrap_or_default()
-            })
+            .map(|f| f.metadata().get("logicalType").cloned().unwrap_or_default())
             .collect();
         let scales: Vec<i64> = orig_schema
             .fields()
@@ -699,10 +705,8 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                         // following Go's integerToDecimal128: cast Int64 → Decimal128(20,0),
                         // then reinterpret as Decimal128(precision, scale).
                         _ => {
-                            let intermediate = arrow_cast::cast(
-                                col.as_ref(),
-                                &DataType::Decimal128(20, 0),
-                            )?;
+                            let intermediate =
+                                arrow_cast::cast(col.as_ref(), &DataType::Decimal128(20, 0))?;
                             let data = intermediate.to_data();
                             // Safety: Decimal128 and Decimal128(20,0) share identical 128-bit
                             // buffer layouts, so this reinterpret is memory-safe.
@@ -742,13 +746,9 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
             "TIME" => arrow_cast::cast(col.as_ref(), target_type),
             "REAL" => arrow_cast::cast(col.as_ref(), &DataType::Float64),
             "TIMESTAMP_NTZ" => convert_timestamp_ntz(col, scale, ts_unit, check_overflow, None),
-            "TIMESTAMP_LTZ" => convert_timestamp_ntz(
-                col,
-                scale,
-                ts_unit,
-                check_overflow,
-                Some(Arc::from("UTC")),
-            ),
+            "TIMESTAMP_LTZ" => {
+                convert_timestamp_ntz(col, scale, ts_unit, check_overflow, Some(Arc::from("UTC")))
+            }
             "TIMESTAMP_TZ" => convert_timestamp_tz(col, scale, ts_unit, check_overflow),
             _ => match col.data_type() {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 => {
@@ -783,10 +783,9 @@ fn convert_timestamp_ntz(
         }
         DataType::Struct(_) => {
             use arrow_array::{Int32Array, Int64Array, StructArray};
-            let struct_arr = col
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| arrow_schema::ArrowError::CastError("expected StructArray".into()))?;
+            let struct_arr = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                arrow_schema::ArrowError::CastError("expected StructArray".into())
+            })?;
             let epoch = struct_arr
                 .column(0)
                 .as_any()
@@ -802,7 +801,14 @@ fn convert_timestamp_ntz(
                     arrow_schema::ArrowError::CastError("expected Int32 fraction".into())
                 })?;
 
-            build_timestamp_from_epoch_fraction(epoch, fraction, struct_arr, scale, check_overflow, target)
+            build_timestamp_from_epoch_fraction(
+                epoch,
+                fraction,
+                struct_arr,
+                scale,
+                check_overflow,
+                target,
+            )
         }
         _ => arrow_cast::cast(col.as_ref(), &target),
     }
@@ -819,10 +825,9 @@ fn convert_timestamp_tz(
     let unit = timestamp_target_unit(scale, ts_unit);
     let target = DataType::Timestamp(unit, Some(Arc::from("UTC")));
 
-    let struct_arr = col
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| arrow_schema::ArrowError::CastError("expected StructArray for TIMESTAMP_TZ".into()))?;
+    let struct_arr = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        arrow_schema::ArrowError::CastError("expected StructArray for TIMESTAMP_TZ".into())
+    })?;
 
     let num_fields = struct_arr.num_columns();
     let epoch = struct_arr
@@ -851,7 +856,15 @@ fn convert_timestamp_tz(
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| arrow_schema::ArrowError::CastError("expected Int32 timezone".into()))?;
 
-        build_timestamp_tz_3field(epoch, fraction, tzoffset, struct_arr, scale, check_overflow, target)
+        build_timestamp_tz_3field(
+            epoch,
+            fraction,
+            tzoffset,
+            struct_arr,
+            scale,
+            check_overflow,
+            target,
+        )
     }
 }
 
@@ -898,8 +911,8 @@ fn build_timestamp_from_epoch_fraction(
         if struct_arr.is_null(i) {
             values.push(None);
         } else {
-            let ns: i128 = epoch.value(i) as i128 * 1_000_000_000
-                + fraction.value(i) as i128 * frac_to_ns;
+            let ns: i128 =
+                epoch.value(i) as i128 * 1_000_000_000 + fraction.value(i) as i128 * frac_to_ns;
             if check_overflow {
                 check_ns_overflow(ns)?;
             }
@@ -940,7 +953,8 @@ fn build_timestamp_tz_2field(
             let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
             let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
 
-            let epoch_ns: i128 = epoch.value(i) as i128 * 10i128.pow((9u32).saturating_sub(scale.clamp(0, 9) as u32));
+            let epoch_ns: i128 = epoch.value(i) as i128
+                * 10i128.pow((9u32).saturating_sub(scale.clamp(0, 9) as u32));
 
             let utc_ns = epoch_ns - tz_offset_ns;
             if check_overflow {
@@ -987,8 +1001,8 @@ fn build_timestamp_tz_3field(
             let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
             let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
 
-            let epoch_ns: i128 = epoch.value(i) as i128 * 1_000_000_000
-                + fraction.value(i) as i128 * frac_to_ns;
+            let epoch_ns: i128 =
+                epoch.value(i) as i128 * 1_000_000_000 + fraction.value(i) as i128 * frac_to_ns;
 
             let utc_ns = epoch_ns - tz_offset_ns;
             if check_overflow {
@@ -1143,8 +1157,8 @@ fn arrow_value_to_sql_literal(arr: &dyn Array, row: usize) -> Result<String> {
         return Ok("NULL".to_string());
     }
     use arrow_array::{
-        BooleanArray, Date32Array, Int16Array, Int32Array, Int64Array,
-        LargeStringArray, StringArray,
+        BooleanArray, Date32Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
+        StringArray,
     };
     macro_rules! num_lit {
         ($T:ty) => {
@@ -1471,8 +1485,7 @@ mod tests {
         use arrow_array::Int16Array;
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int16, true)]));
         let arr = Int16Array::from(vec![Some(10i16), None, Some(30)]);
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
         let reader = ConcatReader {
             batches: vec![batch].into_iter(),
             schema,
@@ -1505,7 +1518,7 @@ mod tests {
 
     #[test]
     fn test_converting_reader_multiple_batches_different_widths() {
-        use arrow_array::{Int32Array, Int8Array};
+        use arrow_array::{Int8Array, Int32Array};
         struct TwoBatchReader {
             batches: std::vec::IntoIter<RecordBatch>,
             schema: Arc<Schema>,
@@ -1522,16 +1535,12 @@ mod tests {
             }
         }
 
-        let declared_schema =
-            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let declared_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
 
         let schema_i8 = Arc::new(Schema::new(vec![Field::new("v", DataType::Int8, false)]));
         let schema_i32 = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let batch1 = RecordBatch::try_new(
-            schema_i8,
-            vec![Arc::new(Int8Array::from(vec![1i8, 2]))],
-        )
-        .unwrap();
+        let batch1 =
+            RecordBatch::try_new(schema_i8, vec![Arc::new(Int8Array::from(vec![1i8, 2]))]).unwrap();
         let batch2 = RecordBatch::try_new(
             schema_i32,
             vec![Arc::new(Int32Array::from(vec![100i32, 200]))],
@@ -1585,7 +1594,10 @@ mod tests {
         let f = make_field_with_meta("t", DataType::Int32, "TIME", "3");
         let schema = Schema::new(vec![f]);
         let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Time32(TimeUnit::Millisecond));
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Time32(TimeUnit::Millisecond)
+        );
     }
 
     #[test]
@@ -1593,7 +1605,10 @@ mod tests {
         let f = make_field_with_meta("t", DataType::Int64, "TIME", "9");
         let schema = Schema::new(vec![f]);
         let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Time64(TimeUnit::Nanosecond));
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Time64(TimeUnit::Nanosecond)
+        );
     }
 
     #[test]
@@ -1617,19 +1632,22 @@ mod tests {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
         let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
     }
 
     #[test]
     fn test_adjust_schema_timestamp_ltz_is_utc() {
-         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_LTZ", "6");
-         let schema = Schema::new(vec![f]);
-         let result = adjust_schema(&schema, false, TimeUnit::Microsecond);
-         assert_eq!(
-             result.field(0).data_type(),
-             &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
-         );
-     }
+        let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_LTZ", "6");
+        let schema = Schema::new(vec![f]);
+        let result = adjust_schema(&schema, false, TimeUnit::Microsecond);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
+        );
+    }
 
     #[test]
     fn test_converting_reader_fixed_scale2_produces_float64() {
@@ -1640,11 +1658,18 @@ mod tests {
             vec![Arc::new(arrow_array::Int64Array::from(vec![12345i64, 255]))],
         )
         .unwrap();
-        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let reader = ConcatReader {
+            batches: vec![batch].into_iter(),
+            schema,
+        };
         let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
-        let col = out.column(0).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
         assert!((col.value(0) - 123.45).abs() < 1e-9);
         assert!((col.value(1) - 2.55).abs() < 1e-9);
     }
@@ -1655,14 +1680,26 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![f]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![12345i64, -255]))],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![
+                12345i64, -255,
+            ]))],
         )
         .unwrap();
-        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let reader = ConcatReader {
+            batches: vec![batch].into_iter(),
+            schema,
+        };
         let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
         let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Decimal128(10, 2));
-        let col = out.column(0).as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::Decimal128(10, 2)
+        );
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         // 12345 with scale 2 = 123.45
         assert_eq!(col.value(0), 12345i128);
         // -255 with scale 2 = -2.55
@@ -1678,7 +1715,10 @@ mod tests {
             vec![Arc::new(arrow_array::Int64Array::from(vec![42i64]))],
         )
         .unwrap();
-        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let reader = ConcatReader {
+            batches: vec![batch].into_iter(),
+            schema,
+        };
         let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
@@ -1697,11 +1737,21 @@ mod tests {
             )],
         )
         .unwrap();
-        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let reader = ConcatReader {
+            batches: vec![batch].into_iter(),
+            schema,
+        };
         let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
         let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Decimal128(10, 2));
-        let col = out.column(0).as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::Decimal128(10, 2)
+        );
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .unwrap();
         assert_eq!(col.value(0), 12345i128);
         assert_eq!(col.value(1), -255i128);
     }
@@ -1719,11 +1769,18 @@ mod tests {
             )],
         )
         .unwrap();
-        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let reader = ConcatReader {
+            batches: vec![batch].into_iter(),
+            schema,
+        };
         let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
-        let col = out.column(0).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
         assert!((col.value(0) - 123.45).abs() < 1e-9);
     }
 
@@ -1737,7 +1794,10 @@ mod tests {
             vec![Arc::new(arrow_array::Int64Array::from(vec![epoch_ns]))],
         )
         .unwrap();
-        let reader = ConcatReader { batches: vec![batch].into_iter(), schema };
+        let reader = ConcatReader {
+            batches: vec![batch].into_iter(),
+            schema,
+        };
         let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
         let out = cr.next().unwrap().unwrap();
         assert_eq!(
@@ -1757,12 +1817,15 @@ mod tests {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
         let result = adjust_schema(&schema, false, TimeUnit::Microsecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     #[test]
     fn test_build_timestamp_tz_2field_year9999() {
-        use arrow_array::{Int64Array, Int32Array, StructArray};
+        use arrow_array::{Int32Array, Int64Array, StructArray};
         use arrow_schema::Field as SchemaField;
 
         let epoch_us: i64 = 253402300799000000; // 9999-12-31T23:59:59Z in microseconds
@@ -1775,23 +1838,44 @@ mod tests {
         ];
         let struct_arr = StructArray::try_new(
             fields.into(),
-            vec![Arc::new(epoch_arr) as ArrayRef, Arc::new(tz_arr) as ArrayRef],
+            vec![
+                Arc::new(epoch_arr) as ArrayRef,
+                Arc::new(tz_arr) as ArrayRef,
+            ],
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let epoch_col = struct_arr.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let tz_col = struct_arr.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let epoch_col = struct_arr
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let tz_col = struct_arr
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
 
         let result = build_timestamp_tz_2field(
-            epoch_col, tz_col, &struct_arr, 6, false,
+            epoch_col,
+            tz_col,
+            &struct_arr,
+            6,
+            false,
             DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
-        ).unwrap();
+        )
+        .unwrap();
 
         let ts = result
             .as_any()
             .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
             .unwrap();
-        assert_eq!(ts.value(0), epoch_us, "year 9999 should round-trip as microseconds");
+        assert_eq!(
+            ts.value(0),
+            epoch_us,
+            "year 9999 should round-trip as microseconds"
+        );
     }
 
     #[test]
@@ -1803,14 +1887,28 @@ mod tests {
             Field::new("fraction", DataType::Int32, true),
         ];
         let struct_arr = arrow_array::StructArray::from(vec![
-            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
-            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
+            (
+                Arc::new(fields[0].clone()),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(fields[1].clone()),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
         ]);
         let result = build_timestamp_from_epoch_fraction(
-            &epoch, &fraction, &struct_arr, -1, false,
+            &epoch,
+            &fraction,
+            &struct_arr,
+            -1,
+            false,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
-        ).expect("should not panic");
-        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        )
+        .expect("should not panic");
+        let ts = result
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .unwrap();
         // scale -1 clamps to 0. frac_to_ns = 10^9.
         // ns = 1 * 10^9 + 5 * 10^9 = 6000000000.
         assert_eq!(ts.value(0), 6_000_000_000);
@@ -1825,14 +1923,28 @@ mod tests {
             Field::new("fraction", DataType::Int32, true),
         ];
         let struct_arr = arrow_array::StructArray::from(vec![
-            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
-            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
+            (
+                Arc::new(fields[0].clone()),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(fields[1].clone()),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
         ]);
         let result = build_timestamp_from_epoch_fraction(
-            &epoch, &fraction, &struct_arr, 10, false,
+            &epoch,
+            &fraction,
+            &struct_arr,
+            10,
+            false,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
-        ).expect("should not panic");
-        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        )
+        .expect("should not panic");
+        let ts = result
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .unwrap();
         // scale 10 clamps to 9. frac_to_ns = 10^0 = 1.
         // ns = 1 * 10^9 + 5 * 1 = 1000000005.
         assert_eq!(ts.value(0), 1_000_000_005);
@@ -1849,15 +1961,33 @@ mod tests {
             Field::new("tzoffset", DataType::Int32, true),
         ];
         let struct_arr = arrow_array::StructArray::from(vec![
-            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
-            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
-            (Arc::new(fields[2].clone()), Arc::new(tzoffset.clone()) as ArrayRef),
+            (
+                Arc::new(fields[0].clone()),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(fields[1].clone()),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(fields[2].clone()),
+                Arc::new(tzoffset.clone()) as ArrayRef,
+            ),
         ]);
         let result = build_timestamp_tz_3field(
-            &epoch, &fraction, &tzoffset, &struct_arr, -1, false,
+            &epoch,
+            &fraction,
+            &tzoffset,
+            &struct_arr,
+            -1,
+            false,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-        ).expect("should not panic");
-        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        )
+        .expect("should not panic");
+        let ts = result
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .unwrap();
         assert_eq!(ts.value(0), 6_000_000_000);
     }
 
@@ -1872,16 +2002,33 @@ mod tests {
             Field::new("tzoffset", DataType::Int32, true),
         ];
         let struct_arr = arrow_array::StructArray::from(vec![
-            (Arc::new(fields[0].clone()), Arc::new(epoch.clone()) as ArrayRef),
-            (Arc::new(fields[1].clone()), Arc::new(fraction.clone()) as ArrayRef),
-            (Arc::new(fields[2].clone()), Arc::new(tzoffset.clone()) as ArrayRef),
+            (
+                Arc::new(fields[0].clone()),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(fields[1].clone()),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(fields[2].clone()),
+                Arc::new(tzoffset.clone()) as ArrayRef,
+            ),
         ]);
         let result = build_timestamp_tz_3field(
-            &epoch, &fraction, &tzoffset, &struct_arr, 10, false,
+            &epoch,
+            &fraction,
+            &tzoffset,
+            &struct_arr,
+            10,
+            false,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-        ).expect("should not panic");
-        let ts = result.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap();
+        )
+        .expect("should not panic");
+        let ts = result
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .unwrap();
         assert_eq!(ts.value(0), 1_000_000_005);
     }
-
 }

@@ -399,36 +399,37 @@ fn collect(
         };
         let key = (cat.clone(), sch.clone());
         if let Some(tables) = tables_by_key.get_mut(&key)
-            && let Some(table) = tables.iter_mut().find(|t| &t.name == tbl) {
-                let nullable_str = row[7].clone();
-                let nullable_int = nullable_str.as_deref().map(|s| {
-                    if s.eq_ignore_ascii_case("YES") {
-                        1i16
-                    } else {
-                        0
-                    }
-                });
-                let ordinal = {
-                    let c = col_counter
-                        .entry((cat.clone(), sch.clone(), tbl.clone()))
-                        .or_insert(0);
-                    *c += 1;
-                    *c
-                };
-                table.columns.push(ColEntry {
-                    name: col_name.clone(),
-                    ordinal_position: ordinal,
-                    remarks: row[5].clone(),
-                    xdbc_type_name: row[6].clone(),
-                    xdbc_column_size: row[8].as_deref().and_then(|s| s.parse().ok()),
-                    xdbc_char_octet_length: row[9].as_deref().and_then(|s| s.parse().ok()),
-                    xdbc_decimal_digits: row[10].as_deref().and_then(|s| s.parse().ok()),
-                    xdbc_num_prec_radix: row[11].as_deref().and_then(|s| s.parse().ok()),
-                    xdbc_nullable: nullable_int,
-                    xdbc_is_nullable: nullable_str,
-                    xdbc_datetime_sub: row[12].as_deref().and_then(|s| s.parse().ok()),
-                });
-            }
+            && let Some(table) = tables.iter_mut().find(|t| &t.name == tbl)
+        {
+            let nullable_str = row[7].clone();
+            let nullable_int = nullable_str.as_deref().map(|s| {
+                if s.eq_ignore_ascii_case("YES") {
+                    1i16
+                } else {
+                    0
+                }
+            });
+            let ordinal = {
+                let c = col_counter
+                    .entry((cat.clone(), sch.clone(), tbl.clone()))
+                    .or_insert(0);
+                *c += 1;
+                *c
+            };
+            table.columns.push(ColEntry {
+                name: col_name.clone(),
+                ordinal_position: ordinal,
+                remarks: row[5].clone(),
+                xdbc_type_name: row[6].clone(),
+                xdbc_column_size: row[8].as_deref().and_then(|s| s.parse().ok()),
+                xdbc_char_octet_length: row[9].as_deref().and_then(|s| s.parse().ok()),
+                xdbc_decimal_digits: row[10].as_deref().and_then(|s| s.parse().ok()),
+                xdbc_num_prec_radix: row[11].as_deref().and_then(|s| s.parse().ok()),
+                xdbc_nullable: nullable_int,
+                xdbc_is_nullable: nullable_str,
+                xdbc_datetime_sub: row[12].as_deref().and_then(|s| s.parse().ok()),
+            });
+        }
     }
 
     Ok(assemble(catalog_names, schemas_by_cat, tables_by_key))
