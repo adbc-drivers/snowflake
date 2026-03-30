@@ -426,10 +426,10 @@ fn test_timestamp_precision_get_table_schema() {
 
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query(
-            "CREATE OR REPLACE TABLE adbc_rust_ts_precision_test \
-             (NTZ_COL TIMESTAMP_NTZ, TZ_COL TIMESTAMP_TZ)",
-        )
+        stmt.set_sql_query(&format!(
+            "CREATE OR REPLACE TABLE {} (NTZ_COL TIMESTAMP_NTZ, TZ_COL TIMESTAMP_TZ)",
+            table_name
+        ))
         .unwrap();
         stmt.execute_update()
             .expect("create ts precision test table");
