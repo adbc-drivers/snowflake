@@ -352,8 +352,8 @@ impl Database {
             } else if !info.is_empty() {
                 let user = percent_decode_str(&info).decode_utf8_lossy();
                 self.set_option(
-                    OptionDatabase::Username, 
-                    OptionValue::String(user.into_owned())
+                    OptionDatabase::Username,
+                    OptionValue::String(user.into_owned()),
                 )?;
             }
         }
