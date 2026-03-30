@@ -456,6 +456,11 @@ jobs:
           pattern: "drivers-*"
           path: "~/drivers"
 
+      - name: Install cargo-about
+        run: |
+          mkdir -p ~/.cargo/bin
+          curl -LsSf https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/cargo-about-0.8.4-x86_64-unknown-linux-musl.tar.gz | tar zxf - -C ~/.cargo/bin --strip-components=1 cargo-about-0.8.4-x86_64-unknown-linux-musl/cargo-about
+
       - name: Generate packages
         working-directory: rust
         run: |
