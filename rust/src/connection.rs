@@ -807,11 +807,7 @@ mod tests {
     #[test]
     fn snowflake_type_timestamp_ntz_scale6_with_ns_unit_returns_us() {
         assert_eq!(
-            snowflake_type_to_arrow(
-                "TIMESTAMP_NTZ(6)",
-                true,
-                arrow_schema::TimeUnit::Nanosecond
-            ),
+            snowflake_type_to_arrow("TIMESTAMP_NTZ(6)", true, arrow_schema::TimeUnit::Nanosecond),
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
         );
     }
@@ -831,11 +827,7 @@ mod tests {
     #[test]
     fn snowflake_type_timestamp_ltz_scale6_with_ns_unit_returns_us() {
         assert_eq!(
-            snowflake_type_to_arrow(
-                "TIMESTAMP_LTZ(6)",
-                true,
-                arrow_schema::TimeUnit::Nanosecond
-            ),
+            snowflake_type_to_arrow("TIMESTAMP_LTZ(6)", true, arrow_schema::TimeUnit::Nanosecond),
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
         );
     }

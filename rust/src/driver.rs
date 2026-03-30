@@ -24,9 +24,9 @@
 use std::sync::Arc;
 
 use adbc_core::{
+    Optionable,
     error::{Error, Result, Status},
     options::{OptionDatabase, OptionValue},
-    Optionable,
 };
 use arrow_schema::TimeUnit;
 use sf_core::apis::database_driver_v1::DatabaseDriverV1;
