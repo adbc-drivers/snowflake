@@ -209,6 +209,12 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		tableType = []string{"TABLE"}
 	}
 
+	// Optimized path: read SHOW TERSE results directly instead of through
+	// RESULT_SCAN SQL templates, reducing Snowflake round-trips from 3-4 to 1-2.
+	if reader, err = c.getObjectsDirectPath(ctx, depth, catalog, dbSchema, tableName, tableType, hasViews, hasTables); reader != nil || err != nil {
+		return
+	}
+
 	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
 	queryFile := queryTemplateGetObjectsAll
 	switch depth {
