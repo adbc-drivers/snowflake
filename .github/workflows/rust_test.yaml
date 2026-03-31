@@ -466,6 +466,11 @@ jobs:
         run: |
           pixi install
 
+          echo "=== Debug: listing ~/drivers ==="
+          ls -laR ~/drivers/ || echo "~/drivers does not exist"
+          echo "=== Debug: glob expansion ==="
+          echo ~/drivers/drivers-*-*/
+
           pixi run adbc-gen-package \
             --name snowflake \
             --root $(pwd) \
@@ -474,7 +479,7 @@ jobs:
             -o ~/packages \
             ~/drivers/drivers-*-*/
 
-          ls ~/packages
+          ls -laR ~/packages
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
         with:
