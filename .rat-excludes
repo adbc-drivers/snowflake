@@ -16,12 +16,22 @@
 .gitmodules
 */go.sum
 */pixi.lock
+*/Cargo.lock
 */*.csproj
 */*.sln
 go/license.tpl
 go/validation/queries/*/*.json
 go/validation/queries/*/*.sql
+<<<<<<< HEAD
 csharp/test/AdbcDrivers.Snowflake.Interop.Tests/Resources/snowflakeconfig.json
 csharp/src/AdbcDrivers.Snowflake/CHANGELOG.md
 .release-please-manifest.json
 release-please-config.json
+=======
+rust/license.tpl
+rust/validation/queries/*/*.json
+rust/validation/queries/*/*.sql
+rust/validation/queries/*/*/*.json
+rust/validation/queries/*/*/*.sql
+csharp/test/Interop/Resources/snowflakeconfig.json
+>>>>>>> 0a634fb (fix licenses)
