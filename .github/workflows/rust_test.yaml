@@ -69,7 +69,7 @@ jobs:
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
-          - { platform: macos, arch: arm64, runner: macos-latest }          
+          - { platform: macos, arch: arm64, runner: macos-latest }
           # Disabled temporarily due to openssl-sys build failures on Windows
           # - { platform: windows, arch: amd64, runner: windows-latest }
     environment: Snowflake CI
@@ -260,7 +260,7 @@ jobs:
             source .env.test
           fi
           set +a
-          pixi run adbc-make build DEBUG=true VERBOSE=true DRIVER=snowflake IMPL_LANG=rust BUILD_TAGS=minicore_disabled          
+          pixi run adbc-make build DEBUG=true VERBOSE=true DRIVER=snowflake IMPL_LANG=rust BUILD_TAGS=minicore_disabled
 
       - name: Start Test Dependencies
         # Can't use Docker on macOS AArch64 runners, and windows containers
@@ -276,7 +276,7 @@ jobs:
               exit 1
             fi
           fi
-      
+
       - name: Validate
         if: runner.os == 'Linux'
         env:
@@ -338,7 +338,7 @@ jobs:
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
-          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }          
+          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
           - { platform: macos, arch: arm64, runner: macos-latest }
           # Disabled temporarily due to openssl-sys build failures on Windows
           # - { platform: windows, arch: amd64, runner: windows-latest }
