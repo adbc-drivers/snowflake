@@ -248,7 +248,7 @@ func showObjType(tableType []string) string {
 
 // execShowTables executes a SHOW TERSE command for tables/objects/views
 // and reads the results directly into a slice.
-func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pattern *string, suffix string) ([]tableEntry, error) {
+func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pattern *string, suffix string) (entries []tableEntry, err error) {
 	query := "SHOW TERSE /* ADBC:getObjects */ " + objType
 	query = addLike(query, pattern)
 	query += suffix
@@ -261,7 +261,9 @@ func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pat
 		}
 		return nil, errToAdbcErr(adbc.StatusIO, err)
 	}
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 
 	return readTableEntries(rows)
 }
@@ -312,7 +314,7 @@ func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
 }
 
 // execShowSchemas executes a SHOW TERSE SCHEMAS command and reads the results directly.
-func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) ([]schemaEntry, error) {
+func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) (entries []schemaEntry, err error) {
 	query := "SHOW TERSE /* ADBC:getObjects */ " + objSchemas
 	query = addLike(query, pattern)
 	query += suffix
@@ -325,7 +327,9 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 		}
 		return nil, errToAdbcErr(adbc.StatusIO, err)
 	}
-	defer rows.Close()
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 
 	return readSchemaEntries(rows)
 }
