@@ -5,10 +5,10 @@ During the implementation and validation of the Rust ADBC Snowflake driver, we e
 This document serves as a reference for future improvements that should ideally be made upstream in `sf_core` or Snowflake itself.
 
 ## 1. Arrow IPC Format and `client_app_id`
-**Issue:** Snowflake's backend determines the default `queryResultFormat` (Arrow IPC vs JSON rowset) based on the `CLIENT_APP_ID` field sent during the login request. Unrecognized client IDs fall back to JSON rowset. 
+**Issue:** Snowflake's backend determines the default `queryResultFormat` (Arrow IPC vs JSON rowset) based on the `CLIENT_APP_ID` field sent during the login request. Unrecognized client IDs fall back to JSON rowset.
 **Impact:** JSON rowset format truncates `FLOAT`/`REAL` values to ~10 significant digits (losing IEEE 754 double precision) and converts `DBL_MAX` to `inf`.
 **Workaround in Driver:** The driver currently omits overriding `client_app_id` (leaving it as `sf_core`'s default `"PythonConnector"`). This tricks Snowflake into recognizing the client and returning true Arrow IPC payloads with full-precision floats.
-**Ideal Fix:** 
+**Ideal Fix:**
 - **Snowflake backend:** Honor `ALTER SESSION SET QUERY_RESULT_FORMAT = 'ARROW_FORCE'` uniformly, regardless of `CLIENT_APP_ID`.
 - **sf_core:** Expose a native way to request Arrow format reliably without depending on a specific `CLIENT_APP_ID`, or ensure that custom client IDs can explicitly opt into Arrow format.
 
@@ -16,12 +16,12 @@ This document serves as a reference for future improvements that should ideally 
 **Issue:** When binding `Float64` parameters, Snowflake relies on string representation if using standard substitution. The Go driver (`gosnowflake`) formats float64 bind parameters with `FormatFloat(..., 32)` (float32 precision, ~7 significant digits), permanently truncating `3.141592653589793` to `"3.1415927"`.
 **Impact:** Test expectations written for the Go driver expect truncated bind values.
 **Workaround in Driver:** The Rust driver uses `format!("{v:?}")` for `Float64` (preserving full precision). For `Float32`, it avoids casting to `f64` first to prevent precision expansion (e.g. `3.14159` → `3.141590118408203`), preserving exact float32 semantics.
-**Ideal Fix:** 
+**Ideal Fix:**
 - **Go Driver / gosnowflake:** Stop truncating float64 bind parameters to 32-bit precision.
 - **sf_core:** Implement native Arrow batch binding (via the Arrow IPC streaming endpoint) rather than relying on SQL string substitution for bind parameters.
 
 ## 3. Timestamp Decoding (Epoch + Fraction)
-**Issue:** `sf_core` decodes `TIMESTAMP_NTZ`/`TIMESTAMP_TZ` columns as a struct containing `epoch` (seconds, Int64) and `fraction` (nanoseconds, Int32/Int64). For pre-1970 timestamps (negative epochs), Snowflake uses floor division (e.g., `-9223372037` seconds + `145224192` nanoseconds), meaning the fraction is always positive. 
+**Issue:** `sf_core` decodes `TIMESTAMP_NTZ`/`TIMESTAMP_TZ` columns as a struct containing `epoch` (seconds, Int64) and `fraction` (nanoseconds, Int32/Int64). For pre-1970 timestamps (negative epochs), Snowflake uses floor division (e.g., `-9223372037` seconds + `145224192` nanoseconds), meaning the fraction is always positive.
 **Impact:** Calculating total nanoseconds requires careful sign handling. If the fraction is subtracted when the epoch is negative (standard C-style truncation logic), the resulting date is off by ~1 second.
 **Workaround in Driver:** The `ConvertingReader` must explicitly add the fraction regardless of the epoch's sign: `epoch * 1_000_000_000 + fraction * frac_to_ns`.
 **Ideal Fix:**
@@ -38,7 +38,7 @@ This document serves as a reference for future improvements that should ideally 
 **Issue:** If `ArrowArrayStreamReader::from_raw` fails on an FFI stream exported by `sf_core`, the Arrow C Data Interface specification states that the release callback is *not* called.
 **Impact:** If the driver doesn't handle the error, the `Box::into_raw` pointer leaks.
 **Workaround in Driver:** We catch the error in `map_err`, reconstruct the `Box` using `Box::from_raw`, and explicitly `drop` it.
-**Ideal Fix:** 
+**Ideal Fix:**
 - **Arrow Crate:** Provide a safer abstraction for FFI stream consumption that guarantees cleanup on failure.
 
 ## 6. Timezone Handling in Arrow IPC
