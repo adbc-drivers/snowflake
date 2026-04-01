@@ -33,6 +33,21 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
+// decimalToString converts an arrow Decimal128 or Decimal256 value to its string
+// representation using the type's scale for proper formatting.
+func decimalToString(field arrow.Field, col arrow.Array, index int) string {
+	switch c := col.(type) {
+	case *array.Decimal128:
+		dt := field.Type.(*arrow.Decimal128Type)
+		return c.Value(index).ToString(dt.Scale)
+	case *array.Decimal256:
+		dt := field.Type.(*arrow.Decimal256Type)
+		return c.Value(index).ToString(dt.Scale)
+	default:
+		panic(fmt.Sprintf("decimalToString called with non-decimal type: %T", col))
+	}
+}
+
 func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []driver.NamedValue) ([]driver.NamedValue, error) {
 	// see goTypeToSnowflake in gosnowflake
 	// technically, snowflake can bind an array of values at once, but
@@ -92,6 +107,41 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 		case *array.LargeString:
 			params[i].Value = sql.NullString{
 				String: column.Value(index),
+				Valid:  column.IsValid(index),
+			}
+		case *array.Timestamp:
+			tsType := field.Type.(*arrow.TimestampType)
+			toTime, err := tsType.GetToTimeFunc()
+			if err != nil {
+				return nil, adbc.Error{
+					Code: adbc.StatusInvalidArgument,
+					Msg:  fmt.Sprintf("[Snowflake] Invalid timezone for bind param '%s': %s", field.Name, err),
+				}
+			}
+			params[i].Value = sql.NullTime{
+				Time:  toTime(column.Value(index)),
+				Valid: column.IsValid(index),
+			}
+		case *array.Binary:
+			if column.IsValid(index) {
+				params[i].Value = column.Value(index)
+			} else {
+				params[i].Value = nil
+			}
+		case *array.LargeBinary:
+			if column.IsValid(index) {
+				params[i].Value = column.Value(index)
+			} else {
+				params[i].Value = nil
+			}
+		case *array.Decimal128:
+			params[i].Value = sql.NullString{
+				String: decimalToString(field, rawColumn, index),
+				Valid:  column.IsValid(index),
+			}
+		case *array.Decimal256:
+			params[i].Value = sql.NullString{
+				String: decimalToString(field, rawColumn, index),
 				Valid:  column.IsValid(index),
 			}
 		default:
