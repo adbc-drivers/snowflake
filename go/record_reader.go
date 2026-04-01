@@ -69,20 +69,21 @@ func getRecTransformer(sc *arrow.Schema, tr []colTransformer) recordTransformer 
 			err  error
 			cols = make([]arrow.Array, r.NumCols())
 		)
+		defer func() {
+			for _, col := range cols {
+				if col != nil {
+					col.Release()
+				}
+			}
+		}()
+
 		for i, col := range r.Columns() {
 			if cols[i], err = tr[i](ctx, col); err != nil {
-				for j := range i {
-					cols[j].Release()
-				}
 				return nil, errToAdbcErr(adbc.StatusInternal, err)
 			}
 		}
 
-		rec := array.NewRecordBatch(sc, cols, r.NumRows())
-		for _, col := range cols {
-			col.Release()
-		}
-		return rec, nil
+		return array.NewRecordBatch(sc, cols, r.NumRows()), nil
 	}
 }
 
