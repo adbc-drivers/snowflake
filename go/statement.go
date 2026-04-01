@@ -67,7 +67,7 @@ type statement struct {
 	targetCatalog  string
 	targetDbSchema string
 	ingestMode     string
-	ingestOptions  *ingestOptions
+	ingestOptions  ingestOptions
 	queryTag       string
 
 	bound      arrow.RecordBatch

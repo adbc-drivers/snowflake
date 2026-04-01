@@ -365,9 +365,10 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 		fields[i] = arrow.Field{
 			Name:     srcMeta.Name,
 			Nullable: srcMeta.Nullable,
-			Metadata: arrow.MetadataFrom(map[string]string{
-				MetadataKeySnowflakeType: srcMeta.Type,
-			}),
+			Metadata: arrow.NewMetadata(
+				[]string{MetadataKeySnowflakeType},
+				[]string{srcMeta.Type},
+			),
 		}
 		switch srcMeta.Type {
 		case "fixed":

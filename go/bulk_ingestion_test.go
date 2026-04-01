@@ -44,7 +44,7 @@ func TestIngestBatchedParquetWithFileLimit(t *testing.T) {
 	defer mem.AssertSize(t, 0)
 
 	ingestOpts := DefaultIngestOptions()
-	parquetProps, arrowProps := newWriterProps(mem, ingestOpts)
+	parquetProps, arrowProps := newWriterProps(mem, &ingestOpts)
 
 	nCols := 3
 	nRecs := 10

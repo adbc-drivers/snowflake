@@ -48,15 +48,31 @@ import (
 const (
 	defaultStatementQueueSize  = 100
 	defaultPrefetchConcurrency = 5
-
-	queryTemplateGetObjectsAll           = "get_objects_all.sql"
-	queryTemplateGetObjectsDbSchemas     = "get_objects_dbschemas.sql"
-	queryTemplateGetObjectsTables        = "get_objects_tables.sql"
-	queryTemplateGetObjectsTerseCatalogs = "get_objects_terse_catalogs.sql"
 )
 
 //go:embed queries/*
 var queryTemplates embed.FS
+
+// queryTemplateCache caches the embedded SQL templates as strings at init
+// time to avoid repeated fs.ReadFile + []byte→string conversion per call.
+var queryTemplateCache map[string]string
+
+func init() {
+	names := []string{
+		"get_objects_all.sql",
+		"get_objects_dbschemas.sql",
+		"get_objects_tables.sql",
+		"get_objects_terse_catalogs.sql",
+	}
+	queryTemplateCache = make(map[string]string, len(names))
+	for _, name := range names {
+		data, err := fs.ReadFile(queryTemplates, path.Join("queries", name))
+		if err != nil {
+			panic("failed to read embedded query template " + name + ": " + err.Error())
+		}
+		queryTemplateCache[name] = string(data)
+	}
+}
 
 type snowflakeConn interface {
 	driver.Conn
@@ -210,20 +226,20 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 	}
 
 	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
-	queryFile := queryTemplateGetObjectsAll
+	queryFile := "get_objects_all.sql"
 	switch depth {
 	case adbc.ObjectDepthCatalogs:
-		queryFile = queryTemplateGetObjectsTerseCatalogs
+		queryFile = "get_objects_terse_catalogs.sql"
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 	case adbc.ObjectDepthDBSchemas:
-		queryFile = queryTemplateGetObjectsDbSchemas
+		queryFile = "get_objects_dbschemas.sql"
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
 			catalog, dbSchema, tableName, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 	case adbc.ObjectDepthTables:
-		queryFile = queryTemplateGetObjectsTables
+		queryFile = "get_objects_tables.sql"
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
 			catalog, dbSchema, tableName, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
@@ -293,11 +309,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			catalog, dbSchema, tableName, &tableQueryID)
 	}
 
-	var queryBytes []byte
-	queryBytes, err = fs.ReadFile(queryTemplates, path.Join("queries", queryFile))
-	if err != nil {
-		return nil, err
-	}
+	query := queryTemplateCache[queryFile]
 
 	// Need constraint subqueries to complete before we can query GetObjects
 	if err = gQueryIDs.Wait(); err != nil {
@@ -330,7 +342,6 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		}
 	}
 
-	query := string(queryBytes)
 	var rows driver.Rows
 	rows, err = conn.QueryContext(ctx, query, nvargs)
 	if err != nil {
@@ -532,13 +543,13 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 	if isnull == "Y" {
 		field.Nullable = true
 	}
-	md := make(map[string]string)
-	md["DATA_TYPE"] = typ
-	md["PRIMARY_KEY"] = primary
+	keys := []string{"DATA_TYPE", "PRIMARY_KEY"}
+	vals := []string{typ, primary}
 	if comment.Valid {
-		md["COMMENT"] = comment.String
+		keys = append(keys, "COMMENT")
+		vals = append(vals, comment.String)
 	}
-	field.Metadata = arrow.MetadataFrom(md)
+	field.Metadata = arrow.NewMetadata(keys, vals)
 
 	paren := strings.Index(typ, "(")
 	if paren == -1 {
@@ -639,8 +650,8 @@ func (c *connectionImpl) getStringQuery(query string) (value string, err error) 
 		}
 	}
 
-	dest := make([]driver.Value, 1)
-	err = result.Next(dest)
+	var dest [1]driver.Value
+	err = result.Next(dest[:])
 	if err == io.EOF {
 		return "", adbc.Error{
 			Msg:  "[Snowflake] Internal query returned no rows",
@@ -688,7 +699,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	var (
 		name, typ, isnull, primary string
 		comment                    sql.NullString
-		fields                     = []arrow.Field{}
+		fields                     []arrow.Field
 	)
 
 	// columns are:
@@ -755,7 +766,6 @@ func (c *connectionImpl) Rollback(_ context.Context) error {
 
 // NewStatement initializes a new statement object tied to this connection
 func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
-	defaultIngestOptions := DefaultIngestOptions()
 	stmtBase := driverbase.NewStatementImplBase(c.Base(), c.ErrorHelper)
 	stmt := &statement{
 		StatementImplBase:     stmtBase,
@@ -765,7 +775,7 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 		prefetchConcurrency:   defaultPrefetchConcurrency,
 		useHighPrecision:      c.useHighPrecision,
 		maxTimestampPrecision: c.maxTimestampPrecision,
-		ingestOptions:         defaultIngestOptions,
+		ingestOptions:         DefaultIngestOptions(),
 	}
 	return driverbase.NewStatement(stmt), nil
 }
