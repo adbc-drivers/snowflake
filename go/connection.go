@@ -26,12 +26,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"embed"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
-	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -50,29 +48,17 @@ const (
 	defaultPrefetchConcurrency = 5
 )
 
-//go:embed queries/*
-var queryTemplates embed.FS
+//go:embed queries/get_objects_all.sql
+var queryGetObjectsAll string
 
-// queryTemplateCache caches the embedded SQL templates as strings at init
-// time to avoid repeated fs.ReadFile + []byte→string conversion per call.
-var queryTemplateCache map[string]string
+//go:embed queries/get_objects_dbschemas.sql
+var queryGetObjectsDbSchemas string
 
-func init() {
-	names := []string{
-		"get_objects_all.sql",
-		"get_objects_dbschemas.sql",
-		"get_objects_tables.sql",
-		"get_objects_terse_catalogs.sql",
-	}
-	queryTemplateCache = make(map[string]string, len(names))
-	for _, name := range names {
-		data, err := fs.ReadFile(queryTemplates, path.Join("queries", name))
-		if err != nil {
-			panic("failed to read embedded query template " + name + ": " + err.Error())
-		}
-		queryTemplateCache[name] = string(data)
-	}
-}
+//go:embed queries/get_objects_tables.sql
+var queryGetObjectsTables string
+
+//go:embed queries/get_objects_terse_catalogs.sql
+var queryGetObjectsTerseCatalogs string
 
 type snowflakeConn interface {
 	driver.Conn
@@ -226,20 +212,20 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 	}
 
 	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
-	queryFile := "get_objects_all.sql"
+	query := queryGetObjectsAll
 	switch depth {
 	case adbc.ObjectDepthCatalogs:
-		queryFile = "get_objects_terse_catalogs.sql"
+		query = queryGetObjectsTerseCatalogs
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 	case adbc.ObjectDepthDBSchemas:
-		queryFile = "get_objects_dbschemas.sql"
+		query = queryGetObjectsDbSchemas
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
 			catalog, dbSchema, tableName, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 	case adbc.ObjectDepthTables:
-		queryFile = "get_objects_tables.sql"
+		query = queryGetObjectsTables
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
 			catalog, dbSchema, tableName, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
@@ -308,8 +294,6 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
 			catalog, dbSchema, tableName, &tableQueryID)
 	}
-
-	query := queryTemplateCache[queryFile]
 
 	// Need constraint subqueries to complete before we can query GetObjects
 	if err = gQueryIDs.Wait(); err != nil {
