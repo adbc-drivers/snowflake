@@ -33,12 +33,16 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
-func convertArrowToNamedValue(batch arrow.RecordBatch, index int) ([]driver.NamedValue, error) {
+func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []driver.NamedValue) ([]driver.NamedValue, error) {
 	// see goTypeToSnowflake in gosnowflake
 	// technically, snowflake can bind an array of values at once, but
 	// only for INSERT, so we can't take advantage of that without
 	// analyzing the query ourselves
-	params := make([]driver.NamedValue, batch.NumCols())
+	if cap(params) >= int(batch.NumCols()) {
+		params = params[:batch.NumCols()]
+	} else {
+		params = make([]driver.NamedValue, batch.NumCols())
+	}
 	for i, field := range batch.Schema().Fields() {
 		rawColumn := batch.Column(i)
 		params[i].Ordinal = i + 1
@@ -104,6 +108,7 @@ type snowflakeBindReader struct {
 	doQuery      func([]driver.NamedValue) (array.RecordReader, error)
 	currentBatch arrow.RecordBatch
 	nextIndex    int64
+	params       []driver.NamedValue
 	// may be nil if we bound only a batch
 	stream array.RecordReader
 }
@@ -152,7 +157,8 @@ func (r *snowflakeBindReader) NextParams() ([]driver.NamedValue, error) {
 		}
 	}
 
-	params, err := convertArrowToNamedValue(r.currentBatch, int(r.nextIndex))
+	params, err := convertArrowToNamedValue(r.currentBatch, int(r.nextIndex), r.params)
+	r.params = params
 	r.nextIndex++
 	return params, err
 }

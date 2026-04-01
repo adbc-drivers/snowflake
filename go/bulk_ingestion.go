@@ -547,8 +547,8 @@ func executeCopyQuery(ctx context.Context, cn snowflakeConn, tableName string, f
 		return nil
 	}
 
+	vals := make([]driver.Value, len(rows.Columns()))
 	for {
-		vals := make([]driver.Value, len(rows.Columns()))
 		err := rows.Next(vals)
 		if err == io.EOF {
 			break
