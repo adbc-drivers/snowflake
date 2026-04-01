@@ -12,4 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-skip = "decimal parameter binding not supported by Snowflake driver"
+[tags]
+sql-type-name = "NUMERIC"

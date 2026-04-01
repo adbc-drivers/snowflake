@@ -13,4 +13,82 @@
 // limitations under the License.
 
 // part: metadata
-skip = "timestamptz_s parameter binding not supported by Snowflake driver"
+
+[setup]
+drop = "test_timestamptz"
+
+[tags]
+sql-type-name = "TIMESTAMP_LTZ(0)"
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT,
+    res TIMESTAMP_LTZ(0),
+    res2 TIMESTAMP_LTZ(0)
+);
+
+// part: bind_query
+
+INSERT INTO test_timestamptz VALUES ($1, $2, $3)
+
+// part: bind_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "i",
+            "flags": []
+        },
+        {
+            "name": "res",
+            "format": "tss:UTC",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "res2",
+            "format": "tss:Asia/Tokyo",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: bind
+
+{"idx": 3, "res": 1684158330, "res2": 1684158330}
+{"idx": 2, "res": 946684800, "res2": 946684800}
+{"idx": 1, "res": -14182940, "res2": -14182940}
+{"idx": 4, "res": 253402300799, "res2": 253402300799}
+{"idx": 0, "res": null, "res2": null}
+
+// part: query
+
+SELECT res, res2 FROM test_timestamptz ORDER BY idx
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "tss:UTC",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "res2",
+            "format": "tss:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected
+
+{"res": null, "res2": null}
+{"res": -14182940, "res2": -14182940}
+{"res": 946684800, "res2": 946684800}
+{"res": 1684158330, "res2": 1684158330}
+{"res": 253402300799, "res2": 253402300799}
