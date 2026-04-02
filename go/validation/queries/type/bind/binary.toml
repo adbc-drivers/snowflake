@@ -12,5 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Skip binary binding tests - not supported by Snowflake driver binding layer
-skip = "Binary parameter binding not supported by Snowflake driver"
+[tags]
+sql-type-name = "BINARY"

@@ -11,6 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Skip date binding tests - not supported by Snowflake driver binding layer
-skip = "Date parameter binding not supported by Snowflake driver"

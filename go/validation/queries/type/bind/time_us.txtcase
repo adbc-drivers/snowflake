@@ -13,4 +13,21 @@
 // limitations under the License.
 
 // part: metadata
-skip = "time_us parameter binding not supported by Snowflake driver"
+
+[setup]
+drop = "test_time_us"
+
+// part: setup_query
+
+CREATE TABLE "test_time_us" (
+    "idx" INT,
+    "res" TIME(6)
+);
+
+// part: bind_query
+
+INSERT INTO "test_time_us" VALUES ($1, $2)
+
+// part: query
+
+SELECT "res" FROM "test_time_us" ORDER BY "idx"
