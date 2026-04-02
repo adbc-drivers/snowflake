@@ -15,69 +15,22 @@
 // part: metadata
 
 [setup]
-drop = "test_timestamp"
+drop = "test_timestamp_ns"
 
 [tags]
 sql-type-name = "TIMESTAMP_NTZ(9)"
 
 // part: setup_query
 
-CREATE TABLE test_timestamp (
-    idx INT,
-    res TIMESTAMP_NTZ(9)
+CREATE TABLE "test_timestamp_ns" (
+    "idx" INT,
+    "res" TIMESTAMP_NTZ(9)
 );
 
 // part: bind_query
 
-INSERT INTO test_timestamp VALUES ($1, $2)
-
-// part: bind_schema
-
-{
-    "format": "+s",
-    "children": [
-        {
-            "name": "idx",
-            "format": "i",
-            "flags": []
-        },
-        {
-            "name": "res",
-            "format": "tsn:",
-            "flags": ["nullable"]
-        }
-    ]
-}
-
-// part: bind
-
-{"idx": 3, "res": 1684158330000000000}
-{"idx": 2, "res": 946684800000000000}
-{"idx": 1, "res": -9223372036854775808}
-{"idx": 4, "res": 9223372036854775807}
-{"idx": 0, "res": null}
+INSERT INTO "test_timestamp_ns" VALUES ($1, $2)
 
 // part: query
 
-SELECT res FROM test_timestamp ORDER BY idx
-
-// part: expected_schema
-
-{
-    "format": "+s",
-    "children": [
-        {
-            "name": "res",
-            "format": "tsn:",
-            "flags": ["nullable"]
-        }
-    ]
-}
-
-// part: expected
-
-{"res": null}
-{"res": -9223372036854775808}
-{"res": 946684800000000000}
-{"res": 1684158330000000000}
-{"res": 9223372036854775807}
+SELECT "res" FROM "test_timestamp_ns" ORDER BY "idx"

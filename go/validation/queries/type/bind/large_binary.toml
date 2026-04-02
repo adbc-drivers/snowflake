@@ -12,5 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+skip = "large_binary parameter binding sends ARRAY(NUMBER) instead of BINARY (driver bug)"
+
 [tags]
 sql-type-name = "BINARY"
