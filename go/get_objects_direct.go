@@ -314,7 +314,7 @@ func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
 }
 
 // execShowSchemas executes a SHOW TERSE SCHEMAS command and reads the results directly.
-func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) (entries []schemaEntry, err error) {
+func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) (_ []schemaEntry, err error) {
 	query := "SHOW TERSE /* ADBC:getObjects */ " + objSchemas
 	query = addLike(query, pattern)
 	query += suffix
@@ -322,6 +322,9 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 	rows, err := c.cn.QueryContext(ctx, query, nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
+		// error code 2043 is what you get when a `SHOW` command doesn't match
+		// anything (e.g. SHOW TERSE DATABASE "nonexistent"). In this case, we
+		// want to return an empty set rather than a failure.
 		if errors.As(err, &sfErr) && sfErr.Number == 2043 {
 			return nil, nil
 		}
@@ -331,10 +334,6 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 		err = errors.Join(err, rows.Close())
 	}()
 
-	return readSchemaEntries(rows)
-}
-
-func readSchemaEntries(rows driver.Rows) ([]schemaEntry, error) {
 	cols := rows.Columns()
 	nameIdx, dbIdx := -1, -1
 	for i, col := range cols {
