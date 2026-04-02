@@ -25,6 +25,7 @@ package snowflake
 import (
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"fmt"
 	"io"
 
@@ -123,14 +124,28 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 				Valid: column.IsValid(index),
 			}
 		case *array.Binary:
+			// gosnowflake's goTypeToSnowflake misclassifies []byte as arrayType
+			// (JSON array of numbers) unless tsmode is explicitly set to binaryType.
+			// Since we can't control tsmode through the driver.NamedValue interface,
+			// hex-encode the bytes as a string instead. Snowflake implicitly converts
+			// TEXT to BINARY for BINARY columns, and this matches the wire format
+			// gosnowflake uses internally (converter.go valueToString with binaryType).
 			if column.IsValid(index) {
-				params[i].Value = column.Value(index)
+				params[i].Value = hex.EncodeToString(column.Value(index))
 			} else {
 				params[i].Value = nil
 			}
 		case *array.LargeBinary:
+			// Same as Binary — see comment above.
 			if column.IsValid(index) {
-				params[i].Value = column.Value(index)
+				params[i].Value = hex.EncodeToString(column.Value(index))
+			} else {
+				params[i].Value = nil
+			}
+		case *array.BinaryView:
+			// Same as Binary — see comment above.
+			if column.IsValid(index) {
+				params[i].Value = hex.EncodeToString(column.Value(index))
 			} else {
 				params[i].Value = nil
 			}

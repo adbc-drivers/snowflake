@@ -166,9 +166,9 @@ func TestConvertBinary(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, params, 1)
 
-	val, ok := params[0].Value.([]byte)
+	val, ok := params[0].Value.(string)
 	require.True(t, ok)
-	assert.Equal(t, expected, val)
+	assert.Equal(t, "deadbeef", val)
 	assert.Equal(t, 1, params[0].Ordinal)
 }
 
@@ -214,9 +214,9 @@ func TestConvertLargeBinary(t *testing.T) {
 	params, err := convertArrowToNamedValue(rec, 0, nil)
 	require.NoError(t, err)
 
-	val, ok := params[0].Value.([]byte)
+	val, ok := params[0].Value.(string)
 	require.True(t, ok)
-	assert.Equal(t, expected, val)
+	assert.Equal(t, "cafebabe", val)
 }
 
 func TestConvertDecimal128WholeNumber(t *testing.T) {
@@ -369,7 +369,7 @@ func TestConvertMixedTypes(t *testing.T) {
 	assert.True(t, now.Equal(nt.Time))
 	assert.Equal(t, 2, params[1].Ordinal)
 
-	assert.Equal(t, []byte{0x01, 0x02}, params[2].Value)
+	assert.Equal(t, "0102", params[2].Value)
 	assert.Equal(t, 3, params[2].Ordinal)
 
 	assert.Equal(t, sql.NullString{String: "99.99", Valid: true}, params[3].Value)
@@ -409,13 +409,13 @@ func TestConvertMultipleRows(t *testing.T) {
 	require.NoError(t, err)
 	nt0 := params0[0].Value.(sql.NullTime)
 	assert.True(t, t1.Equal(nt0.Time))
-	assert.Equal(t, []byte{0xAA}, params0[1].Value)
+	assert.Equal(t, "aa", params0[1].Value)
 
 	params1, err := convertArrowToNamedValue(rec, 1, nil)
 	require.NoError(t, err)
 	nt1 := params1[0].Value.(sql.NullTime)
 	assert.True(t, t2.Equal(nt1.Time))
-	assert.Equal(t, []byte{0xBB}, params1[1].Value)
+	assert.Equal(t, "bb", params1[1].Value)
 }
 
 func TestConvertParamsReuse(t *testing.T) {
@@ -439,7 +439,7 @@ func TestConvertParamsReuse(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, existing[:1], params)
-	assert.Equal(t, []byte{0xFF}, params[0].Value)
+	assert.Equal(t, "ff", params[0].Value)
 }
 
 func TestConvertTimestampInvalidTimezone(t *testing.T) {
