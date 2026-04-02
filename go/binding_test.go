@@ -484,3 +484,150 @@ func TestConvertUnsupportedTypeReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Unsupported bind param")
 }
+
+func TestConvertStringView(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "sv", Type: arrow.BinaryTypes.StringView, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	bldr.Field(0).(*array.StringViewBuilder).Append("hello view")
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, sql.NullString{String: "hello view", Valid: true}, params[0].Value)
+}
+
+func TestConvertFixedSizeBinary(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "fsb", Type: &arrow.FixedSizeBinaryType{ByteWidth: 4}, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	bldr.Field(0).(*array.FixedSizeBinaryBuilder).Append([]byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, "deadbeef", params[0].Value)
+}
+
+func TestConvertDate32(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "d", Type: arrow.FixedWidthTypes.Date32, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	expected := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
+	bldr.Field(0).(*array.Date32Builder).Append(arrow.Date32FromTime(expected))
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	nt := params[0].Value.(sql.NullTime)
+	assert.True(t, nt.Valid)
+	assert.True(t, expected.Equal(nt.Time))
+}
+
+func TestConvertDate64(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "d", Type: arrow.FixedWidthTypes.Date64, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	expected := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
+	bldr.Field(0).(*array.Date64Builder).Append(arrow.Date64FromTime(expected))
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	nt := params[0].Value.(sql.NullTime)
+	assert.True(t, nt.Valid)
+	assert.True(t, expected.Equal(nt.Time))
+}
+
+func TestConvertTime32(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "t", Type: &arrow.Time32Type{Unit: arrow.Second}, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	bldr.Field(0).(*array.Time32Builder).Append(arrow.Time32(43200)) // 12:00:00
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	nt := params[0].Value.(sql.NullTime)
+	assert.True(t, nt.Valid)
+	assert.Equal(t, 12, nt.Time.Hour())
+	assert.Equal(t, 0, nt.Time.Minute())
+}
+
+func TestConvertTime64(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "t", Type: &arrow.Time64Type{Unit: arrow.Microsecond}, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	// 12:30:45.123456
+	us := int64(12*3600+30*60+45)*1e6 + 123456
+	bldr.Field(0).(*array.Time64Builder).Append(arrow.Time64(us))
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	nt := params[0].Value.(sql.NullTime)
+	assert.True(t, nt.Valid)
+	assert.Equal(t, 12, nt.Time.Hour())
+	assert.Equal(t, 30, nt.Time.Minute())
+	assert.Equal(t, 45, nt.Time.Second())
+}

@@ -12,5 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Skip string_view tests - not supported by Snowflake driver
-skip = "string view not supported by Snowflake driver"
+skip = "ingest DDL generation does not support STRING_VIEW Arrow type"

@@ -110,6 +110,11 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 				String: column.Value(index),
 				Valid:  column.IsValid(index),
 			}
+		case *array.StringView:
+			params[i].Value = sql.NullString{
+				String: column.Value(index),
+				Valid:  column.IsValid(index),
+			}
 		case *array.Timestamp:
 			tsType := field.Type.(*arrow.TimestampType)
 			toTime, err := tsType.GetToTimeFunc()
@@ -121,6 +126,28 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 			}
 			params[i].Value = sql.NullTime{
 				Time:  toTime(column.Value(index)),
+				Valid: column.IsValid(index),
+			}
+		case *array.Date32:
+			params[i].Value = sql.NullTime{
+				Time:  column.Value(index).ToTime(),
+				Valid: column.IsValid(index),
+			}
+		case *array.Date64:
+			params[i].Value = sql.NullTime{
+				Time:  column.Value(index).ToTime(),
+				Valid: column.IsValid(index),
+			}
+		case *array.Time32:
+			unit := field.Type.(*arrow.Time32Type).Unit
+			params[i].Value = sql.NullTime{
+				Time:  column.Value(index).ToTime(unit),
+				Valid: column.IsValid(index),
+			}
+		case *array.Time64:
+			unit := field.Type.(*arrow.Time64Type).Unit
+			params[i].Value = sql.NullTime{
+				Time:  column.Value(index).ToTime(unit),
 				Valid: column.IsValid(index),
 			}
 		case *array.Binary:
@@ -143,6 +170,13 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 				params[i].Value = nil
 			}
 		case *array.BinaryView:
+			// Same as Binary — see comment above.
+			if column.IsValid(index) {
+				params[i].Value = hex.EncodeToString(column.Value(index))
+			} else {
+				params[i].Value = nil
+			}
+		case *array.FixedSizeBinary:
 			// Same as Binary — see comment above.
 			if column.IsValid(index) {
 				params[i].Value = hex.EncodeToString(column.Value(index))
