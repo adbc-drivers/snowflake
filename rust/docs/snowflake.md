@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-{}
 ---
 
 {{ cross_reference|safe }}
@@ -109,8 +108,6 @@ Examples:
 
 ## Previous Versions
 
-To see documentation for previous versions of this driver, see the following:
-
-- [v1.10.0](./v1.10.0.md)
+There are no previous published versions of this driver yet.
 
 [snowflake]: https://www.snowflake.com/

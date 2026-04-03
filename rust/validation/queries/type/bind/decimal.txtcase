@@ -14,20 +14,32 @@
 
 // part: metadata
 
+sort-keys = [["res", "ascending"]]
+
 [setup]
-drop = "test_timestamp"
+drop = "test_decimal"
 
 [tags]
-sql-type-name = "TIMESTAMP_NTZ"
+sql-type-name = "NUMERIC"
+caveats = ["With use_high_precision=false, Snowflake returns NUMERIC as double"]
 
-// part: setup_query
+// part: expected_schema
 
-CREATE OR REPLACE TABLE "test_timestamp" ("idx" INT, "res" TIMESTAMP(0));
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "g",
+            "flags": ["nullable"]
+        }
+    ]
+}
 
-// part: bind_query
+// part: expected
 
-INSERT INTO "test_timestamp" VALUES ($1, $2)
-
-// part: query
-
-SELECT "res" FROM "test_timestamp" ORDER BY "idx"
+{"res": null}
+{"res": -999.99}
+{"res": 0.0}
+{"res": 123.45}
+{"res": 9999999.99}

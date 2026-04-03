@@ -18,10 +18,10 @@ import pytest
 
 def test_package() -> None:
     uri = "snowflake://example:foo@nonexistent/test"
-    # Just ensure the driver itself loads
+    # Verify the driver loads and reaches the auth phase (not a load failure).
     with pytest.raises(
         adbc_driver_manager.dbapi.ProgrammingError,
-        match="(?i)failed to (auth|login)|UNAUTHENTICATED",
+        match="(?i)(?:failed to (?:auth|login)|unauthenticated)",
     ):
         with adbc_driver_manager.dbapi.connect(driver="snowflake", uri=uri):
             pass
