@@ -266,6 +266,7 @@ impl adbc_core::Connection for Connection {
             use_high_precision: self.use_high_precision,
             timestamp_precision: self.timestamp_precision,
             bound_batches: vec![],
+            last_query_id: None,
         })
     }
 

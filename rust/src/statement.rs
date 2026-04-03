@@ -22,7 +22,7 @@ use adbc_core::{
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use sf_core::apis::database_driver_v1::Handle;
+use sf_core::apis::database_driver_v1::{BindingType, DataPtr, Handle};
 
 use crate::driver::{Inner, TimestampPrecision};
 
@@ -40,6 +40,7 @@ pub struct Statement {
     pub(crate) timestamp_precision: TimestampPrecision,
     /// Parameter batches stored by bind() / bind_stream(). Each row is one execution.
     pub(crate) bound_batches: Vec<RecordBatch>,
+    pub(crate) last_query_id: Option<String>,
 }
 
 impl Drop for Statement {
@@ -137,6 +138,14 @@ impl Optionable for Statement {
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
                 Ok(self.query_tag.clone().unwrap_or_default())
             }
+            OptionStatement::Other(ref k) if k == "adbc.snowflake.sql.query_id" => {
+                self.last_query_id.clone().ok_or_else(|| {
+                    Error::with_message_and_status(
+                        "no query has been executed yet",
+                        Status::NotFound,
+                    )
+                })
+            }
             _ => Err(Error::with_message_and_status(
                 format!("option not found: {}", key.as_ref()),
                 Status::NotFound,
@@ -167,65 +176,47 @@ impl Optionable for Statement {
 }
 
 impl Statement {
-    /// Execute a parameterized query once per row of every bound batch.
-    /// Parameter values are substituted directly as SQL literals — this avoids
-    /// relying on sf_core's JSON binding path and works with all Snowflake
-    /// server versions without session configuration.
-    fn execute_bound(&self, query: String) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-        let mut result_schema: Option<Arc<Schema>> = None;
+    /// Execute a parameterized query with all bound rows sent as JSON bindings
+    /// in a single round-trip via sf_core's `BindingType::Json` API.
+    fn execute_bound(
+        &mut self,
+        query: String,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
+        let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
+        let binding = BindingType::Json(data_ptr);
 
-        for bound_batch in &self.bound_batches {
-            for row_idx in 0..bound_batch.num_rows() {
-                let bound_sql = substitute_params(&query, bound_batch, row_idx)?;
+        let result = self
+            .inner
+            .runtime
+            .block_on(async {
+                self.inner
+                    .sf
+                    .statement_set_sql_query(self.stmt_handle, query)
+                    .await?;
+                self.inner
+                    .sf
+                    .statement_execute_query(self.stmt_handle, Some(binding))
+                    .await
+            })
+            .map_err(crate::error::api_error_to_adbc_error)?;
 
-                let result = self
-                    .inner
-                    .runtime
-                    .block_on(async {
-                        self.inner
-                            .sf
-                            .statement_set_sql_query(self.stmt_handle, bound_sql)
-                            .await?;
-                        self.inner
-                            .sf
-                            .statement_execute_query(self.stmt_handle, None)
-                            .await
-                    })
-                    .map_err(crate::error::api_error_to_adbc_error)?;
+        self.last_query_id = Some(result.query_id.clone());
 
-                // Safety: same as execute().
-                let raw = Box::into_raw(result.stream)
-                    as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-                let reader =
-                    unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-                        .map_err(|e| {
-                            // Safety: Arrow's C Data Interface specifies that on failure, from_raw
-                            // does NOT call the stream's release callback, so reconstructing the
-                            // Box here is the only release path — no double-free risk.
-                            drop(unsafe { Box::from_raw(raw) });
-                            Error::with_message_and_status(e.to_string(), Status::IO)
-                        })?;
-
-                if result_schema.is_none() {
-                    result_schema = Some(reader.schema());
-                }
-                for batch in reader {
-                    let batch = batch
-                        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
-                    all_batches.push(batch);
-                }
-            }
-        }
-
-        let schema = result_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+        // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
+        // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
+        let raw =
+            Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+            .map_err(|e| {
+                drop(unsafe { Box::from_raw(raw) });
+                Error::with_message_and_status(e.to_string(), Status::IO)
+            })?;
         Ok(Box::new(ConvertingReader::new(
-            ConcatReader {
-                batches: all_batches.into_iter(),
-                schema,
-            },
+            reader,
             self.use_high_precision,
             self.timestamp_precision.time_unit(),
+            self.timestamp_precision,
         )))
     }
 
@@ -289,7 +280,6 @@ impl adbc_core::Statement for Statement {
 
         self.apply_query_tag()?;
 
-        // If parameters are bound, execute once per row and concatenate results.
         if !self.bound_batches.is_empty() {
             return self.execute_bound(query);
         }
@@ -309,15 +299,15 @@ impl adbc_core::Statement for Statement {
             })
             .map_err(crate::error::api_error_to_adbc_error)?;
 
+        self.last_query_id = Some(result.query_id.clone());
+
         // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
         // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
         let raw =
             Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
             .map_err(|e| {
-                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
-                // does NOT call the stream's release callback, so reconstructing the
-                // Box here is the only release path — no double-free risk.
+                // Safety: on failure, from_raw does NOT call the stream's release callback.
                 drop(unsafe { Box::from_raw(raw) });
                 Error::with_message_and_status(e.to_string(), Status::IO)
             })?;
@@ -325,6 +315,7 @@ impl adbc_core::Statement for Statement {
             reader,
             self.use_high_precision,
             self.timestamp_precision.time_unit(),
+            self.timestamp_precision,
         )))
     }
 
@@ -340,30 +331,35 @@ impl adbc_core::Statement for Statement {
 
         self.apply_query_tag()?;
 
-        // Parameterised DML: execute once per bound row and sum row counts.
+        // Parameterised DML: execute once with JSON bindings.
         if !self.bound_batches.is_empty() {
-            let mut total: i64 = 0;
-            for bound_batch in &self.bound_batches {
-                for row_idx in 0..bound_batch.num_rows() {
-                    let sql = substitute_params(&query, bound_batch, row_idx)?;
-                    let result = self
-                        .inner
-                        .runtime
-                        .block_on(async {
-                            self.inner
-                                .sf
-                                .statement_set_sql_query(self.stmt_handle, sql)
-                                .await?;
-                            self.inner
-                                .sf
-                                .statement_execute_query(self.stmt_handle, None)
-                                .await
-                        })
-                        .map_err(crate::error::api_error_to_adbc_error)?;
-                    total += result.rows_affected.unwrap_or(0);
-                }
-            }
-            return Ok(if is_ddl(&query) { None } else { Some(total) });
+            let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
+            let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
+            let binding = BindingType::Json(data_ptr);
+
+            let result = self
+                .inner
+                .runtime
+                .block_on(async {
+                    self.inner
+                        .sf
+                        .statement_set_sql_query(self.stmt_handle, query)
+                        .await?;
+                    self.inner
+                        .sf
+                        .statement_execute_query(self.stmt_handle, Some(binding))
+                        .await
+                })
+                .map_err(crate::error::api_error_to_adbc_error)?;
+
+            self.last_query_id = Some(result.query_id.clone());
+
+            let rows = if is_ddl(self.query.as_deref().unwrap_or("")) {
+                None
+            } else {
+                result.rows_affected
+            };
+            return Ok(rows);
         }
 
         let result = self
@@ -380,6 +376,8 @@ impl adbc_core::Statement for Statement {
                     .await
             })
             .map_err(crate::error::api_error_to_adbc_error)?;
+
+        self.last_query_id = Some(result.query_id.clone());
 
         // DDL statements (CREATE, DROP, ALTER, TRUNCATE) return a non-meaningful row
         // count from Snowflake (typically 1 for "success"). Per the ADBC convention,
@@ -414,20 +412,17 @@ impl adbc_core::Statement for Statement {
             })
             .map_err(crate::error::api_error_to_adbc_error)?;
 
+        self.last_query_id = Some(result.query_id.clone());
+
         // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
         // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
         let raw =
             Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
             .map_err(|e| {
-                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
-                // does NOT call the stream's release callback, so reconstructing the
-                // Box here is the only release path — no double-free risk.
                 drop(unsafe { Box::from_raw(raw) });
                 Error::with_message_and_status(e.to_string(), Status::IO)
             })?;
-        // .schema() calls get_schema on the FFI stream without consuming any record batches.
-        // Dropping the reader invokes the stream's release callback.
         Ok(adjust_schema(
             &reader.schema(),
             self.use_high_precision,
@@ -475,11 +470,13 @@ impl adbc_core::Statement for Statement {
 
 // ── ConcatReader: chains multiple RecordBatches into a single reader ──────────
 
+#[cfg(test)]
 struct ConcatReader {
     batches: std::vec::IntoIter<RecordBatch>,
     schema: Arc<Schema>,
 }
 
+#[cfg(test)]
 impl Iterator for ConcatReader {
     type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -487,6 +484,7 @@ impl Iterator for ConcatReader {
     }
 }
 
+#[cfg(test)]
 impl RecordBatchReader for ConcatReader {
     fn schema(&self) -> Arc<Schema> {
         self.schema.clone()
@@ -622,12 +620,18 @@ pub(crate) struct ConvertingReader<R: RecordBatchReader> {
     schema: Arc<Schema>,
     use_high_precision: bool,
     ts_unit: TimeUnit,
+    check_overflow: bool,
     logical_types: Vec<String>,
     scales: Vec<i64>,
 }
 
 impl<R: RecordBatchReader> ConvertingReader<R> {
-    pub(crate) fn new(inner: R, use_high_precision: bool, ts_unit: TimeUnit) -> Self {
+    pub(crate) fn new(
+        inner: R,
+        use_high_precision: bool,
+        ts_unit: TimeUnit,
+        ts_precision: TimestampPrecision,
+    ) -> Self {
         let orig_schema = inner.schema();
         let logical_types: Vec<String> = orig_schema
             .fields()
@@ -645,11 +649,13 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
             })
             .collect();
         let schema = adjust_schema(&orig_schema, use_high_precision, ts_unit);
+
         Self {
             inner,
             schema,
             use_high_precision,
             ts_unit,
+            check_overflow: ts_precision == TimestampPrecision::NanosecondsErrorOnOverflow,
             logical_types,
             scales,
         }
@@ -1005,10 +1011,7 @@ impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
             Err(e) => return Some(Err(e)),
         };
 
-        // check_overflow is intentionally false: overflow truncation is accepted
-        // for far-future/far-past timestamps at nanosecond precision. Callers
-        // that need strict overflow detection should use a separate validation step.
-        let check_overflow = false;
+        let check_overflow = self.check_overflow;
 
         let adjusted_columns: std::result::Result<Vec<ArrayRef>, arrow_schema::ArrowError> = batch
             .columns()
@@ -1046,150 +1049,388 @@ impl<R: RecordBatchReader> RecordBatchReader for ConvertingReader<R> {
     }
 }
 
-// ── Parameter substitution ────────────────────────────────────────────────────
+// ── JSON parameter bindings ───────────────────────────────────────────────────
 
-/// Replaces each `?` placeholder in `query` with the SQL literal value of the
-/// corresponding bound column at `row_idx`.
-///
-/// Skips `?` inside SQL string literals (`'…'`), line comments (`--…`), and
-/// block comments (`/*…*/`) so only true parameter markers are substituted.
-/// Returns `InvalidArguments` if there are more `?` markers than bound columns.
-fn substitute_params(query: &str, batch: &RecordBatch, row_idx: usize) -> Result<String> {
-    let mut result = String::with_capacity(query.len() * 2);
-    let mut param_idx = 0usize;
-    let mut chars = query.chars().peekable();
+fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
+    match dt {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Decimal128(_, _) => Ok("FIXED"),
+        DataType::Float32 | DataType::Float64 => Ok("REAL"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("TEXT"),
+        DataType::Boolean => Ok("BOOLEAN"),
+        DataType::Date32 | DataType::Date64 => Ok("DATE"),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_)
+        | DataType::BinaryView => Ok("BINARY"),
+        DataType::Time32(_) | DataType::Time64(_) => Ok("TIME"),
+        DataType::Timestamp(_, None) => Ok("TIMESTAMP_NTZ"),
+        DataType::Timestamp(_, Some(_)) => Ok("TIMESTAMP_LTZ"),
+        _ => Err(Error::with_message_and_status(
+            format!("unsupported bind parameter type: {dt:?}"),
+            Status::NotImplemented,
+        )),
+    }
+}
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            // SQL string literal — copy verbatim; '' is an escaped quote (stay in string)
-            '\'' => {
-                result.push('\'');
-                loop {
-                    match chars.next() {
-                        None => break,
-                        Some('\'') => {
-                            result.push('\'');
-                            if chars.peek() == Some(&'\'') {
-                                result.push(chars.next().unwrap()); // escaped ''
-                            } else {
-                                break; // end of string
-                            }
-                        }
-                        Some(c) => result.push(c),
-                    }
-                }
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
             }
-            // Line comment -- copy until end of line
-            '-' if chars.peek() == Some(&'-') => {
-                result.push('-');
-                result.push(chars.next().unwrap());
-                for c in chars.by_ref() {
-                    result.push(c);
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
-            // Block comment /* … */ — copy verbatim
-            '/' if chars.peek() == Some(&'*') => {
-                result.push('/');
-                result.push(chars.next().unwrap());
-                let mut prev = '\0';
-                for c in chars.by_ref() {
-                    result.push(c);
-                    if prev == '*' && c == '/' {
-                        break;
-                    }
-                    prev = c;
-                }
-            }
-            // Parameter placeholder
-            '?' => {
-                if param_idx >= batch.num_columns() {
-                    return Err(Error::with_message_and_status(
-                        format!(
-                            "query has more '?' placeholders than bound columns (have {})",
-                            batch.num_columns()
-                        ),
-                        Status::InvalidArguments,
-                    ));
-                }
-                let col = batch.column(param_idx);
-                result.push_str(&arrow_value_to_sql_literal(col.as_ref(), row_idx)?);
-                param_idx += 1;
-            }
-            c => result.push(c),
+            c => out.push(c),
         }
     }
-    Ok(result)
+    out
 }
 
-/// Formats an Arrow column value at `row` as a Snowflake SQL literal.
-/// NULL → `NULL`; strings are single-quoted; numbers are unquoted.
-fn arrow_value_to_sql_literal(arr: &dyn Array, row: usize) -> Result<String> {
-    if arr.is_null(row) {
-        return Ok("NULL".to_string());
+fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<String> {
+    if batches.is_empty() {
+        return Ok("{}".to_string());
     }
-    use arrow_array::{
-        BooleanArray, Date32Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
-        StringArray,
-    };
-    macro_rules! num_lit {
-        ($T:ty) => {
-            if let Some(a) = arr.as_any().downcast_ref::<$T>() {
-                return Ok(format!("{}", a.value(row)));
+
+    let num_cols = batches[0].num_columns();
+    let schema = batches[0].schema();
+
+    let mut col_types: Vec<&'static str> = Vec::with_capacity(num_cols);
+    for i in 0..num_cols {
+        col_types.push(snowflake_type_name(schema.field(i).data_type())?);
+    }
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    let mut col_values: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(total_rows); num_cols];
+
+    for batch in batches {
+        for col_idx in 0..num_cols {
+            let col = batch.column(col_idx);
+            let dt = col.data_type();
+            for row in 0..batch.num_rows() {
+                if col.is_null(row) {
+                    col_values[col_idx].push(None);
+                    continue;
+                }
+                let val = format_arrow_value(col.as_ref(), row, dt)?;
+                col_values[col_idx].push(val);
             }
-        };
+        }
     }
-    // Floats need {:?} format which always emits a decimal point or exponent
-    // (e.g. "3.14", "1.7976931348623157e308"). The {} Display format may produce
-    // a huge integer string (e.g. "179769300...") that Snowflake rejects.
-    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Float64Array>() {
-        let v = a.value(row);
-        return if v.is_finite() {
-            Ok(format!("{v:?}"))
-        } else {
-            Ok("NULL".to_string())
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Float32Array>() {
-        let v = a.value(row);
-        return if v.is_finite() {
-            Ok(format!("{v:?}"))
-        } else {
-            Ok("NULL".to_string())
-        };
-    }
-    num_lit!(Int64Array);
-    num_lit!(Int32Array);
-    num_lit!(Int16Array);
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return Ok(sql_str_lit(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(sql_str_lit(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(if a.value(row) { "TRUE" } else { "FALSE" }.to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
-        return Ok(format!(
-            "'{}'::DATE",
-            days_since_epoch_to_date_str(a.value(row) as i64)
+
+    let mut json = String::from("{");
+    for col_idx in 0..num_cols {
+        if col_idx > 0 {
+            json.push(',');
+        }
+        let key = col_idx + 1;
+        json.push_str(&format!(
+            "\"{}\":{{\"type\":\"{}\",\"value\":",
+            key, col_types[col_idx]
         ));
+
+        if total_rows == 1 {
+            match &col_values[col_idx][0] {
+                None => json.push_str("null"),
+                Some(v) => {
+                    json.push('"');
+                    json.push_str(&escape_json_string(v));
+                    json.push('"');
+                }
+            }
+        } else {
+            json.push('[');
+            for (i, v) in col_values[col_idx].iter().enumerate() {
+                if i > 0 {
+                    json.push(',');
+                }
+                match v {
+                    None => json.push_str("null"),
+                    Some(s) => {
+                        json.push('"');
+                        json.push_str(&escape_json_string(s));
+                        json.push('"');
+                    }
+                }
+            }
+            json.push(']');
+        }
+        json.push('}');
     }
-    Err(Error::with_message_and_status(
-        format!("unsupported bind parameter type: {:?}", arr.data_type()),
-        Status::NotImplemented,
-    ))
+    json.push('}');
+    Ok(json)
 }
 
-/// Wraps `s` in single quotes.
-/// Backslashes are doubled first (some Snowflake sessions treat `\'` as an escape
-/// sequence, which would prematurely close the literal), then single quotes are
-/// doubled per ANSI SQL.
-fn sql_str_lit(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Option<String>> {
+    use arrow_array::*;
+    match dt {
+        DataType::Int8 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Int16 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Int32 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Int64 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::UInt8 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::UInt16 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::UInt32 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::UInt64 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Float32 => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row);
+            if v.is_finite() {
+                Ok(Some(format!("{v:?}")))
+            } else {
+                Ok(None)
+            }
+        }
+        DataType::Float64 => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row);
+            if v.is_finite() {
+                Ok(Some(format!("{v:?}")))
+            } else {
+                Ok(None)
+            }
+        }
+        DataType::Utf8 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::LargeUtf8 => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Boolean => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Date32 => {
+            let days = arr
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(row) as i64;
+            Ok(Some((days * 86_400_000).to_string()))
+        }
+        DataType::Date64 => {
+            let ms = arr
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .unwrap()
+                .value(row);
+            Ok(Some(ms.to_string()))
+        }
+        DataType::Decimal128(_, scale) => {
+            let val = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(row);
+            Ok(Some(decimal128_to_string(val, *scale)))
+        }
+        DataType::Binary => {
+            let bytes = arr
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(row);
+            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+        }
+        DataType::LargeBinary => {
+            let bytes = arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(row);
+            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let bytes = arr
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(row);
+            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+        }
+        DataType::BinaryView => {
+            let bytes = arr
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap()
+                .value(row);
+            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+        }
+        DataType::Utf8View => Ok(Some(
+            arr.as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Time32(TimeUnit::Second) => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Time32SecondArray>()
+                .unwrap()
+                .value(row) as i64;
+            Ok(Some((v * 1_000_000_000).to_string()))
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .unwrap()
+                .value(row) as i64;
+            Ok(Some((v * 1_000_000).to_string()))
+        }
+        DataType::Time32(_) => {
+            unreachable!("Time32 only supports Second and Millisecond units")
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .unwrap()
+                .value(row);
+            Ok(Some((v * 1_000).to_string()))
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap()
+                .value(row);
+            Ok(Some(v.to_string()))
+        }
+        DataType::Time64(_) => {
+            unreachable!("Time64 only supports Microsecond and Nanosecond units")
+        }
+        DataType::Timestamp(unit, _) => {
+            let (v, multiplier) = match unit {
+                TimeUnit::Second => (
+                    arr.as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap()
+                        .value(row),
+                    1_000_000_000i64,
+                ),
+                TimeUnit::Millisecond => (
+                    arr.as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap()
+                        .value(row),
+                    1_000_000i64,
+                ),
+                TimeUnit::Microsecond => (
+                    arr.as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(row),
+                    1_000i64,
+                ),
+                TimeUnit::Nanosecond => (
+                    arr.as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .value(row),
+                    1i64,
+                ),
+            };
+            Ok(Some((v as i128 * multiplier as i128).to_string()))
+        }
+        _ => Err(Error::with_message_and_status(
+            format!("unsupported bind parameter type: {dt:?}"),
+            Status::NotImplemented,
+        )),
+    }
+}
+
+fn decimal128_to_string(value: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return value.to_string();
+    }
+    let sign = if value < 0 { "-" } else { "" };
+    let abs = value.unsigned_abs();
+    let divisor = 10u128.pow(scale as u32);
+    let integer_part = abs / divisor;
+    let fractional_part = abs % divisor;
+    format!(
+        "{sign}{integer_part}.{fractional_part:0>width$}",
+        width = scale as usize
+    )
 }
 
 /// Converts days since Unix epoch (1970-01-01) to a YYYY-MM-DD string.
@@ -1236,6 +1477,12 @@ fn is_ddl(query: &str) -> bool {
         || upper.starts_with("TRUNCATE ")
         || upper.starts_with("RENAME ")
         || upper.starts_with("COMMENT ")
+        || upper.starts_with("GRANT ")
+        || upper.starts_with("REVOKE ")
+        || upper.starts_with("SHOW ")
+        || upper.starts_with("USE ")
+        || upper.starts_with("DESCRIBE ")
+        || upper.starts_with("DESC ")
 }
 
 #[cfg(test)]
@@ -1258,6 +1505,7 @@ mod tests {
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
+            last_query_id: None,
         }
     }
 
@@ -1302,6 +1550,7 @@ mod tests {
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
+            last_query_id: None,
         };
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
@@ -1325,6 +1574,7 @@ mod tests {
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
+            last_query_id: None,
         };
         stmt.set_sql_query("SELECT 1").unwrap();
         assert!(stmt.target_table.is_none());
@@ -1443,7 +1693,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
         let col = out
@@ -1464,7 +1719,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         let col = out
             .column(0)
@@ -1484,7 +1744,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
         assert_eq!(out.num_rows(), 0);
@@ -1525,7 +1790,12 @@ mod tests {
             batches: vec![batch1, batch2].into_iter(),
             schema: declared_schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
 
         let out1 = cr.next().unwrap().unwrap();
         assert_eq!(out1.column(0).data_type(), &DataType::Int64);
@@ -1636,7 +1906,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            false,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
         let col = out
@@ -1663,7 +1938,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(
             out.schema().field(0).data_type(),
@@ -1693,7 +1973,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
     }
@@ -1715,7 +2000,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, true, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            true,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(
             out.schema().field(0).data_type(),
@@ -1747,7 +2037,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            false,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
         let col = out
@@ -1772,7 +2067,12 @@ mod tests {
             batches: vec![batch].into_iter(),
             schema,
         };
-        let mut cr = ConvertingReader::new(reader, false, TimeUnit::Nanosecond);
+        let mut cr = ConvertingReader::new(
+            reader,
+            false,
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+        );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(
             out.schema().field(0).data_type(),
@@ -2004,5 +2304,82 @@ mod tests {
             .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1_000_000_005);
+    }
+
+    #[test]
+    fn test_arrow_batches_to_json_bindings_basic() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![123, 456])) as ArrayRef,
+                Arc::new(arrow_array::StringArray::from(vec!["hello", "world"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let json = arrow_batches_to_json_bindings(&[batch]).unwrap();
+        assert!(json.contains("\"1\":{\"type\":\"FIXED\",\"value\":[\"123\",\"456\"]}"));
+        assert!(json.contains("\"2\":{\"type\":\"TEXT\",\"value\":[\"hello\",\"world\"]}"));
+    }
+
+    #[test]
+    fn test_arrow_batches_to_json_bindings_with_nulls() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+                Arc::new(arrow_array::StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let json = arrow_batches_to_json_bindings(&[batch]).unwrap();
+        assert!(json.contains("\"1\":{\"type\":\"FIXED\",\"value\":[\"1\",null,\"3\"]}"));
+        assert!(json.contains("\"2\":{\"type\":\"TEXT\",\"value\":[\"a\",\"b\",null]}"));
+    }
+
+    #[test]
+    fn test_arrow_batches_to_json_bindings_float_precision() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Float64Array::from(vec![3.141592653589793])) as ArrayRef],
+        )
+        .unwrap();
+
+        let json = arrow_batches_to_json_bindings(&[batch]).unwrap();
+        assert!(
+            json.contains("3.141592653589793"),
+            "should preserve full f64 precision, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_decimal128_to_string_negative_fractional() {
+        // Values in (-1, 0) must preserve the negative sign
+        assert_eq!(decimal128_to_string(-50, 2), "-0.50");
+        assert_eq!(decimal128_to_string(-1, 1), "-0.1");
+        assert_eq!(decimal128_to_string(-999, 3), "-0.999");
+        // Normal negative values
+        assert_eq!(decimal128_to_string(-150, 2), "-1.50");
+        // Positive values unchanged
+        assert_eq!(decimal128_to_string(50, 2), "0.50");
+        assert_eq!(decimal128_to_string(150, 2), "1.50");
+        // Zero
+        assert_eq!(decimal128_to_string(0, 2), "0.00");
+        // No scale
+        assert_eq!(decimal128_to_string(-42, 0), "-42");
     }
 }
