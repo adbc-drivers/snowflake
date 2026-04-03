@@ -33,9 +33,11 @@ elif [[ "$2" == "linux" ]]; then
         sed -i 's/wget openssl openssl-devel openssl-static/wget openssl openssl-devel openssl-static perl-IPC-Cmd perl-Time-Piece/g' "$DOCKERFILE"
 
         echo "Patching $COMPOSEFILE to use local image tag and set HOME=/tmp"
-        # Change the image tag so docker compose doesn't try to pull it from ghcr.io and instead builds it locally
         sed -i 's/image: ghcr.io\/adbc-drivers\/dev/image: local-patched\/adbc-drivers-dev/g' "$COMPOSEFILE"
-        # Inject HOME=/tmp so that rust crates (like protoc) can write to cache directories when running as non-root user
-        sed -i 's/^    volumes:/    environment:\n      - HOME=\/tmp\n    volumes:/' "$COMPOSEFILE"
+        grep -q 'HOME=/tmp' "$COMPOSEFILE" || \
+            sed -i 's/^    volumes:/    environment:\n      - HOME=\/tmp\n    volumes:/' "$COMPOSEFILE"
+    else
+        echo "Could not find Dockerfile at $DOCKERFILE or compose.yaml at $COMPOSEFILE — aborting."
+        exit 1
     fi
 fi

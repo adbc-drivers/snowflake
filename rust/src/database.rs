@@ -329,8 +329,22 @@ impl Database {
 
         if let Some(info) = user_info {
             if let Some(colon) = info.find(':') {
-                let user = percent_decode_str(&info[..colon]).decode_utf8_lossy();
-                let pass = percent_decode_str(&info[colon + 1..]).decode_utf8_lossy();
+                let user = percent_decode_str(&info[..colon])
+                    .decode_utf8()
+                    .map_err(|e| {
+                        Error::with_message_and_status(
+                            &format!("invalid UTF-8 in URI username: {e}"),
+                            Status::InvalidArguments,
+                        )
+                    })?;
+                let pass = percent_decode_str(&info[colon + 1..])
+                    .decode_utf8()
+                    .map_err(|e| {
+                        Error::with_message_and_status(
+                            &format!("invalid UTF-8 in URI password: {e}"),
+                            Status::InvalidArguments,
+                        )
+                    })?;
                 if !user.is_empty() {
                     self.set_option(
                         OptionDatabase::Username,
@@ -342,7 +356,12 @@ impl Database {
                     OptionValue::String(pass.into_owned()),
                 )?;
             } else if !info.is_empty() {
-                let user = percent_decode_str(&info).decode_utf8_lossy();
+                let user = percent_decode_str(&info).decode_utf8().map_err(|e| {
+                    Error::with_message_and_status(
+                        &format!("invalid UTF-8 in URI username: {e}"),
+                        Status::InvalidArguments,
+                    )
+                })?;
                 self.set_option(
                     OptionDatabase::Username,
                     OptionValue::String(user.into_owned()),
@@ -380,7 +399,14 @@ impl Database {
             for pair in q.split('&') {
                 if let Some(eq) = pair.find('=') {
                     let k = &pair[..eq];
-                    let v = &pair[eq + 1..];
+                    let v = percent_decode_str(&pair[eq + 1..])
+                        .decode_utf8()
+                        .map_err(|e| {
+                            Error::with_message_and_status(
+                                &format!("invalid UTF-8 in URI query parameter: {e}"),
+                                Status::InvalidArguments,
+                            )
+                        })?;
                     let adbc_key = match k {
                         "warehouse" => "adbc.snowflake.sql.warehouse",
                         "role" => "adbc.snowflake.sql.role",
@@ -396,7 +422,7 @@ impl Database {
                     };
                     self.set_option(
                         OptionDatabase::Other(adbc_key.into()),
-                        OptionValue::String(v.to_string()),
+                        OptionValue::String(v.into_owned()),
                     )?;
                 }
             }

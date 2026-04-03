@@ -82,9 +82,11 @@ class SnowflakeQuirks(model.DriverQuirks):
         )
 
     def quote_one_identifier(self, identifier: str) -> str:
-        """Quote an identifier to preserve case and ensure consistency."""
         identifier = identifier.replace('"', '""')
         return f'"{identifier}"'
+
+    def bind_parameter(self, index: int) -> str:
+        return f"${index}"
 
     def split_statement(self, statement: str) -> list[str]:
         return quirks.split_statement(statement, dialect=self.name)
