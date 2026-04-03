@@ -1,10 +1,10 @@
-# Copyright (c) 2025 ADBC Drivers Contributors
+# Copyright (c) 2026 ADBC Drivers Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#         http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,19 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.github/pull_request_template.md
-.gitmodules
-*/go.sum
-*/pixi.lock
-*/Cargo.lock
-*/*.csproj
-*/*.sln
-go/license.tpl
-go/validation/queries/*/*.json
-go/validation/queries/*/*.sql
-rust/license.tpl
-rust/validation/queries/*/*.json
-rust/validation/queries/*/*.sql
-rust/validation/queries/*/*/*.json
-rust/validation/queries/*/*/*.sql
-csharp/test/Interop/Resources/snowflakeconfig.json
+# Disable dynamic linking to avoid linker errors from sf_core's dylib crate-type
+# when building test binaries on Linux.
+[build]
+rustflags = ["-C", "prefer-dynamic=no"]

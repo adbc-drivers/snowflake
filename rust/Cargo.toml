@@ -1,0 +1,43 @@
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "adbc-driver-snowflake"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adbc_core = "0.22.0"
+adbc_ffi  = "0.22.0"
+sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core", rev = "42b799464edec27361668b6b18792c7cc38cb785" }
+arrow-array  = { version = "57.3.0", default-features = false, features = ["ffi", "chrono-tz"] }
+arrow-buffer = { version = "57.3.0", default-features = false }
+arrow-schema = { version = "57.3.0", default-features = false }
+arrow-cast   = { version = "57.3.0", default-features = false }
+log          = "0.4.22"
+tokio        = { version = "1", features = ["rt-multi-thread"] }
+percent-encoding = "2.3.2"
+# Force vendored (static) OpenSSL for manylinux compatibility.
+# This crate doesn't call openssl APIs directly; it exists to ensure
+# all transitive deps link statically. Bump manually on OpenSSL CVEs.
+openssl = { version = "0.10.76", features = ["vendored"] }
+
+[dev-dependencies]
+env_logger = "0.10"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
