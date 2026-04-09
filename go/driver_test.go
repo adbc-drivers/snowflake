@@ -3131,7 +3131,7 @@ func (suite *SnowflakeTests) TestGetStatisticsBasic() {
 		adbc.GetStatisticsSchema, statsRdr.Schema())
 
 	// Read and extract statistics for our table
-	var allStats []map[string]any
+	var allStats []testutil.Statistic
 	for statsRdr.Next() {
 		rec := statsRdr.RecordBatch()
 		suite.Greater(rec.NumRows(), int64(0), "Should have at least one catalog")
@@ -3142,41 +3142,35 @@ func (suite *SnowflakeTests) TestGetStatisticsBasic() {
 
 	suite.Greater(len(allStats), 0, "Should find statistics for STATISTICS_TEST table")
 
-	// Convert to lookup maps for easier assertions
-	statisticsFound, statisticsApprox := testutil.StatisticsToLookupMaps(allStats)
-
-	// Verify we got all expected statistics
-	// Base statistics (always present in exact mode):
-	suite.Contains(statisticsFound, int16(6), "Should have row_count statistic")
-	suite.Contains(statisticsFound, int16(1024), "Should have bytes statistic")
-	suite.Contains(statisticsFound, int16(1025), "Should have retention_time statistic")
+	// Convert to lookup map for easier assertions
+	statsMap := testutil.StatisticsToLookupMap(allStats)
 
 	// Row count: We inserted 400 rows (4 batches × 100)
-	rowCount, hasRowCount := statisticsFound[int16(6)].(float64)
-	suite.True(hasRowCount, "row_count statistic should be present as float64")
+	rowCount, ok := statsMap[int16(6)].StatisticValue.(float64)
+	suite.True(ok, "row_count statistic should be present as float64")
 	suite.GreaterOrEqual(rowCount, float64(400), "Row count should be non-negative")
-	suite.True(statisticsApprox[int16(6)], "row_count should be approximate (cached)")
+	suite.True(statsMap[int16(6)].IsApproximate, "row_count should be approximate (cached)")
 	suite.T().Logf("Row count: %.0f (note: may be stale due to INFORMATION_SCHEMA caching)", rowCount)
 
 	// Bytes: Should be > 0, reasonable size for 400 rows with data
-	bytes, hasBytes := statisticsFound[int16(1024)].(int64)
-	suite.True(hasBytes, "bytes statistic should be present")
+	bytes, ok := statsMap[int16(1024)].StatisticValue.(int64)
+	suite.True(ok, "bytes statistic should be present")
 	suite.Greater(bytes, int64(1000), "Bytes should be > 1000 for 400 rows with data")
-	suite.True(statisticsApprox[int16(1024)], "bytes should be approximate (cached)")
+	suite.True(statsMap[int16(1024)].IsApproximate, "bytes should be approximate (cached)")
 	suite.T().Logf("Bytes: %d", bytes)
 
 	// Retention time: Default is usually 1 day for new tables
-	retentionTime, hasRetention := statisticsFound[int16(1025)].(int64)
-	suite.True(hasRetention, "retention_time statistic should be present")
+	retentionTime, ok := statsMap[int16(1025)].StatisticValue.(int64)
+	suite.True(ok, "retention_time statistic should be present")
 	suite.GreaterOrEqual(retentionTime, int64(1), "Retention time should be at least 1 day")
-	suite.True(statisticsApprox[int16(1025)], "retention_time should be approximate (cached)")
+	suite.True(statsMap[int16(1025)].IsApproximate, "retention_time should be approximate (cached)")
 	suite.T().Logf("Retention time: %d days", retentionTime)
 
 	// Check if clustering depth is present
-	if clusteringDepth, ok := statisticsFound[int16(1029)].(float64); ok {
+	if clusteringDepth, ok := statsMap[int16(1029)].StatisticValue.(float64); ok {
 		suite.T().Logf("Clustering depth found: %.2f", clusteringDepth)
 		// In exact mode, clustering depth should NOT be approximate
-		suite.False(statisticsApprox[int16(1029)], "clustering_depth should be exact (not approximate) in exact mode")
+		suite.False(statsMap[int16(1029)].IsApproximate, "clustering_depth should be exact (not approximate) in exact mode")
 		suite.GreaterOrEqual(clusteringDepth, 0.0, "Clustering depth should be non-negative")
 	} else {
 		suite.T().Log("Clustering depth not returned (may require table to be physically clustered)")
@@ -3184,22 +3178,22 @@ func (suite *SnowflakeTests) TestGetStatisticsBasic() {
 
 	// Check for storage breakdown statistics (may not be present without ACCOUNTADMIN)
 	hasStorageMetrics := false
-	if activeBytes, ok := statisticsFound[int16(1026)].(int64); ok {
+	if activeBytes, ok := statsMap[int16(1026)].StatisticValue.(int64); ok {
 		suite.T().Logf("Active bytes found: %d", activeBytes)
 		suite.GreaterOrEqual(activeBytes, int64(0), "Active bytes should be non-negative")
 		// In exact mode, storage metrics should NOT be approximate
-		suite.False(statisticsApprox[int16(1026)], "active_bytes should be exact (not approximate) in exact mode")
+		suite.False(statsMap[int16(1026)].IsApproximate, "active_bytes should be exact (not approximate) in exact mode")
 		hasStorageMetrics = true
 	}
-	if timeTravelBytes, ok := statisticsFound[int16(1027)].(int64); ok {
+	if timeTravelBytes, ok := statsMap[int16(1027)].StatisticValue.(int64); ok {
 		suite.T().Logf("Time Travel bytes found: %d", timeTravelBytes)
 		suite.GreaterOrEqual(timeTravelBytes, int64(0), "Time Travel bytes should be non-negative")
-		suite.False(statisticsApprox[int16(1027)], "time_travel_bytes should be exact (not approximate) in exact mode")
+		suite.False(statsMap[int16(1027)].IsApproximate, "time_travel_bytes should be exact (not approximate) in exact mode")
 	}
-	if failsafeBytes, ok := statisticsFound[int16(1028)].(int64); ok {
+	if failsafeBytes, ok := statsMap[int16(1028)].StatisticValue.(int64); ok {
 		suite.T().Logf("Failsafe bytes found: %d", failsafeBytes)
 		suite.GreaterOrEqual(failsafeBytes, int64(0), "Failsafe bytes should be non-negative")
-		suite.False(statisticsApprox[int16(1028)], "failsafe_bytes should be exact (not approximate) in exact mode")
+		suite.False(statsMap[int16(1028)].IsApproximate, "failsafe_bytes should be exact (not approximate) in exact mode")
 	}
 
 	if !hasStorageMetrics {

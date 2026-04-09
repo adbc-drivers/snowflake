@@ -111,7 +111,7 @@ func (c *connectionImpl) GetStatistics(
 	}
 
 	if (catalog != nil && *catalog == "") || (dbSchema != nil && *dbSchema == "") || (tableName != nil && *tableName == "") {
-		return driverbase.EmptyGetStatisticsReader(c.Alloc)
+		return driverbase.EmptyGetStatisticsReader()
 	}
 
 	// Determine which databases to query:
@@ -159,7 +159,7 @@ func (c *connectionImpl) GetStatistics(
 	}
 
 	if len(databasesToQuery) == 0 {
-		return driverbase.EmptyGetStatisticsReader(c.Alloc)
+		return driverbase.EmptyGetStatisticsReader()
 	}
 
 	// Query tables from each matching database and group by catalog
@@ -219,7 +219,7 @@ func (c *connectionImpl) GetStatistics(
 	}
 
 	if len(tablesByCatalog) == 0 {
-		return driverbase.EmptyGetStatisticsReader(c.Alloc)
+		return driverbase.EmptyGetStatisticsReader()
 	}
 
 	// Build statistics for each catalog
