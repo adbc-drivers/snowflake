@@ -22,13 +22,13 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-adbc_core = "0.22.0"
-adbc_ffi  = "0.22.0"
-sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core", rev = "42b799464edec27361668b6b18792c7cc38cb785" }
-arrow-array  = { version = "57.3.0", default-features = false, features = ["ffi", "chrono-tz"] }
-arrow-buffer = { version = "57.3.0", default-features = false }
-arrow-schema = { version = "57.3.0", default-features = false }
-arrow-cast   = { version = "57.3.0", default-features = false }
+adbc_core = ">=0.22.0"
+adbc_ffi  = ">=0.22.0"
+sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core", rev = "1b8fc700c6fc10464851407da90ac5f9645758f7" }
+arrow-array  = { version = "58.1.0", default-features = false, features = ["ffi", "chrono-tz"] }
+arrow-buffer = { version = "58.1.0", default-features = false }
+arrow-schema = { version = "58.1.0", default-features = false }
+arrow-cast   = { version = "58.1.0", default-features = false }
 log          = "0.4.22"
 tokio        = { version = "1", features = ["rt-multi-thread"] }
 percent-encoding = "2.3.2"

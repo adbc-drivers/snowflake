@@ -38,6 +38,8 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::ArrowParsing { .. } => Status::IO,
         ApiError::ChunkFetch { .. } => Status::IO,
         ApiError::Base64Decoding { .. } => Status::IO,
+        ApiError::HttpRequest { .. } => Status::IO,
+        ApiError::TokenRequest { .. } => Status::Unauthenticated,
     };
     Error::with_message_and_status(err.to_string(), status)
 }
