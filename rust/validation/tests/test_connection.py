@@ -12,19 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.github/pull_request_template.md
-.gitmodules
-*/go.sum
-*/pixi.lock
-*/Cargo.lock
-*/*.csproj
-*/*.sln
-go/license.tpl
-go/validation/queries/*/*.json
-go/validation/queries/*/*.sql
-rust/license.tpl
-rust/validation/queries/*/*.json
-rust/validation/queries/*/*.sql
-rust/validation/queries/*/*/*.json
-rust/validation/queries/*/*/*.sql
-csharp/test/Interop/Resources/snowflakeconfig.json
+from adbc_drivers_validation.tests.connection import (
+    TestConnection,  # noqa: F401
+    generate_tests,
+)
+
+from . import snowflake
+
+
+def pytest_generate_tests(metafunc) -> None:
+    quirks = [snowflake.get_quirks(metafunc.config.getoption("vendor_version"))]
+    return generate_tests(quirks, metafunc)
