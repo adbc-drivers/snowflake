@@ -548,7 +548,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 					return nil, err
 				}
 
-				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision)
+				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision, nil)
 				return reader, err
 			},
 			currentBatch: st.bound,
@@ -566,6 +566,12 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 		return
 	}
 
+	// Detect geo columns before executing the query. For table scans,
+	// try to extract the table name and run DESCRIBE TABLE to identify
+	// GEOGRAPHY/GEOMETRY columns (catalog metadata is unaffected by WKB output format).
+	// TODO: Support arbitrary queries — currently only table scans get geoarrow metadata.
+	geoCols := st.cnxn.detectGeoColumnsFromQuery(ctx, st.query)
+
 	var loader gosnowflake.ArrowStreamLoader
 	loader, err = st.cnxn.cn.QueryArrowStream(ctx, st.query)
 	if err != nil {
@@ -573,7 +579,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 		return
 	}
 
-	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision)
+	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision, geoCols)
 	nRows = loader.TotalRows()
 	return
 }
