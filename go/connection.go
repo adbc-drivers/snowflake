@@ -79,6 +79,8 @@ type connectionImpl struct {
 
 	activeTransaction     bool
 	useHighPrecision      bool
+	streamRetryEnabled    bool
+	autodetectJSONBatches bool
 	maxTimestampPrecision MaxTimestampPrecision
 }
 
@@ -758,6 +760,8 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 		queueSize:             defaultStatementQueueSize,
 		prefetchConcurrency:   defaultPrefetchConcurrency,
 		useHighPrecision:      c.useHighPrecision,
+		streamRetryEnabled:    c.streamRetryEnabled,
+		autodetectJSONBatches: c.autodetectJSONBatches,
 		maxTimestampPrecision: c.maxTimestampPrecision,
 		ingestOptions:         DefaultIngestOptions(),
 	}
@@ -802,6 +806,32 @@ func (c *connectionImpl) SetOption(key, value string) error {
 			c.useHighPrecision = true
 		case adbc.OptionValueDisabled:
 			c.useHighPrecision = false
+		default:
+			return adbc.Error{
+				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return nil
+	case OptionStreamRetryEnabled:
+		switch value {
+		case adbc.OptionValueEnabled:
+			c.streamRetryEnabled = true
+		case adbc.OptionValueDisabled:
+			c.streamRetryEnabled = false
+		default:
+			return adbc.Error{
+				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return nil
+	case OptionAutodetectJSONBatches:
+		switch value {
+		case adbc.OptionValueEnabled:
+			c.autodetectJSONBatches = true
+		case adbc.OptionValueDisabled:
+			c.autodetectJSONBatches = false
 		default:
 			return adbc.Error{
 				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,

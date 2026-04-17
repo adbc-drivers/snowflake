@@ -82,6 +82,8 @@ type databaseImpl struct {
 	cfg *gosnowflake.Config
 
 	useHighPrecision      bool
+	streamRetryEnabled    bool
+	autodetectJSONBatches bool
 	maxTimestampPrecision MaxTimestampPrecision
 	defaultAppName        string
 }
@@ -160,6 +162,16 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 		return d.cfg.ClientConfigFile, nil
 	case OptionUseHighPrecision:
 		if d.useHighPrecision {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionStreamRetryEnabled:
+		if d.streamRetryEnabled {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionAutodetectJSONBatches:
+		if d.autodetectJSONBatches {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
@@ -510,6 +522,30 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
+	case OptionStreamRetryEnabled:
+		switch v {
+		case adbc.OptionValueEnabled:
+			d.streamRetryEnabled = true
+		case adbc.OptionValueDisabled:
+			d.streamRetryEnabled = false
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionStreamRetryEnabled, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+	case OptionAutodetectJSONBatches:
+		switch v {
+		case adbc.OptionValueEnabled:
+			d.autodetectJSONBatches = true
+		case adbc.OptionValueDisabled:
+			d.autodetectJSONBatches = false
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionAutodetectJSONBatches, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
 	case OptionMaxTimestampPrecision:
 		switch v {
 		case OptionValueNanoseconds, OptionValueNanosecondsNoOverflow, OptionValueMicroseconds:
@@ -551,6 +587,8 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 		// SetOption(OptionUseHighPrecision, adbc.OptionValueDisabled) to
 		// get Int64/Float64 instead
 		useHighPrecision:      d.useHighPrecision,
+		streamRetryEnabled:    d.streamRetryEnabled,
+		autodetectJSONBatches: d.autodetectJSONBatches,
 		maxTimestampPrecision: d.maxTimestampPrecision,
 		ConnectionImplBase:    driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 	}
