@@ -334,6 +334,9 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 		err = errors.Join(err, rows.Close())
 	}()
 
+	// SHOW TERSE is not actually fixed and has changed between versions in the past,
+	// so we look up by name to avoid possible breaking if snowflake adds, removes,
+	// or reorders columns in the future.
 	cols := rows.Columns()
 	nameIdx, dbIdx := -1, -1
 	for i, col := range cols {
