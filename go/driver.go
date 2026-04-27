@@ -300,3 +300,7 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 
 	return driverbase.NewDatabase(db), nil
 }
+
+func quoteTblName(name string) string {
+	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
+}
