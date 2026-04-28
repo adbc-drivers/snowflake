@@ -87,7 +87,7 @@ type databaseImpl struct {
 }
 
 //nolint:staticcheck // ignore snowflake deprecated warnings for now
-func (d *databaseImpl) GetOption(key string) (string, error) {
+func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error) {
 	switch key {
 	case adbc.OptionKeyUsername:
 		return d.cfg.User, nil
@@ -180,10 +180,10 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 			return *val, nil
 		}
 	}
-	return d.DatabaseImplBase.GetOption(key)
+	return d.DatabaseImplBase.GetOption(ctx, key)
 }
 
-func (d *databaseImpl) SetOption(key string, value string) error {
+func (d *databaseImpl) SetOption(ctx context.Context, key string, value string) error {
 	return d.SetOptionInternal(key, value, nil)
 }
 
@@ -195,7 +195,7 @@ func ParseSnowflakeURI(uri string) (*gosnowflake.Config, error) {
 	return gosnowflake.ParseDSN(uri)
 }
 
-func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
+func (d *databaseImpl) SetOptions(ctx context.Context, cnOptions map[string]string) error {
 	uri, ok := cnOptions[adbc.OptionKeyURI]
 	if ok {
 		cfg, err := ParseSnowflakeURI(uri)
@@ -528,7 +528,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	return nil
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection, err error) {
+func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.ConnectionWithContext, err error) {
 	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
 	defer driverbase.EndSpan(span, err)
 
@@ -566,10 +566,10 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 	return adbcConnection, err
 }
 
-func (d *databaseImpl) Close() error {
+func (d *databaseImpl) Close(ctx context.Context) error {
 	return nil
 }
 
 var (
-	_ adbc.PostInitOptions = (*databaseImpl)(nil)
+	_ adbc.GetSetOptionsWithContext = (*databaseImpl)(nil)
 )

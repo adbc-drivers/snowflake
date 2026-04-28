@@ -230,10 +230,11 @@ func WithTransporter(transporter http.RoundTripper) Option {
 // when creating the Snowflake database.
 type Driver interface {
 	adbc.Driver
+	driverbase.DriverWithContext
 
 	// NewDatabaseWithOptions creates a new Snowflake database with the provided options.
-	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.Database, error)
-	NewDatabaseWithOptionsContext(context.Context, map[string]string, ...Option) (adbc.Database, error)
+	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.DatabaseWithContext, error)
+	NewDatabaseWithOptionsContext(context.Context, map[string]string, ...Option) (adbc.DatabaseWithContext, error)
 }
 
 var _ Driver = (*driverImpl)(nil)
@@ -252,17 +253,17 @@ func NewDriver(alloc memory.Allocator) Driver {
 }
 
 func (d *driverImpl) NewDatabase(opts map[string]string) (adbc.Database, error) {
-	return d.NewDatabaseWithContext(context.Background(), opts)
+	return nil, adbc.Error{Code: adbc.StatusNotImplemented, Msg: "use NewDatabaseWithContext"}
 }
 
-func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.Database, error) {
+func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.DatabaseWithContext, error) {
 	return d.NewDatabaseWithOptionsContext(ctx, opts)
 }
 
 func (d *driverImpl) NewDatabaseWithOptions(
 	opts map[string]string,
 	optFuncs ...Option,
-) (adbc.Database, error) {
+) (adbc.DatabaseWithContext, error) {
 	return d.NewDatabaseWithOptionsContext(context.Background(), opts, optFuncs...)
 }
 
@@ -270,7 +271,7 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	ctx context.Context,
 	opts map[string]string,
 	optFuncs ...Option,
-) (adbc.Database, error) {
+) (adbc.DatabaseWithContext, error) {
 	opts = maps.Clone(opts)
 
 	dbBase, err := driverbase.NewDatabaseImplBase(ctx, &d.DriverImplBase)
@@ -287,7 +288,7 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 		defaultAppName:        defaultAppName,
 		maxTimestampPrecision: Nanoseconds,
 	}
-	if err := db.SetOptions(opts); err != nil {
+	if err := db.SetOptions(ctx, opts); err != nil {
 		return nil, err
 	}
 

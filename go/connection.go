@@ -408,49 +408,49 @@ func (*connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
 }
 
 // GetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentCatalog() (string, error) {
+func (c *connectionImpl) GetCurrentCatalog(ctx context.Context) (string, error) {
 	return c.getStringQuery("SELECT CURRENT_DATABASE()")
 }
 
 // GetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
+func (c *connectionImpl) GetCurrentDbSchema(ctx context.Context) (string, error) {
 	return c.getStringQuery("SELECT CURRENT_SCHEMA()")
 }
 
 // SetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentCatalog(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE DATABASE %s;", quoteIdentifier(value)), nil)
+func (c *connectionImpl) SetCurrentCatalog(ctx context.Context, value string) error {
+	_, err := c.cn.ExecContext(ctx, fmt.Sprintf("USE DATABASE %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentDbSchema(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE SCHEMA %s;", quoteIdentifier(value)), nil)
+func (c *connectionImpl) SetCurrentDbSchema(ctx context.Context, value string) error {
+	_, err := c.cn.ExecContext(ctx, fmt.Sprintf("USE SCHEMA %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetAutocommit implements driverbase.AutocommitSetter.
-func (c *connectionImpl) SetAutocommit(enabled bool) error {
+func (c *connectionImpl) SetAutocommit(ctx context.Context, enabled bool) error {
 	if enabled {
 		if c.activeTransaction {
-			_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
+			_, err := c.cn.ExecContext(ctx, "COMMIT", nil)
 			if err != nil {
 				return errToAdbcErr(adbc.StatusInternal, err)
 			}
 			c.activeTransaction = false
 		}
-		_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = true", nil)
+		_, err := c.cn.ExecContext(ctx, "ALTER SESSION SET AUTOCOMMIT = true", nil)
 		return err
 	}
 
 	if !c.activeTransaction {
-		_, err := c.cn.ExecContext(context.Background(), "BEGIN", nil)
+		_, err := c.cn.ExecContext(ctx, "BEGIN", nil)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInternal, err)
 		}
 		c.activeTransaction = true
 	}
-	_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = false", nil)
+	_, err := c.cn.ExecContext(ctx, "ALTER SESSION SET AUTOCOMMIT = false", nil)
 	return err
 }
 
@@ -755,7 +755,7 @@ func (c *connectionImpl) Rollback(_ context.Context) error {
 }
 
 // NewStatement initializes a new statement object tied to this connection
-func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
+func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithContext, error) {
 	stmtBase := driverbase.NewStatementImplBase(c.Base(), c.ErrorHelper)
 	stmt := &statement{
 		StatementImplBase:     stmtBase,
@@ -771,8 +771,8 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 }
 
 // Close closes this connection and releases any associated resources.
-func (c *connectionImpl) Close() (err error) {
-	_, span := driverbase.StartSpan(context.Background(), "connectionImpl.Close", c)
+func (c *connectionImpl) Close(ctx context.Context) (err error) {
+	_, span := driverbase.StartSpan(ctx, "connectionImpl.Close", c)
 	defer driverbase.EndSpan(span, err)
 
 	if c.cn == nil {
@@ -797,7 +797,7 @@ func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition 
 	}
 }
 
-func (c *connectionImpl) SetOption(key, value string) error {
+func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
 	switch key {
 	case OptionUseHighPrecision:
 		// statements will inherit the value of the OptionUseHighPrecision
@@ -816,6 +816,6 @@ func (c *connectionImpl) SetOption(key, value string) error {
 		}
 		return nil
 	default:
-		return c.Base().SetOption(key, value)
+		return c.Base().SetOption(ctx, key, value)
 	}
 }
