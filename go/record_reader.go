@@ -43,6 +43,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/snowflakedb/gosnowflake"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -559,7 +561,193 @@ type reader struct {
 	done     chan struct{} // signals all producer goroutines have finished
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (array.RecordReader, error) {
+const defaultStreamMaxRetries = 3
+
+// batchStreamer is the subset of gosnowflake.ArrowStreamBatch needed for reading.
+type batchStreamer interface {
+	GetStream(ctx context.Context) (io.ReadCloser, error)
+}
+
+// batchResetter is an optional interface that a batchStreamer may implement
+// to allow clearing the cached stream for retry. gosnowflake's
+// ArrowStreamBatch.GetStream caches its internal reader after the first
+// successful HTTP response; without Reset, a mid-stream failure (e.g. TCP
+// RST) leaves the batch permanently broken. When Reset is available,
+// bufferBatchBody calls it before each retry to force a fresh download.
+type batchResetter interface {
+	Reset() error
+}
+
+// countingReadCloser wraps an io.ReadCloser and counts bytes read.
+// Used for diagnosing truncated Arrow IPC streams.
+type countingReadCloser struct {
+	inner     io.ReadCloser
+	bytesRead int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.inner.Read(p)
+	c.bytesRead += int64(n)
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error {
+	return c.inner.Close()
+}
+
+// readBatchRecords reads all Arrow records from a Snowflake batch with retries.
+// It buffers the entire stream body into memory before IPC parsing to isolate
+// network I/O from Arrow deserialization. If the download fails, it retries
+// up to maxRetries times. Records are only returned on full success.
+//
+// NOTE: Retry only works when GetStream itself fails (rr stays nil in
+// gosnowflake). Mid-stream TCP resets cannot be retried because
+// ArrowStreamBatch.GetStream caches its internal reader. The buffering
+// still helps by reading the body at full network speed (reducing the
+// window for connection resets) and providing clear diagnostics.
+func readBatchRecords(ctx context.Context, batch batchStreamer, alloc memory.Allocator, transform recordTransformer, maxRetries int) ([]arrow.RecordBatch, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		recs, err := tryReadBatch(ctx, batch, alloc, transform)
+		if err == nil {
+			trace.SpanFromContext(ctx).AddEvent("readBatchRecords.success", trace.WithAttributes(
+				attribute.Int("attempt", attempt),
+				attribute.Int("records", len(recs)),
+			))
+			return recs, nil
+		}
+		trace.SpanFromContext(ctx).AddEvent("readBatchRecords.failed", trace.WithAttributes(
+			attribute.Int("attempt", attempt),
+			attribute.String("error", err.Error()),
+		))
+		// Release any partial records from the failed attempt
+		for _, r := range recs {
+			r.Release()
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("failed to read Arrow batch after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+// tryReadBatch downloads the full stream body into memory, then parses
+// Arrow IPC records from the buffer. Buffering the body first means:
+// 1. The HTTP body is consumed at full network speed (no IPC parsing backpressure)
+// 2. The TCP connection is held open for a shorter time
+// 3. Network errors are caught before any IPC state is created
+func tryReadBatch(ctx context.Context, batch batchStreamer, alloc memory.Allocator, transform recordTransformer) (recs []arrow.RecordBatch, err error) {
+	raw, err := batch.GetStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Buffer the entire stream body into memory to isolate network I/O
+	data, err := io.ReadAll(raw)
+	closeErr := raw.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to buffer stream body (read %d bytes): %w", len(data), err)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("failed to close stream after buffering %d bytes: %w", len(data), closeErr)
+	}
+
+	// Parse IPC from the in-memory buffer — this cannot fail due to network issues
+	rr, err := ipc.NewReader(bytes.NewReader(data), ipc.WithAllocator(alloc))
+	if err != nil {
+		return nil, fmt.Errorf("ipc.NewReader failed on %d buffered bytes: %w", len(data), err)
+	}
+	defer rr.Release()
+
+	for rr.Next() && ctx.Err() == nil {
+		rec := rr.RecordBatch()
+		rec, err = transform(ctx, rec)
+		if err != nil {
+			return recs, err
+		}
+		recs = append(recs, rec)
+	}
+	if err = rr.Err(); err != nil {
+		return recs, err
+	}
+	if ctx.Err() != nil {
+		return recs, ctx.Err()
+	}
+	return recs, nil
+}
+
+// bufferBatchBody downloads the full batch stream body into memory with
+// retry on failure, returning the raw bytes. This isolates the network
+// I/O so that IPC parsing can proceed from an in-memory buffer.
+// The raw []byte is only held until the caller finishes parsing; callers
+// should stream records to their destination as they parse rather than
+// accumulating them, to minimize peak memory.
+//
+// If the batch implements batchResetter (i.e. has a Reset() method),
+// it is called before each retry to clear the cached stream, enabling
+// a fresh HTTP download. Without Reset, retries only help when
+// GetStream itself fails before the HTTP response starts streaming.
+func bufferBatchBody(ctx context.Context, batch batchStreamer, maxRetries int) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		// On retries, reset the batch's cached stream so GetStream
+		// will re-download from cloud storage.
+		if attempt > 0 {
+			if resetter, ok := batch.(batchResetter); ok {
+				if err := resetter.Reset(); err != nil {
+					trace.SpanFromContext(ctx).AddEvent("bufferBatchBody.resetFailed", trace.WithAttributes(
+						attribute.Int("attempt", attempt),
+						attribute.String("error", err.Error()),
+					))
+					// Reset failure is not fatal — GetStream may still
+					// return the stale stream, which will likely fail again.
+				}
+			}
+		}
+
+		raw, err := batch.GetStream(ctx)
+		if err != nil {
+			trace.SpanFromContext(ctx).AddEvent("bufferBatchBody.getStreamFailed", trace.WithAttributes(
+				attribute.Int("attempt", attempt),
+				attribute.String("error", err.Error()),
+			))
+			lastErr = err
+			continue
+		}
+
+		data, err := io.ReadAll(raw)
+		closeErr := raw.Close()
+		if err != nil {
+			trace.SpanFromContext(ctx).AddEvent("bufferBatchBody.readFailed", trace.WithAttributes(
+				attribute.Int("attempt", attempt),
+				attribute.Int("bytesRead", len(data)),
+				attribute.String("error", err.Error()),
+			))
+			lastErr = fmt.Errorf("failed to buffer stream body (read %d bytes): %w", len(data), err)
+			continue
+		}
+		if closeErr != nil {
+			lastErr = fmt.Errorf("failed to close stream after buffering %d bytes: %w", len(data), closeErr)
+			continue
+		}
+
+		trace.SpanFromContext(ctx).AddEvent("bufferBatchBody.success", trace.WithAttributes(
+			attribute.Int("attempt", attempt),
+			attribute.Int("bytes", len(data)),
+			attribute.Int("capacityBytes", cap(data)),
+		))
+		return data, nil
+	}
+	return nil, fmt.Errorf("failed to buffer batch body after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision, streamRetryEnabled bool, maxTimestampPrecision MaxTimestampPrecision) (array.RecordReader, error) {
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
@@ -683,17 +871,29 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		return rdr, nil
 	}
 
+	trace.SpanFromContext(ctx).AddEvent("newRecordReader", trace.WithAttributes(
+		attribute.Int("batches", len(batches)),
+		attribute.Int64("totalRows", ld.TotalRows()),
+		attribute.Bool("streamRetryEnabled", streamRetryEnabled),
+	))
+
 	// Do all error-prone initialization first, before starting goroutines
-	r, err := batches[0].GetStream(ctx)
+	raw0, err := batches[0].GetStream(ctx)
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusIO, err)
 	}
 
+	r := &countingReadCloser{inner: raw0}
+
 	rr, err := ipc.NewReader(r, ipc.WithAllocator(alloc))
 	if err != nil {
-		_ = r.Close() // Clean up the stream
+		trace.SpanFromContext(ctx).AddEvent("newRecordReader.ipcReaderFailed", trace.WithAttributes(
+			attribute.Int64("bytesRead", r.bytesRead),
+			attribute.String("error", err.Error()),
+		))
+		_ = r.Close()
 		return nil, adbc.Error{
-			Msg:  err.Error(),
+			Msg:  fmt.Sprintf("batch[0]: ipc.NewReader failed after reading %d bytes: %s", r.bytesRead, err.Error()),
 			Code: adbc.StatusInvalidState,
 		}
 	}
@@ -749,51 +949,100 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		return rr.Err()
 	})
 
+	// Track cumulative buffer allocations across all batches for diagnostics
+	var totalBufferedBytes atomic.Int64
+	var totalBufferCapacity atomic.Int64
+
 	lastChannelIndex := len(chs) - 1
 	go func() {
-		for i, b := range batches[1:] {
-			batch, batchIdx := b, i+1
+		for i := range batches[1:] {
+			batch, batchIdx := &batches[i+1], i+1
 			// Channels already initialized above, no need to create them here
-			group.Go(func() (err error) {
-				// close channels (except the last) so that Next can move on to the next channel properly
-				if batchIdx != lastChannelIndex {
-					defer close(chs[batchIdx])
-				}
+			group.Go(func(batch batchStreamer, batchIdx int) func() error {
+				return func() (err error) {
+					// close channels (except the last) so that Next can move on to the next channel properly
+					if batchIdx != lastChannelIndex {
+						defer close(chs[batchIdx])
+					}
 
-				rdr, err := batch.GetStream(ctx)
-				if err != nil {
-					return err
-				}
-				defer func() {
-					err = errors.Join(err, rdr.Close())
-				}()
+					if streamRetryEnabled {
+						// Buffer the HTTP body into memory with retry, then parse IPC
+						// from the buffer while streaming records directly to the channel.
+						// This avoids accumulating all records in a local slice.
+						data, err := bufferBatchBody(ctx, batch, defaultStreamMaxRetries)
+						if err != nil {
+							trace.SpanFromContext(ctx).AddEvent("batch.bufferBody.failed", trace.WithAttributes(
+								attribute.Int("batchIndex", batchIdx),
+								attribute.String("error", err.Error()),
+							))
+							return err
+						}
+						totalBufferedBytes.Add(int64(len(data)))
+						totalBufferCapacity.Add(int64(cap(data)))
 
-				rr, err := ipc.NewReader(rdr, ipc.WithAllocator(alloc))
-				if err != nil {
-					return err
-				}
-				defer rr.Release()
+						rr, err := ipc.NewReader(bytes.NewReader(data), ipc.WithAllocator(alloc))
+						if err != nil {
+							return fmt.Errorf("batch[%d]: ipc.NewReader failed on %d buffered bytes: %w", batchIdx, len(data), err)
+						}
+						defer rr.Release()
 
-				for rr.Next() && ctx.Err() == nil {
-					rec := rr.RecordBatch()
-					rec, err = recTransform(ctx, rec)
+						for rr.Next() && ctx.Err() == nil {
+							rec := rr.RecordBatch()
+							rec, err = recTransform(ctx, rec)
+							if err != nil {
+								return err
+							}
+							select {
+							case chs[batchIdx] <- rec:
+							case <-ctx.Done():
+								rec.Release()
+								return ctx.Err()
+							}
+						}
+						return rr.Err()
+					}
+
+					// Original streaming path: read directly from stream without buffering
+					rawStream, err := batch.GetStream(ctx)
 					if err != nil {
+						trace.SpanFromContext(ctx).AddEvent("batch.GetStream.failed", trace.WithAttributes(
+							attribute.Int("batchIndex", batchIdx),
+							attribute.String("error", err.Error()),
+						))
 						return err
 					}
+					countingStream := &countingReadCloser{inner: rawStream}
+					defer func() {
+						err = errors.Join(err, countingStream.Close())
+					}()
 
-					// Use context-aware send to prevent deadlock
-					select {
-					case chs[batchIdx] <- rec:
-						// Successfully sent
-					case <-ctx.Done():
-						// Context cancelled, clean up and exit
-						rec.Release()
-						return ctx.Err()
+					rr, err := ipc.NewReader(countingStream, ipc.WithAllocator(alloc))
+					if err != nil {
+						trace.SpanFromContext(ctx).AddEvent("batch.ipcReader.failed", trace.WithAttributes(
+							attribute.Int("batchIndex", batchIdx),
+							attribute.Int64("bytesRead", countingStream.bytesRead),
+							attribute.String("error", err.Error()),
+						))
+						return fmt.Errorf("batch[%d]: ipc.NewReader failed after reading %d bytes: %w", batchIdx, countingStream.bytesRead, err)
 					}
-				}
+					defer rr.Release()
 
-				return rr.Err()
-			})
+					for rr.Next() && ctx.Err() == nil {
+						rec := rr.RecordBatch()
+						rec, err = recTransform(ctx, rec)
+						if err != nil {
+							return err
+						}
+						select {
+						case chs[batchIdx] <- rec:
+						case <-ctx.Done():
+							rec.Release()
+							return ctx.Err()
+						}
+					}
+					return rr.Err()
+				}
+			}(batch, batchIdx))
 		}
 
 		// place this here so that we always clean up, but they can't be in a
@@ -801,6 +1050,13 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		// the call to wait and the calls to group.Go to kick off the jobs
 		// to perform the pre-fetching (GH-1283).
 		rdr.err = group.Wait()
+		if streamRetryEnabled {
+			trace.SpanFromContext(ctx).AddEvent("streamRetry.summary", trace.WithAttributes(
+				attribute.Int64("totalBufferedBytes", totalBufferedBytes.Load()),
+				attribute.Int64("totalBufferCapacityBytes", totalBufferCapacity.Load()),
+				attribute.Int("batchCount", len(batches)-1),
+			))
+		}
 		// don't close the last channel until after the group is finished,
 		// so that Next() can only return after reader.err may have been set
 		close(chs[lastChannelIndex])

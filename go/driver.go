@@ -89,6 +89,15 @@ const (
 	// `microseconds`: Limits the max Timestamp precision to microseconds, which is safe for all values.
 	OptionMaxTimestampPrecision = "adbc.snowflake.sql.client_option.max_timestamp_precision"
 
+	// OptionStreamRetryEnabled controls whether batch reads from Snowflake
+	// use a buffered approach that reads the entire HTTP response body into
+	// memory before IPC parsing, with retry on failure. When enabled, this
+	// reduces the TCP connection open time (mitigating connection resets from
+	// cloud storage) and provides clearer diagnostics on network errors.
+	// When disabled, batches are read in the original streaming mode directly
+	// from the network. Default is disabled.
+	OptionStreamRetryEnabled = "adbc.snowflake.sql.client_option.stream_retry_enabled"
+
 	OptionApplicationName  = "adbc.snowflake.sql.client_option.app_name"
 	OptionSSLSkipVerify    = "adbc.snowflake.sql.client_option.tls_skip_verify"
 	OptionOCSPFailOpenMode = "adbc.snowflake.sql.client_option.ocsp_fail_open_mode"
