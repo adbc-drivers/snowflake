@@ -79,6 +79,7 @@ type connectionImpl struct {
 
 	activeTransaction     bool
 	useHighPrecision      bool
+	streamRetryEnabled    bool
 	maxTimestampPrecision MaxTimestampPrecision
 }
 
@@ -764,6 +765,7 @@ func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithCo
 		queueSize:             defaultStatementQueueSize,
 		prefetchConcurrency:   defaultPrefetchConcurrency,
 		useHighPrecision:      c.useHighPrecision,
+		streamRetryEnabled:    c.streamRetryEnabled,
 		maxTimestampPrecision: c.maxTimestampPrecision,
 		ingestOptions:         DefaultIngestOptions(),
 	}
@@ -808,6 +810,19 @@ func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error
 			c.useHighPrecision = true
 		case adbc.OptionValueDisabled:
 			c.useHighPrecision = false
+		default:
+			return adbc.Error{
+				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return nil
+	case OptionStreamRetryEnabled:
+		switch value {
+		case adbc.OptionValueEnabled:
+			c.streamRetryEnabled = true
+		case adbc.OptionValueDisabled:
+			c.streamRetryEnabled = false
 		default:
 			return adbc.Error{
 				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,

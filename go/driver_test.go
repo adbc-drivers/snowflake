@@ -2878,6 +2878,61 @@ func (suite *SnowflakeTests) TestGetObjectsVector() {
 	}
 }
 
+func (suite *SnowflakeTests) TestCallStoredProcedureStreamRetry() {
+	// Test calling a stored procedure that returns a result set via JSON chunks,
+	// exercising both the stream-retry and non-retry batch reading paths.
+	// JSON-formatted chunks are detected automatically via the gosnowflake
+	// QueryResultFormatProvider interface.
+
+	// Create a temporary stored procedure that generates enough rows to produce
+	// multiple downloadable JSON chunks.
+	createProc := fmt.Sprintf(`
+		CREATE OR REPLACE PROCEDURE %s.%s.test_json_batches_proc()
+		RETURNS TABLE(id INT, val STRING)
+		LANGUAGE SQL
+		AS
+		$$
+		DECLARE
+			res RESULTSET;
+		BEGIN
+			res := (SELECT SEQ4() AS id, RANDSTR(100, RANDOM()) AS val FROM TABLE(GENERATOR(ROWCOUNT => 10000)));
+			RETURN TABLE(res);
+		END;
+		$$`, suite.Quirks.catalogName, suite.Quirks.schemaName)
+
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, createProc))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	callSQL := fmt.Sprintf("CALL %s.%s.test_json_batches_proc()", suite.Quirks.catalogName, suite.Quirks.schemaName)
+
+	for _, enabled := range []string{adbc.OptionValueEnabled, adbc.OptionValueDisabled} {
+		suite.Run("stream_retry_"+enabled, func() {
+			suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStreamRetryEnabled, enabled))
+			suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, callSQL))
+
+			rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+			suite.Require().NoError(err, "ExecuteQuery failed with stream_retry=%s", enabled)
+			defer rdr.Release()
+
+			schema := rdr.Schema()
+			suite.T().Logf("stream_retry=%s  schema: %s", enabled, schema)
+
+			totalRows := int64(0)
+			batchCount := 0
+			for rdr.Next() {
+				rec := rdr.RecordBatch()
+				totalRows += rec.NumRows()
+				batchCount++
+			}
+			suite.Require().NoError(rdr.Err(), "reader error with stream_retry=%s", enabled)
+
+			suite.T().Logf("stream_retry=%s  batches=%d  totalRows=%d", enabled, batchCount, totalRows)
+			suite.Greater(totalRows, int64(0), "expected rows from stored procedure")
+		})
+	}
+}
+
 func TestSnowflakeURIScheme(t *testing.T) {
 	testCases := []struct {
 		name                  string

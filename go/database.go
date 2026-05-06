@@ -88,6 +88,7 @@ type databaseImpl struct {
 	cfg *gosnowflake.Config
 
 	useHighPrecision      bool
+	streamRetryEnabled    bool
 	maxTimestampPrecision MaxTimestampPrecision
 	defaultAppName        string
 }
@@ -168,6 +169,11 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return d.cfg.ClientConfigFile, nil
 	case OptionUseHighPrecision:
 		if d.useHighPrecision {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionStreamRetryEnabled:
+		if d.streamRetryEnabled {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
@@ -522,6 +528,18 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
+	case OptionStreamRetryEnabled:
+		switch v {
+		case adbc.OptionValueEnabled:
+			d.streamRetryEnabled = true
+		case adbc.OptionValueDisabled:
+			d.streamRetryEnabled = false
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionStreamRetryEnabled, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
 	case OptionMaxTimestampPrecision:
 		switch v {
 		case OptionValueNanoseconds, OptionValueNanosecondsNoOverflow, OptionValueMicroseconds:
@@ -563,6 +581,7 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 		// SetOption(OptionUseHighPrecision, adbc.OptionValueDisabled) to
 		// get Int64/Float64 instead
 		useHighPrecision:      d.useHighPrecision,
+		streamRetryEnabled:    d.streamRetryEnabled,
 		maxTimestampPrecision: d.maxTimestampPrecision,
 		ConnectionImplBase:    driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 	}
