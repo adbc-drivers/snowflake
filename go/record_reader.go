@@ -34,6 +34,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -770,9 +771,28 @@ type reader struct {
 	curChIndex int
 	rec        arrow.RecordBatch
 	err        error
+	errMu      sync.Mutex
+	errOnce    sync.Once
 
 	cancelFn context.CancelFunc
 	done     chan struct{} // signals all producer goroutines have finished
+}
+
+func (r *reader) setErr(err error) {
+	if err == nil {
+		return
+	}
+	r.errOnce.Do(func() {
+		r.errMu.Lock()
+		r.err = err
+		r.errMu.Unlock()
+	})
+}
+
+func (r *reader) getErr() error {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	return r.err
 }
 
 const defaultStreamMaxRetries = 3
@@ -780,6 +800,7 @@ const defaultStreamMaxRetries = 3
 // batchStreamer is the subset of gosnowflake.ArrowStreamBatch needed for reading.
 type batchStreamer interface {
 	GetStream(ctx context.Context) (io.ReadCloser, error)
+	NumRows() int64
 }
 
 // countingReadCloser wraps an io.ReadCloser and counts bytes read.
@@ -797,6 +818,60 @@ func (c *countingReadCloser) Read(p []byte) (int, error) {
 
 func (c *countingReadCloser) Close() error {
 	return c.inner.Close()
+}
+
+func rowCountMismatchError(scope string, expectedRows, actualRows int64) error {
+	return errToAdbcErr(adbc.StatusInvalidData, fmt.Errorf(
+		"%s row count mismatch: expected %d rows, got %d",
+		scope,
+		expectedRows,
+		actualRows,
+	))
+}
+
+func validateRowCount(scope string, expectedRows, actualRows int64) error {
+	if expectedRows != actualRows {
+		return rowCountMismatchError(scope, expectedRows, actualRows)
+	}
+	return nil
+}
+
+func finalizeBatchRead(ctx context.Context, scope string, expectedRows, actualRows int64, readerErr error) error {
+	if readerErr != nil {
+		return readerErr
+	}
+	// rr.Next() performs one more read after the last emitted record to confirm
+	// stream completion. If cancellation lands during that final probe after at
+	// least one row was already emitted, an exact row-count match still means the
+	// batch completed successfully.
+	rowCountErr := validateRowCount(scope, expectedRows, actualRows)
+	if rowCountErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && actualRows == 0 {
+			return ctxErr
+		}
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && actualRows < expectedRows {
+		return ctxErr
+	}
+	return rowCountErr
+}
+
+type batchStreamTarget struct {
+	scope           string
+	expectedRows    int64
+	initialRowsRead int64
+	out             chan<- arrow.RecordBatch
+	totalRowsRead   *atomic.Int64
+}
+
+func newBatchStreamTarget(batchIdx int, batch batchStreamer, out chan<- arrow.RecordBatch, totalRowsRead *atomic.Int64) batchStreamTarget {
+	return batchStreamTarget{
+		scope:         fmt.Sprintf("batch[%d]", batchIdx),
+		expectedRows:  batch.NumRows(),
+		out:           out,
+		totalRowsRead: totalRowsRead,
+	}
 }
 
 // readBatchRecords reads all Arrow records from a Snowflake batch with retries.
@@ -849,6 +924,7 @@ func tryReadBatch(ctx context.Context, batch batchStreamer, alloc memory.Allocat
 	}
 	defer rr.Release()
 
+	var rowsRead int64
 	for rr.Next() && ctx.Err() == nil {
 		rec := rr.RecordBatch()
 		rec, err = transform(ctx, rec)
@@ -856,14 +932,79 @@ func tryReadBatch(ctx context.Context, batch batchStreamer, alloc memory.Allocat
 			return recs, err
 		}
 		recs = append(recs, rec)
+		rowsRead += rec.NumRows()
 	}
-	if err = rr.Err(); err != nil {
+	if err = finalizeBatchRead(ctx, "batch stream", batch.NumRows(), rowsRead, rr.Err()); err != nil {
 		return recs, err
 	}
-	if ctx.Err() != nil {
-		return recs, ctx.Err()
-	}
 	return recs, nil
+}
+
+func streamRecordReaderToChannel(
+	ctx context.Context,
+	rr *ipc.Reader,
+	transform recordTransformer,
+	target batchStreamTarget,
+) error {
+	rowsRead := target.initialRowsRead
+	for rr.Next() && ctx.Err() == nil {
+		rec := rr.RecordBatch()
+		rec, err := transform(ctx, rec)
+		if err != nil {
+			return err
+		}
+		select {
+		case target.out <- rec:
+			rowsRead += rec.NumRows()
+			if target.totalRowsRead != nil {
+				target.totalRowsRead.Add(rec.NumRows())
+			}
+		case <-ctx.Done():
+			rec.Release()
+			return ctx.Err()
+		}
+	}
+	return finalizeBatchRead(ctx, target.scope, target.expectedRows, rowsRead, rr.Err())
+}
+
+func streamBatchToChannel(
+	ctx context.Context,
+	batchIdx int,
+	batch batchStreamer,
+	alloc memory.Allocator,
+	transform recordTransformer,
+	target batchStreamTarget,
+) (err error) {
+	rawStream, err := batch.GetStream(ctx)
+	if err != nil {
+		trace.SpanFromContext(ctx).AddEvent("batch.GetStream.failed", trace.WithAttributes(
+			attribute.Int("batchIndex", batchIdx),
+			attribute.String("error", err.Error()),
+		))
+		return err
+	}
+	countingStream := &countingReadCloser{inner: rawStream}
+	defer func() {
+		err = errors.Join(err, countingStream.Close())
+	}()
+
+	rr, err := ipc.NewReader(countingStream, ipc.WithAllocator(alloc))
+	if err != nil {
+		trace.SpanFromContext(ctx).AddEvent("batch.ipcReader.failed", trace.WithAttributes(
+			attribute.Int("batchIndex", batchIdx),
+			attribute.Int64("bytesRead", countingStream.bytesRead),
+			attribute.String("error", err.Error()),
+		))
+		return fmt.Errorf("batch[%d]: ipc.NewReader failed after reading %d bytes: %w", batchIdx, countingStream.bytesRead, err)
+	}
+	defer rr.Release()
+
+	return streamRecordReaderToChannel(
+		ctx,
+		rr,
+		transform,
+		target,
+	)
 }
 
 // readJSONBatches handles the case where GetBatches() returned downloadable
@@ -887,7 +1028,7 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 	}
 
-	if ld.TotalRows() == 0 {
+	if ld.TotalRows() == 0 && len(batches) == 0 {
 		return array.NewRecordReader(schema, []arrow.RecordBatch{})
 	}
 
@@ -896,6 +1037,7 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 
 	var results []arrow.RecordBatch
 	var rawData [][]*string
+	var totalRowsRead int64
 	for batchIdx, b := range batches {
 		var data []byte
 		if batchIdx == 0 {
@@ -961,8 +1103,12 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		defer rec.Release()
 
 		results = append(results, rec)
+		totalRowsRead += rec.NumRows()
 	}
 
+	if err := validateRowCount("result set", ld.TotalRows(), totalRowsRead); err != nil {
+		return nil, err
+	}
 	return array.NewRecordReader(schema, results)
 }
 
@@ -986,7 +1132,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			}
 		}
 
-		if ld.TotalRows() == 0 {
+		if ld.TotalRows() == 0 && len(rawData) == 0 && len(batches) == 0 {
 			return array.NewRecordReader(schema, []arrow.RecordBatch{})
 		}
 
@@ -1000,6 +1146,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		defer rec.Release()
 
 		results := []arrow.RecordBatch{rec}
+		totalRowsRead := rec.NumRows()
 		for _, b := range batches {
 			rdr, err := b.GetStream(ctx)
 			if err != nil {
@@ -1066,13 +1213,20 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			defer rec.Release()
 
 			results = append(results, rec)
+			totalRowsRead += rec.NumRows()
 		}
 
+		if err := validateRowCount("result set", ld.TotalRows(), totalRowsRead); err != nil {
+			return nil, err
+		}
 		return array.NewRecordReader(schema, results)
 	}
 
 	// Handle empty batches case early
 	if len(batches) == 0 {
+		if err := validateRowCount("result set", ld.TotalRows(), 0); err != nil {
+			return nil, err
+		}
 		schema, err := rowTypesToArrowSchema(ctx, ld, useHighPrecision, maxTimestampPrecision)
 		if err != nil {
 			return nil, err
@@ -1169,6 +1323,8 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 
 	var recTransform recordTransformer
 	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision, geoCols)
+	var totalRowsRead atomic.Int64
+	batch0Target := newBatchStreamTarget(0, &batches[0], chs[0], &totalRowsRead)
 
 	if firstRec != nil {
 		transformed, err := recTransform(ctx, firstRec)
@@ -1180,35 +1336,26 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		// chs[0] is buffered (bufferSize >= 1), so this never blocks.
 		chs[0] <- transformed
+		rows := transformed.NumRows()
+		totalRowsRead.Add(rows)
+		batch0Target.initialRowsRead = rows
 	}
 
 	group.Go(func() (err error) {
 		defer rr.Release()
 		defer func() {
+			rdr.setErr(err)
 			err = errors.Join(err, r.Close())
 		}()
 		if len(batches) > 1 {
 			defer close(chs[0])
 		}
-
-		for rr.Next() && ctx.Err() == nil {
-			rec := rr.RecordBatch()
-			rec, err = recTransform(ctx, rec)
-			if err != nil {
-				return err
-			}
-
-			// Use context-aware send to prevent deadlock
-			select {
-			case chs[0] <- rec:
-				// Successfully sent
-			case <-ctx.Done():
-				// Context cancelled, clean up and exit
-				rec.Release()
-				return ctx.Err()
-			}
-		}
-		return rr.Err()
+		return streamRecordReaderToChannel(
+			ctx,
+			rr,
+			recTransform,
+			batch0Target,
+		)
 	})
 
 	lastChannelIndex := len(chs) - 1
@@ -1218,6 +1365,9 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			// Channels already initialized above, no need to create them here
 			group.Go(func(batch batchStreamer, batchIdx int) func() error {
 				return func() (err error) {
+					defer func() {
+						rdr.setErr(err)
+					}()
 					// close channels (except the last) so that Next can move on to the next channel properly
 					if batchIdx != lastChannelIndex {
 						defer close(chs[batchIdx])
@@ -1239,6 +1389,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 						for i, rec := range recs {
 							select {
 							case chs[batchIdx] <- rec:
+								totalRowsRead.Add(rec.NumRows())
 								recs[i] = nil // ownership transferred to channel
 							case <-ctx.Done():
 								rec.Release()
@@ -1254,45 +1405,14 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 						return nil
 					}
 
-					// Original streaming path: read directly from stream without buffering
-					rawStream, err := batch.GetStream(ctx)
-					if err != nil {
-						trace.SpanFromContext(ctx).AddEvent("batch.GetStream.failed", trace.WithAttributes(
-							attribute.Int("batchIndex", batchIdx),
-							attribute.String("error", err.Error()),
-						))
-						return err
-					}
-					countingStream := &countingReadCloser{inner: rawStream}
-					defer func() {
-						err = errors.Join(err, countingStream.Close())
-					}()
-
-					rr, err := ipc.NewReader(countingStream, ipc.WithAllocator(alloc))
-					if err != nil {
-						trace.SpanFromContext(ctx).AddEvent("batch.ipcReader.failed", trace.WithAttributes(
-							attribute.Int("batchIndex", batchIdx),
-							attribute.Int64("bytesRead", countingStream.bytesRead),
-							attribute.String("error", err.Error()),
-						))
-						return fmt.Errorf("batch[%d]: ipc.NewReader failed after reading %d bytes: %w", batchIdx, countingStream.bytesRead, err)
-					}
-					defer rr.Release()
-
-					for rr.Next() && ctx.Err() == nil {
-						rec := rr.RecordBatch()
-						rec, err = recTransform(ctx, rec)
-						if err != nil {
-							return err
-						}
-						select {
-						case chs[batchIdx] <- rec:
-						case <-ctx.Done():
-							rec.Release()
-							return ctx.Err()
-						}
-					}
-					return rr.Err()
+					return streamBatchToChannel(
+						ctx,
+						batchIdx,
+						batch,
+						alloc,
+						recTransform,
+						newBatchStreamTarget(batchIdx, batch, chs[batchIdx], &totalRowsRead),
+					)
 				}
 			}(batch, batchIdx))
 		}
@@ -1301,7 +1421,10 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		// separate goroutine. Otherwise we'll have a race condition between
 		// the call to wait and the calls to group.Go to kick off the jobs
 		// to perform the pre-fetching (GH-1283).
-		rdr.err = group.Wait()
+		rdr.setErr(group.Wait())
+		if rdr.getErr() == nil {
+			rdr.setErr(validateRowCount("result set", ld.TotalRows(), totalRowsRead.Load()))
+		}
 		// don't close the last channel until after the group is finished,
 		// so that Next() can only return after reader.err may have been set
 		close(chs[lastChannelIndex])
@@ -1325,7 +1448,7 @@ func (r *reader) RecordBatch() arrow.RecordBatch {
 }
 
 func (r *reader) Err() error {
-	return r.err
+	return r.getErr()
 }
 
 func (r *reader) Next() bool {
@@ -1341,11 +1464,14 @@ func (r *reader) Next() bool {
 	var ok bool
 	for r.curChIndex < len(r.chs) {
 		if r.rec, ok = <-r.chs[r.curChIndex]; ok {
-			break
+			return true
+		}
+		if r.getErr() != nil {
+			return false
 		}
 		r.curChIndex++
 	}
-	return r.rec != nil
+	return false
 }
 
 func (r *reader) Retain() {

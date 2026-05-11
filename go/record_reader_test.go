@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -32,8 +34,9 @@ import (
 
 // mockBatch implements batchStreamer for testing.
 type mockBatch struct {
-	streams []func() (io.ReadCloser, error)
+	streams []func(context.Context) (io.ReadCloser, error)
 	call    int
+	numRows int64
 }
 
 func (m *mockBatch) GetStream(ctx context.Context) (io.ReadCloser, error) {
@@ -42,7 +45,11 @@ func (m *mockBatch) GetStream(ctx context.Context) (io.ReadCloser, error) {
 	}
 	fn := m.streams[m.call]
 	m.call++
-	return fn()
+	return fn(ctx)
+}
+
+func (m *mockBatch) NumRows() int64 {
+	return m.numRows
 }
 
 // buildIPCBytes writes Arrow IPC record batches to a byte buffer.
@@ -54,6 +61,13 @@ func buildIPCBytes(alloc memory.Allocator, schema *arrow.Schema, records []arrow
 	}
 	_ = w.Close()
 	return buf.Bytes()
+}
+
+func truncateIPCStream(data []byte) []byte {
+	if len(data) <= 8 {
+		return append([]byte(nil), data...)
+	}
+	return append([]byte(nil), data[:len(data)-8]...)
 }
 
 func testSchema() *arrow.Schema {
@@ -82,16 +96,48 @@ func failingTransform(msg string) recordTransformer {
 	}
 }
 
-func streamFromBytes(data []byte) func() (io.ReadCloser, error) {
-	return func() (io.ReadCloser, error) {
+func streamFromBytes(data []byte) func(context.Context) (io.ReadCloser, error) {
+	return func(context.Context) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(data)), nil
 	}
 }
 
-func streamError(err error) func() (io.ReadCloser, error) {
-	return func() (io.ReadCloser, error) {
+func streamError(err error) func(context.Context) (io.ReadCloser, error) {
+	return func(context.Context) (io.ReadCloser, error) {
 		return nil, err
 	}
+}
+
+type contextEOFStream struct {
+	ctx context.Context
+
+	prefix bytes.Reader
+
+	blockOnce sync.Once
+	blocked   chan struct{}
+}
+
+func newContextEOFStream(ctx context.Context, prefix []byte) *contextEOFStream {
+	return &contextEOFStream{
+		ctx:     ctx,
+		prefix:  *bytes.NewReader(prefix),
+		blocked: make(chan struct{}),
+	}
+}
+
+func (s *contextEOFStream) Read(p []byte) (int, error) {
+	if s.prefix.Len() > 0 {
+		return s.prefix.Read(p)
+	}
+	s.blockOnce.Do(func() {
+		close(s.blocked)
+	})
+	<-s.ctx.Done()
+	return 0, io.EOF
+}
+
+func (s *contextEOFStream) Close() error {
+	return nil
 }
 
 // --- tryReadBatch tests ---
@@ -105,7 +151,7 @@ func TestTryReadBatch_Success(t *testing.T) {
 	defer rec.Release()
 
 	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){streamFromBytes(data)}}
+	batch := &mockBatch{numRows: 3, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
 
 	recs, err := tryReadBatch(context.Background(), batch, alloc, identityTransform)
 	require.NoError(t, err)
@@ -130,7 +176,7 @@ func TestTryReadBatch_MultipleRecords(t *testing.T) {
 	defer rec2.Release()
 
 	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec1, rec2})
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){streamFromBytes(data)}}
+	batch := &mockBatch{numRows: 4, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
 
 	recs, err := tryReadBatch(context.Background(), batch, alloc, identityTransform)
 	require.NoError(t, err)
@@ -151,7 +197,7 @@ func TestTryReadBatch_EmptyStream(t *testing.T) {
 
 	schema := testSchema()
 	data := buildIPCBytes(alloc, schema, nil) // no records, just schema
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){streamFromBytes(data)}}
+	batch := &mockBatch{numRows: 0, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
 
 	recs, err := tryReadBatch(context.Background(), batch, alloc, identityTransform)
 	require.NoError(t, err)
@@ -162,7 +208,7 @@ func TestTryReadBatch_GetStreamError(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	defer alloc.AssertSize(t, 0)
 
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){
+	batch := &mockBatch{streams: []func(context.Context) (io.ReadCloser, error){
 		streamError(fmt.Errorf("network down")),
 	}}
 
@@ -181,7 +227,7 @@ func TestTryReadBatch_TransformError(t *testing.T) {
 	defer rec.Release()
 
 	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){streamFromBytes(data)}}
+	batch := &mockBatch{numRows: 1, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
 
 	recs, err := tryReadBatch(context.Background(), batch, alloc, failingTransform("bad transform"))
 	require.Error(t, err)
@@ -204,7 +250,7 @@ func TestTryReadBatch_CancelledContext(t *testing.T) {
 	defer rec.Release()
 
 	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){streamFromBytes(data)}}
+	batch := &mockBatch{numRows: 1, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
 
 	recs, err := tryReadBatch(ctx, batch, alloc, identityTransform)
 	// Either GetStream or context check will surface the error
@@ -231,7 +277,7 @@ func TestReadBatchRecords_SuccessFirstAttempt(t *testing.T) {
 	defer rec.Release()
 
 	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){streamFromBytes(data)}}
+	batch := &mockBatch{numRows: 2, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
 
 	recs, err := readBatchRecords(context.Background(), batch, alloc, identityTransform, 3)
 	require.NoError(t, err)
@@ -252,7 +298,7 @@ func TestReadBatchRecords_SuccessAfterRetries(t *testing.T) {
 	goodData := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
 
 	// First two calls fail, third succeeds
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){
+	batch := &mockBatch{numRows: 3, streams: []func(context.Context) (io.ReadCloser, error){
 		streamError(fmt.Errorf("fail 1")),
 		streamError(fmt.Errorf("fail 2")),
 		streamFromBytes(goodData),
@@ -271,7 +317,7 @@ func TestReadBatchRecords_ExhaustsRetries(t *testing.T) {
 	defer alloc.AssertSize(t, 0)
 
 	maxRetries := 2
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){
+	batch := &mockBatch{streams: []func(context.Context) (io.ReadCloser, error){
 		streamError(fmt.Errorf("fail 1")),
 		streamError(fmt.Errorf("fail 2")),
 		streamError(fmt.Errorf("fail 3")),
@@ -288,7 +334,7 @@ func TestReadBatchRecords_ZeroRetries(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	defer alloc.AssertSize(t, 0)
 
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){
+	batch := &mockBatch{streams: []func(context.Context) (io.ReadCloser, error){
 		streamError(fmt.Errorf("only chance")),
 	}}
 
@@ -305,7 +351,7 @@ func TestReadBatchRecords_CancelledContextSkipsRetries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){
+	batch := &mockBatch{streams: []func(context.Context) (io.ReadCloser, error){
 		streamError(fmt.Errorf("should not reach")),
 	}}
 
@@ -347,7 +393,7 @@ func TestReadBatchRecords_PartialRecordsReleasedOnRetry(t *testing.T) {
 		return r, nil
 	}
 
-	batch := &mockBatch{streams: []func() (io.ReadCloser, error){
+	batch := &mockBatch{numRows: 1, streams: []func(context.Context) (io.ReadCloser, error){
 		streamFromBytes(failData),
 		streamFromBytes(goodData),
 	}}
@@ -427,5 +473,337 @@ func TestFixedToFloat64Transformer(t *testing.T) {
 			require.IsType(t, (*array.Float64)(nil), out)
 			assert.InDelta(t, tc.want, out.(*array.Float64).Value(0), 1e-4)
 		})
+	}
+}
+
+func TestReadBatchRecords_RetriesAfterRowCountMismatch(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	shortRec := buildTestRecord(alloc, schema, []int64{1})
+	defer shortRec.Release()
+	goodRec := buildTestRecord(alloc, schema, []int64{1, 2})
+	defer goodRec.Release()
+
+	shortData := buildIPCBytes(alloc, schema, []arrow.RecordBatch{shortRec})
+	goodData := buildIPCBytes(alloc, schema, []arrow.RecordBatch{goodRec})
+	batch := &mockBatch{numRows: 2, streams: []func(context.Context) (io.ReadCloser, error){
+		streamFromBytes(shortData),
+		streamFromBytes(goodData),
+	}}
+
+	recs, err := readBatchRecords(context.Background(), batch, alloc, identityTransform, 1)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	defer recs[0].Release()
+
+	assert.EqualValues(t, 2, recs[0].NumRows())
+	assert.Equal(t, 2, batch.call)
+}
+
+func TestTryReadBatch_TruncatedStreamFailsRowCountValidation(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	rec := buildTestRecord(alloc, schema, []int64{1})
+	defer rec.Release()
+
+	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
+	batch := &mockBatch{numRows: 3, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
+
+	recs, err := tryReadBatch(context.Background(), batch, alloc, identityTransform)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch stream row count mismatch: expected 3 rows, got 1")
+	for _, r := range recs {
+		r.Release()
+	}
+}
+
+func TestStreamBatchToChannel_TruncatedStreamFailsRowCountValidation(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	rec := buildTestRecord(alloc, schema, []int64{1})
+	defer rec.Release()
+
+	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
+	batch := &mockBatch{numRows: 3, streams: []func(context.Context) (io.ReadCloser, error){streamFromBytes(data)}}
+	out := make(chan arrow.RecordBatch, 1)
+
+	err := streamBatchToChannel(context.Background(), 2, batch, alloc, identityTransform, newBatchStreamTarget(2, batch, out, nil))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch[2] row count mismatch: expected 3 rows, got 1")
+
+	select {
+	case rec := <-out:
+		assert.EqualValues(t, 1, rec.NumRows())
+		rec.Release()
+	default:
+		require.FailNow(t, "streamBatchToChannel should have emitted the partial record before reporting the row count mismatch")
+	}
+}
+
+func TestValidateRowCount_UsesNeutralMismatchMessage(t *testing.T) {
+	err := validateRowCount("result set", 5, 3)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "result set row count mismatch: expected 5 rows, got 3")
+	assert.NotContains(t, err.Error(), "ended early")
+}
+
+func TestStreamBatchToChannel_CancellationReturnsContextError(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	schemaOnly := truncateIPCStream(buildIPCBytes(alloc, schema, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	streamCh := make(chan *contextEOFStream, 1)
+	batch := &mockBatch{
+		numRows: 0,
+		streams: []func(context.Context) (io.ReadCloser, error){
+			func(ctx context.Context) (io.ReadCloser, error) {
+				stream := newContextEOFStream(ctx, schemaOnly)
+				streamCh <- stream
+				return stream, nil
+			},
+		},
+	}
+
+	out := make(chan arrow.RecordBatch, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- streamBatchToChannel(ctx, 0, batch, alloc, identityTransform, newBatchStreamTarget(0, batch, out, nil))
+	}()
+
+	stream := <-streamCh
+	<-stream.blocked
+	cancel()
+
+	err := <-errCh
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestReaderLateCancellationAfterLastRecordReturnsSuccess(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	rec := buildTestRecord(alloc, schema, []int64{1})
+	defer rec.Release()
+
+	recordThenBlockAtEOF := truncateIPCStream(buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	streamCh := make(chan *contextEOFStream, 1)
+	chs := []chan arrow.RecordBatch{make(chan arrow.RecordBatch, 1)}
+	rdr := &reader{
+		refCount: 1,
+		chs:      chs,
+		cancelFn: cancel,
+		done:     make(chan struct{}),
+	}
+
+	batch := &mockBatch{
+		numRows: 1,
+		streams: []func(context.Context) (io.ReadCloser, error){
+			func(ctx context.Context) (io.ReadCloser, error) {
+				stream := newContextEOFStream(ctx, recordThenBlockAtEOF)
+				streamCh <- stream
+				return stream, nil
+			},
+		},
+	}
+
+	go func() {
+		rdr.setErr(streamBatchToChannel(ctx, 0, batch, alloc, identityTransform, newBatchStreamTarget(0, batch, chs[0], nil)))
+		close(chs[0])
+		close(rdr.done)
+	}()
+
+	stream := <-streamCh
+	require.True(t, rdr.Next(), "reader should emit the completed batch before cancellation")
+	assert.EqualValues(t, 1, rdr.RecordBatch().NumRows())
+
+	<-stream.blocked
+	cancel()
+
+	nextCh := make(chan bool, 1)
+	go func() {
+		nextCh <- rdr.Next()
+	}()
+
+	select {
+	case got := <-nextCh:
+		assert.False(t, got)
+	case <-time.After(200 * time.Millisecond):
+		require.FailNow(t, "reader.Next should finish after late cancellation")
+	}
+
+	require.NoError(t, rdr.Err(), "late cancellation after the final batch should not surface as reader error")
+
+	releaseDone := make(chan struct{})
+	go func() {
+		rdr.Release()
+		close(releaseDone)
+	}()
+	select {
+	case <-releaseDone:
+	case <-time.After(200 * time.Millisecond):
+		require.FailNow(t, "reader.Release should not block after late cancellation")
+	}
+}
+
+func TestReaderStopsAfterEarlierBatchFailureDespiteLaterPrefetch(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	failingRec := buildTestRecord(alloc, schema, []int64{1})
+	defer failingRec.Release()
+	laterRec := buildTestRecord(alloc, schema, []int64{2})
+	defer laterRec.Release()
+
+	shortData := buildIPCBytes(alloc, schema, []arrow.RecordBatch{failingRec})
+	laterData := buildIPCBytes(alloc, schema, []arrow.RecordBatch{laterRec})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	chs := []chan arrow.RecordBatch{
+		make(chan arrow.RecordBatch, 1),
+		make(chan arrow.RecordBatch, 1),
+	}
+	rdr := &reader{
+		refCount: 1,
+		chs:      chs,
+		cancelFn: cancel,
+		done:     make(chan struct{}),
+	}
+
+	failingBatch := &mockBatch{
+		numRows: 2,
+		streams: []func(context.Context) (io.ReadCloser, error){
+			streamFromBytes(shortData),
+		},
+	}
+	laterBatch := &mockBatch{
+		numRows: 1,
+		streams: []func(context.Context) (io.ReadCloser, error){
+			streamFromBytes(laterData),
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		err := streamBatchToChannel(ctx, 1, laterBatch, alloc, identityTransform, newBatchStreamTarget(1, laterBatch, chs[1], nil))
+		rdr.setErr(err)
+		close(chs[1])
+	}()
+
+	require.Eventually(t, func() bool {
+		return len(chs[1]) == 1
+	}, 200*time.Millisecond, 10*time.Millisecond, "later batch should prefetch before the earlier batch fails")
+
+	go func() {
+		defer wg.Done()
+		err := streamBatchToChannel(ctx, 0, failingBatch, alloc, identityTransform, newBatchStreamTarget(0, failingBatch, chs[0], nil))
+		rdr.setErr(err)
+		close(chs[0])
+	}()
+
+	go func() {
+		wg.Wait()
+		close(rdr.done)
+	}()
+
+	require.True(t, rdr.Next(), "reader should emit the partial record from the failing batch first")
+	assert.EqualValues(t, 1, rdr.RecordBatch().NumRows())
+
+	assert.False(t, rdr.Next(), "reader should stop before yielding rows from later prefetched batches")
+	require.Error(t, rdr.Err())
+	assert.Contains(t, rdr.Err().Error(), "batch[0] row count mismatch: expected 2 rows, got 1")
+	assert.Len(t, chs[1], 1, "later prefetched rows should remain queued for release, not be returned by Next")
+
+	releaseDone := make(chan struct{})
+	go func() {
+		rdr.Release()
+		close(releaseDone)
+	}()
+	select {
+	case <-releaseDone:
+	case <-time.After(200 * time.Millisecond):
+		require.FailNow(t, "reader.Release should not block after suppressing later prefetched rows")
+	}
+}
+
+func TestReaderCancellationSetsErrBeforeNextAndReleaseReturns(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	schemaOnly := truncateIPCStream(buildIPCBytes(alloc, schema, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	streamCh := make(chan *contextEOFStream, 1)
+	chs := []chan arrow.RecordBatch{make(chan arrow.RecordBatch)}
+	rdr := &reader{
+		refCount: 1,
+		chs:      chs,
+		cancelFn: cancel,
+		done:     make(chan struct{}),
+	}
+
+	batch := &mockBatch{
+		numRows: 0,
+		streams: []func(context.Context) (io.ReadCloser, error){
+			func(ctx context.Context) (io.ReadCloser, error) {
+				stream := newContextEOFStream(ctx, schemaOnly)
+				streamCh <- stream
+				return stream, nil
+			},
+		},
+	}
+
+	go func() {
+		rdr.setErr(streamBatchToChannel(ctx, 0, batch, alloc, identityTransform, newBatchStreamTarget(0, batch, chs[0], nil)))
+		close(chs[0])
+		close(rdr.done)
+	}()
+
+	nextCh := make(chan bool, 1)
+	go func() {
+		nextCh <- rdr.Next()
+	}()
+
+	stream := <-streamCh
+	<-stream.blocked
+	cancel()
+
+	select {
+	case got := <-nextCh:
+		assert.False(t, got)
+	case <-time.After(200 * time.Millisecond):
+		require.FailNow(t, "reader.Next should not block after cancellation")
+	}
+	require.Error(t, rdr.Err())
+	assert.ErrorIs(t, rdr.Err(), context.Canceled)
+
+	releaseDone := make(chan struct{})
+	go func() {
+		rdr.Release()
+		close(releaseDone)
+	}()
+	select {
+	case <-releaseDone:
+	case <-time.After(200 * time.Millisecond):
+		require.FailNow(t, "reader.Release should not block after cancellation")
 	}
 }
