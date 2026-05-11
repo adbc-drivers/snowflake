@@ -24,6 +24,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
@@ -360,4 +361,53 @@ func TestReadBatchRecords_PartialRecordsReleasedOnRetry(t *testing.T) {
 	// The allocator check in defer will catch any leaked memory from the
 	// partial records of the failed first attempt.
 	assert.EqualValues(t, 1, recs[0].NumRows())
+}
+
+// TestIntegerToDecimal128_LargeUnscaledValue is the regression test for the NUMBER(38, 11) crash.
+//
+// When useHighPrecision=false, Snowflake sends the column as int64 on the wire.
+// Before the fix, the guard "Precision > 15 && Precision < 19" skipped the safe
+// decimal128 intermediate path for precision >= 19, causing compute.Divide to attempt
+// a direct int64→float64 safe cast. Arrow's safe cast rejects values outside
+// [-9007199254740992, 9007199254740992] (i.e. > 2^53), triggering:
+//
+//	"invalid: integer value 42135425651100000 not in range: -9007199254740992 to 9007199254740992"
+//
+// The fix removes the upper bound so any precision > 15 uses the decimal128 intermediate path.
+// This test verifies:
+//  1. integerToDecimal128 handles a large unscaled int64 value without error.
+//  2. The resulting Decimal128 can be cast to float64 to recover the original decimal.
+func TestIntegerToDecimal128_LargeUnscaledValue(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	// 421354.25651100000 stored as NUMBER(38,11) → unscaled int64 = 42135425651100000
+	// This value exceeds 2^53 = 9007199254740992, so the old compute.Divide path crashed.
+	const unscaledValue = int64(42135425651100000)
+	const scale = int32(11)
+	const precision = int32(38)
+
+	// Build an int64 Arrow array — exactly what Snowflake sends over the wire.
+	bldr := array.NewInt64Builder(alloc)
+	defer bldr.Release()
+	bldr.Append(unscaledValue)
+	int64Arr := bldr.NewInt64Array()
+	defer int64Arr.Release()
+
+	dt := &arrow.Decimal128Type{Precision: precision, Scale: scale}
+	ctx := context.Background()
+
+	// This is the path that the fixed code uses for precision > 15.
+	dec128Arr, err := integerToDecimal128(ctx, int64Arr, dt)
+	require.NoError(t, err, "integerToDecimal128 must succeed for large unscaled values")
+	defer dec128Arr.Release()
+
+	// Cast to float64 to get the final value (as the low-precision path does).
+	float64Arr, err := compute.CastArray(ctx, dec128Arr, compute.UnsafeCastOptions(arrow.PrimitiveTypes.Float64))
+	require.NoError(t, err, "Decimal128→float64 cast must succeed")
+	defer float64Arr.Release()
+
+	got := float64Arr.(*array.Float64).Value(0)
+	// 42135425651100000 / 10^11 = 421354.256511
+	assert.InDelta(t, 421354.256511, got, 1e-4)
 }

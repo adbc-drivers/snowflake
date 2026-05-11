@@ -127,9 +127,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				} else {
 					if srcMeta.Scale != 0 {
 						f.Type = arrow.PrimitiveTypes.Float64
-						// For precisions of 16, 17 and 18, a conversion from int64 to float64 fails with an error
-						// So for these precisions, we instead convert first to a decimal128 and then to a float64.
-						if srcMeta.Precision > 15 && srcMeta.Precision < 19 {
+						if srcMeta.Precision > 15 {
 							transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
 								result, err := integerToDecimal128(ctx, a, &arrow.Decimal128Type{
 									Precision: int32(srcMeta.Precision),
