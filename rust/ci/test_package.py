@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.github/pull_request_template.md
-.gitmodules
-*/go.sum
-*/pixi.lock
-*/Cargo.lock
-*/*.csproj
-*/*.sln
-go/license.tpl
-go/validation/queries/*/*.json
-go/validation/queries/*/*.sql
-rust/license.tpl
-rust/validation/queries/*/*.json
-rust/validation/queries/*/*.sql
-rust/validation/queries/*/*/*.json
-rust/validation/queries/*/*/*.sql
-csharp/test/Interop/Resources/snowflakeconfig.json
+import adbc_driver_manager.dbapi
+import pytest
+
+
+def test_package() -> None:
+    uri = "snowflake://example:foo@nonexistent/test"
+    # Verify the driver loads and reaches the auth phase (not a load failure).
+    with pytest.raises(
+        adbc_driver_manager.dbapi.ProgrammingError,
+        match="(?i)(?:failed to (?:auth|login)|unauthenticated)",
+    ):
+        with adbc_driver_manager.dbapi.connect(driver="snowflake", uri=uri):
+            pass
