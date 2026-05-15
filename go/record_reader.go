@@ -127,31 +127,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				} else {
 					if srcMeta.Scale != 0 {
 						f.Type = arrow.PrimitiveTypes.Float64
-						if srcMeta.Precision > 15 {
-							transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-								result, err := integerToDecimal128(ctx, a, &arrow.Decimal128Type{
-									Precision: int32(srcMeta.Precision),
-									Scale:     int32(srcMeta.Scale),
-								})
-								if err != nil {
-									return nil, err
-								}
-								defer result.Release()
-								return compute.CastArray(ctx, result, compute.UnsafeCastOptions(f.Type))
-							}
-						} else {
-							// For precisions less than 16, we can simply scale the integer value appropriately
-							transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-								result, err := compute.Divide(ctx, compute.ArithmeticOptions{NoCheckOverflow: true},
-									&compute.ArrayDatum{Value: a.Data()},
-									compute.NewDatum(math.Pow10(int(srcMeta.Scale))))
-								if err != nil {
-									return nil, err
-								}
-								defer result.Release()
-								return result.(*compute.ArrayDatum).MakeArray(), nil
-							}
-						}
+						transformers[i] = fixedToFloat64Transformer(int32(srcMeta.Precision), int32(srcMeta.Scale))
 					} else {
 						f.Type = arrow.PrimitiveTypes.Int64
 						transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
@@ -340,6 +316,47 @@ func getArrowTimestampFromTime(val time.Time, unit arrow.TimeUnit, originalArrow
 	}
 
 	return arrow.TimestampFromTime(val, unit)
+}
+
+// fixedToFloat64Transformer returns the column transformer used by getTransformer
+// for FIXED Snowflake columns when useHighPrecision=false and scale != 0.
+//
+// Snowflake transmits FIXED columns as int64 on the wire. For precisions > 15 the
+// unscaled value can exceed 2^53, so the simple compute.Divide path (which performs
+// a safe int64->float64 cast) fails. In that case we widen to Decimal128 first.
+// For precisions <= 15 the unscaled value safely fits in float64, so we just scale
+// the integer directly.
+func fixedToFloat64Transformer(precision, scale int32) colTransformer {
+	if precision > 15 {
+		return scaledIntToFloat64Transformer(precision, scale)
+	}
+	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+		result, err := compute.Divide(ctx, compute.ArithmeticOptions{NoCheckOverflow: true},
+			&compute.ArrayDatum{Value: a.Data()},
+			compute.NewDatum(math.Pow10(int(scale))))
+		if err != nil {
+			return nil, err
+		}
+		defer result.Release()
+		return result.(*compute.ArrayDatum).MakeArray(), nil
+	}
+}
+
+// scaledIntToFloat64Transformer returns the column transformer used by
+// fixedToFloat64Transformer when precision > 15. It converts a Snowflake
+// scaled-integer column (transmitted as int64) to float64 by first widening to
+// Decimal128, avoiding the int64->float64 safe cast failure that occurs when the
+// unscaled value exceeds 2^53.
+func scaledIntToFloat64Transformer(precision, scale int32) colTransformer {
+	dt := &arrow.Decimal128Type{Precision: precision, Scale: scale}
+	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+		result, err := integerToDecimal128(ctx, a, dt)
+		if err != nil {
+			return nil, err
+		}
+		defer result.Release()
+		return compute.CastArray(ctx, result, compute.UnsafeCastOptions(arrow.PrimitiveTypes.Float64))
+	}
 }
 
 func integerToDecimal128(ctx context.Context, a arrow.Array, dt *arrow.Decimal128Type) (arrow.Array, error) {
