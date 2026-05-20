@@ -361,3 +361,71 @@ func TestReadBatchRecords_PartialRecordsReleasedOnRetry(t *testing.T) {
 	// partial records of the failed first attempt.
 	assert.EqualValues(t, 1, recs[0].NumRows())
 }
+
+// TestFixedToFloat64Transformer covers the driver code path that was changed by
+// the NUMBER(38, 11) fix.
+//
+// getTransformer wires fixedToFloat64Transformer for every FIXED Snowflake column
+// with useHighPrecision=false and scale != 0. The function chooses between two
+// internal paths based on precision:
+//
+//   - precision <= 15: scale the int64 in place via compute.Divide (the unscaled
+//     value safely fits in float64).
+//   - precision >  15: widen to Decimal128 first, because the unscaled int64 can
+//     exceed 2^53 and a direct int64->float64 safe cast would fail with
+//     "integer value ... not in range: -9007199254740992 to 9007199254740992".
+//
+// Before the fix the precision>15 path was gated by an extra "precision < 19"
+// upper bound, so NUMBER(p, s) columns with p >= 19 (e.g. NUMBER(38, 11)) fell
+// through to compute.Divide and crashed on any unscaled value > 2^53. This test
+// exercises both branches of the guard fixedToFloat64Transformer now owns.
+func TestFixedToFloat64Transformer(t *testing.T) {
+	cases := []struct {
+		name          string
+		precision     int32
+		scale         int32
+		unscaledValue int64
+		want          float64
+	}{
+		{
+			// Regression case: NUMBER(38, 11) with unscaled value > 2^53
+			// (9007199254740992). Pre-fix this crashed; post-fix it goes through
+			// the Decimal128 intermediate path.
+			name:          "precision38_unscaledExceeds2Pow53",
+			precision:     38,
+			scale:         11,
+			unscaledValue: 42135425651100000,
+			want:          421354.256511,
+		},
+		{
+			// Happy path that was always working: precision <= 15 uses the
+			// in-place compute.Divide path. Included to guard against the
+			// refactor accidentally rerouting small precisions.
+			name:          "precision10_compactValue",
+			precision:     10,
+			scale:         2,
+			unscaledValue: 12345,
+			want:          123.45,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer alloc.AssertSize(t, 0)
+
+			bldr := array.NewInt64Builder(alloc)
+			defer bldr.Release()
+			bldr.Append(tc.unscaledValue)
+			int64Arr := bldr.NewInt64Array()
+			defer int64Arr.Release()
+
+			transformer := fixedToFloat64Transformer(tc.precision, tc.scale)
+			out, err := transformer(context.Background(), int64Arr)
+			require.NoError(t, err)
+			defer out.Release()
+
+			require.IsType(t, (*array.Float64)(nil), out)
+			assert.InDelta(t, tc.want, out.(*array.Float64).Value(0), 1e-4)
+		})
+	}
+}
