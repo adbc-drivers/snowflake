@@ -152,7 +152,7 @@ func stripEWKBSRIDColumn(_ context.Context, a arrow.Array) (arrow.Array, error) 
 	bldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
 	defer bldr.Release()
 	bldr.Reserve(ba.Len())
-	for i := 0; i < ba.Len(); i++ {
+	for i := range ba.Len() {
 		if ba.IsNull(i) {
 			bldr.AppendNull()
 			continue
@@ -179,13 +179,13 @@ func analyzeGeoFromBatch(rec arrow.RecordBatch) map[string]geoColumnInfo {
 			continue
 		}
 		var (
-			firstSRID uint32
-			haveSRID  bool
-			mixed     bool
-			isGeo     bool
+			firstSRID  uint32
+			haveSRID   bool
+			mixed      bool
+			isGeo      bool
 			classified bool
 		)
-		for j := 0; j < ba.Len(); j++ {
+		for j := range ba.Len() {
 			if ba.IsNull(j) {
 				continue
 			}

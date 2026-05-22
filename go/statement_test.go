@@ -48,7 +48,7 @@ func (g *geoArrowType) ExtensionEquals(other arrow.ExtensionType) bool {
 	return g.ExtensionName() == other.ExtensionName()
 }
 func (g *geoArrowType) ArrayType() reflect.Type {
-	return reflect.TypeOf(array.ExtensionArrayBase{})
+	return reflect.TypeFor[array.ExtensionArrayBase]()
 }
 
 func TestToSnowflakeType(t *testing.T) {

@@ -665,7 +665,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 // When the user has set ingest_geo_type explicitly, that value is honored for
 // every column (current behavior). Otherwise the column's CRS metadata decides:
 // any non-EPSG:4326 SRID promotes the column to GEOMETRY so the SRID survives
-// the round trip; missing CRS, EPSG:4326, or unparseable CRS stays GEOGRAPHY.
+// the round trip; missing CRS, EPSG:4326, or unparsable CRS stays GEOGRAPHY.
 func (opts *ingestOptions) resolveGeoType(extMeta string) string {
 	if opts.geoTypeExplicit {
 		return opts.geoType
