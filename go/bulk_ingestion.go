@@ -122,6 +122,20 @@ type ingestOptions struct {
 	//
 	// Default is true.
 	vectorizedScanner bool
+	// Snowflake type to use for geoarrow columns (geoarrow.wkb, geoarrow.wkt).
+	//
+	// Valid values are "geography" (default) and "geometry".
+	// GEOGRAPHY is always WGS84 (SRID 4326). GEOMETRY supports any SRID;
+	// the SRID is extracted from geoarrow extension metadata and applied
+	// via ST_SETSRID after COPY INTO.
+	geoType string
+	// Whether geoType was set explicitly via SetOption. When false (the
+	// default), each geoarrow column's target type is decided per-column
+	// from its CRS metadata: a non-EPSG:4326 SRID promotes that column to
+	// GEOMETRY so the SRID survives the round trip; everything else stays
+	// GEOGRAPHY. Setting the option pins the type for all geoarrow columns
+	// and disables per-column promotion.
+	geoTypeExplicit bool
 }
 
 func DefaultIngestOptions() ingestOptions {
@@ -133,6 +147,7 @@ func DefaultIngestOptions() ingestOptions {
 		compressionCodec:  defaultCompressionCodec,
 		compressionLevel:  defaultCompressionLevel,
 		vectorizedScanner: defaultVectorizedScanner,
+		geoType:           "geography",
 	}
 }
 
@@ -141,7 +156,7 @@ func DefaultIngestOptions() ingestOptions {
 //
 // The Record must already be bound by calling stmt.Bind(), and will be released
 // and reset upon completion.
-func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) {
+func (st *statement) ingestRecord(ctx context.Context, copyQ string) (nrows int64, err error) {
 	defer func() {
 		// Record already released by writeParquet()
 		st.bound = nil
@@ -209,7 +224,7 @@ func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) 
 	}
 
 	// Load the uploaded file into the target table
-	_, err = st.cnxn.cn.ExecContext(ctx, copyQuery, []driver.NamedValue{{Value: target}})
+	_, err = st.cnxn.cn.ExecContext(ctx, copyQ, []driver.NamedValue{{Value: target}})
 	if err != nil {
 		return
 	}
@@ -225,7 +240,7 @@ func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) 
 //
 // The RecordReader must already be bound by calling stmt.BindStream(), and will
 // be released and reset upon completion.
-func (st *statement) ingestStream(ctx context.Context) (nrows int64, err error) {
+func (st *statement) ingestStream(ctx context.Context, copyQ string) (nrows int64, err error) {
 	defer func() {
 		st.streamBind.Release()
 		st.streamBind = nil
@@ -298,7 +313,7 @@ func (st *statement) ingestStream(ctx context.Context) (nrows int64, err error) 
 	}
 
 	// Kickoff background tasks to COPY Parquet files into Snowflake table as they are uploaded
-	fileReady, finishCopy, cancelCopy := runCopyTasks(ctx, st.cnxn.cn, target, int(st.ingestOptions.copyConcurrency))
+	fileReady, finishCopy, cancelCopy := runCopyTasks(ctx, st.cnxn.cn, copyQ, target, int(st.ingestOptions.copyConcurrency))
 
 	// Read Parquet files from buffer pool and upload to Snowflake stage in parallel
 	g.Go(func() error {
@@ -532,8 +547,8 @@ func uploadAllStreams(
 	return g.Wait()
 }
 
-func executeCopyQuery(ctx context.Context, cn snowflakeConn, tableName string, filesToCopy *fileSet) (err error) {
-	rows, err := cn.QueryContext(ctx, copyQuery, []driver.NamedValue{{Value: tableName}})
+func executeCopyQuery(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, filesToCopy *fileSet) (err error) {
+	rows, err := cn.QueryContext(ctx, copyQ, []driver.NamedValue{{Value: tableName}})
 	if err != nil {
 		return err
 	}
@@ -566,7 +581,7 @@ func executeCopyQuery(ctx context.Context, cn snowflakeConn, tableName string, f
 	return nil
 }
 
-func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concurrency int) (func(string), func() error, func()) {
+func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, concurrency int) (func(string), func() error, func()) {
 	var filesToCopy fileSet
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -631,7 +646,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concu
 				time.Sleep(backoff)
 			}
 
-			if err := executeCopyQuery(ctx, cn, tableName, &filesToCopy); err != nil {
+			if err := executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy); err != nil {
 				return err
 			}
 
@@ -670,7 +685,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concu
 			}
 
 			g.Go(func() error {
-				return executeCopyQuery(ctx, cn, tableName, &filesToCopy)
+				return executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy)
 			})
 		}
 	}()

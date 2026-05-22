@@ -516,9 +516,21 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 			field.Type = arrow.FixedWidthTypes.Timestamp_ns
 		}
 	case "GEOGRAPHY":
-		fallthrough
+		// With GEOGRAPHY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
+		// GEOGRAPHY is always WGS84 (SRID 4326).
+		field.Type = arrow.BinaryTypes.Binary
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name":     "geoarrow.wkb",
+			"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+		})
 	case "GEOMETRY":
-		field.Type = arrow.BinaryTypes.String
+		// With GEOMETRY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
+		// TODO: SRID for GEOMETRY requires inspecting data or a separate query.
+		// Same cross-driver issue as adbc-drivers/redshift#2 and adbc-drivers/databricks#350.
+		field.Type = arrow.BinaryTypes.Binary
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name": "geoarrow.wkb",
+		})
 	case "VECTOR":
 		// despite the fact that Snowflake *does* support returning data
 		// for VECTOR typed columns as Arrow FixedSizeLists, there's no way
@@ -561,9 +573,16 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
 		case "GEOGRAPHY":
-			fallthrough
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name":     "geoarrow.wkb",
+				"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+			})
 		case "GEOMETRY":
-			field.Type = arrow.BinaryTypes.String
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
+			})
 		case "BOOLEAN":
 			field.Type = arrow.FixedWidthTypes.Boolean
 		default:

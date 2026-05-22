@@ -562,6 +562,22 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
 	defer driverbase.EndSpan(span, err)
 
+	// Request EWKB so the SRID is encoded inline in every geometry value.
+	// The record reader peeks the first batch, lifts the SRID into geoarrow.wkb
+	// field metadata, and strips the EWKB prefix so consumers see plain ISO/OGC
+	// WKB. GEOGRAPHY is always WGS84 but we keep both formats in sync for a
+	// single decoding path.
+	if d.cfg.Params == nil {
+		d.cfg.Params = make(map[string]*string)
+	}
+	ewkb := "EWKB"
+	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
+		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &ewkb
+	}
+	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
+		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &ewkb
+	}
+
 	connector := gosnowflake.NewConnector(drv, *d.cfg)
 
 	ctx = gosnowflake.WithArrowAllocator(

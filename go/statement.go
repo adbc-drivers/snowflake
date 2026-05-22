@@ -25,6 +25,7 @@ package snowflake
 import (
 	"context"
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -51,6 +52,11 @@ const (
 	OptionStatementIngestCompressionCodec  = "adbc.snowflake.statement.ingest_compression_codec" // TODO(GH-1473): Implement option
 	OptionStatementIngestCompressionLevel  = "adbc.snowflake.statement.ingest_compression_level" // TODO(GH-1473): Implement option
 	OptionStatementVectorizedScanner       = "adbc.snowflake.statement.ingest_use_vectorized_scanner"
+	// OptionStatementIngestGeoType controls the Snowflake type created for
+	// columns with geoarrow extension types (geoarrow.wkb, geoarrow.wkt).
+	// Valid values are "geography" (default) and "geometry".
+	// GEOGRAPHY is always WGS84 (SRID 4326). GEOMETRY supports any SRID.
+	OptionStatementIngestGeoType = "adbc.snowflake.statement.ingest_geo_type"
 )
 
 type statement struct {
@@ -276,6 +282,18 @@ func (st *statement) SetOption(ctx context.Context, key string, val string) erro
 		}
 		st.ingestOptions.vectorizedScanner = vectorized
 		return nil
+	case OptionStatementIngestGeoType:
+		switch strings.ToLower(val) {
+		case "geography", "geometry":
+			st.ingestOptions.geoType = strings.ToLower(val)
+			st.ingestOptions.geoTypeExplicit = true
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("[Snowflake] invalid geo type '%s': must be 'geography' or 'geometry'", val),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return nil
 	default:
 		return st.Base().SetOption(ctx, key, val)
 	}
@@ -429,7 +447,13 @@ func toSnowflakeType(dt arrow.DataType) string {
 	return ""
 }
 
-func (st *statement) initIngest(ctx context.Context) error {
+// initIngest creates the target table for ingestion.
+//
+// geoTypeOverrides maps field names to Snowflake types ("geography" or "geometry")
+// for geo columns that should be created with native types instead of their Arrow
+// storage type (BINARY/TEXT). This is used when COPY transform handles inline
+// conversion, so the table must have native geo columns from the start.
+func (st *statement) initIngest(ctx context.Context, geoTypeOverrides map[string]string) error {
 	var (
 		createBldr strings.Builder
 	)
@@ -455,7 +479,19 @@ func (st *statement) initIngest(ctx context.Context) error {
 
 		createBldr.WriteString(quoteIdentifier(f.Name))
 		createBldr.WriteString(" ")
-		ty := toSnowflakeType(f.Type)
+
+		// Use geo type override if provided (for COPY transform path).
+		// Geo column detection happens in buildCopyQuery, which checks both
+		// arrow.EXTENSION types and ARROW:extension:name field metadata — the
+		// latter is needed for data arriving over the C Data Interface, where
+		// extension types are not registered. The override map ensures the
+		// CREATE TABLE uses GEOGRAPHY/GEOMETRY for those columns.
+		var ty string
+		if override, ok := geoTypeOverrides[f.Name]; ok {
+			ty = override
+		} else {
+			ty = toSnowflakeType(f.Type)
+		}
 		if ty == "" {
 			return adbc.Error{
 				Msg:  fmt.Sprintf("unimplemented type conversion for field %s, arrow type: %s", f.Name, f.Type),
@@ -506,16 +542,205 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 		}
 	}
 
-	err := st.initIngest(ctx)
+	// Capture schema before ingest (ingestRecord nils st.bound after completion)
+	var schema *arrow.Schema
+	if st.bound != nil {
+		schema = st.bound.Schema()
+	} else {
+		schema = st.streamBind.Schema()
+	}
+
+	// Build the COPY query. If the schema has geo columns, this is a COPY
+	// transform that converts WKB/WKT → GEOGRAPHY/GEOMETRY inline during
+	// COPY INTO; otherwise it is the plain copy query.
+	copyQ, geoOverrides := st.buildCopyQuery(schema)
+
+	err := st.initIngest(ctx, geoOverrides)
 	if err != nil {
 		return -1, err
 	}
 
 	if st.bound != nil {
-		return st.ingestRecord(ctx)
+		return st.ingestRecord(ctx, copyQ)
+	}
+	return st.ingestStream(ctx, copyQ)
+}
+
+// buildCopyQuery returns the COPY query to use for ingestion and a map of
+// geo column name → Snowflake type for table creation overrides. When the
+// schema contains geoarrow columns, a COPY transform is returned that
+// converts WKB/WKT to GEOGRAPHY/GEOMETRY inline during COPY INTO — Snowflake's
+// COPY INTO from Parquet normally cannot load WKB directly into
+// GEOGRAPHY/GEOMETRY columns, and a COPY transform works around this by
+// applying TO_GEOGRAPHY/TO_GEOMETRY in the SELECT clause of the COPY subquery.
+//
+// Geo column detection covers both arrow.EXTENSION types and
+// ARROW:extension:name field metadata so that data arriving over the C Data
+// Interface (where extension types are not registered) is also recognized.
+func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]string) {
+	if schema == nil {
+		return copyQuery, nil
 	}
 
-	return st.ingestStream(ctx)
+	// Detect geo columns: either a registered arrow.ExtensionType or the
+	// ARROW:extension:name field metadata (the C Data Interface case).
+	type geoCol struct {
+		name    string
+		extName string
+		extMeta string
+	}
+	var geoCols []geoCol
+
+	for _, f := range schema.Fields() {
+		var extName, extMeta string
+		if f.Type.ID() == arrow.EXTENSION {
+			ext := f.Type.(arrow.ExtensionType)
+			extName = ext.ExtensionName()
+			extMeta = ext.Serialize()
+		} else if name, ok := f.Metadata.GetValue("ARROW:extension:name"); ok {
+			extName = name
+			extMeta, _ = f.Metadata.GetValue("ARROW:extension:metadata")
+		}
+
+		switch extName {
+		case "geoarrow.wkb", "geoarrow.wkb_view", "geoarrow.wkt", "geoarrow.wkt_view":
+			geoCols = append(geoCols, geoCol{name: f.Name, extName: extName, extMeta: extMeta})
+		}
+	}
+
+	if len(geoCols) == 0 {
+		return copyQuery, nil
+	}
+
+	// Build a COPY transform with inline geo conversion. Each geo column's
+	// target type is resolved per-column so a non-4326 CRS can promote that
+	// column to GEOMETRY while sibling 4326 columns stay GEOGRAPHY.
+	geoOverrides := make(map[string]string, len(geoCols))
+	var selectCols []string
+	for _, f := range schema.Fields() {
+		quoted := quoteIdentifier(f.Name)
+		parqRef := fmt.Sprintf("$1:%s", quoted)
+
+		// Check if this field is a geo column.
+		var gc *geoCol
+		for i := range geoCols {
+			if geoCols[i].name == f.Name {
+				gc = &geoCols[i]
+				break
+			}
+		}
+
+		if gc == nil {
+			// Non-geo column: reference directly from Parquet, Snowflake auto-casts to target type.
+			selectCols = append(selectCols, fmt.Sprintf("%s AS %s", parqRef, quoted))
+			continue
+		}
+
+		// Geo column: apply conversion function.
+		isWKB := strings.Contains(gc.extName, "wkb")
+		geoType := st.ingestOptions.resolveGeoType(gc.extMeta)
+		geoOverrides[gc.name] = geoType
+		var expr string
+		if geoType == "geography" {
+			if isWKB {
+				expr = fmt.Sprintf("TO_GEOGRAPHY(%s::BINARY, true) AS %s", parqRef, quoted)
+			} else {
+				expr = fmt.Sprintf("TRY_TO_GEOGRAPHY(%s::VARCHAR) AS %s", parqRef, quoted)
+			}
+		} else {
+			srid := extractSRIDFromMeta(gc.extMeta)
+			if srid != 0 {
+				if isWKB {
+					expr = fmt.Sprintf("ST_SETSRID(TO_GEOMETRY(%s::BINARY), %d) AS %s", parqRef, srid, quoted)
+				} else {
+					expr = fmt.Sprintf("ST_SETSRID(TO_GEOMETRY(%s::VARCHAR), %d) AS %s", parqRef, srid, quoted)
+				}
+			} else {
+				if isWKB {
+					expr = fmt.Sprintf("TO_GEOMETRY(%s::BINARY) AS %s", parqRef, quoted)
+				} else {
+					expr = fmt.Sprintf("TO_GEOMETRY(%s::VARCHAR) AS %s", parqRef, quoted)
+				}
+			}
+		}
+		selectCols = append(selectCols, expr)
+	}
+
+	transformQ := fmt.Sprintf(
+		"COPY INTO IDENTIFIER(?) FROM (SELECT %s FROM @%s)",
+		strings.Join(selectCols, ", "),
+		bindStageName,
+	)
+	return transformQ, geoOverrides
+}
+
+// resolveGeoType picks the Snowflake target type for a single geoarrow column.
+// When the user has set ingest_geo_type explicitly, that value is honored for
+// every column (current behavior). Otherwise the column's CRS metadata decides:
+// any non-EPSG:4326 SRID promotes the column to GEOMETRY so the SRID survives
+// the round trip; missing CRS, EPSG:4326, or unparsable CRS stays GEOGRAPHY.
+func (opts *ingestOptions) resolveGeoType(extMeta string) string {
+	if opts.geoTypeExplicit {
+		return opts.geoType
+	}
+	srid := extractSRIDFromMeta(extMeta)
+	if srid != 0 && srid != 4326 {
+		return "geometry"
+	}
+	return "geography"
+}
+
+// extractSRIDFromMeta extracts the SRID from geoarrow extension metadata string.
+// The metadata is a JSON string that may contain a "crs" field.
+// Supported formats:
+//   - PROJJSON: {"crs": {"id": {"authority": "EPSG", "code": 4326}}}
+//   - Simple string: "EPSG:4326" (as CRS value)
+//
+// Returns 0 if no SRID can be determined.
+func extractSRIDFromMeta(metadata string) int {
+	if metadata == "" {
+		return 0
+	}
+
+	type projID struct {
+		Authority string `json:"authority"`
+		Code      int    `json:"code"`
+	}
+	type projCRS struct {
+		ID projID `json:"id"`
+	}
+	type geoarrowMeta struct {
+		CRS json.RawMessage `json:"crs"`
+	}
+
+	var meta geoarrowMeta
+	if err := json.Unmarshal([]byte(metadata), &meta); err != nil {
+		return 0
+	}
+
+	if len(meta.CRS) == 0 {
+		return 0
+	}
+
+	// CRS can be a string like "EPSG:4326" or a PROJJSON object
+	var crsStr string
+	if err := json.Unmarshal(meta.CRS, &crsStr); err == nil {
+		if strings.HasPrefix(crsStr, "EPSG:") {
+			if code, err := strconv.Atoi(crsStr[5:]); err == nil {
+				return code
+			}
+		}
+		return 0
+	}
+
+	var crs projCRS
+	if err := json.Unmarshal(meta.CRS, &crs); err == nil {
+		if strings.EqualFold(crs.ID.Authority, "EPSG") && crs.ID.Code != 0 {
+			return crs.ID.Code
+		}
+	}
+
+	return 0
 }
 
 // ExecuteQuery executes the current query or prepared statement
