@@ -13,7 +13,6 @@
 # limitations under the License.
 
 # Tests that NUMERIC(38,0) returns int64 when use_high_precision=false
-# with values that fit within int64 range.
 
 [setup]
 drop = "test_numeric_low_precision"
@@ -23,3 +22,6 @@ drop = "test_numeric_low_precision"
 
 [tags]
 sql-type-name = "NUMERIC"
+caveats = [
+  "When use_high_precision=false, values exceeding int64 range are silently truncated — the driver discards the upper bits and returns only the lower 64 bits without warning."
+]
