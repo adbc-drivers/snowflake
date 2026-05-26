@@ -476,6 +476,81 @@ func TestFixedToFloat64Transformer(t *testing.T) {
 	}
 }
 
+func TestCastIntegerToTimestamp(t *testing.T) {
+	// 1506347332300000123 ns is 2017-09-25, with sub-microsecond digits (123).
+	const yr2017Ns int64 = 1506347332300000123
+
+	cases := []struct {
+		name              string
+		dt                *arrow.TimestampType
+		originalArrowUnit arrow.TimeUnit
+		input             int64
+		want              arrow.Timestamp
+	}{
+		{
+			// Regression for issue #135: a scale-9 (nanosecond) column delivered as
+			// a single int64 must be rescaled, not reinterpreted, when the
+			// "microseconds" option forces the field to timestamp[us]. Reinterpreting
+			// inflated the value 1000x (2017 -> year 49704).
+			name:              "scale9_microseconds_rescales",
+			dt:                &arrow.TimestampType{Unit: arrow.Microsecond},
+			originalArrowUnit: arrow.Nanosecond,
+			input:             yr2017Ns,
+			want:              arrow.Timestamp(yr2017Ns / 1000), // 1506347332300000, truncated
+		},
+		{
+			// Default nanoseconds mode: native unit matches the field unit, so the
+			// integer is reinterpreted unchanged.
+			name:              "scale9_nanoseconds_reinterprets",
+			dt:                &arrow.TimestampType{Unit: arrow.Nanosecond},
+			originalArrowUnit: arrow.Nanosecond,
+			input:             yr2017Ns,
+			want:              arrow.Timestamp(yr2017Ns),
+		},
+		{
+			// The timezone on the target type is preserved through the rescale.
+			name:              "ltz_microseconds_preservesTimeZone",
+			dt:                &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "America/Los_Angeles"},
+			originalArrowUnit: arrow.Nanosecond,
+			input:             yr2017Ns,
+			want:              arrow.Timestamp(yr2017Ns / 1000),
+		},
+		{
+			// A negative ns value carrying sub-microsecond digits floors toward
+			// negative infinity (-...233), matching the struct path's UnixMicro
+			// rather than truncating toward zero (-...232).
+			name:              "negative_microseconds_floors",
+			dt:                &arrow.TimestampType{Unit: arrow.Microsecond},
+			originalArrowUnit: arrow.Nanosecond,
+			input:             -6285681744183232512,
+			want:              arrow.Timestamp(-6285681744183233),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer alloc.AssertSize(t, 0)
+
+			bldr := array.NewInt64Builder(alloc)
+			defer bldr.Release()
+			bldr.Append(tc.input)
+			bldr.AppendNull()
+			in := bldr.NewInt64Array()
+			defer in.Release()
+
+			out, err := castIntegerToTimestamp(context.Background(), in, tc.dt, tc.originalArrowUnit)
+			require.NoError(t, err)
+			defer out.Release()
+
+			ts := out.(*array.Timestamp)
+			require.Equal(t, tc.dt.Unit, ts.DataType().(*arrow.TimestampType).Unit)
+			require.Equal(t, tc.dt.TimeZone, ts.DataType().(*arrow.TimestampType).TimeZone)
+			assert.Equal(t, tc.want, ts.Value(0))
+			assert.True(t, ts.IsNull(1), "null should be preserved")
+		})
+	}
+}
+
 func TestReadBatchRecords_RetriesAfterRowCountMismatch(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	defer alloc.AssertSize(t, 0)

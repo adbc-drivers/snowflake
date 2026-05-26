@@ -354,7 +354,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
 
 				if a.DataType().ID() != arrow.STRUCT {
-					return compute.CastArray(ctx, a, compute.SafeCastOptions(dt))
+					return castIntegerToTimestamp(ctx, a, dt, originalArrowUnit)
 				}
 
 				pool := compute.GetAllocator(ctx)
@@ -406,14 +406,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 						tb.Append(v)
 					}
 				} else {
-					for i, t := range a.(*array.Int64).Int64Values() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						tb.Append(arrow.Timestamp(t))
-					}
+					return castIntegerToTimestamp(ctx, a, dt, originalArrowUnit)
 				}
 				return tb.NewArray(), nil
 			}
@@ -516,6 +509,51 @@ func getArrowTimestampFromTime(val time.Time, unit arrow.TimeUnit, originalArrow
 	}
 
 	return arrow.TimestampFromTime(val, unit)
+}
+
+// castIntegerToTimestamp converts a raw integer timestamp column (transmitted by
+// Snowflake as a single int64 in the column's native scale unit, originalArrowUnit)
+// to the target arrow timestamp type dt.
+//
+// Normally the native unit matches dt.Unit and the integer is reinterpreted in
+// place. When the "microseconds" max-precision option forces a scale-9
+// (nanosecond) column to a microsecond field type, the units differ; a plain
+// reinterpret would treat the nanosecond count as microseconds and inflate every
+// value 1000x (e.g. a 2017 timestamp becomes year 49704). In that case we rescale
+// by integer division, flooring toward negative infinity so the result matches
+// the struct path's time.Time/UnixMicro conversion (and unlike arrow's cast,
+// which truncates toward zero and would disagree by one unit for negative values
+// carrying sub-unit precision).
+func castIntegerToTimestamp(ctx context.Context, a arrow.Array, dt *arrow.TimestampType, originalArrowUnit arrow.TimeUnit) (arrow.Array, error) {
+	if dt.Unit == originalArrowUnit {
+		return compute.CastArray(ctx, a, compute.SafeCastOptions(dt))
+	}
+
+	// The only case where the units differ is a finer native unit downscaled to a
+	// coarser target (nanoseconds -> microseconds). Each coarser arrow.TimeUnit
+	// step is a factor of 1000.
+	divisor := int64(1)
+	for u := dt.Unit; u < originalArrowUnit; u++ {
+		divisor *= 1000
+	}
+
+	pool := compute.GetAllocator(ctx)
+	tb := array.NewTimestampBuilder(pool, dt)
+	defer tb.Release()
+
+	values := a.(*array.Int64).Int64Values()
+	for i, v := range values {
+		if a.IsNull(i) {
+			tb.AppendNull()
+			continue
+		}
+		scaled := v / divisor
+		if v%divisor != 0 && v < 0 {
+			scaled-- // floor toward negative infinity
+		}
+		tb.Append(arrow.Timestamp(scaled))
+	}
+	return tb.NewArray(), nil
 }
 
 // fixedToFloat64Transformer returns the column transformer used by getTransformer
