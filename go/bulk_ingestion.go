@@ -348,8 +348,21 @@ func newWriterProps(mem memory.Allocator, opts *ingestOptions) (*parquet.WriterP
 	return parquetProps, arrowProps
 }
 
-func readRecords(ctx context.Context, rdr array.RecordReader, out chan<- arrow.RecordBatch) error {
+func readRecords(ctx context.Context, rdr array.RecordReader, out chan<- arrow.RecordBatch) (err error) {
 	defer close(out)
+	// The bound RecordReader is producer-supplied and may panic from
+	// Next(): arrow-go's C Data import, for example, panics when an
+	// inbound batch's column count does not match the advertised schema.
+	// Convert any such panic into an ADBC error so the caller gets a
+	// diagnosable failure instead of an aborted host process.
+	defer func() {
+		if r := recover(); r != nil {
+			err = adbc.Error{
+				Msg:  fmt.Sprintf("failed to read record batch from bound stream: %v", r),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+	}()
 
 	for rdr.Next() {
 		rec := rdr.RecordBatch()
