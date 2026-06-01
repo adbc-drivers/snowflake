@@ -89,40 +89,5 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 }
             }
         }
-
-        private static bool ContainsException(Exception exception, Type? exceptionType, out Exception? containedException)
-        {
-            if (exceptionType == null)
-            {
-                containedException = null;
-                return false;
-            }
-
-            Exception? e = exception;
-            while (e != null)
-            {
-                if (exceptionType.IsInstanceOfType(e))
-                {
-                    containedException = e;
-                    return true;
-                }
-                else if (e is AggregateException aggregateException)
-                {
-                    foreach (Exception? ex in aggregateException.InnerExceptions)
-                    {
-                        if (ContainsException(ex, exceptionType, out Exception? inner))
-                        {
-                            containedException = inner;
-                            return true;
-                        }
-                    }
-                }
-                e = e.InnerException;
-            }
-
-            containedException = null;
-            return false;
-        }
-
     }
 }
