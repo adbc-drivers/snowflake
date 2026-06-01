@@ -1,8 +1,5 @@
 ﻿/*
-* Copyright (c) 2025 ADBC Drivers Contributors
-*
-* This file has been modified from its original version, which is
-* under the Apache License:
+* Copyright (c) 2026 ADBC Drivers Contributors
 *
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
