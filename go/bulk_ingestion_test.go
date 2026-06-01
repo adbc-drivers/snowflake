@@ -29,8 +29,10 @@ import (
 	"io"
 	"testing"
 
+	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/cdata"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/stretchr/testify/assert"
@@ -139,6 +141,86 @@ func TestQualifiedTableName(t *testing.T) {
 			assert.Equal(t, tt.expected, st.qualifiedTableName())
 		})
 	}
+}
+
+// TestReadRecordsRecoversFromSchemaMismatch exercises the panic-to-error
+// contract of readRecords. A producer-supplied RecordReader whose advertised
+// schema disagrees with the batch it yields will cause arrow-go's cdata
+// import to panic inside Next(); readRecords must turn that into an ADBC
+// error rather than letting it abort the host process.
+func TestReadRecordsRecoversFromSchemaMismatch(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	// Reader advertises two columns...
+	advertised := arrow.NewSchema([]arrow.Field{
+		{Name: "name1", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "name2", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	// ...but the batch it actually produces only contains one.
+	bldr := array.NewStringBuilder(mem)
+	defer bldr.Release()
+	bldr.Append("aaa")
+	bldr.Append("bbb")
+	col := bldr.NewArray()
+	defer col.Release()
+
+	batchSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "name1", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	batch := array.NewRecordBatch(batchSchema, []arrow.Array{col}, 2)
+	defer batch.Release()
+
+	src := &mismatchedReader{advertisedSchema: advertised, batch: batch}
+
+	// Round-trip through the C Data interface so Next() goes through the
+	// cdata import path where the panic on mismatch originates.
+	var cstream cdata.CArrowArrayStream
+	cdata.ExportRecordReader(src, &cstream)
+
+	importedRdr, err := cdata.ImportCRecordReader(&cstream, advertised)
+	require.NoError(t, err)
+	imported, ok := importedRdr.(array.RecordReader)
+	require.True(t, ok, "imported reader does not implement array.RecordReader: %T", importedRdr)
+	defer imported.Release()
+
+	// A regression would manifest as a panic propagating out of Next().
+	out := make(chan arrow.RecordBatch, 1)
+	go func() {
+		for rec := range out {
+			rec.Release()
+		}
+	}()
+	err = readRecords(context.Background(), imported, out)
+
+	require.Error(t, err, "expected a clean error from a mismatched stream")
+	var adbcErr adbc.Error
+	require.ErrorAs(t, err, &adbcErr)
+	assert.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
+	assert.Contains(t, adbcErr.Msg, "mismatch")
+}
+
+// mismatchedReader advertises one schema but yields a batch with a different
+// column count. Used to drive the C Data import path through readRecords.
+type mismatchedReader struct {
+	advertisedSchema *arrow.Schema
+	batch            arrow.RecordBatch
+	emitted          bool
+}
+
+func (r *mismatchedReader) Retain()                        {}
+func (r *mismatchedReader) Release()                       {}
+func (r *mismatchedReader) Schema() *arrow.Schema          { return r.advertisedSchema }
+func (r *mismatchedReader) Err() error                     { return nil }
+func (r *mismatchedReader) RecordBatch() arrow.RecordBatch { return r.batch }
+func (r *mismatchedReader) Record() arrow.RecordBatch      { return r.batch }
+func (r *mismatchedReader) Next() bool {
+	if r.emitted {
+		return false
+	}
+	r.emitted = true
+	return true
 }
 
 func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
