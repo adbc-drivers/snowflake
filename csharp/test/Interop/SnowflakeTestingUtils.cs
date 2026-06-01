@@ -110,6 +110,21 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.Default.User, "username");
                 parameters[SnowflakeParameters.PASSWORD] = Parameter(testConfiguration.Authentication.Default.Password, "password");
             }
+            else if (testConfiguration.Authentication.SnowflakeJwt is not null)
+            {
+                parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthJwt;
+                parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.SnowflakeJwt.User, "username");
+                parameters[SnowflakeParameters.PKCS8_VALUE] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKey, "private_key");
+                if (!string.IsNullOrEmpty(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase))
+                {
+                    parameters[SnowflakeParameters.PKCS8_PASS] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase, "private_key_passphrase");
+                }
+            }
+            else if (testConfiguration.Authentication.OAuth is not null)
+            {
+                parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthOAuth;
+                parameters[SnowflakeParameters.AUTH_TOKEN] = Parameter(testConfiguration.Authentication.OAuth.Token, "oauth_token");
+            }
 
             if (!string.IsNullOrWhiteSpace(testConfiguration.Host))
             {
@@ -121,7 +136,6 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 parameters[SnowflakeParameters.DATABASE] = testConfiguration.Database;
             }
 
-            Dictionary<string, string> options = new Dictionary<string, string>() { };
             AdbcDriver snowflakeDriver = GetSnowflakeAdbcDriver(testConfiguration);
 
             return snowflakeDriver;
