@@ -110,7 +110,10 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.Default.User, "username");
                 parameters[SnowflakeParameters.PASSWORD] = Parameter(testConfiguration.Authentication.Default.Password, "password");
             }
-            else if (testConfiguration.Authentication.SnowflakeJwt is not null)
+            else if (testConfiguration.Authentication.SnowflakeJwt is not null
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.User)
+                && (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKey)
+                    || !string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile)))
             {
                 parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthJwt;
                 parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.SnowflakeJwt.User, "username");
