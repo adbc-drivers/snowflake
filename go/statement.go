@@ -603,7 +603,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 		}
 
 		switch extName {
-		case "geoarrow.wkb", "geoarrow.wkb_view", "geoarrow.wkt", "geoarrow.wkt_view":
+		case "geoarrow.wkb", "geoarrow.wkt":
 			geoCols = append(geoCols, geoCol{name: f.Name, extName: extName, extMeta: extMeta})
 		}
 	}
@@ -648,7 +648,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 				expr = fmt.Sprintf("TRY_TO_GEOGRAPHY(%s::VARCHAR) AS %s", parqRef, quoted)
 			}
 		} else {
-			srid := extractSRIDFromMeta(gc.extMeta)
+			srid, _ := extractSRIDFromMeta(gc.extMeta)
 			if srid != 0 {
 				if isWKB {
 					expr = fmt.Sprintf("ST_SETSRID(TO_GEOMETRY(%s::BINARY), %d) AS %s", parqRef, srid, quoted)
@@ -683,23 +683,25 @@ func (opts *ingestOptions) resolveGeoType(extMeta string) string {
 	if opts.geoTypeExplicit {
 		return opts.geoType
 	}
-	srid := extractSRIDFromMeta(extMeta)
-	if srid != 0 && srid != 4326 {
-		return "geometry"
+	srid, edges := extractSRIDFromMeta(extMeta)
+	if srid == 4326 && edges == "spherical" {
+		return "geography"
 	}
-	return "geography"
+	return "geometry"
 }
 
-// extractSRIDFromMeta extracts the SRID from geoarrow extension metadata string.
-// The metadata is a JSON string that may contain a "crs" field.
+// extractSRIDFromMeta extracts the SRID and edges from GeoArrow extension
+// metadata string.  The metadata is a JSON string that may contain a "crs"
+// field.
+//
 // Supported formats:
 //   - PROJJSON: {"crs": {"id": {"authority": "EPSG", "code": 4326}}}
 //   - Simple string: "EPSG:4326" (as CRS value)
 //
 // Returns 0 if no SRID can be determined.
-func extractSRIDFromMeta(metadata string) int {
+func extractSRIDFromMeta(metadata string) (int, string) {
 	if metadata == "" {
-		return 0
+		return 0, ""
 	}
 
 	type projID struct {
@@ -710,16 +712,17 @@ func extractSRIDFromMeta(metadata string) int {
 		ID projID `json:"id"`
 	}
 	type geoarrowMeta struct {
-		CRS json.RawMessage `json:"crs"`
+		CRS   json.RawMessage `json:"crs"`
+		Edges string          `json:"edges"`
 	}
 
 	var meta geoarrowMeta
 	if err := json.Unmarshal([]byte(metadata), &meta); err != nil {
-		return 0
+		return 0, ""
 	}
 
 	if len(meta.CRS) == 0 {
-		return 0
+		return 0, meta.Edges
 	}
 
 	// CRS can be a string like "EPSG:4326" or a PROJJSON object
@@ -727,20 +730,20 @@ func extractSRIDFromMeta(metadata string) int {
 	if err := json.Unmarshal(meta.CRS, &crsStr); err == nil {
 		if strings.HasPrefix(crsStr, "EPSG:") {
 			if code, err := strconv.Atoi(crsStr[5:]); err == nil {
-				return code
+				return code, meta.Edges
 			}
 		}
-		return 0
+		return 0, meta.Edges
 	}
 
 	var crs projCRS
 	if err := json.Unmarshal(meta.CRS, &crs); err == nil {
 		if strings.EqualFold(crs.ID.Authority, "EPSG") && crs.ID.Code != 0 {
-			return crs.ID.Code
+			return crs.ID.Code, meta.Edges
 		}
 	}
 
-	return 0
+	return 0, meta.Edges
 }
 
 // ExecuteQuery executes the current query or prepared statement

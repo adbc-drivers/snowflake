@@ -60,6 +60,8 @@ var queryGetObjectsTables string
 //go:embed queries/get_objects_terse_catalogs.sql
 var queryGetObjectsTerseCatalogs string
 
+const geographyGeoArrowJson = `{"crs":"EPSG:4326","edges":"spherical"}`
+
 type snowflakeConn interface {
 	driver.Conn
 	driver.ConnBeginTx
@@ -524,12 +526,10 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 		field.Type = arrow.BinaryTypes.Binary
 		field.Metadata = arrow.MetadataFrom(map[string]string{
 			"ARROW:extension:name":     "geoarrow.wkb",
-			"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+			"ARROW:extension:metadata": geographyGeoArrowJson,
 		})
 	case "GEOMETRY":
 		// With GEOMETRY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
-		// TODO: SRID for GEOMETRY requires inspecting data or a separate query.
-		// Same cross-driver issue as adbc-drivers/redshift#2 and adbc-drivers/databricks#350.
 		field.Type = arrow.BinaryTypes.Binary
 		field.Metadata = arrow.MetadataFrom(map[string]string{
 			"ARROW:extension:name": "geoarrow.wkb",
@@ -582,7 +582,7 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 			field.Type = arrow.BinaryTypes.Binary
 			field.Metadata = arrow.MetadataFrom(map[string]string{
 				"ARROW:extension:name":     "geoarrow.wkb",
-				"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
+				"ARROW:extension:metadata": geographyGeoArrowJson,
 			})
 		case "GEOMETRY":
 			field.Type = arrow.BinaryTypes.Binary
