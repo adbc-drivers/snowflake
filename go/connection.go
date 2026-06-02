@@ -541,7 +541,7 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	return field
 }
 
-func descToField(name, typ, isnull, primary string, comment sql.NullString, maxTimestampPrecision MaxTimestampPrecision) (field arrow.Field, err error) {
+func descToField(name, typ, isnull, primary string, comment sql.NullString, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (field arrow.Field, err error) {
 	field.Name = name
 	if isnull == "Y" {
 		field.Nullable = true
@@ -609,10 +609,25 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 				Code: adbc.StatusInvalidData,
 			}
 		}
-		if scale == 0 {
-			field.Type = arrow.PrimitiveTypes.Int64
+		if useHighPrecision {
+			paren := strings.Index(typ, "(")
+			precision, err := strconv.ParseInt(typ[paren+1:comma], 10, 32)
+			if err != nil {
+				return field, adbc.Error{
+					Msg:  "[snowflake] could not parse precision from type '" + typ + "'",
+					Code: adbc.StatusInvalidData,
+				}
+			}
+			field.Type = &arrow.Decimal128Type{
+				Precision: int32(precision),
+				Scale:     int32(scale),
+			}
 		} else {
-			field.Type = arrow.PrimitiveTypes.Float64
+			if scale == 0 {
+				field.Type = arrow.PrimitiveTypes.Int64
+			} else {
+				field.Type = arrow.PrimitiveTypes.Float64
+			}
 		}
 	case "TIME":
 		field.Type = arrow.FixedWidthTypes.Time64ns
@@ -735,7 +750,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		}
 
 		var f arrow.Field
-		f, err = descToField(name, typ, isnull, primary, comment, c.maxTimestampPrecision)
+		f, err = descToField(name, typ, isnull, primary, comment, c.useHighPrecision, c.maxTimestampPrecision)
 		if err != nil {
 			return nil, err
 		}

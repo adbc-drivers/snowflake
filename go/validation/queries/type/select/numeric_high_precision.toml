@@ -15,8 +15,11 @@
 [setup]
 drop = "test_numeric_high_precision"
 
+# high precision is the default so "revert" should keep it as true
+[setup.connection.options]
+"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "true", revert = "true" }
 [setup.statement.options]
-"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "true", revert = "false" }
+"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "true", revert = "true" }
 
 [tags]
-sql-type-name = "NUMERIC"
+sql-type-name = "NUMERIC (use_high_precision = true)"

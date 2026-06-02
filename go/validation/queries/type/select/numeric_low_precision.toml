@@ -17,11 +17,13 @@
 [setup]
 drop = "test_numeric_low_precision"
 
+[setup.connection.options]
+"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "false", revert = "true" }
 [setup.statement.options]
-"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "false", revert = "false" }
+"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "false", revert = "true" }
 
 [tags]
-sql-type-name = "NUMERIC"
+sql-type-name = "NUMERIC (use_high_precision = false)"
 caveats = [
   "When use_high_precision=false, values exceeding int64 range are silently truncated — the driver discards the upper bits and returns only the lower 64 bits without warning."
 ]
