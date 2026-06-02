@@ -38,8 +38,7 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
         public async Task CanCancelStatementTest()
         {
             const int millisecondsDelay = 500;
-            const string query = "SELECT SYSTEM$WAIT(30)";
-
+            const string query = "SELECT SYSTEM$WAIT(5)";
             var snowflakeTestConfiguration = SnowflakeTestingUtils.TestConfiguration;
 
             using AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(snowflakeTestConfiguration, out Dictionary<string, string> parameters);
