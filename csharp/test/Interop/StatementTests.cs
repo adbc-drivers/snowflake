@@ -42,11 +42,10 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
             return adbcDatabase.Connect(options);
         }
 
-        [SkippableTheory()]
+        [SkippableTheory]
         [InlineData("SELECT SYSTEM$WAIT(30)", true)]
         [InlineData("SELECT SYSTEM$WAIT(1)", false)]
-        internal virtual async Task CanCancelStatementTest(string query, bool testCancel)
-        {
+        public async Task CanCancelStatementTest(string query, bool testCancel)
             const int millisecondsDelay = 500;
 
             var snowflakeTestConfiguration = SnowflakeTestingUtils.TestConfiguration;
