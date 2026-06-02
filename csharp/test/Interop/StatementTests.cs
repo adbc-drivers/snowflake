@@ -63,6 +63,7 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                     _outputHelper?.WriteLine($"QueryResultRowCount: {queryResult.RowCount}");
                     queryResult.Stream?.Dispose();
                     Assert.Fail("Expected query to be cancelled, but it completed successfully.");
+                }
                 catch (AdbcException ex)
                 {
                     Assert.Contains("[snowflake] context canceled", ex.Message, StringComparison.OrdinalIgnoreCase);
