@@ -104,7 +104,9 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 { SnowflakeParameters.USE_HIGH_PRECISION, testConfiguration.UseHighPrecision.ToString().ToLowerInvariant() }
             };
 
-            if (testConfiguration.Authentication.Default is not null)
+            if (testConfiguration.Authentication.Default is not null
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.Default.User)
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.Default.Password))
             {
                 parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthSnowflake;
                 parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.Default.User, "username");
