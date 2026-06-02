@@ -93,7 +93,6 @@ type databaseImpl struct {
 	defaultAppName        string
 }
 
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
 func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error) {
 	switch key {
 	case adbc.OptionKeyUsername:
@@ -209,7 +208,6 @@ func ParseSnowflakeURI(uri string) (*gosnowflake.Config, error) {
 	return gosnowflake.ParseDSN(uri)
 }
 
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
 func (d *databaseImpl) SetOptions(ctx context.Context, cnOptions map[string]string) error {
 	uri, ok := cnOptions[adbc.OptionKeyURI]
 	if ok {
@@ -247,7 +245,7 @@ func (d *databaseImpl) SetOptions(ctx context.Context, cnOptions map[string]stri
 //
 // cnOptions is nil if the option is being set post-initialiation.
 //
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
+
 func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[string]string) error {
 	var err error
 	var ok bool
