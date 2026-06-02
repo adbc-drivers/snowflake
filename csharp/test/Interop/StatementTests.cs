@@ -61,8 +61,8 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
 
                     QueryResult queryResult = await queryTask;
                     _outputHelper?.WriteLine($"QueryResultRowCount: {queryResult.RowCount}");
-                    Assert.Fail("Expecting query to timeout, but it did not.");
-                }
+                    queryResult.Stream?.Dispose();
+                    Assert.Fail("Expected query to be cancelled, but it completed successfully.");
                 catch (AdbcException ex)
                 {
                     Assert.Contains("[snowflake] context canceled", ex.Message, StringComparison.OrdinalIgnoreCase);
