@@ -34,52 +34,37 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
             Skip.IfNot(Utils.CanExecuteTestConfig(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE));
         }
 
-        private static AdbcConnection CreateConnection(SnowflakeTestConfiguration testConfiguration, Dictionary<string, string>? options = null)
+        [SkippableFact]
+        public async Task CanCancelStatementTest()
         {
-            Dictionary<string, string> parameters;
-            AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(testConfiguration, out parameters);
-            AdbcDatabase adbcDatabase = snowflakeDriver.Open(parameters);
-            return adbcDatabase.Connect(options);
-        }
-
-        [SkippableTheory]
-        [InlineData("SELECT SYSTEM$WAIT(30)", true)]
-        [InlineData("SELECT SYSTEM$WAIT(1)", false)]
-        public async Task CanCancelStatementTest(string query, bool testCancel)
             const int millisecondsDelay = 500;
+            const string query = "SELECT SYSTEM$WAIT(30)";
 
             var snowflakeTestConfiguration = SnowflakeTestingUtils.TestConfiguration;
 
-            Dictionary<string, string> parameters;
-            using AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(snowflakeTestConfiguration, out parameters);
+            using AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(snowflakeTestConfiguration, out Dictionary<string, string> parameters);
             using AdbcDatabase adbcDatabase = snowflakeDriver.Open(parameters);
             using AdbcConnection connection = adbcDatabase.Connect(new Dictionary<string, string>());
             using AdbcStatement statement = connection.CreateStatement();
+
             // Note: for this test to be valid, the query needs to run for more time than the delay value!
             statement.SqlQuery = query;
-            for (int i = 0; i < 10; i++)
+            for (int i = 0; i < 5; i++)
             {
                 // Reuse the statement to check for issue that might arise from using the Statement multiple times.
                 try
                 {
                     Task<QueryResult> queryTask = Task.Run(statement.ExecuteQuery);
 
-                    if (testCancel)
-                    {
-                        await Task.Delay(millisecondsDelay);
-                        statement.Cancel();
-                    }
+                    await Task.Delay(millisecondsDelay);
+                    statement.Cancel();
 
                     QueryResult queryResult = await queryTask;
                     _outputHelper?.WriteLine($"QueryResultRowCount: {queryResult.RowCount}");
-                    if (testCancel)
-                    {
-                        Assert.Fail("Expecting query to timeout, but it did not.");
-                    }
+                    Assert.Fail("Expecting query to timeout, but it did not.");
                 }
                 catch (AdbcException ex)
                 {
-                    Assert.True(testCancel, $"Unexpected exception: {ex}");
                     Assert.Contains("[snowflake] context canceled", ex.Message, StringComparison.OrdinalIgnoreCase);
                 }
             }

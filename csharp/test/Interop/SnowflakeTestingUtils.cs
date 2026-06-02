@@ -114,7 +114,20 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
             {
                 parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthJwt;
                 parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.SnowflakeJwt.User, "username");
-                parameters[SnowflakeParameters.PKCS8_VALUE] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKey, "private_key");
+                if (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKey))
+                {
+                    parameters[SnowflakeParameters.PKCS8_VALUE] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKey, "private_key");
+                }
+                else if (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile)
+                    && File.Exists(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile))
+                {
+                    string privateKey = File.ReadAllText(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile);
+                    parameters[SnowflakeParameters.PKCS8_VALUE] = privateKey;
+                }
+                else
+                {
+                    throw new InvalidOperationException("JWT authentication requires either a private key value or a valid private key file path.");
+                }
                 if (!string.IsNullOrEmpty(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase))
                 {
                     parameters[SnowflakeParameters.PKCS8_PASS] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase, "private_key_passphrase");

@@ -16,11 +16,12 @@
         "auth_oauth": {
             "token": ""
         },
-        "auth_jwt": {
-            "private_key_file": "",
-            "private_key_pwd": "",
-            "user": ""
-        },
+      "auth_jwt": {
+        "user": "",
+        "private_key": "",
+        "private_key_file": "",
+        "private_key_pwd": ""
+      },
         "auth_snowflake": {
             "user": "",
             "password": ""
