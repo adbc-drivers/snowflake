@@ -136,10 +136,15 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                     parameters[SnowflakeParameters.PKCS8_PASS] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase, "private_key_passphrase");
                 }
             }
-            else if (testConfiguration.Authentication.OAuth is not null)
+            else if (testConfiguration.Authentication.OAuth is not null
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.OAuth.Token))
             {
                 parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthOAuth;
                 parameters[SnowflakeParameters.AUTH_TOKEN] = Parameter(testConfiguration.Authentication.OAuth.Token, "oauth_token");
+                if (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.OAuth.User))
+                {
+                    parameters[SnowflakeParameters.USERNAME] = testConfiguration.Authentication.OAuth.User;
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(testConfiguration.Host))
