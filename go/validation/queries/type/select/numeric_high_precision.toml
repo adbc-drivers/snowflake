@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 ADBC Drivers Contributors
+# Copyright (c) 2026 ADBC Drivers Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-[pytest]
-junit_suite_name = validation
-junit_duration_report = call
-xfail_strict = true
+[setup]
+drop = "test_numeric_high_precision"
 
-markers =
-    feature: test for a driver-specific feature
-    requires_features
+# high precision is the default so "revert" should keep it as true
+[setup.connection.options]
+"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "true", revert = "true" }
+[setup.statement.options]
+"adbc.snowflake.sql.client_option.use_high_precision" = { apply = "true", revert = "true" }
 
-filterwarnings =
-    error
-    ignore:record_property is incompatible with junit_family:pytest.PytestWarning
+[tags]
+sql-type-name = "NUMERIC (use_high_precision = true)"

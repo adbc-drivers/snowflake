@@ -29,7 +29,11 @@ if __name__ == "__main__":
 
     reports = [report.resolve() for report in Path(".").glob("validation-report*.xml")]
     generate_documentation.generate(
-        snowflake.get_quirks,
+        "snowflake",
+        lambda version, vendor: snowflake.get_quirks(version),
+        [
+            ("snowflake", "Snowflake"),
+        ],
         reports,
         template,
         args.output.resolve(),
