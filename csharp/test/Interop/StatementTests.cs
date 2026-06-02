@@ -50,8 +50,11 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
 
             var snowflakeTestConfiguration = SnowflakeTestingUtils.TestConfiguration;
 
-            AdbcConnection connection = StatementTests.CreateConnection(snowflakeTestConfiguration);
-            AdbcStatement statement = connection.CreateStatement();
+            Dictionary<string, string> parameters;
+            using AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(snowflakeTestConfiguration, out parameters);
+            using AdbcDatabase adbcDatabase = snowflakeDriver.Open(parameters);
+            using AdbcConnection connection = adbcDatabase.Connect(new Dictionary<string, string>());
+            using AdbcStatement statement = connection.CreateStatement();
             // Note: for this test to be valid, the query needs to run for more time than the delay value!
             statement.SqlQuery = query;
             for (int i = 0; i < 10; i++)
