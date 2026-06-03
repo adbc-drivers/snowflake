@@ -84,7 +84,7 @@ func TestToSnowflakeType(t *testing.T) {
 func TestBuildCopyQueryDetectsGeoViaFieldMetadata(t *testing.T) {
 	geoMeta := arrow.NewMetadata(
 		[]string{"ARROW:extension:name", "ARROW:extension:metadata"},
-		[]string{"geoarrow.wkb", ""},
+		[]string{"geoarrow.wkb", `{"crs":"EPSG:4326", "edges":"spherical"}`},
 	)
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
@@ -92,7 +92,8 @@ func TestBuildCopyQueryDetectsGeoViaFieldMetadata(t *testing.T) {
 	}, nil)
 
 	st := &statement{ingestOptions: DefaultIngestOptions()}
-	copyQ, overrides := st.buildCopyQuery(schema)
+	copyQ, overrides, err := st.buildCopyQuery(schema)
+	assert.NoError(t, err)
 
 	assert.Equal(t, "geography", overrides["geom"], "geo column must be created as GEOGRAPHY")
 	assert.NotEqual(t, copyQuery, copyQ, "must not fall back to plain copyQuery when geo cols are present")
@@ -113,7 +114,8 @@ func TestBuildCopyQueryGeometryWithSRID(t *testing.T) {
 	}, nil)
 
 	st := &statement{ingestOptions: DefaultIngestOptions()}
-	copyQ, overrides := st.buildCopyQuery(schema)
+	copyQ, overrides, err := st.buildCopyQuery(schema)
+	assert.NoError(t, err)
 
 	assert.Equal(t, "geometry", overrides["geom"])
 	assert.Contains(t, copyQ, "ST_SETSRID(TO_GEOMETRY")
@@ -138,7 +140,8 @@ func TestBuildCopyQueryExplicitGeoTypeOverrides(t *testing.T) {
 	opts.geoType = "geometry"
 	opts.geoTypeExplicit = true
 	st := &statement{ingestOptions: opts}
-	copyQ, overrides := st.buildCopyQuery(schema)
+	copyQ, overrides, err := st.buildCopyQuery(schema)
+	assert.NoError(t, err)
 
 	assert.Equal(t, "geometry", overrides["geom"], "explicit geoType must override CRS-derived default")
 	assert.Contains(t, copyQ, "TO_GEOMETRY")
@@ -158,7 +161,8 @@ func TestBuildCopyQueryQuotesExoticColumnNames(t *testing.T) {
 	}, nil)
 
 	st := &statement{ingestOptions: DefaultIngestOptions()}
-	copyQ, _ := st.buildCopyQuery(schema)
+	copyQ, _, err := st.buildCopyQuery(schema)
+	assert.NoError(t, err)
 
 	// Snowflake escapes embedded " by doubling: weird"geom → "weird""geom"
 	assert.Contains(t, copyQ, `"weird""geom"`, "column with embedded quote must use Snowflake doubled-quote escaping")
@@ -174,7 +178,8 @@ func TestBuildCopyQueryNoGeoColumnsReturnsPlainCopy(t *testing.T) {
 	}, nil)
 
 	st := &statement{ingestOptions: DefaultIngestOptions()}
-	copyQ, overrides := st.buildCopyQuery(schema)
+	copyQ, overrides, err := st.buildCopyQuery(schema)
+	assert.NoError(t, err)
 
 	assert.Empty(t, overrides)
 	assert.Equal(t, copyQuery, copyQ, "non-geo schemas must use the plain copyQuery constant verbatim")
@@ -208,4 +213,42 @@ func TestExtractSRIDFromMeta(t *testing.T) {
 			assert.Equal(t, tt.edges, edges)
 		})
 	}
+}
+
+func TestResolveGeoType(t *testing.T) {
+	opts := &ingestOptions{}
+
+	ty, err := opts.resolveGeoType(0, "geom", `{"crs":"EPSG:4326"}`)
+	assert.NoError(t, err)
+	assert.Equal(t, "geometry", ty)
+
+	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857"}`)
+	assert.NoError(t, err)
+	assert.Equal(t, "geometry", ty)
+
+	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:4326", "edges":"spherical"}`)
+	assert.NoError(t, err)
+	assert.Equal(t, "geography", ty)
+
+	_, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857", "edges":"spherical"}`)
+	assert.ErrorContains(t, err, `field #1 ("geom") is a GeoArrow array with spherical edges`)
+
+	// explicit geoType should override CRS-derived default
+	opts.geoType = "geometry"
+	opts.geoTypeExplicit = true
+	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:4326"}`)
+	assert.NoError(t, err)
+	assert.Equal(t, "geometry", ty)
+
+	opts.geoType = "geography"
+	opts.geoTypeExplicit = true
+	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857"}`)
+	assert.NoError(t, err)
+	assert.Equal(t, "geography", ty)
+
+	opts.geoType = "geography"
+	opts.geoTypeExplicit = true
+	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857", "edges":"spherical"}`)
+	assert.NoError(t, err)
+	assert.Equal(t, "geography", ty)
 }

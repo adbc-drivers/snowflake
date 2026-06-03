@@ -553,9 +553,12 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 	// Build the COPY query. If the schema has geo columns, this is a COPY
 	// transform that converts WKB/WKT → GEOGRAPHY/GEOMETRY inline during
 	// COPY INTO; otherwise it is the plain copy query.
-	copyQ, geoOverrides := st.buildCopyQuery(schema)
+	copyQ, geoOverrides, err := st.buildCopyQuery(schema)
+	if err != nil {
+		return -1, err
+	}
 
-	err := st.initIngest(ctx, geoOverrides)
+	err = st.initIngest(ctx, geoOverrides)
 	if err != nil {
 		return -1, err
 	}
@@ -577,9 +580,9 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 // Geo column detection covers both arrow.EXTENSION types and
 // ARROW:extension:name field metadata so that data arriving over the C Data
 // Interface (where extension types are not registered) is also recognized.
-func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]string) {
+func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]string, error) {
 	if schema == nil {
-		return copyQuery, nil
+		return copyQuery, nil, nil
 	}
 
 	// Detect geo columns: either a registered arrow.ExtensionType or the
@@ -609,7 +612,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 	}
 
 	if len(geoCols) == 0 {
-		return copyQuery, nil
+		return copyQuery, nil, nil
 	}
 
 	// Build a COPY transform with inline geo conversion. Each geo column's
@@ -617,7 +620,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 	// column to GEOMETRY while sibling 4326 columns stay GEOGRAPHY.
 	geoOverrides := make(map[string]string, len(geoCols))
 	var selectCols []string
-	for _, f := range schema.Fields() {
+	for fieldIndex, f := range schema.Fields() {
 		quoted := quoteIdentifier(f.Name)
 		parqRef := fmt.Sprintf("$1:%s", quoted)
 
@@ -638,7 +641,11 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 
 		// Geo column: apply conversion function.
 		isWKB := strings.Contains(gc.extName, "wkb")
-		geoType := st.ingestOptions.resolveGeoType(gc.extMeta)
+		geoType, err := st.ingestOptions.resolveGeoType(fieldIndex, f.Name, gc.extMeta)
+		if err != nil {
+			return "", nil, err
+		}
+
 		geoOverrides[gc.name] = geoType
 		var expr string
 		if geoType == "geography" {
@@ -671,7 +678,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 		strings.Join(selectCols, ", "),
 		bindStageName,
 	)
-	return transformQ, geoOverrides
+	return transformQ, geoOverrides, nil
 }
 
 // resolveGeoType picks the Snowflake target type for a single geoarrow column.
@@ -679,15 +686,23 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 // every column (current behavior). Otherwise the column's CRS metadata decides:
 // any non-EPSG:4326 SRID promotes the column to GEOMETRY so the SRID survives
 // the round trip; missing CRS, EPSG:4326, or unparsable CRS stays GEOGRAPHY.
-func (opts *ingestOptions) resolveGeoType(extMeta string) string {
+func (opts *ingestOptions) resolveGeoType(fieldIndex int, fieldName string, extMeta string) (string, error) {
 	if opts.geoTypeExplicit {
-		return opts.geoType
+		return opts.geoType, nil
 	}
 	srid, edges := extractSRIDFromMeta(extMeta)
 	if srid == 4326 && edges == "spherical" {
-		return "geography"
+		return "geography", nil
+	} else if edges == "spherical" {
+		// Snowflake GEOGRAPHY is always SRID 4326, so if the user
+		// specified spherical edges but a different SRID, we should
+		// error/ask them to explicitly set the geo type
+		return "", adbc.Error{
+			Msg:  fmt.Sprintf("[snowflake] field #%d (%s) is a GeoArrow array with spherical edges but an SRID of %d; Snowflake GEOGRAPHY is always SRID 4326, so explicitly set %s to choose whether to ingest this as GEOGRAPHY or GEOMETRY", fieldIndex + 1, quoteIdentifier(fieldName), srid, OptionStatementIngestGeoType),
+			Code: adbc.StatusInvalidData,
+		}
 	}
-	return "geometry"
+	return "geometry", nil
 }
 
 // extractSRIDFromMeta extracts the SRID and edges from GeoArrow extension
