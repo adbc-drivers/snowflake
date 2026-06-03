@@ -461,6 +461,11 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	field := arrow.Field{Name: columnInfo.ColumnName, Nullable: driverbase.ValueOrZero(columnInfo.XdbcNullable) != 0}
 
 	switch driverbase.ValueOrZero(columnInfo.XdbcTypeName) {
+	case "ARRAY":
+		field.Type = arrow.BinaryTypes.String
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name": "arrow.json",
+		})
 	case "NUMBER":
 		if c.useHighPrecision {
 			field.Type = &arrow.Decimal128Type{
@@ -484,8 +489,6 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
 		field.Type = arrow.FixedWidthTypes.Boolean
-	case "ARRAY":
-		fallthrough
 	case "VARIANT":
 		fallthrough
 	case "OBJECT":
@@ -567,7 +570,10 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 		// array, object and variant are all represented as strings by
 		// snowflake's return
 		case "ARRAY":
-			fallthrough
+			field.Type = arrow.BinaryTypes.String
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
 		case "OBJECT":
 			fallthrough
 		case "VARIANT":

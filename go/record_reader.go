@@ -298,6 +298,11 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		}
 
 		switch strings.ToUpper(srcMeta.Type) {
+		case "ARRAY":
+			f.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
+			transformers[i] = identCol
 		case "FIXED":
 			switch f.Type.ID() {
 			case arrow.DECIMAL, arrow.DECIMAL256:
@@ -632,6 +637,11 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 			fields[i].Type = arrow.BinaryTypes.Binary
 		case "boolean":
 			fields[i].Type = arrow.FixedWidthTypes.Boolean
+		case "array":
+			fields[i].Type = arrow.BinaryTypes.String
+			fields[i].Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
 		default:
 			fields[i].Type = arrow.BinaryTypes.String
 		}
