@@ -698,7 +698,7 @@ func (opts *ingestOptions) resolveGeoType(fieldIndex int, fieldName string, extM
 		// specified spherical edges but a different SRID, we should
 		// error/ask them to explicitly set the geo type
 		return "", adbc.Error{
-			Msg:  fmt.Sprintf("[snowflake] field #%d (%s) is a GeoArrow array with spherical edges but an SRID of %d; Snowflake GEOGRAPHY is always SRID 4326, so explicitly set %s to choose whether to ingest this as GEOGRAPHY or GEOMETRY", fieldIndex + 1, quoteIdentifier(fieldName), srid, OptionStatementIngestGeoType),
+			Msg:  fmt.Sprintf("[snowflake] field #%d (%s) is a GeoArrow array with spherical edges but an SRID of %d; Snowflake GEOGRAPHY is always SRID 4326, so explicitly set %s to choose whether to ingest this as GEOGRAPHY or GEOMETRY", fieldIndex+1, quoteIdentifier(fieldName), srid, OptionStatementIngestGeoType),
 			Code: adbc.StatusInvalidData,
 		}
 	}
