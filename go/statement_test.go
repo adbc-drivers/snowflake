@@ -190,10 +190,14 @@ func TestExtractSRIDFromMeta(t *testing.T) {
 		{"empty", "", 0, ""},
 		{"PROJJSON 4326", `{"crs":{"id":{"authority":"EPSG","code":4326}}}`, 4326, ""},
 		{"PROJJSON 4326 with edges", `{"crs":{"id":{"authority":"EPSG","code":4326}},"edges":"spherical"}`, 4326, "spherical"},
+		{"PROJJSON CRS84", `{"crs":{"id":{"authority":"OGC","code":"CRS84"}},"edges":"spherical"}`, 4326, "spherical"},
+		{"PROJJSON EPSG", `{"crs":{"id":{"authority":"EPSG","code":"4326"}},"edges":"spherical"}`, 4326, "spherical"},
 		{"EPSG string", `{"crs":"EPSG:3857"}`, 3857, ""},
 		{"EPSG string with edges", `{"crs":"EPSG:3857","edges":"spherical"}`, 3857, "spherical"},
 		{"no CRS", `{"edges":"planar"}`, 0, "planar"},
 		{"null CRS", `{"crs":null}`, 0, ""},
+		{"OGC", `{"crs":"OGC:CRS84"}`, 4326, ""},
+		{"OGC with edges", `{"crs":"OGC:CRS84","edges":"spherical"}`, 4326, "spherical"},
 		{"invalid JSON", `not json`, 0, ""},
 	}
 

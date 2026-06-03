@@ -711,6 +711,15 @@ func extractSRIDFromMeta(metadata string) (int, string) {
 	type projCRS struct {
 		ID projID `json:"id"`
 	}
+
+	type projIDString struct {
+		Authority string `json:"authority"`
+		Code      string `json:"code"`
+	}
+	type projCRSString struct {
+		ID projIDString `json:"id"`
+	}
+
 	type geoarrowMeta struct {
 		CRS   json.RawMessage `json:"crs"`
 		Edges string          `json:"edges"`
@@ -732,6 +741,8 @@ func extractSRIDFromMeta(metadata string) (int, string) {
 			if code, err := strconv.Atoi(crsStr[5:]); err == nil {
 				return code, meta.Edges
 			}
+		} else if crsStr == "OGC:CRS84" {
+			return 4326, meta.Edges
 		}
 		return 0, meta.Edges
 	}
@@ -740,6 +751,17 @@ func extractSRIDFromMeta(metadata string) (int, string) {
 	if err := json.Unmarshal(meta.CRS, &crs); err == nil {
 		if strings.EqualFold(crs.ID.Authority, "EPSG") && crs.ID.Code != 0 {
 			return crs.ID.Code, meta.Edges
+		}
+	}
+
+	var crsString projCRSString
+	if err := json.Unmarshal(meta.CRS, &crsString); err == nil {
+		if strings.EqualFold(crsString.ID.Authority, "EPSG") {
+			if code, err := strconv.Atoi(crsString.ID.Code); err == nil {
+				return code, meta.Edges
+			}
+		} else if strings.EqualFold(crsString.ID.Authority, "OGC") && strings.EqualFold(crsString.ID.Code, "CRS84") {
+			return 4326, meta.Edges
 		}
 	}
 
