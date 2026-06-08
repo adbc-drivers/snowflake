@@ -97,6 +97,10 @@ func (r *concatReader) Schema() *arrow.Schema {
 }
 func (r *concatReader) Next() bool {
 	for r.currentReader != nil && !r.currentReader.Next() {
+		if err := r.currentReader.Err(); err != nil {
+			r.err = err
+			break
+		}
 		r.nextReader()
 	}
 	if r.currentReader == nil || r.err != nil {

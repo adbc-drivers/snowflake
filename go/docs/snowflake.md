@@ -107,6 +107,218 @@ Examples:
 
 {{ footnotes|safe }}
 
+## Options
+
+### Connection Options
+
+`adbc.snowflake.sql.account`
+: **Type:** string
+
+  The Snowflake account name.
+
+`adbc.snowflake.sql.auth_type`
+: **Values:** (see table below). **Default:** `auth_snowflake`
+
+  How to authenticate to Snowflake.
+
+  | Auth Method        | Description                                                                                         |
+  |--------------------|-----------------------------------------------------------------------------------------------------|
+  | `auth_snowflake`   | username/password                                                                                   |
+  | `auth_oauth`       | OAuth                                                                                               |
+  | `auth_ext_browser` | use an external browser to access a FED and perform SSO auth                                        |
+  | `auth_okta`        | use a native OKTA URL to perform SSO authentication on Okta                                         |
+  | `auth_jwt`         | use a JWT                                                                                           |
+  | `auth_mfa`         | username/password with MFA                                                                          |
+  | `auth_pat`         | use a programmatic access token                                                                     |
+  | `auth_wif`         | use Workload Identity Federation; must specify `adbc.snowflake.sql.client_option.identity_provider` |
+
+`adbc.snowflake.sql.client_option.app_name`
+: **Type:** string
+
+  The application name to report to Snowflake.
+
+`adbc.snowflake.sql.client_option.auth_token`
+: **Type:** string
+
+  The auth token to use.
+
+`adbc.snowflake.sql.client_option.cache_mfa_token`
+: **Type:** boolean
+
+  Whether to cache the MFA token in the OS credential manager.
+
+`adbc.snowflake.sql.client_option.client_timeout`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.config_file`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.disable_telemetry`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.identity_provider`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.jwt_expire_timeout`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.jwt_private_key`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.keep_session_alive`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.login_timeout`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.ocsp_fail_open_mode`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.okta_url`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.request_timeout`
+: **Type:** string
+
+`adbc.snowflake.sql.client_option.store_temp_creds`
+: **Type:** string
+
+  Whether to cache the ID token in the OS credential manager.
+
+`adbc.snowflake.sql.client_option.tls_skip_verify`
+: **Type:** string
+
+  (INSECURE) do not validate the server's TLS certificate.
+
+`adbc.snowflake.sql.client_option.tracing`
+: **Type:** string
+
+  (Deprecated) set the log level.
+
+`adbc.snowflake.sql.db`
+: **Type:** string
+
+  The database name to connect to.
+
+`adbc.snowflake.sql.region`
+: **Type:** string
+
+  The warehouse region.
+
+`adbc.snowflake.sql.role`
+: **Type:** string
+
+  The role to use.
+
+`adbc.snowflake.sql.schema`
+: **Type:** string
+
+  The schema to connect to.
+
+`adbc.snowflake.sql.uri.host`
+: **Type:** string
+
+`adbc.snowflake.sql.uri.port`
+: **Type:** string
+
+`adbc.snowflake.sql.uri.protocol`
+: **Values:** `http` or `https`
+
+`adbc.snowflake.sql.warehouse`
+: **Type:** string
+
+  The warehouse to connect to.
+
+### Options Affecting Queries
+
+`adbc.rpc.result_queue_size`
+: **Type:** int. **Default:** 100
+
+  The max number of batches to buffer for each result stream.
+
+  Can be set on the statement.
+
+`adbc.snowflake.rpc.prefetch_concurrency`
+: **Type:** int. **Default:** 5
+
+  The max number of result streams to fetch in parallel.
+
+  Can be set on the statement.
+
+`adbc.snowflake.sql.client_option.max_timestamp_precision`
+: **Values:** `nanoseconds`, `nanoseconds_error_on_overflow`, `microseconds`. **Default:** `nanoseconds`
+
+  The Snowflake TIMESTAMP_LTZ, TIMESTAMP_NTZ, and TIMESTAMP_TZ types with nanosecond precision have a range greater than is possible to represent with Arrow nanosecond timestamps. This option controls what to do: `nanoseconds` will simply let the value overflow, `nanoseconds_error_on_overflow` will validate values and raise an error if they would overflow (at a performance cost), and `microseconds` will truncate to microseconds, which can represent the full range.
+
+  Can be set on the database.
+
+`adbc.snowflake.sql.client_option.stream_retry_enabled`
+: **Type:** boolean. **Default:** false
+
+  Whether to buffer data read, retrying on failure, or directly yield the underlying result stream. If enabled, transient network failures will be retried up to a fixed number of attempts.
+
+  Can be set on the database, connection, and statement.
+
+`adbc.snowflake.sql.client_option.use_high_precision`
+: **Type:** boolean. **Default:** true
+
+  For [NUMBER columns](https://docs.snowflake.com/en/sql-reference/data-types-numeric#number), whether to read as Arrow decimals, or as Arrow int64/float64. Note that when disabled, there is risk of data being truncated.
+
+  Can be set on the database, connection, and statement.
+
+`adbc.snowflake.statement.ingest_copy_concurrency`
+: **Type:** int. **Default:** 4
+
+  When ingesting, the max number of Parquet files to `COPY INTO` in parallel.
+
+  Can be set on the statement.
+
+`adbc.snowflake.statement.ingest_geo_type`
+: **Values:** `geography` or `geometry`. **Default:** `geography`
+
+  Which Snowflake data type to use when ingesting columns of GeoArrow extension types (`geoarrow.wkb`, `geoarrow.wkt`).
+
+  Can be set on the statement.
+
+`adbc.snowflake.statement.ingest_target_file_size`
+: **Type:** int. **Default:** 10 MiB
+
+  When ingesting, the approximate target size of Parquet files to create. The actual size will tend to be slightly larger; if set to 0 there is no limit.
+
+  Can be set on the statement.
+
+`adbc.snowflake.statement.ingest_upload_concurrency`
+: **Type:** int. **Default:** 8
+
+  When ingesting, the max number of Parquet files to upload in parallel.
+
+  Can be set on the statement.
+
+`adbc.snowflake.statement.ingest_use_vectorized_scanner`
+: **Type:** boolean. **Default:** true
+
+  Whether to pass [`USE_VECTORIZED_SCANNER=TRUE`](https://docs.snowflake.com/en/sql-reference/sql/copy-into-table#label-use-vectorized-scanner) when ingesting data via `COPY INTO`.
+
+`adbc.snowflake.statement.ingest_writer_concurrency`
+: **Type:** int. **Default:** number of vCPUs detected
+
+  When ingesting, the max number of Parquet files to write in parallel.
+
+  Can be set on the statement.
+
+`adbc.snowflake.statement.query_tag`
+: **Type:** string. **Default:** (unset)
+
+  A query tag to apply to queries, which can be used for monitoring.
+
+  Can be set on the statement.
+
 ## Previous Versions
 
 To see documentation for previous versions of this driver, see the following:

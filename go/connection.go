@@ -39,7 +39,7 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -59,6 +59,8 @@ var queryGetObjectsTables string
 
 //go:embed queries/get_objects_terse_catalogs.sql
 var queryGetObjectsTerseCatalogs string
+
+const geographyGeoArrowJson = `{"crs":"EPSG:4326","edges":"spherical"}`
 
 type snowflakeConn interface {
 	driver.Conn
@@ -210,6 +212,12 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 	if len(tableType) > 0 && depth >= adbc.ObjectDepthTables && !hasViews && !hasTables {
 		tableName = &badTableType
 		tableType = []string{"TABLE"}
+	}
+
+	// Optimized path: read SHOW TERSE results directly instead of through
+	// RESULT_SCAN SQL templates, reducing Snowflake round-trips from 3-4 to 1-2.
+	if reader, err = c.getObjectsDirectPath(ctx, depth, catalog, dbSchema, tableName, tableType, hasViews, hasTables); reader != nil || err != nil {
+		return
 	}
 
 	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
@@ -405,49 +413,49 @@ func (*connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
 }
 
 // GetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentCatalog() (string, error) {
+func (c *connectionImpl) GetCurrentCatalog(ctx context.Context) (string, error) {
 	return c.getStringQuery("SELECT CURRENT_DATABASE()")
 }
 
 // GetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
+func (c *connectionImpl) GetCurrentDbSchema(ctx context.Context) (string, error) {
 	return c.getStringQuery("SELECT CURRENT_SCHEMA()")
 }
 
 // SetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentCatalog(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE DATABASE %s;", quoteIdentifier(value)), nil)
+func (c *connectionImpl) SetCurrentCatalog(ctx context.Context, value string) error {
+	_, err := c.cn.ExecContext(ctx, fmt.Sprintf("USE DATABASE %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentDbSchema(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE SCHEMA %s;", quoteIdentifier(value)), nil)
+func (c *connectionImpl) SetCurrentDbSchema(ctx context.Context, value string) error {
+	_, err := c.cn.ExecContext(ctx, fmt.Sprintf("USE SCHEMA %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetAutocommit implements driverbase.AutocommitSetter.
-func (c *connectionImpl) SetAutocommit(enabled bool) error {
+func (c *connectionImpl) SetAutocommit(ctx context.Context, enabled bool) error {
 	if enabled {
 		if c.activeTransaction {
-			_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
+			_, err := c.cn.ExecContext(ctx, "COMMIT", nil)
 			if err != nil {
 				return errToAdbcErr(adbc.StatusInternal, err)
 			}
 			c.activeTransaction = false
 		}
-		_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = true", nil)
+		_, err := c.cn.ExecContext(ctx, "ALTER SESSION SET AUTOCOMMIT = true", nil)
 		return err
 	}
 
 	if !c.activeTransaction {
-		_, err := c.cn.ExecContext(context.Background(), "BEGIN", nil)
+		_, err := c.cn.ExecContext(ctx, "BEGIN", nil)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInternal, err)
 		}
 		c.activeTransaction = true
 	}
-	_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = false", nil)
+	_, err := c.cn.ExecContext(ctx, "ALTER SESSION SET AUTOCOMMIT = false", nil)
 	return err
 }
 
@@ -457,6 +465,11 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	field := arrow.Field{Name: columnInfo.ColumnName, Nullable: driverbase.ValueOrZero(columnInfo.XdbcNullable) != 0}
 
 	switch driverbase.ValueOrZero(columnInfo.XdbcTypeName) {
+	case "ARRAY":
+		field.Type = arrow.BinaryTypes.String
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name": "arrow.json",
+		})
 	case "NUMBER":
 		if c.useHighPrecision {
 			field.Type = &arrow.Decimal128Type{
@@ -480,8 +493,6 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
 		field.Type = arrow.FixedWidthTypes.Boolean
-	case "ARRAY":
-		fallthrough
 	case "VARIANT":
 		fallthrough
 	case "OBJECT":
@@ -512,9 +523,19 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 			field.Type = arrow.FixedWidthTypes.Timestamp_ns
 		}
 	case "GEOGRAPHY":
-		fallthrough
+		// With GEOGRAPHY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
+		// GEOGRAPHY is always WGS84 (SRID 4326).
+		field.Type = arrow.BinaryTypes.Binary
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name":     "geoarrow.wkb",
+			"ARROW:extension:metadata": geographyGeoArrowJson,
+		})
 	case "GEOMETRY":
-		field.Type = arrow.BinaryTypes.String
+		// With GEOMETRY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
+		field.Type = arrow.BinaryTypes.Binary
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name": "geoarrow.wkb",
+		})
 	case "VECTOR":
 		// despite the fact that Snowflake *does* support returning data
 		// for VECTOR typed columns as Arrow FixedSizeLists, there's no way
@@ -525,7 +546,7 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	return field
 }
 
-func descToField(name, typ, isnull, primary string, comment sql.NullString, maxTimestampPrecision MaxTimestampPrecision) (field arrow.Field, err error) {
+func descToField(name, typ, isnull, primary string, comment sql.NullString, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (field arrow.Field, err error) {
 	field.Name = name
 	if isnull == "Y" {
 		field.Nullable = true
@@ -551,15 +572,25 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		// array, object and variant are all represented as strings by
 		// snowflake's return
 		case "ARRAY":
-			fallthrough
+			field.Type = arrow.BinaryTypes.String
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
 		case "OBJECT":
 			fallthrough
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
 		case "GEOGRAPHY":
-			fallthrough
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name":     "geoarrow.wkb",
+				"ARROW:extension:metadata": geographyGeoArrowJson,
+			})
 		case "GEOMETRY":
-			field.Type = arrow.BinaryTypes.String
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
+			})
 		case "BOOLEAN":
 			field.Type = arrow.FixedWidthTypes.Boolean
 		default:
@@ -586,10 +617,25 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 				Code: adbc.StatusInvalidData,
 			}
 		}
-		if scale == 0 {
-			field.Type = arrow.PrimitiveTypes.Int64
+		if useHighPrecision {
+			paren := strings.Index(typ, "(")
+			precision, err := strconv.ParseInt(typ[paren+1:comma], 10, 32)
+			if err != nil {
+				return field, adbc.Error{
+					Msg:  "[snowflake] could not parse precision from type '" + typ + "'",
+					Code: adbc.StatusInvalidData,
+				}
+			}
+			field.Type = &arrow.Decimal128Type{
+				Precision: int32(precision),
+				Scale:     int32(scale),
+			}
 		} else {
-			field.Type = arrow.PrimitiveTypes.Float64
+			if scale == 0 {
+				field.Type = arrow.PrimitiveTypes.Int64
+			} else {
+				field.Type = arrow.PrimitiveTypes.Float64
+			}
 		}
 	case "TIME":
 		field.Type = arrow.FixedWidthTypes.Time64ns
@@ -712,7 +758,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		}
 
 		var f arrow.Field
-		f, err = descToField(name, typ, isnull, primary, comment, c.maxTimestampPrecision)
+		f, err = descToField(name, typ, isnull, primary, comment, c.useHighPrecision, c.maxTimestampPrecision)
 		if err != nil {
 			return nil, err
 		}
@@ -752,7 +798,7 @@ func (c *connectionImpl) Rollback(_ context.Context) error {
 }
 
 // NewStatement initializes a new statement object tied to this connection
-func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
+func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithContext, error) {
 	stmtBase := driverbase.NewStatementImplBase(c.Base(), c.ErrorHelper)
 	stmt := &statement{
 		StatementImplBase:     stmtBase,
@@ -769,8 +815,8 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 }
 
 // Close closes this connection and releases any associated resources.
-func (c *connectionImpl) Close() (err error) {
-	_, span := driverbase.StartSpan(context.Background(), "connectionImpl.Close", c)
+func (c *connectionImpl) Close(ctx context.Context) (err error) {
+	_, span := driverbase.StartSpan(ctx, "connectionImpl.Close", c)
 	defer driverbase.EndSpan(span, err)
 
 	if c.cn == nil {
@@ -795,7 +841,7 @@ func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition 
 	}
 }
 
-func (c *connectionImpl) SetOption(key, value string) error {
+func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
 	switch key {
 	case OptionUseHighPrecision:
 		// statements will inherit the value of the OptionUseHighPrecision
@@ -827,6 +873,6 @@ func (c *connectionImpl) SetOption(key, value string) error {
 		}
 		return nil
 	default:
-		return c.Base().SetOption(key, value)
+		return c.Base().SetOption(ctx, key, value)
 	}
 }

@@ -33,7 +33,7 @@ import (
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
 )
 
 const (
@@ -90,12 +90,13 @@ const (
 	OptionMaxTimestampPrecision = "adbc.snowflake.sql.client_option.max_timestamp_precision"
 
 	// OptionStreamRetryEnabled controls whether batch reads from Snowflake
-	// use a buffered approach that reads the entire HTTP response body into
-	// memory before IPC parsing, with retry on failure. When enabled, this
-	// reduces the TCP connection open time (mitigating connection resets from
-	// cloud storage) and provides clearer diagnostics on network errors.
-	// When disabled, batches are read in the original streaming mode directly
-	// from the network. Default is disabled.
+	// use a retry-based approach that buffers entire batches and retries on
+	// failure, or the original streaming approach that reads directly from
+	// the network. When enabled, transient network errors during reads of
+	// batches[1:] will be retried up to a fixed number of attempts; batch[0]
+	// is always read via the original streaming path because its IPC reader
+	// is shared to discover the schema. When disabled, all batches use the
+	// original inline streaming path. Default is disabled.
 	OptionStreamRetryEnabled = "adbc.snowflake.sql.client_option.stream_retry_enabled"
 
 	OptionApplicationName  = "adbc.snowflake.sql.client_option.app_name"
@@ -239,10 +240,11 @@ func WithTransporter(transporter http.RoundTripper) Option {
 // when creating the Snowflake database.
 type Driver interface {
 	adbc.Driver
+	driverbase.DriverWithContext
 
 	// NewDatabaseWithOptions creates a new Snowflake database with the provided options.
-	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.Database, error)
-	NewDatabaseWithOptionsContext(context.Context, map[string]string, ...Option) (adbc.Database, error)
+	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.DatabaseWithContext, error)
+	NewDatabaseWithOptionsContext(context.Context, map[string]string, ...Option) (adbc.DatabaseWithContext, error)
 }
 
 var _ Driver = (*driverImpl)(nil)
@@ -261,17 +263,17 @@ func NewDriver(alloc memory.Allocator) Driver {
 }
 
 func (d *driverImpl) NewDatabase(opts map[string]string) (adbc.Database, error) {
-	return d.NewDatabaseWithContext(context.Background(), opts)
+	return nil, adbc.Error{Code: adbc.StatusNotImplemented, Msg: "use NewDatabaseWithContext"}
 }
 
-func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.Database, error) {
+func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.DatabaseWithContext, error) {
 	return d.NewDatabaseWithOptionsContext(ctx, opts)
 }
 
 func (d *driverImpl) NewDatabaseWithOptions(
 	opts map[string]string,
 	optFuncs ...Option,
-) (adbc.Database, error) {
+) (adbc.DatabaseWithContext, error) {
 	return d.NewDatabaseWithOptionsContext(context.Background(), opts, optFuncs...)
 }
 
@@ -279,7 +281,7 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	ctx context.Context,
 	opts map[string]string,
 	optFuncs ...Option,
-) (adbc.Database, error) {
+) (adbc.DatabaseWithContext, error) {
 	opts = maps.Clone(opts)
 
 	dbBase, err := driverbase.NewDatabaseImplBase(ctx, &d.DriverImplBase)
@@ -293,10 +295,11 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	db := &databaseImpl{
 		DatabaseImplBase:      dbBase,
 		useHighPrecision:      true,
+		streamRetryEnabled:    false,
 		defaultAppName:        defaultAppName,
 		maxTimestampPrecision: Nanoseconds,
 	}
-	if err := db.SetOptions(opts); err != nil {
+	if err := db.SetOptions(ctx, opts); err != nil {
 		return nil, err
 	}
 
@@ -308,4 +311,8 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	}
 
 	return driverbase.NewDatabase(db), nil
+}
+
+func quoteTblName(name string) string {
+	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
 }

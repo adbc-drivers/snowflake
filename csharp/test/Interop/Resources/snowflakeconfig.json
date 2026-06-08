@@ -17,9 +17,10 @@
             "token": ""
         },
         "auth_jwt": {
+            "user": "",
+            "private_key": "",
             "private_key_file": "",
-            "private_key_pwd": "",
-            "user": ""
+            "private_key_pwd": ""
         },
         "auth_snowflake": {
             "user": "",

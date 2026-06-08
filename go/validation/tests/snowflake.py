@@ -89,6 +89,6 @@ class SnowflakeQuirks(model.DriverQuirks):
 @functools.cache
 def get_quirks(version: str) -> SnowflakeQuirks:
     quirks = SnowflakeQuirks()
-    if version != quirks.short_version:
+    if version != quirks.short_version and version != "latest":
         raise ValueError(f"Unsupported Snowflake version: {version}")
     return quirks

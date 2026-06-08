@@ -47,7 +47,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -122,6 +122,20 @@ type ingestOptions struct {
 	//
 	// Default is true.
 	vectorizedScanner bool
+	// Snowflake type to use for geoarrow columns (geoarrow.wkb, geoarrow.wkt).
+	//
+	// Valid values are "geography" (default) and "geometry".
+	// GEOGRAPHY is always WGS84 (SRID 4326). GEOMETRY supports any SRID;
+	// the SRID is extracted from geoarrow extension metadata and applied
+	// via ST_SETSRID after COPY INTO.
+	geoType string
+	// Whether geoType was set explicitly via SetOption. When false (the
+	// default), each geoarrow column's target type is decided per-column
+	// from its CRS metadata: a non-EPSG:4326 SRID promotes that column to
+	// GEOMETRY so the SRID survives the round trip; everything else stays
+	// GEOGRAPHY. Setting the option pins the type for all geoarrow columns
+	// and disables per-column promotion.
+	geoTypeExplicit bool
 }
 
 func DefaultIngestOptions() ingestOptions {
@@ -133,6 +147,7 @@ func DefaultIngestOptions() ingestOptions {
 		compressionCodec:  defaultCompressionCodec,
 		compressionLevel:  defaultCompressionLevel,
 		vectorizedScanner: defaultVectorizedScanner,
+		geoType:           "geography",
 	}
 }
 
@@ -141,7 +156,7 @@ func DefaultIngestOptions() ingestOptions {
 //
 // The Record must already be bound by calling stmt.Bind(), and will be released
 // and reset upon completion.
-func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) {
+func (st *statement) ingestRecord(ctx context.Context, copyQ string) (nrows int64, err error) {
 	defer func() {
 		// Record already released by writeParquet()
 		st.bound = nil
@@ -209,7 +224,7 @@ func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) 
 	}
 
 	// Load the uploaded file into the target table
-	_, err = st.cnxn.cn.ExecContext(ctx, copyQuery, []driver.NamedValue{{Value: target}})
+	_, err = st.cnxn.cn.ExecContext(ctx, copyQ, []driver.NamedValue{{Value: target}})
 	if err != nil {
 		return
 	}
@@ -225,7 +240,7 @@ func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) 
 //
 // The RecordReader must already be bound by calling stmt.BindStream(), and will
 // be released and reset upon completion.
-func (st *statement) ingestStream(ctx context.Context) (nrows int64, err error) {
+func (st *statement) ingestStream(ctx context.Context, copyQ string) (nrows int64, err error) {
 	defer func() {
 		st.streamBind.Release()
 		st.streamBind = nil
@@ -298,7 +313,7 @@ func (st *statement) ingestStream(ctx context.Context) (nrows int64, err error) 
 	}
 
 	// Kickoff background tasks to COPY Parquet files into Snowflake table as they are uploaded
-	fileReady, finishCopy, cancelCopy := runCopyTasks(ctx, st.cnxn.cn, target, int(st.ingestOptions.copyConcurrency))
+	fileReady, finishCopy, cancelCopy := runCopyTasks(ctx, st.cnxn.cn, copyQ, target, int(st.ingestOptions.copyConcurrency))
 
 	// Read Parquet files from buffer pool and upload to Snowflake stage in parallel
 	g.Go(func() error {
@@ -333,8 +348,21 @@ func newWriterProps(mem memory.Allocator, opts *ingestOptions) (*parquet.WriterP
 	return parquetProps, arrowProps
 }
 
-func readRecords(ctx context.Context, rdr array.RecordReader, out chan<- arrow.RecordBatch) error {
+func readRecords(ctx context.Context, rdr array.RecordReader, out chan<- arrow.RecordBatch) (err error) {
 	defer close(out)
+	// The bound RecordReader is producer-supplied and may panic from
+	// Next(): arrow-go's C Data import, for example, panics when an
+	// inbound batch's column count does not match the advertised schema.
+	// Convert any such panic into an ADBC error so the caller gets a
+	// diagnosable failure instead of an aborted host process.
+	defer func() {
+		if r := recover(); r != nil {
+			err = adbc.Error{
+				Msg:  fmt.Sprintf("failed to read record batch from bound stream: %v", r),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+	}()
 
 	for rdr.Next() {
 		rec := rdr.RecordBatch()
@@ -488,7 +516,7 @@ func uploadStream(ctx context.Context, cn snowflakeConn, r io.Reader, name strin
 	putQuery := fmt.Sprintf(putQueryTmpl, name)
 	putQuery = strings.ReplaceAll(putQuery, "\\", "\\\\") // Windows compatibility
 
-	_, err := cn.ExecContext(gosnowflake.WithFileStream(ctx, r), putQuery, nil)
+	_, err := cn.ExecContext(gosnowflake.WithFilePutStream(ctx, r), putQuery, nil)
 	if err != nil {
 		return err
 	}
@@ -532,8 +560,8 @@ func uploadAllStreams(
 	return g.Wait()
 }
 
-func executeCopyQuery(ctx context.Context, cn snowflakeConn, tableName string, filesToCopy *fileSet) (err error) {
-	rows, err := cn.QueryContext(ctx, copyQuery, []driver.NamedValue{{Value: tableName}})
+func executeCopyQuery(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, filesToCopy *fileSet) (err error) {
+	rows, err := cn.QueryContext(ctx, copyQ, []driver.NamedValue{{Value: tableName}})
 	if err != nil {
 		return err
 	}
@@ -566,7 +594,7 @@ func executeCopyQuery(ctx context.Context, cn snowflakeConn, tableName string, f
 	return nil
 }
 
-func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concurrency int) (func(string), func() error, func()) {
+func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, concurrency int) (func(string), func() error, func()) {
 	var filesToCopy fileSet
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -631,7 +659,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concu
 				time.Sleep(backoff)
 			}
 
-			if err := executeCopyQuery(ctx, cn, tableName, &filesToCopy); err != nil {
+			if err := executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy); err != nil {
 				return err
 			}
 
@@ -670,7 +698,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, tableName string, concu
 			}
 
 			g.Go(func() error {
-				return executeCopyQuery(ctx, cn, tableName, &filesToCopy)
+				return executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy)
 			})
 		}
 	}()
