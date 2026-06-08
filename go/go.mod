@@ -17,13 +17,13 @@ module github.com/adbc-drivers/snowflake/go
 go 1.26.1
 
 require (
-	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260531215508-9a56b1c7bd6d
-	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260427080211-5b908ab0cfd8
-	github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260427080211-5b908ab0cfd8
+	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260608064711-7f3f9a9f3990
+	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260608002410-49f9e21a1d4a
+	github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260608064711-7f3f9a9f3990
 	github.com/apache/arrow-adbc/go/adbc v1.11.0
 	github.com/apache/arrow-go/v18 v18.6.0
 	github.com/google/uuid v1.6.0
-	github.com/snowflakedb/gosnowflake/v2 v2.0.2
+	github.com/snowflakedb/gosnowflake/v2 v2.1.0
 	github.com/stretchr/testify v1.11.1
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	go.opentelemetry.io/otel v1.44.0
@@ -89,7 +89,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
-	golang.org/x/exp v0.0.0-20260529124908-c761662dc8c9 // indirect
+	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
