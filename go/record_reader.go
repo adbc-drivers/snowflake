@@ -1258,11 +1258,6 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		attribute.Int("batches", len(batches)),
 		attribute.Int64("totalRows", ld.TotalRows()),
 		attribute.Bool("streamRetryEnabled", streamRetryEnabled),
-	))
-
-	trace.SpanFromContext(ctx).AddEvent("newRecordReader", trace.WithAttributes(
-		attribute.Int("batches", len(batches)),
-		attribute.Int64("totalRows", ld.TotalRows()),
 		attribute.Int("jsonDataLen", len(ld.JSONData())),
 	))
 
