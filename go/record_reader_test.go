@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -805,5 +806,150 @@ func TestReaderCancellationSetsErrBeforeNextAndReleaseReturns(t *testing.T) {
 	case <-releaseDone:
 	case <-time.After(200 * time.Millisecond):
 		require.FailNow(t, "reader.Release should not block after cancellation")
+	}
+}
+
+// shortReadStream delivers data in chunks no larger than chunkSize per Read.
+// If errAtOffset > 0, it returns injectedErr once that many bytes have been
+// delivered, simulating mid-frame truncation (gosnowflake#1781).
+type shortReadStream struct {
+	data        []byte
+	pos         int
+	chunkSize   int
+	errAtOffset int
+	injectedErr error
+}
+
+func (s *shortReadStream) Read(p []byte) (int, error) {
+	if s.errAtOffset > 0 && s.pos >= s.errAtOffset {
+		return 0, s.injectedErr
+	}
+	if s.pos >= len(s.data) {
+		return 0, io.EOF
+	}
+	n := min(len(p), s.chunkSize)
+	remaining := len(s.data) - s.pos
+	if n > remaining {
+		n = remaining
+	}
+	if s.errAtOffset > 0 && s.pos+n > s.errAtOffset {
+		n = s.errAtOffset - s.pos
+	}
+	copy(p, s.data[s.pos:s.pos+n])
+	s.pos += n
+	return n, nil
+}
+
+func (s *shortReadStream) Close() error { return nil }
+
+func streamShortReads(data []byte, chunkSize int) func(context.Context) (io.ReadCloser, error) {
+	return func(context.Context) (io.ReadCloser, error) {
+		return &shortReadStream{data: data, chunkSize: chunkSize}, nil
+	}
+}
+
+func streamShortReadsThenError(data []byte, chunkSize, errAtOffset int, err error) func(context.Context) (io.ReadCloser, error) {
+	return func(context.Context) (io.ReadCloser, error) {
+		return &shortReadStream{
+			data:        data,
+			chunkSize:   chunkSize,
+			errAtOffset: errAtOffset,
+			injectedErr: err,
+		}, nil
+	}
+}
+
+// Sanity check that legal short reads alone (n < len(p), nil err) don't break
+// IPC decoding — the failure in gosnowflake#1781 requires a mid-frame error.
+func TestTryReadBatch_ShortReadsSucceed(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+
+	schema := testSchema()
+	rec := buildTestRecord(alloc, schema, []int64{1, 2, 3, 4, 5})
+	defer rec.Release()
+
+	data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
+	batch := &mockBatch{numRows: 5, streams: []func(context.Context) (io.ReadCloser, error){
+		streamShortReads(data, 1),
+	}}
+
+	recs, err := tryReadBatch(context.Background(), batch, alloc, identityTransform)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	defer recs[0].Release()
+	assert.EqualValues(t, 5, recs[0].NumRows())
+}
+
+// Reproduces gosnowflake#1781 and validates the streamRetryEnabled flag:
+// with retries disabled (matching the production "no retry" branch in
+// newRecordReader) the mid-frame IPC error surfaces; with retries enabled
+// the same broken first stream is recovered by a second attempt.
+func TestStreamRetryEnabled_RecoversFromShortReadMidFrameError(t *testing.T) {
+	schema := testSchema()
+
+	cases := []struct {
+		name               string
+		streamRetryEnabled bool
+		expectErr          bool
+	}{
+		{name: "disabled_surfacesIPCError", streamRetryEnabled: false, expectErr: true},
+		{name: "enabled_recovers", streamRetryEnabled: true, expectErr: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer alloc.AssertSize(t, 0)
+
+			rec := buildTestRecord(alloc, schema, []int64{11, 22, 33, 44})
+			defer rec.Release()
+
+			data := buildIPCBytes(alloc, schema, []arrow.RecordBatch{rec})
+			require.Greater(t, len(data), 32)
+			truncationOffset := len(data) - 8
+
+			batch := &mockBatch{numRows: 4, streams: []func(context.Context) (io.ReadCloser, error){
+				streamShortReadsThenError(data, 16, truncationOffset, io.ErrUnexpectedEOF),
+				streamShortReads(data, 16),
+			}}
+
+			// Mirror the production dispatch in newRecordReader.
+			ctx := context.Background()
+			var recs []arrow.RecordBatch
+			var err error
+			if tc.streamRetryEnabled {
+				recs, err = readBatchRecords(ctx, batch, alloc, identityTransform, defaultStreamMaxRetries)
+			} else {
+				out := make(chan arrow.RecordBatch, 4)
+				target := newBatchStreamTarget(0, batch, out, nil)
+				err = streamBatchToChannel(ctx, 0, batch, alloc, identityTransform, target)
+				close(out)
+				for r := range out {
+					recs = append(recs, r)
+				}
+			}
+
+			if tc.expectErr {
+				require.Error(t, err, "expected IPC error to surface without retry")
+				msg := err.Error()
+				assert.True(t,
+					strings.Contains(msg, "could not read message body") ||
+						strings.Contains(msg, "unexpected EOF") ||
+						strings.Contains(msg, "row count mismatch"),
+					"expected IPC body-read failure, got: %s", msg,
+				)
+				for _, r := range recs {
+					r.Release()
+				}
+				return
+			}
+
+			require.NoError(t, err, "retry should recover from mid-frame truncation")
+			require.Len(t, recs, 1)
+			defer recs[0].Release()
+			assert.EqualValues(t, 4, recs[0].NumRows())
+			assert.Equal(t, 2, batch.call, "retry should have been invoked")
+		})
 	}
 }
