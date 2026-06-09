@@ -120,13 +120,13 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 	case OptionAuthType:
 		return d.cfg.Authenticator.String(), nil
 	case OptionLoginTimeout:
-		return strconv.FormatFloat(d.cfg.LoginTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.LoginTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionRequestTimeout:
-		return strconv.FormatFloat(d.cfg.RequestTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.RequestTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionJwtExpireTimeout:
-		return strconv.FormatFloat(d.cfg.JWTExpireTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.JWTExpireTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientTimeout:
-		return strconv.FormatFloat(d.cfg.ClientTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.ClientTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionApplicationName:
 		return d.cfg.Application, nil
 	case OptionSSLSkipVerify:
@@ -163,7 +163,7 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		}
 		return adbc.OptionValueDisabled, nil
 	case OptionLogTracing:
-		return d.cfg.Tracing, nil
+		return d.cfg.Tracing, nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
 		return d.cfg.ClientConfigFile, nil
 	case OptionUseHighPrecision:
@@ -225,8 +225,7 @@ func (d *databaseImpl) SetOptions(ctx context.Context, cnOptions map[string]stri
 	}
 	// XXX(https://github.com/apache/arrow-adbc/issues/2792): Snowflake
 	// has a tendency to spam the log by default, so set the log level
-
-	d.cfg.Tracing = "fatal"
+	d.cfg.Tracing = "fatal" //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 
 	// set default application name to track
 	// unless user overrides it
@@ -244,8 +243,6 @@ func (d *databaseImpl) SetOptions(ctx context.Context, cnOptions map[string]stri
 // SetOptionInternal sets the option for the database.
 //
 // cnOptions is nil if the option is being set post-initialiation.
-//
-
 func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[string]string) error {
 	var err error
 	var ok bool
@@ -299,7 +296,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.LoginTimeout = dur
+		d.cfg.LoginTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionRequestTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {
@@ -311,7 +308,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.RequestTimeout = dur
+		d.cfg.RequestTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionJwtExpireTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {
@@ -323,7 +320,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.JWTExpireTimeout = dur
+		d.cfg.JWTExpireTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {
@@ -335,7 +332,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.ClientTimeout = dur
+		d.cfg.ClientTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionApplicationName:
 		if !strings.HasPrefix(v, "[ADBC]") {
 			v = d.defaultAppName + v
@@ -511,7 +508,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			}
 		}
 	case OptionLogTracing:
-		d.cfg.Tracing = v
+		d.cfg.Tracing = v //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
 		d.cfg.ClientConfigFile = v
 	case OptionUseHighPrecision:
