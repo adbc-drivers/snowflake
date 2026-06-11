@@ -1666,6 +1666,82 @@ func (suite *SnowflakeTests) TestMetadataGetObjectsColumnsXdbc() {
 
 }
 
+func (suite *SnowflakeTests) TestMetadataGetObjectsColumnsBinaryXdbc() {
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, "binary_columns"))
+
+	db := sql.OpenDB(suite.Quirks.connector)
+	defer testutil.CheckedClose(suite.T(), db)
+
+	_, err := db.ExecContext(suite.ctx, `CREATE TABLE "binary_columns" (COL_BINARY BINARY, COL_BINARY_N BINARY(10))`)
+	suite.Require().NoError(err)
+	defer func() {
+		_ = suite.Quirks.DropTable(suite.cnxn, "binary_columns")
+	}()
+
+	var (
+		expectedColnames  = []string{"col_binary", "col_binary_n"}
+		expectedTypeNames = []string{"BINARY", "BINARY"}
+		expectedColSizes  = []string{"8388608", "10"}
+	)
+
+	catalog := suite.Quirks.Catalog()
+	schema := suite.Quirks.DBSchema()
+	filterTable := "binary_columns"
+
+	rdr, err := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthColumns, &catalog, &schema, &filterTable, nil, nil)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	var (
+		foundExpected = false
+		colnames      = make([]string, 0)
+		typeNames     = make([]string, 0)
+		colSizes      = make([]string, 0)
+	)
+
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		catalogDbSchemasList := rec.Column(1).(*array.List)
+		catalogDbSchemas := catalogDbSchemasList.ListValues().(*array.Struct)
+		dbSchemaNames := catalogDbSchemas.Field(0).(*array.String)
+		dbSchemaTablesList := catalogDbSchemas.Field(1).(*array.List)
+		dbSchemaTables := dbSchemaTablesList.ListValues().(*array.Struct)
+		tableColumnsList := dbSchemaTables.Field(2).(*array.List)
+		tableColumns := tableColumnsList.ListValues().(*array.Struct)
+
+		for row := range rec.NumRows() {
+			dbSchemaIdxStart, dbSchemaIdxEnd := catalogDbSchemasList.ValueOffsets(int(row))
+			for dbSchemaIdx := dbSchemaIdxStart; dbSchemaIdx < dbSchemaIdxEnd; dbSchemaIdx++ {
+				schemaName := dbSchemaNames.Value(int(dbSchemaIdx))
+				tblIdxStart, tblIdxEnd := dbSchemaTablesList.ValueOffsets(int(dbSchemaIdx))
+				for tblIdx := tblIdxStart; tblIdx < tblIdxEnd; tblIdx++ {
+					tableName := dbSchemaTables.Field(0).(*array.String).Value(int(tblIdx))
+					if strings.EqualFold(schemaName, suite.Quirks.DBSchema()) && strings.EqualFold("binary_columns", tableName) {
+						foundExpected = true
+
+						colIdxStart, colIdxEnd := tableColumnsList.ValueOffsets(int(tblIdx))
+						for colIdx := colIdxStart; colIdx < colIdxEnd; colIdx++ {
+							name := tableColumns.Field(0).(*array.String).Value(int(colIdx))
+							colnames = append(colnames, strings.ToLower(name))
+
+							typeNames = append(typeNames, tableColumns.Field(4).(*array.String).Value(int(colIdx)))
+
+							colSize := tableColumns.Field(5).(*array.Int32).Value(int(colIdx))
+							colSizes = append(colSizes, strconv.Itoa(int(colSize)))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	suite.NoError(rdr.Err())
+	suite.True(foundExpected)
+	suite.ElementsMatch(expectedColnames, colnames)
+	suite.ElementsMatch(expectedTypeNames, typeNames)
+	suite.ElementsMatch(expectedColSizes, colSizes)
+}
+
 func (suite *SnowflakeTests) TestNewDatabaseGetSetOptions() {
 	key1, val1 := "key1", "val1"
 	key2, val2 := "key2", "val2"

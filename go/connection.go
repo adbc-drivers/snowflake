@@ -191,7 +191,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 
 	var (
 		pkQueryID, fkQueryID, uniqueQueryID, terseDbQueryID string
-		showSchemaQueryID, tableQueryID                     string
+		showSchemaQueryID, tableQueryID, columnsQueryID     string
 	)
 
 	conn := c.cn
@@ -287,6 +287,11 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			return err
 		})
 
+		gQueryIDs.Go(func() (err error) {
+			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+suffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT")
+			return err
+		})
+
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
@@ -324,6 +329,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		sql.Named("SHOW_DB_QUERY_ID", terseDbQueryID),
 		sql.Named("SHOW_SCHEMA_QUERY_ID", showSchemaQueryID),
 		sql.Named("SHOW_TABLE_QUERY_ID", tableQueryID),
+		sql.Named("SHOW_COLUMNS_QUERY_ID", columnsQueryID),
 	}
 
 	nvargs := make([]driver.NamedValue, len(args))
