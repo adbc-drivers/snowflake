@@ -24,6 +24,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/decimal256"
+	"github.com/apache/arrow-go/v18/arrow/float16"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -322,6 +323,55 @@ func TestConvertDecimal256(t *testing.T) {
 	ns := params[0].Value.(sql.NullString)
 	assert.True(t, ns.Valid)
 	assert.Equal(t, "123.456", ns.String)
+}
+
+func TestConvertFloat16(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "f16", Type: arrow.FixedWidthTypes.Float16, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	bldr.Field(0).(*array.Float16Builder).Append(float16.New(1.5))
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+	require.Len(t, params, 1)
+
+	nf := params[0].Value.(sql.NullFloat64)
+	assert.True(t, nf.Valid)
+	assert.Equal(t, 1.5, nf.Float64)
+	assert.Equal(t, 1, params[0].Ordinal)
+}
+
+func TestConvertFloat16Null(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "f16", Type: arrow.FixedWidthTypes.Float16, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, sc)
+	defer bldr.Release()
+
+	bldr.Field(0).(*array.Float16Builder).AppendNull()
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	params, err := convertArrowToNamedValue(rec, 0, nil)
+	require.NoError(t, err)
+
+	nf := params[0].Value.(sql.NullFloat64)
+	assert.False(t, nf.Valid)
 }
 
 func TestConvertMixedTypes(t *testing.T) {

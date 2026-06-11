@@ -68,6 +68,12 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 				Bool:  column.Value(index),
 				Valid: column.IsValid(index),
 			}
+		case *array.Float16:
+			// Snowflake only recognizes float64
+			params[i].Value = sql.NullFloat64{
+				Float64: float64(column.Value(index).Float32()),
+				Valid:   column.IsValid(index),
+			}
 		case *array.Float32:
 			// Snowflake only recognizes float64
 			params[i].Value = sql.NullFloat64{
