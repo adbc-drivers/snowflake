@@ -36,6 +36,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/snowflakedb/gosnowflake/v2"
 	semconv "go.opentelemetry.io/otel/semconv/v1.30.0"
 	"go.opentelemetry.io/otel/trace"
@@ -49,8 +50,8 @@ const (
 	OptionStatementIngestUploadConcurrency = "adbc.snowflake.statement.ingest_upload_concurrency"
 	OptionStatementIngestCopyConcurrency   = "adbc.snowflake.statement.ingest_copy_concurrency"
 	OptionStatementIngestTargetFileSize    = "adbc.snowflake.statement.ingest_target_file_size"
-	OptionStatementIngestCompressionCodec  = "adbc.snowflake.statement.ingest_compression_codec" // TODO(GH-1473): Implement option
-	OptionStatementIngestCompressionLevel  = "adbc.snowflake.statement.ingest_compression_level" // TODO(GH-1473): Implement option
+	OptionStatementIngestCompressionCodec  = "adbc.snowflake.statement.ingest_compression_codec"
+	OptionStatementIngestCompressionLevel  = "adbc.snowflake.statement.ingest_compression_level"
 	OptionStatementVectorizedScanner       = "adbc.snowflake.statement.ingest_use_vectorized_scanner"
 	// OptionStatementIngestGeoType controls the Snowflake type created for
 	// columns with geoarrow extension types (geoarrow.wkb, geoarrow.wkt).
@@ -170,6 +171,27 @@ func (st *statement) GetOptionDouble(ctx context.Context, key string) (float64, 
 	}
 }
 
+// parseCompressionCodec resolves a codec name (case-insensitive) via Arrow's
+// canonical names. The GetCodec call rejects codecs Arrow knows by name but has
+// no registered implementation for (e.g. lzo, plain lz4), which would otherwise
+// fail only later at write time.
+func parseCompressionCodec(val string) (compress.Compression, error) {
+	var codec compress.Compression
+	if err := codec.UnmarshalText([]byte(strings.ToUpper(strings.TrimSpace(val)))); err != nil {
+		return 0, adbc.Error{
+			Msg:  fmt.Sprintf("[Snowflake] invalid compression codec '%s': must be one of uncompressed, snappy, gzip, brotli, zstd, lz4_raw", val),
+			Code: adbc.StatusInvalidArgument,
+		}
+	}
+	if _, err := compress.GetCodec(codec); err != nil {
+		return 0, adbc.Error{
+			Msg:  fmt.Sprintf("[Snowflake] unsupported compression codec '%s': %s", val, err.Error()),
+			Code: adbc.StatusInvalidArgument,
+		}
+	}
+	return codec, nil
+}
+
 // SetOption sets a string option on this statement
 func (st *statement) SetOption(ctx context.Context, key string, val string) error {
 	switch key {
@@ -250,6 +272,22 @@ func (st *statement) SetOption(ctx context.Context, key string, val string) erro
 			}
 		}
 		return st.SetOptionInt(ctx, key, int64(size))
+	case OptionStatementIngestCompressionCodec:
+		codec, err := parseCompressionCodec(val)
+		if err != nil {
+			return err
+		}
+		st.ingestOptions.compressionCodec = codec
+		return nil
+	case OptionStatementIngestCompressionLevel:
+		level, err := strconv.Atoi(val)
+		if err != nil {
+			return adbc.Error{
+				Msg:  fmt.Sprintf("[Snowflake] could not parse '%s' as int for option '%s'", val, key),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return st.SetOptionInt(ctx, key, int64(level))
 	case OptionStatementQueryTag:
 		st.queryTag = val
 		return nil
@@ -377,6 +415,9 @@ func (st *statement) SetOptionInt(ctx context.Context, key string, value int64) 
 			}
 		}
 		st.ingestOptions.targetFileSize = uint(value)
+		return nil
+	case OptionStatementIngestCompressionLevel:
+		st.ingestOptions.compressionLevel = int(value)
 		return nil
 	}
 	return adbc.Error{

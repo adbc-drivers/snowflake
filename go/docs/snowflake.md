@@ -272,6 +272,20 @@ Examples:
 
   Can be set on the database, connection, and statement.
 
+`adbc.snowflake.statement.ingest_compression_codec`
+: **Values:** `uncompressed`, `snappy`, `gzip`, `brotli`, `zstd`, or `lz4_raw` (case-insensitive). **Default:** `snappy`
+
+  When ingesting, the compression codec to use for the Parquet files that are created and uploaded.
+
+  Can be set on the statement.
+
+`adbc.snowflake.statement.ingest_compression_level`
+: **Type:** int. **Default:** the default level for the selected codec
+
+  When ingesting, the codec-specific compression level for the Parquet files that are created. The valid range depends on the codec; some codecs (such as `snappy`) ignore it.
+
+  Can be set on the statement.
+
 `adbc.snowflake.statement.ingest_copy_concurrency`
 : **Type:** int. **Default:** 4
 
