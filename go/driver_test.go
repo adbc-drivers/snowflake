@@ -234,6 +234,7 @@ func (s *SnowflakeQuirks) SupportsConcurrentStatements() bool          { return 
 func (s *SnowflakeQuirks) SupportsCurrentCatalogSchema() bool          { return true }
 func (s *SnowflakeQuirks) SupportsExecuteSchema() bool                 { return true }
 func (s *SnowflakeQuirks) SupportsGetSetOptions() bool                 { return true }
+func (s *SnowflakeQuirks) SupportsGetTableSchema() bool                { return true }
 func (s *SnowflakeQuirks) SupportsPartitionedData() bool               { return false }
 func (s *SnowflakeQuirks) SupportsStatistics() bool                    { return true }
 func (s *SnowflakeQuirks) SupportsTransactions() bool                  { return true }

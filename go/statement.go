@@ -137,6 +137,11 @@ func (st *statement) GetOption(ctx context.Context, key string) (string, error) 
 	switch key {
 	case OptionStatementQueryTag:
 		return st.queryTag, nil
+	case OptionStreamRetryEnabled:
+		if st.streamRetryEnabled {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
 	default:
 		return st.Base().GetOption(ctx, key)
 	}
