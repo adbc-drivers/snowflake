@@ -14,7 +14,7 @@
 
 module github.com/adbc-drivers/snowflake/go
 
-go 1.26.1
+go 1.26.4
 
 require (
 	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260608064711-7f3f9a9f3990
