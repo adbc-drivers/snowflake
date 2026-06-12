@@ -15,12 +15,16 @@
 package snowflake
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
+	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // geoArrowType implements arrow.ExtensionType for testing geoarrow types
@@ -251,4 +255,67 @@ func TestResolveGeoType(t *testing.T) {
 	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857", "edges":"spherical"}`)
 	assert.NoError(t, err)
 	assert.Equal(t, "geography", ty)
+}
+
+func TestSetOptionCompressionCodec(t *testing.T) {
+	tests := []struct {
+		name     string
+		val      string
+		expected compress.Compression
+	}{
+		{"snappy lower", "snappy", compress.Codecs.Snappy},
+		{"snappy upper", "SNAPPY", compress.Codecs.Snappy},
+		{"gzip", "gzip", compress.Codecs.Gzip},
+		{"zstd", "zstd", compress.Codecs.Zstd},
+		{"brotli", "brotli", compress.Codecs.Brotli},
+		{"lz4_raw", "lz4_raw", compress.Codecs.Lz4Raw},
+		{"uncompressed", "uncompressed", compress.Codecs.Uncompressed},
+		{"mixed case and spaces", "  ZsTd  ", compress.Codecs.Zstd},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &statement{ingestOptions: DefaultIngestOptions()}
+			require.NoError(t, st.SetOption(context.Background(), OptionStatementIngestCompressionCodec, tt.val))
+			assert.Equal(t, tt.expected, st.ingestOptions.compressionCodec)
+		})
+	}
+}
+
+func TestSetOptionCompressionCodecInvalid(t *testing.T) {
+	for _, val := range []string{"lzo", "lz4", "garbage", ""} {
+		t.Run("invalid_"+val, func(t *testing.T) {
+			st := &statement{ingestOptions: DefaultIngestOptions()}
+			err := st.SetOption(context.Background(), OptionStatementIngestCompressionCodec, val)
+			require.Error(t, err)
+			var adbcErr adbc.Error
+			require.ErrorAs(t, err, &adbcErr)
+			assert.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
+		})
+	}
+}
+
+func TestSetOptionCompressionLevel(t *testing.T) {
+	t.Run("via SetOption", func(t *testing.T) {
+		st := &statement{ingestOptions: DefaultIngestOptions()}
+		require.NoError(t, st.SetOption(context.Background(), OptionStatementIngestCompressionLevel, "6"))
+		assert.Equal(t, 6, st.ingestOptions.compressionLevel)
+	})
+	t.Run("via SetOptionInt", func(t *testing.T) {
+		st := &statement{ingestOptions: DefaultIngestOptions()}
+		require.NoError(t, st.SetOptionInt(context.Background(), OptionStatementIngestCompressionLevel, 9))
+		assert.Equal(t, 9, st.ingestOptions.compressionLevel)
+	})
+	t.Run("negative level accepted", func(t *testing.T) {
+		st := &statement{ingestOptions: DefaultIngestOptions()}
+		require.NoError(t, st.SetOptionInt(context.Background(), OptionStatementIngestCompressionLevel, -1))
+		assert.Equal(t, -1, st.ingestOptions.compressionLevel)
+	})
+	t.Run("non-integer rejected", func(t *testing.T) {
+		st := &statement{ingestOptions: DefaultIngestOptions()}
+		err := st.SetOption(context.Background(), OptionStatementIngestCompressionLevel, "notanint")
+		require.Error(t, err)
+		var adbcErr adbc.Error
+		require.ErrorAs(t, err, &adbcErr)
+		assert.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
+	})
 }
