@@ -240,14 +240,23 @@ Examples:
 `adbc.rpc.result_queue_size`
 : **Type:** int. **Default:** 100
 
-  The max number of batches to buffer for each result stream.
+  The max number of batches to buffer for each result stream. Batches are
+  prefetched in parallel up to `adbc.snowflake.rpc.prefetch_concurrency`
+  streams at a time.
 
-  Can be set on the statement.
+  Can be set on the statement. For example:
+
+  ```python
+  with conn.cursor() as cur:
+      cur.adbc_statement.set_options(**{"adbc.rpc.result_queue_size": "200"})
+      cur.execute("SELECT * FROM my_table")
+  ```
 
 `adbc.snowflake.rpc.prefetch_concurrency`
 : **Type:** int. **Default:** 5
 
-  The max number of result streams to fetch in parallel.
+  The max number of result streams to fetch in parallel. Each stream buffers up
+  to `adbc.rpc.result_queue_size` batches.
 
   Can be set on the statement.
 
