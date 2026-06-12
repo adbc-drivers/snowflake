@@ -148,43 +148,90 @@ Examples:
   Whether to cache the MFA token in the OS credential manager.
 
 `adbc.snowflake.sql.client_option.client_timeout`
-: **Type:** string
+: **Type:** duration string (e.g. `300ms`, `1.5s`, or `1m30s`)
+
+  Timeout for a network round trip plus reading the HTTP response. Uses Go's
+  [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) format; negative
+  values are treated as their absolute value.
 
 `adbc.snowflake.sql.client_option.config_file`
-: **Type:** string
+: **Type:** string (file path)
+
+  Path to the gosnowflake client configuration file used for "easy logging"
+  (controls the driver's log level and log output path).
 
 `adbc.snowflake.sql.client_option.disable_telemetry`
-: **Type:** string
+: **Type:** boolean. **Default:** false
+
+  When enabled, disables the driver's usage telemetry by setting the
+  `CLIENT_TELEMETRY_ENABLED` session parameter to `false`.
 
 `adbc.snowflake.sql.client_option.identity_provider`
-: **Type:** string
+: **Values:** `AWS`, `AZURE`, `GCP`, or `OIDC`
+
+  The Workload Identity Federation provider used to generate the identity
+  attestation. Must be set when `adbc.snowflake.sql.auth_type` is `auth_wif`.
 
 `adbc.snowflake.sql.client_option.jwt_expire_timeout`
-: **Type:** string
+: **Type:** duration string (e.g. `300ms`, `1.5s`, or `1m30s`)
+
+  How long a generated key-pair-authentication JWT remains valid. Uses Go's
+  [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) format; negative
+  values are treated as their absolute value.
 
 `adbc.snowflake.sql.client_option.jwt_private_key`
-: **Type:** string
+: **Type:** string (file path)
+
+  Path to a file containing the RSA private key (PKCS#1 or PKCS#8, PEM or DER)
+  used to sign the JWT for key-pair authentication (`auth_jwt`).
 
 `adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password`
 : **Type:** string
 
+  Passphrase used to decrypt an encrypted PKCS#8 private key supplied via
+  `adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value`.
+
 `adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value`
-: **Type:** string
+: **Type:** string (PEM)
+
+  The RSA private key for key-pair authentication supplied inline as a PKCS#8
+  PEM value, instead of as a file path. If the PEM is an encrypted private key,
+  also set `adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password`.
 
 `adbc.snowflake.sql.client_option.keep_session_alive`
-: **Type:** string
+: **Type:** boolean. **Default:** false
+
+  When enabled, keeps the Snowflake session alive (does not log it out) after the
+  connection is closed.
 
 `adbc.snowflake.sql.client_option.login_timeout`
-: **Type:** string
+: **Type:** duration string (e.g. `300ms`, `1.5s`, or `1m30s`)
+
+  Login retry timeout, excluding network round trip and reading the HTTP
+  response. Uses Go's [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration)
+  format; negative values are treated as their absolute value.
 
 `adbc.snowflake.sql.client_option.ocsp_fail_open_mode`
-: **Type:** string
+: **Type:** boolean. **Default:** true (fail-open)
+
+  Controls OCSP certificate-revocation behavior. When enabled (fail-open), a
+  revocation check that cannot complete (for example, an unreachable OCSP
+  responder) is treated as a soft failure and the connection proceeds; when
+  disabled (fail-closed), such a failure rejects the connection.
 
 `adbc.snowflake.sql.client_option.okta_url`
-: **Type:** string
+: **Type:** string (URL)
+
+  The native Okta URL (for example, `https://<org>.okta.com`) used for SSO when
+  `adbc.snowflake.sql.auth_type` is `auth_okta`.
 
 `adbc.snowflake.sql.client_option.request_timeout`
-: **Type:** string
+: **Type:** duration string (e.g. `300ms`, `1.5s`, or `1m30s`)
+
+  Request retry timeout for non-login requests, excluding network round trip and
+  reading the HTTP response. Uses Go's
+  [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) format; negative
+  values are treated as their absolute value.
 
 `adbc.snowflake.sql.client_option.store_temp_creds`
 : **Type:** string
@@ -224,11 +271,19 @@ Examples:
 `adbc.snowflake.sql.uri.host`
 : **Type:** string
 
+  The Snowflake host to connect to. Normally derived from the account
+  identifier; set this only to override the host (for example, a private-link or
+  proxy hostname).
+
 `adbc.snowflake.sql.uri.port`
-: **Type:** string
+: **Type:** int. **Default:** 443
+
+  The port to connect to.
 
 `adbc.snowflake.sql.uri.protocol`
-: **Values:** `http` or `https`
+: **Values:** `http` or `https`. **Default:** `https`
+
+  The protocol scheme used for connections.
 
 `adbc.snowflake.sql.warehouse`
 : **Type:** string
