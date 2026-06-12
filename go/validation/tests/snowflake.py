@@ -66,22 +66,24 @@ class SnowflakeQuirks(model.DriverQuirks):
 
     @property
     def sample_ddl_constraints(self) -> list[str]:
-        # The leading "z" column is dropped after creation so constraint columns
-        # are not at ordinal position 1, ensuring GetObjects maps them by name
-        # rather than by ordinal position.
+        # Identifiers are quoted to preserve lower case: Snowflake folds unquoted
+        # names to upper case, but the validation suite matches the names exactly
+        # as written. The leading "z" column is dropped after creation so the
+        # constraint columns are not at ordinal position 1, ensuring GetObjects
+        # maps them by name rather than by ordinal position.
         return [
-            "CREATE TABLE constraint_primary (z INT, a INT, b STRING, PRIMARY KEY (a))",
-            "CREATE TABLE constraint_primary_multi (z INT, a INT, b STRING, PRIMARY KEY (b, a))",
-            "CREATE TABLE constraint_primary_multi2 (z INT, a STRING, b INT, PRIMARY KEY (a, b))",
-            "CREATE TABLE constraint_unique (z INT, a INT, b INT, c INT, UNIQUE (a), UNIQUE (c, b))",
-            "CREATE TABLE constraint_foreign (z INT, a INT, b INT, FOREIGN KEY (b) REFERENCES constraint_primary (a))",
-            "CREATE TABLE constraint_foreign_multi (z INT, a INT, b INT, c STRING, FOREIGN KEY (c, b) REFERENCES constraint_primary_multi2 (a, b))",
-            "ALTER TABLE constraint_primary DROP COLUMN z",
-            "ALTER TABLE constraint_primary_multi DROP COLUMN z",
-            "ALTER TABLE constraint_primary_multi2 DROP COLUMN z",
-            "ALTER TABLE constraint_unique DROP COLUMN z",
-            "ALTER TABLE constraint_foreign DROP COLUMN z",
-            "ALTER TABLE constraint_foreign_multi DROP COLUMN z",
+            'CREATE TABLE "constraint_primary" ("z" INT, "a" INT, "b" STRING, PRIMARY KEY ("a"))',
+            'CREATE TABLE "constraint_primary_multi" ("z" INT, "a" INT, "b" STRING, PRIMARY KEY ("b", "a"))',
+            'CREATE TABLE "constraint_primary_multi2" ("z" INT, "a" STRING, "b" INT, PRIMARY KEY ("a", "b"))',
+            'CREATE TABLE "constraint_unique" ("z" INT, "a" INT, "b" INT, "c" INT, UNIQUE ("a"), UNIQUE ("c", "b"))',
+            'CREATE TABLE "constraint_foreign" ("z" INT, "a" INT, "b" INT, FOREIGN KEY ("b") REFERENCES "constraint_primary" ("a"))',
+            'CREATE TABLE "constraint_foreign_multi" ("z" INT, "a" INT, "b" INT, "c" STRING, FOREIGN KEY ("c", "b") REFERENCES "constraint_primary_multi2" ("a", "b"))',
+            'ALTER TABLE "constraint_primary" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_primary_multi" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_primary_multi2" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_unique" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_foreign" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_foreign_multi" DROP COLUMN "z"',
         ]
 
     def is_table_not_found(self, table_name: str | None, error: Exception) -> bool:
