@@ -401,6 +401,8 @@ Examples:
 
 To see documentation for previous versions of this driver, see the following:
 
+- [v1.10.3](./v1.10.3.md)
+- [v1.10.1](./v1.10.1.md)
 - [v1.10.0](./v1.10.0.md)
 
 [snowflake]: https://www.snowflake.com/
