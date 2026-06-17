@@ -89,6 +89,8 @@ type databaseImpl struct {
 
 	useHighPrecision      bool
 	streamRetryEnabled    bool
+	geographyOutputFormat string
+	geometryOutputFormat  string
 	maxTimestampPrecision MaxTimestampPrecision
 	defaultAppName        string
 }
@@ -176,6 +178,10 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
+	case OptionGeographyOutputFormat:
+		return d.geographyOutputFormat, nil
+	case OptionGeometryOutputFormat:
+		return d.geometryOutputFormat, nil
 	case OptionMaxTimestampPrecision:
 		switch d.maxTimestampPrecision {
 		case Microseconds:
@@ -535,6 +541,16 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
+	case OptionGeographyOutputFormat:
+		if err := validateGeoOutputFormat(k, v); err != nil {
+			return err
+		}
+		d.geographyOutputFormat = strings.ToUpper(v)
+	case OptionGeometryOutputFormat:
+		if err := validateGeoOutputFormat(k, v); err != nil {
+			return err
+		}
+		d.geometryOutputFormat = strings.ToUpper(v)
 	case OptionMaxTimestampPrecision:
 		switch v {
 		case OptionValueNanoseconds, OptionValueNanosecondsNoOverflow, OptionValueMicroseconds:
@@ -553,24 +569,36 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	return nil
 }
 
+func validateGeoOutputFormat(optionName, value string) error {
+	switch strings.ToUpper(value) {
+	case "EWKB", "GEOJSON":
+		return nil
+	default:
+		return adbc.Error{
+			Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s' (must be 'EWKB' or 'GeoJSON')", optionName, value),
+			Code: adbc.StatusInvalidArgument,
+		}
+	}
+}
+
 func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.ConnectionWithContext, err error) {
 	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
 	defer driverbase.EndSpan(span, err)
 
-	// Request EWKB so the SRID is encoded inline in every geometry value.
-	// The record reader peeks the first batch, lifts the SRID into geoarrow.wkb
-	// field metadata, and strips the EWKB prefix so consumers see plain ISO/OGC
-	// WKB. GEOGRAPHY is always WGS84 but we keep both formats in sync for a
-	// single decoding path.
+	// Set the Snowflake session output format for GEOGRAPHY/GEOMETRY based on
+	// the configured option. EWKB enables the GeoArrow path (binary + SRID
+	// peek); GeoJSON returns text strings. Only set the session parameter if
+	// the user hasn't already configured it directly via the Params map.
 	if d.cfg.Params == nil {
 		d.cfg.Params = make(map[string]*string)
 	}
-	ewkb := "EWKB"
 	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
-		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &ewkb
+		f := d.geographyOutputFormat
+		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &f
 	}
 	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
-		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &ewkb
+		f := d.geometryOutputFormat
+		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &f
 	}
 
 	connector := gosnowflake.NewConnector(drv, *d.cfg)
@@ -593,6 +621,8 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 		// get Int64/Float64 instead
 		useHighPrecision:      d.useHighPrecision,
 		streamRetryEnabled:    d.streamRetryEnabled,
+		geographyOutputFormat: d.geographyOutputFormat,
+		geometryOutputFormat:  d.geometryOutputFormat,
 		maxTimestampPrecision: d.maxTimestampPrecision,
 		ConnectionImplBase:    driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 	}

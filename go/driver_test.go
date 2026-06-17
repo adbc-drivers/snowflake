@@ -1818,6 +1818,76 @@ func (suite *SnowflakeTests) TestBooleanType() {
 	}
 }
 
+func (suite *SnowflakeTests) TestGeometryAsGeoArrow() {
+	// With geography/geometry output format set to EWKB: columns returned as geoarrow.wkb binary
+	opts := suite.Quirks.DatabaseOptions()
+	opts[driver.OptionGeographyOutputFormat] = "EWKB"
+	opts[driver.OptionGeometryOutputFormat] = "EWKB"
+
+	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, opts)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
+
+	cnxn, err := db.Open(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), cnxn, suite.ctx)
+
+	stmt, err := cnxn.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), stmt, suite.ctx)
+
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx,
+		"SELECT TO_GEOGRAPHY('POINT(-122.35 47.62)') AS geog, TO_GEOMETRY('POINT(0 0)') AS geom"))
+	rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.True(rdr.Next())
+	rec := rdr.RecordBatch()
+
+	// GEOGRAPHY column should be binary with geoarrow.wkb extension
+	geogField := rec.Schema().Field(0)
+	suite.Equal(arrow.BINARY, geogField.Type.ID())
+	extName, ok := geogField.Metadata.GetValue("ARROW:extension:name")
+	suite.True(ok)
+	suite.Equal("geoarrow.wkb", extName)
+
+	// GEOMETRY column should also be binary with geoarrow.wkb extension
+	geomField := rec.Schema().Field(1)
+	suite.Equal(arrow.BINARY, geomField.Type.ID())
+	extName, ok = geomField.Metadata.GetValue("ARROW:extension:name")
+	suite.True(ok)
+	suite.Equal("geoarrow.wkb", extName)
+}
+
+func (suite *SnowflakeTests) TestGeometryAsText() {
+	// Default behavior (GeoJSON): GEOGRAPHY/GEOMETRY returned as UTF-8 strings
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx,
+		"SELECT TO_GEOGRAPHY('POINT(-122.35 47.62)') AS geog, TO_GEOMETRY('POINT(0 0)') AS geom"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.True(rdr.Next())
+	rec := rdr.RecordBatch()
+
+	// GEOGRAPHY column should be UTF-8 string
+	geogField := rec.Schema().Field(0)
+	suite.Equal(arrow.STRING, geogField.Type.ID())
+	_, hasExt := geogField.Metadata.GetValue("ARROW:extension:name")
+	suite.False(hasExt, "GeoJSON format should not set geoarrow extension metadata")
+
+	// GEOMETRY column should also be UTF-8 string
+	geomField := rec.Schema().Field(1)
+	suite.Equal(arrow.STRING, geomField.Type.ID())
+	_, hasExt = geomField.Metadata.GetValue("ARROW:extension:name")
+	suite.False(hasExt, "GeoJSON format should not set geoarrow extension metadata")
+
+	// Verify we get actual text data (GeoJSON format)
+	geogCol := rec.Column(0).(*array.String)
+	suite.Contains(geogCol.Value(0), "Point")
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = "microseconds"

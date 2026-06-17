@@ -99,6 +99,18 @@ const (
 	// original inline streaming path. Default is disabled.
 	OptionStreamRetryEnabled = "adbc.snowflake.sql.client_option.stream_retry_enabled"
 
+	// OptionGeographyOutputFormat controls the output format for GEOGRAPHY
+	// columns. Valid values are "EWKB" and "GeoJSON" (default, case-insensitive).
+	// When set to EWKB, GEOGRAPHY columns are returned as geoarrow.wkb binary
+	// with CRS metadata. When set to GeoJSON, they are returned as UTF-8 text.
+	OptionGeographyOutputFormat = "adbc.snowflake.sql.client_option.geography_output_format"
+
+	// OptionGeometryOutputFormat controls the output format for GEOMETRY
+	// columns. Valid values are "EWKB" and "GeoJSON" (default, case-insensitive).
+	// When set to EWKB, GEOMETRY columns are returned as geoarrow.wkb binary
+	// with CRS metadata. When set to GeoJSON, they are returned as UTF-8 text.
+	OptionGeometryOutputFormat = "adbc.snowflake.sql.client_option.geometry_output_format"
+
 	OptionApplicationName  = "adbc.snowflake.sql.client_option.app_name"
 	OptionSSLSkipVerify    = "adbc.snowflake.sql.client_option.tls_skip_verify"
 	OptionOCSPFailOpenMode = "adbc.snowflake.sql.client_option.ocsp_fail_open_mode"
@@ -296,6 +308,8 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 		DatabaseImplBase:      dbBase,
 		useHighPrecision:      true,
 		streamRetryEnabled:    false,
+		geographyOutputFormat: "GEOJSON",
+		geometryOutputFormat:  "GEOJSON",
 		defaultAppName:        defaultAppName,
 		maxTimestampPrecision: Nanoseconds,
 	}

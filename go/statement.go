@@ -872,7 +872,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 					return nil, err
 				}
 
-				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision)
+				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision, st.cnxn.useGeoArrow())
 				return reader, err
 			},
 			currentBatch: st.bound,
@@ -897,7 +897,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 		return
 	}
 
-	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision)
+	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision, st.cnxn.useGeoArrow())
 	nRows = loader.TotalRows()
 	return
 }
