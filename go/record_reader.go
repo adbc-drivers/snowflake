@@ -1122,7 +1122,7 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	return array.NewRecordReader(schema, results)
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision, streamRetryEnabled bool, maxTimestampPrecision MaxTimestampPrecision) (array.RecordReader, error) {
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision, streamRetryEnabled bool, maxTimestampPrecision MaxTimestampPrecision, useGeoArrow bool) (array.RecordReader, error) {
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
@@ -1301,17 +1301,20 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		attribute.String("schema", rr.Schema().String()),
 	))
 
-	// Peek the first record from the first IPC batch so we can identify any
-	// binary columns that carry EWKB geometries (and lift their SRID into
-	// geoarrow.wkb field metadata) before fixing the result schema. The
-	// geometry shape is determined per-query from the data itself, so this
-	// works for any SQL — table scans, joins, CTEs, ST_Transform, etc. —
-	// without needing to parse the user's query text.
+	// When useGeoArrow is true (at least one geo output format is EWKB), peek
+	// the first record from the first IPC batch so we can identify any binary
+	// columns that carry EWKB geometries (and lift their SRID into
+	// geoarrow.wkb field metadata) before fixing the result schema. When
+	// useGeoArrow is false, skip the peek — geography/geometry columns arrive
+	// as text strings.
 	var firstRec arrow.RecordBatch
-	if rr.Next() {
-		firstRec = rr.RecordBatch()
+	var geoCols map[string]geoColumnInfo
+	if useGeoArrow {
+		if rr.Next() {
+			firstRec = rr.RecordBatch()
+		}
+		geoCols = analyzeGeoFromBatch(firstRec)
 	}
-	geoCols := analyzeGeoFromBatch(firstRec)
 
 	// Now setup concurrency primitives after error-prone operations
 	group, ctx := errgroup.WithContext(compute.WithAllocator(ctx, alloc))

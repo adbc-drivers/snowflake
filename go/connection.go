@@ -82,7 +82,15 @@ type connectionImpl struct {
 	activeTransaction     bool
 	useHighPrecision      bool
 	streamRetryEnabled    bool
+	geographyOutputFormat string
+	geometryOutputFormat  string
 	maxTimestampPrecision MaxTimestampPrecision
+}
+
+// useGeoArrow reports whether the EWKB peek/GeoArrow path should be used.
+// This is true when at least one of the geo output formats is EWKB.
+func (c *connectionImpl) useGeoArrow() bool {
+	return c.geographyOutputFormat == "EWKB" || c.geometryOutputFormat == "EWKB"
 }
 
 func escapeSingleQuoteForLike(arg string) string {
@@ -527,19 +535,27 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 			field.Type = arrow.FixedWidthTypes.Timestamp_ns
 		}
 	case "GEOGRAPHY":
-		// With GEOGRAPHY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
-		// GEOGRAPHY is always WGS84 (SRID 4326).
-		field.Type = arrow.BinaryTypes.Binary
-		field.Metadata = arrow.MetadataFrom(map[string]string{
-			"ARROW:extension:name":     "geoarrow.wkb",
-			"ARROW:extension:metadata": geographyGeoArrowJson,
-		})
+		if c.geographyOutputFormat == "GEOJSON" {
+			field.Type = arrow.BinaryTypes.String
+		} else {
+			// With GEOGRAPHY_OUTPUT_FORMAT=EWKB, data arrives as binary WKB.
+			// GEOGRAPHY is always WGS84 (SRID 4326).
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name":     "geoarrow.wkb",
+				"ARROW:extension:metadata": geographyGeoArrowJson,
+			})
+		}
 	case "GEOMETRY":
-		// With GEOMETRY_OUTPUT_FORMAT=WKB, data arrives as binary WKB.
-		field.Type = arrow.BinaryTypes.Binary
-		field.Metadata = arrow.MetadataFrom(map[string]string{
-			"ARROW:extension:name": "geoarrow.wkb",
-		})
+		if c.geometryOutputFormat == "GEOJSON" {
+			field.Type = arrow.BinaryTypes.String
+		} else {
+			// With GEOMETRY_OUTPUT_FORMAT=EWKB, data arrives as binary WKB.
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
+			})
+		}
 	case "VECTOR":
 		// despite the fact that Snowflake *does* support returning data
 		// for VECTOR typed columns as Arrow FixedSizeLists, there's no way
@@ -550,7 +566,7 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	return field
 }
 
-func descToField(name, typ, isnull, primary string, comment sql.NullString, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (field arrow.Field, err error) {
+func descToField(name, typ, isnull, primary string, comment sql.NullString, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geographyOutputFormat, geometryOutputFormat string) (field arrow.Field, err error) {
 	field.Name = name
 	if isnull == "Y" {
 		field.Nullable = true
@@ -585,16 +601,24 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
 		case "GEOGRAPHY":
-			field.Type = arrow.BinaryTypes.Binary
-			field.Metadata = arrow.MetadataFrom(map[string]string{
-				"ARROW:extension:name":     "geoarrow.wkb",
-				"ARROW:extension:metadata": geographyGeoArrowJson,
-			})
+			if geographyOutputFormat == "GEOJSON" {
+				field.Type = arrow.BinaryTypes.String
+			} else {
+				field.Type = arrow.BinaryTypes.Binary
+				field.Metadata = arrow.MetadataFrom(map[string]string{
+					"ARROW:extension:name":     "geoarrow.wkb",
+					"ARROW:extension:metadata": geographyGeoArrowJson,
+				})
+			}
 		case "GEOMETRY":
-			field.Type = arrow.BinaryTypes.Binary
-			field.Metadata = arrow.MetadataFrom(map[string]string{
-				"ARROW:extension:name": "geoarrow.wkb",
-			})
+			if geometryOutputFormat == "GEOJSON" {
+				field.Type = arrow.BinaryTypes.String
+			} else {
+				field.Type = arrow.BinaryTypes.Binary
+				field.Metadata = arrow.MetadataFrom(map[string]string{
+					"ARROW:extension:name": "geoarrow.wkb",
+				})
+			}
 		case "BOOLEAN":
 			field.Type = arrow.FixedWidthTypes.Boolean
 		default:
@@ -762,7 +786,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		}
 
 		var f arrow.Field
-		f, err = descToField(name, typ, isnull, primary, comment, c.useHighPrecision, c.maxTimestampPrecision)
+		f, err = descToField(name, typ, isnull, primary, comment, c.useHighPrecision, c.maxTimestampPrecision, c.geographyOutputFormat, c.geometryOutputFormat)
 		if err != nil {
 			return nil, err
 		}
