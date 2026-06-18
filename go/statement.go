@@ -330,6 +330,9 @@ func (st *statement) SetOption(ctx context.Context, key string, val string) erro
 		case "geography", "geometry":
 			st.ingestOptions.geoType = strings.ToLower(val)
 			st.ingestOptions.geoTypeExplicit = true
+		case "":
+			st.ingestOptions.geoType = "geography"
+			st.ingestOptions.geoTypeExplicit = false
 		default:
 			return adbc.Error{
 				Msg:  fmt.Sprintf("[Snowflake] invalid geo type '%s': must be 'geography' or 'geometry'", val),

@@ -205,6 +205,11 @@ func errToAdbcErr(code adbc.Status, err error) error {
 		case gosnowflake.SQLStateConnectionRejected:
 			code = adbc.StatusUnauthorized
 		}
+		switch sferr.Number {
+		case 100383:
+			// geometry self-intersection
+			code = adbc.StatusInvalidArgument
+		}
 
 		return adbc.Error{
 			Code:       code,

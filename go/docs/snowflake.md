@@ -315,6 +315,12 @@ Examples:
 
   Can be set on the statement.
 
+`adbc.snowflake.sql.client_option.geography_output_format`
+`adbc.snowflake.sql.client_option.geometry_output_format`
+: **Values:** `GeoJSON`, `EKWB`. **Default:** `GeoJSON`
+
+  The format used to return geometry/geography data. The default of GeoJSON will return these columns as string columns containing JSON data. If set to EWKB, instead `geoarrow.wkb` extension columns will be returned with CRS metadata in the extension type.
+
 `adbc.snowflake.sql.client_option.max_timestamp_precision`
 : **Values:** `nanoseconds`, `nanoseconds_error_on_overflow`, `microseconds`. **Default:** `nanoseconds`
 
@@ -358,9 +364,9 @@ Examples:
   Can be set on the statement.
 
 `adbc.snowflake.statement.ingest_geo_type`
-: **Values:** `geography` or `geometry`. **Default:** `geography`
+: **Values:** `geography`, `geometry`, or empty string. **Default:** empty string
 
-  Which Snowflake data type to use when ingesting columns of GeoArrow extension types (`geoarrow.wkb`, `geoarrow.wkt`).
+  Which Snowflake data type to use when ingesting columns of GeoArrow extension types (`geoarrow.wkb`, `geoarrow.wkt`). If empty, then it will be detected: if the SRID is 4326 and `edges:spherical` is set, then it will be ingested as GEOGRAPHY, else GEOMETRY. If explicitly set, the driver will use the specified type.
 
   Can be set on the statement.
 

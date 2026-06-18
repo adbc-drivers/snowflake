@@ -289,7 +289,8 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				"ARROW:extension:name": "geoarrow.wkb",
 			}
 			if geoCol.srid != 0 {
-				meta["ARROW:extension:metadata"] = fmt.Sprintf(`{"crs":"EPSG:%d"}`, geoCol.srid)
+				// We also can't know whether this is a geography or geometry column, so we can't set "edges":"spherical"
+				meta["ARROW:extension:metadata"] = fmt.Sprintf(`{"crs":"EPSG:%d","crs_type":"authority_code"}`, geoCol.srid)
 			}
 			f.Metadata = arrow.MetadataFrom(meta)
 			transformers[i] = stripEWKBSRIDColumn

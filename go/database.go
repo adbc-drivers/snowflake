@@ -575,7 +575,7 @@ func validateGeoOutputFormat(optionName, value string) error {
 		return nil
 	default:
 		return adbc.Error{
-			Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s' (must be 'EWKB' or 'GeoJSON')", optionName, value),
+			Msg:  fmt.Sprintf("[snowflake] invalid value for database option '%s': '%s' (must be 'EWKB' or 'GeoJSON')", optionName, value),
 			Code: adbc.StatusInvalidArgument,
 		}
 	}
@@ -593,12 +593,10 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 		d.cfg.Params = make(map[string]*string)
 	}
 	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
-		f := d.geographyOutputFormat
-		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &f
+		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = new(d.geographyOutputFormat)
 	}
 	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
-		f := d.geometryOutputFormat
-		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &f
+		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = new(d.geometryOutputFormat)
 	}
 
 	connector := gosnowflake.NewConnector(drv, *d.cfg)

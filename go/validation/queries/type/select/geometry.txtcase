@@ -1,0 +1,73 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//         http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// part: metadata
+
+[setup]
+drop = "TEST_GEOMETRY"
+
+[tags]
+caveats = ["Snowflake does not return the SRID in GEOJSON format"]
+field-type-name = "GEOMETRY"
+sql-type-name = "GEOMETRY (geometry_output_format = GEOJSON)"
+
+// part: setup_query
+
+CREATE TABLE TEST_GEOMETRY (
+    IDX INTEGER,
+    RES GEOMETRY
+);
+
+-- it appears Snowflake can't handle things like ST_SETSRID or ST_GEOMETRYFROMWKT inside a VALUES
+INSERT INTO TEST_GEOMETRY VALUES (1, NULL),
+  (2, 'GEOMETRYCOLLECTION EMPTY'),
+  (3, 'POINT(1 2)'),
+  (4, 'LINESTRING(1 2, 3 4)'),
+  (5, 'POLYGON((0 0, 1 0, 1 1, 0 1))'),
+  (6, 'MULTIPOINT(1 2, 3 4)'),
+  (7, 'MULTILINESTRING((1 2, 3 4), (5 6, 7 8))'),
+  (8, 'MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1)), ((0 0, -1 0, -1 -1, 0 -1)))'),
+  (9, 'GEOMETRYCOLLECTION(POINT(1 2), LINESTRING(3 4, 5 6))')
+;
+
+UPDATE TEST_GEOMETRY SET RES = ST_SETSRID(RES, 2029);
+
+// part: query
+
+SELECT RES FROM TEST_GEOMETRY ORDER BY IDX ASC
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "RES",
+            "format": "u",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected
+
+{"RES": null}
+{"RES": null}
+{"RES": "{\n  \"coordinates\": [\n    1.000000000000000e+00,\n    2.000000000000000e+00\n  ],\n  \"type\": \"Point\"\n}"}
+{"RES": "{\n  \"coordinates\": [\n    [\n      1.000000000000000e+00,\n      2.000000000000000e+00\n    ],\n    [\n      3.000000000000000e+00,\n      4.000000000000000e+00\n    ]\n  ],\n  \"type\": \"LineString\"\n}"}
+{"RES": "{\n  \"coordinates\": [\n    [\n      [\n        0.000000000000000e+00,\n        0.000000000000000e+00\n      ],\n      [\n        1.000000000000000e+00,\n        0.000000000000000e+00\n      ],\n      [\n        1.000000000000000e+00,\n        1.000000000000000e+00\n      ],\n      [\n        0.000000000000000e+00,\n        1.000000000000000e+00\n      ]\n    ]\n  ],\n  \"type\": \"Polygon\"\n}"}
+{"RES": "{\n  \"coordinates\": [\n    [\n      1.000000000000000e+00,\n      2.000000000000000e+00\n    ],\n    [\n      3.000000000000000e+00,\n      4.000000000000000e+00\n    ]\n  ],\n  \"type\": \"MultiPoint\"\n}"}
+{"RES": "{\n  \"coordinates\": [\n    [\n      [\n        1.000000000000000e+00,\n        2.000000000000000e+00\n      ],\n      [\n        3.000000000000000e+00,\n        4.000000000000000e+00\n      ]\n    ],\n    [\n      [\n        5.000000000000000e+00,\n        6.000000000000000e+00\n      ],\n      [\n        7.000000000000000e+00,\n        8.000000000000000e+00\n      ]\n    ]\n  ],\n  \"type\": \"MultiLineString\"\n}"}
+{"RES": "{\n  \"coordinates\": [\n    [\n      [\n        [\n          0.000000000000000e+00,\n          0.000000000000000e+00\n        ],\n        [\n          1.000000000000000e+00,\n          0.000000000000000e+00\n        ],\n        [\n          1.000000000000000e+00,\n          1.000000000000000e+00\n        ],\n        [\n          0.000000000000000e+00,\n          1.000000000000000e+00\n        ]\n      ]\n    ],\n    [\n      [\n        [\n          0.000000000000000e+00,\n          0.000000000000000e+00\n        ],\n        [\n          -1.000000000000000e+00,\n          0.000000000000000e+00\n        ],\n        [\n          -1.000000000000000e+00,\n          -1.000000000000000e+00\n        ],\n        [\n          0.000000000000000e+00,\n          -1.000000000000000e+00\n        ]\n      ]\n    ]\n  ],\n  \"type\": \"MultiPolygon\"\n}"}
+{"RES": "{\n  \"geometries\": [\n    {\n      \"coordinates\": [\n        1.000000000000000e+00,\n        2.000000000000000e+00\n      ],\n      \"type\": \"Point\"\n    },\n    {\n      \"coordinates\": [\n        [\n          3.000000000000000e+00,\n          4.000000000000000e+00\n        ],\n        [\n          5.000000000000000e+00,\n          6.000000000000000e+00\n        ]\n      ],\n      \"type\": \"LineString\"\n    }\n  ],\n  \"type\": \"GeometryCollection\"\n}"}

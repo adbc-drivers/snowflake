@@ -1,0 +1,109 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//         http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// part: metadata
+
+[setup]
+drop = "TEST_GEOMETRY"
+
+[setup.connection.options]
+"adbc.snowflake.sql.client_option.geometry_output_format" = { apply = "EWKB", revert = "GeoJSON" }
+
+[tags]
+field-type-name = "GEOMETRY"
+sql-type-name = "GEOMETRY (geometry_output_format = EWKB)"
+
+// part: setup_query
+
+CREATE TABLE TEST_GEOMETRY (
+    IDX INTEGER,
+    RES GEOMETRY
+);
+
+INSERT INTO TEST_GEOMETRY VALUES (1, NULL),
+  (2, 'GEOMETRYCOLLECTION EMPTY'),
+  (3, 'POINT(1 2)'),
+  (4, 'LINESTRING(1 2, 3 4)'),
+  (5, 'POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'),
+  (6, 'MULTIPOINT(1 2, 3 4)'),
+  (7, 'MULTILINESTRING((1 2, 3 4), (5 6, 7 8))'),
+  (8, 'MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((0 0, -1 0, -1 -1, 0 -1, 0 0)))'),
+  (9, 'GEOMETRYCOLLECTION(POINT(1 2), LINESTRING(3 4, 5 6))')
+;
+
+UPDATE TEST_GEOMETRY SET RES = ST_SETSRID(RES, 2029);
+
+// part: query
+
+SELECT RES FROM TEST_GEOMETRY ORDER BY IDX ASC
+
+// part: catalog_schema
+// for gettableschema, we know the "real" type and can provide full metadata
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "RES",
+            "format": "z",
+            "flags": ["nullable"],
+            "metadata": {
+                "ARROW:extension:name": "geoarrow.wkb"
+            }
+        }
+    ]
+}
+
+// part: execute_schema
+// snowflake does not tag geo types, so they come back as plain binary, and we
+// have to detect the real type; but for executeschema, we can't do that, so all
+// we see is binary
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "RES",
+            "format": "z",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected_schema
+// for query execution, we can detect geo, but don't know whether it's geography or geometry
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "RES",
+            "format": "z",
+            "flags": ["nullable"],
+            "metadata": {
+                "ARROW:extension:name": "geoarrow.wkb",
+                "ARROW:extension:metadata": "{\"crs\":\"EPSG:2029\",\"crs_type\":\"authority_code\"}"
+            }
+        }
+    ]
+}
+
+// part: expected
+
+{"RES": null}
+{"RES": null}
+{"RES": "AQEAAAAAAAAAAADwPwAAAAAAAABA"}
+{"RES": "AQIAAAACAAAAAAAAAAAA8D8AAAAAAAAAQAAAAAAAAAhAAAAAAAAAEEA="}
+{"RES": "AQMAAAABAAAABQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwPwAAAAAAAAAAAAAAAAAA8D8AAAAAAADwPwAAAAAAAAAAAAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAA"}
+{"RES": "AQQAAAACAAAAAQEAAAAAAAAAAADwPwAAAAAAAABAAQEAAAAAAAAAAAAIQAAAAAAAABBA"}
+{"RES": "AQUAAAACAAAAAQIAAAACAAAAAAAAAAAA8D8AAAAAAAAAQAAAAAAAAAhAAAAAAAAAEEABAgAAAAIAAAAAAAAAAAAUQAAAAAAAABhAAAAAAAAAHEAAAAAAAAAgQA=="}
+{"RES": "AQYAAAACAAAAAQMAAAABAAAABQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwPwAAAAAAAAAAAAAAAAAA8D8AAAAAAADwPwAAAAAAAAAAAAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAQMAAAABAAAABQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwvwAAAAAAAAAAAAAAAAAA8L8AAAAAAADwvwAAAAAAAAAAAAAAAAAA8L8AAAAAAAAAAAAAAAAAAAAA"}
+{"RES": "AQcAAAACAAAAAQEAAAAAAAAAAADwPwAAAAAAAABAAQIAAAACAAAAAAAAAAAACEAAAAAAAAAQQAAAAAAAABRAAAAAAAAAGEA="}

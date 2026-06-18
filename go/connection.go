@@ -60,7 +60,7 @@ var queryGetObjectsTables string
 //go:embed queries/get_objects_terse_catalogs.sql
 var queryGetObjectsTerseCatalogs string
 
-const geographyGeoArrowJson = `{"crs":"EPSG:4326","edges":"spherical"}`
+const geographyGeoArrowJson = `{"crs":"EPSG:4326","crs_type":"authority_code","edges":"spherical"}`
 
 type snowflakeConn interface {
 	driver.Conn
@@ -869,6 +869,13 @@ func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition 
 	}
 }
 
+func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
+	switch key {
+	default:
+		return c.Base().GetOption(ctx, key)
+	}
+}
+
 func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
 	switch key {
 	case OptionUseHighPrecision:
@@ -899,6 +906,26 @@ func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
+		return nil
+	case OptionGeographyOutputFormat:
+		if err := validateGeoOutputFormat(key, value); err != nil {
+			return err
+		}
+		_, err := c.cn.ExecContext(ctx, fmt.Sprintf("ALTER SESSION SET GEOGRAPHY_OUTPUT_FORMAT = '%s'", value), nil)
+		if err != nil {
+			return errToAdbcErr(adbc.StatusInternal, err)
+		}
+		c.geographyOutputFormat = value
+		return nil
+	case OptionGeometryOutputFormat:
+		if err := validateGeoOutputFormat(key, value); err != nil {
+			return err
+		}
+		_, err := c.cn.ExecContext(ctx, fmt.Sprintf("ALTER SESSION SET GEOMETRY_OUTPUT_FORMAT = '%s'", value), nil)
+		if err != nil {
+			return errToAdbcErr(adbc.StatusInternal, err)
+		}
+		c.geometryOutputFormat = value
 		return nil
 	default:
 		return c.Base().SetOption(ctx, key, value)
