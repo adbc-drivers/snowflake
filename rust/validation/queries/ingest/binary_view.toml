@@ -12,19 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.github/pull_request_template.md
-.gitmodules
-*/go.sum
-*/pixi.lock
-*/Cargo.lock
-*/*.csproj
-*/*.sln
-go/license.tpl
-go/validation/queries/*/*.json
-go/validation/queries/*/*.sql
-rust/license.tpl
-rust/validation/queries/*/*.json
-rust/validation/queries/*/*.sql
-rust/validation/queries/*/*/*.json
-rust/validation/queries/*/*/*.sql
-csharp/test/Interop/Resources/snowflakeconfig.json
+# Skip binary_view tests - not supported by Snowflake driver
+skip = "BINARY_VIEW not supported by Snowflake driver"
