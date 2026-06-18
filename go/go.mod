@@ -21,7 +21,7 @@ require (
 	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260608002410-49f9e21a1d4a
 	github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260608064711-7f3f9a9f3990
 	github.com/apache/arrow-adbc/go/adbc v1.11.0
-	github.com/apache/arrow-go/v18 v18.6.0
+	github.com/apache/arrow-go/v18 v18.6.1-0.20260610195748-ef9e9859a205
 	github.com/google/uuid v1.6.0
 	github.com/snowflakedb/gosnowflake/v2 v2.1.0
 	github.com/stretchr/testify v1.11.1

@@ -29,7 +29,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/adbc-drivers/driverbase-go/testutil"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -246,27 +245,4 @@ func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
 
 	schema := arrow.NewSchema(fields, nil)
 	return array.NewRecordBatch(schema, cols, int64(nRows))
-}
-
-func TestParquetLargeList(t *testing.T) {
-	// Test that upstream is broken
-	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
-	defer mem.AssertSize(t, 0)
-
-	schema := arrow.NewSchema([]arrow.Field{
-		{
-			Name:     "values",
-			Type:     arrow.LargeListOf(arrow.PrimitiveTypes.Int32),
-			Nullable: true,
-		},
-	}, nil)
-	batch := testutil.RecordFromJSON(t, mem, schema, `[{"values": [1, 2, 3]}, {"values": null}, {"values": [4, 5]}]`)
-	ch := make(chan arrow.RecordBatch, 1)
-	ch <- batch
-
-	var buf bytes.Buffer
-	parquetProps, arrowProps := newWriterProps(mem, new(DefaultIngestOptions()))
-
-	err := writeParquet(batch.Schema(), &buf, ch, -1, parquetProps, arrowProps)
-	require.ErrorContains(t, err, "type mismatch, column is int32 writer, arrow array is large_list, and not a compatible type")
 }
