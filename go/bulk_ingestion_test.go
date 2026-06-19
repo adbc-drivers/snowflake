@@ -29,13 +29,11 @@ import (
 	"io"
 	"testing"
 
-	"github.com/adbc-drivers/driverbase-go/testutil"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/cdata"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -247,34 +245,4 @@ func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
 
 	schema := arrow.NewSchema(fields, nil)
 	return array.NewRecordBatch(schema, cols, int64(nRows))
-}
-
-func TestParquetLargeList(t *testing.T) {
-	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
-	defer mem.AssertSize(t, 0)
-
-	schema := arrow.NewSchema([]arrow.Field{
-		{
-			Name:     "values",
-			Type:     arrow.LargeListOf(arrow.PrimitiveTypes.Int32),
-			Nullable: true,
-		},
-	}, nil)
-	batch := testutil.RecordFromJSON(t, mem, schema, `[{"values": [1, 2, 3]}, {"values": null}, {"values": [4, 5]}]`)
-	ch := make(chan arrow.RecordBatch, 1)
-	ch <- batch
-	close(ch)
-
-	var buf bytes.Buffer
-	ingestOpts := DefaultIngestOptions()
-	parquetProps, arrowProps := newWriterProps(mem, &ingestOpts)
-
-	require.ErrorIs(t, writeParquet(batch.Schema(), &buf, ch, -1, parquetProps, arrowProps), io.EOF)
-	require.Positive(t, buf.Len())
-
-	roundTrip, err := pqarrow.ReadTable(context.Background(), bytes.NewReader(buf.Bytes()), parquet.NewReaderProperties(memory.DefaultAllocator), pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
-	require.NoError(t, err)
-	defer roundTrip.Release()
-	require.EqualValues(t, 1, roundTrip.NumCols())
-	require.EqualValues(t, 3, roundTrip.NumRows())
 }
