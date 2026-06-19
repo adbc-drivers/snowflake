@@ -2306,11 +2306,6 @@ func (suite *SnowflakeTests) TestIntDecimalLowPrecision() {
 				numberString = "-" + numberString
 			}
 			query := "SELECT CAST('" + numberString + fmt.Sprintf("' AS NUMBER(%d, %d)) AS RESULT", precision, scale)
-			decimalNumber, err := decimal128.FromString(numberString, int32(precision), int32(scale))
-			suite.NoError(err)
-			// The current behavior of the driver for decimal128 values too large to fit into 64 bits is to simply
-			// return the low 64 bits of the value.
-			number := int64(decimalNumber.LowBits())
 
 			suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionUseHighPrecision, adbc.OptionValueDisabled))
 			suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, query))
@@ -2320,11 +2315,23 @@ func (suite *SnowflakeTests) TestIntDecimalLowPrecision() {
 
 			suite.EqualValues(1, n)
 			suite.Truef(arrow.TypeEqual(arrow.PrimitiveTypes.Int64, rdr.Schema().Field(0).Type), "expected int64, got %s", rdr.Schema().Field(0).Type)
-			suite.True(rdr.Next())
-			rec := rdr.RecordBatch()
 
-			value := rec.Column(0).(*array.Int64).Value(0)
-			suite.Equal(number, value)
+			// An all-nines value only fits in int64 up to precision 18; beyond that
+			// it exceeds the int64 range and, with use_high_precision=false, the
+			// driver now reports an error rather than truncating to the low 64 bits.
+			if precision <= 18 {
+				decimalNumber, err := decimal128.FromString(numberString, int32(precision), int32(scale))
+				suite.Require().NoError(err)
+				suite.True(rdr.Next())
+				rec := rdr.RecordBatch()
+				value := rec.Column(0).(*array.Int64).Value(0)
+				suite.Equal(int64(decimalNumber.LowBits()), value)
+			} else {
+				suite.False(rdr.Next())
+				var adbcErr adbc.Error
+				suite.Require().ErrorAs(rdr.Err(), &adbcErr)
+				suite.Equal(adbc.StatusInvalidData, adbcErr.Code)
+			}
 		}
 	}
 }
