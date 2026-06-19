@@ -237,6 +237,14 @@ func TestResolveGeoType(t *testing.T) {
 	_, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857", "edges":"spherical"}`)
 	assert.ErrorContains(t, err, `field #1 ("geom") is a GeoArrow array with spherical edges`)
 
+	ty, err = opts.resolveGeoType(0, "geom", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "geometry", ty)
+
+	ty, err = opts.resolveGeoType(0, "geom", "{}")
+	assert.NoError(t, err)
+	assert.Equal(t, "geometry", ty)
+
 	// explicit geoType should override CRS-derived default
 	opts.geoType = "geometry"
 	opts.geoTypeExplicit = true
