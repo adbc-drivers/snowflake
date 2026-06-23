@@ -1,0 +1,85 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//         http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// part: metadata
+
+[setup.statement.options]
+"adbc.snowflake.statement.ingest_geo_type" = { apply = "geography", revert = "" }
+
+[tags]
+sql-type-name = "GEOGRAPHY (ingest geoarrow.wkt)"
+
+// part: input_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value",
+            "format": "u",
+            "flags": ["nullable"],
+            "metadata": {
+                "ARROW:extension:name": "geoarrow.wkt",
+                "ARROW:extension:metadata": "{\"crs\":\"EPSG:4326\",\"crs_type\":\"authority_code\",\"edges\":\"spherical\"}"
+            }
+        }
+    ]
+}
+
+// part: input
+
+{"idx": 0, "value": null}
+{"idx": 1, "value": "GEOMETRYCOLLECTION EMPTY"}
+{"idx": 2, "value": "POINT(1 2)"}
+{"idx": 3, "value": "LINESTRING(1 2, 3 4)"}
+{"idx": 4, "value": "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))"}
+{"idx": 5, "value": "MULTIPOINT(1 2, 3 4)"}
+{"idx": 6, "value": "MULTILINESTRING((1 2, 3 4), (5 6, 7 8))"}
+{"idx": 7, "value": "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((0 0, -1 0, -1 -1, 0 -1, 0 0)))"}
+{"idx": 8, "value": "GEOMETRYCOLLECTION(POINT(1 2), LINESTRING(3 4, 5 6))"}
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value",
+            "format": "u",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected
+
+{"idx": 0, "value": null}
+{"idx": 1, "value": null}
+{"idx": 2, "value": "{\n  \"coordinates\": [\n    1,\n    2\n  ],\n  \"type\": \"Point\"\n}"}
+{"idx": 3, "value": "{\n  \"coordinates\": [\n    [\n      1,\n      2\n    ],\n    [\n      3,\n      4\n    ]\n  ],\n  \"type\": \"LineString\"\n}"}
+{"idx": 4, "value": "{\n  \"coordinates\": [\n    [\n      [\n        0,\n        0\n      ],\n      [\n        1,\n        0\n      ],\n      [\n        1,\n        1\n      ],\n      [\n        0,\n        1\n      ],\n      [\n        0,\n        0\n      ]\n    ]\n  ],\n  \"type\": \"Polygon\"\n}"}
+{"idx": 5, "value": "{\n  \"coordinates\": [\n    [\n      1,\n      2\n    ],\n    [\n      3,\n      4\n    ]\n  ],\n  \"type\": \"MultiPoint\"\n}"}
+{"idx": 6, "value": "{\n  \"coordinates\": [\n    [\n      [\n        1,\n        2\n      ],\n      [\n        3,\n        4\n      ]\n    ],\n    [\n      [\n        5,\n        6\n      ],\n      [\n        7,\n        8\n      ]\n    ]\n  ],\n  \"type\": \"MultiLineString\"\n}"}
+{"idx": 7, "value": "{\n  \"coordinates\": [\n    [\n      [\n        [\n          0,\n          0\n        ],\n        [\n          1,\n          0\n        ],\n        [\n          1,\n          1\n        ],\n        [\n          0,\n          1\n        ],\n        [\n          0,\n          0\n        ]\n      ]\n    ],\n    [\n      [\n        [\n          0,\n          0\n        ],\n        [\n          -1,\n          0\n        ],\n        [\n          -1,\n          -1\n        ],\n        [\n          0,\n          -1\n        ],\n        [\n          0,\n          0\n        ]\n      ]\n    ]\n  ],\n  \"type\": \"MultiPolygon\"\n}"}
+{"idx": 8, "value": "{\n  \"geometries\": [\n    {\n      \"coordinates\": [\n        1,\n        2\n      ],\n      \"type\": \"Point\"\n    },\n    {\n      \"coordinates\": [\n        [\n          3,\n          4\n        ],\n        [\n          5,\n          6\n        ]\n      ],\n      \"type\": \"LineString\"\n    }\n  ],\n  \"type\": \"GeometryCollection\"\n}"}
