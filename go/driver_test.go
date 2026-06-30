@@ -1888,6 +1888,48 @@ func (suite *SnowflakeTests) TestGeometryAsText() {
 	suite.Contains(geogCol.Value(0), "Point")
 }
 
+func (suite *SnowflakeTests) TestUUIDType() {
+	// Snowflake's UUID data type is delivered as text over the wire, so it must
+	// surface as Arrow utf8 in every path. Before this was handled, the metadata
+	// paths failed ("Snowflake Data Type UUID not implemented" / nil field type),
+	// which surfaced downstream (e.g. Power BI) as "Unable to understand the type
+	// for column".
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `CREATE OR REPLACE TABLE UUID_TYPE_TEST (
+		UUID_ID UUID,
+		VARCHAR_ID VARCHAR
+	)`))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx,
+		"INSERT INTO UUID_TYPE_TEST SELECT uuid_string(), uuid_string()"))
+	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	// Metadata path: GetTableSchema (DESC TABLE -> descToField).
+	cat, sch := suite.Quirks.catalogName, suite.Quirks.schemaName
+	tableSchema, err := suite.cnxn.GetTableSchema(suite.ctx, &cat, &sch, "UUID_TYPE_TEST")
+	suite.Require().NoError(err)
+	suite.Truef(arrow.TypeEqual(arrow.BinaryTypes.String, tableSchema.Field(0).Type),
+		"GetTableSchema UUID_ID: expected utf8, got %s", tableSchema.Field(0).Type)
+
+	// Data path: result schema must match, and values must round-trip.
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT * FROM UUID_TYPE_TEST"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	uuidField := rdr.Schema().Field(0)
+	suite.Truef(arrow.TypeEqual(arrow.BinaryTypes.String, uuidField.Type),
+		"SELECT UUID_ID: expected utf8, got %s", uuidField.Type)
+
+	suite.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	uuidCol := rec.Column(0).(*array.String)
+	_, parseErr := uuid.Parse(uuidCol.Value(0))
+	suite.NoErrorf(parseErr, "UUID_ID value %q should parse as a UUID", uuidCol.Value(0))
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = "microseconds"
