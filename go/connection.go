@@ -501,6 +501,10 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 		field.Type = arrow.PrimitiveTypes.Float64
 	case "TEXT":
 		field.Type = arrow.BinaryTypes.String
+	case "UUID":
+		// Snowflake delivers UUID values as text over the wire, so the result
+		// schema for a UUID column is utf8; keep metadata discovery consistent.
+		field.Type = arrow.BinaryTypes.String
 	case "BINARY":
 		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
@@ -599,6 +603,10 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 		case "OBJECT":
 			fallthrough
 		case "VARIANT":
+			field.Type = arrow.BinaryTypes.String
+		case "UUID":
+			// Snowflake delivers UUID values as text, so the result schema for a
+			// UUID column is utf8; keep DESC-based discovery consistent with it.
 			field.Type = arrow.BinaryTypes.String
 		case "GEOGRAPHY":
 			if geographyOutputFormat == "GEOJSON" {
