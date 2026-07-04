@@ -25,6 +25,7 @@ func TestShowColumnsScope(t *testing.T) {
 		want                   string
 	}{
 		{"concrete names with underscores scope to the table", sp("DB_NAME"), sp("TEST_SCHEMA"), sp("LINEITEM"), ` IN TABLE "DB_NAME"."TEST_SCHEMA"."LINEITEM"`},
+		{"underscore is treated as a literal, not a single-char wildcard", sp("FOO_BAR"), sp("SCH"), sp("TBL"), ` IN TABLE "FOO_BAR"."SCH"."TBL"`},
 		{"wildcard table scopes to the schema", sp("DB_NAME"), sp("TEST_SCHEMA"), sp("%"), ` IN SCHEMA "DB_NAME"."TEST_SCHEMA"`},
 		{"nil schema scopes to the database", sp("DB_NAME"), nil, nil, ` IN DATABASE "DB_NAME"`},
 		{"nil catalog falls back to account", nil, nil, nil, " IN ACCOUNT"},
