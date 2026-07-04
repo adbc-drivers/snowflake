@@ -125,8 +125,10 @@ func getQueryID(ctx context.Context, query string, driverConn driver.QueryerCont
 	rows, err := driverConn.QueryContext(ctx, query, nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
-		// No results. Generate a dummy result set instead
-		if emptyQuery != "" && errors.As(err, &sfErr) && sfErr.Number == 2043 {
+		// 2043: the SHOW command matched nothing. 2003: the scoped object does
+		// not exist or is not authorized. In both cases substitute an empty
+		// result set so RESULT_SCAN has a valid (empty) source to read from.
+		if emptyQuery != "" && errors.As(err, &sfErr) && (sfErr.Number == 2043 || sfErr.Number == 2003) {
 			return getQueryID(ctx, emptyQuery, driverConn, "")
 		}
 		return "", err
@@ -191,6 +193,43 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 
 func isWildcardStr(ident string) bool {
 	return strings.ContainsAny(ident, "_%")
+}
+
+// scopeIdentifier reports whether ident can be used as a concrete object name to
+// narrow a SHOW command's scope (IN DATABASE/SCHEMA/TABLE). Only the
+// multi-character wildcard '%' and the match-all sentinels force a broader
+// scope; a '_' is treated as a literal character. Treating '_' as a wildcard
+// here would scope SHOW COLUMNS to IN ACCOUNT for ordinary names like
+// "DB_NAME", scanning every column in the entire account; the downstream ILIKE
+// filtering in the query template still applies the pattern semantics.
+func scopeIdentifier(ident *string) (string, bool) {
+	if ident == nil {
+		return "", false
+	}
+	s := *ident
+	if s == "" || s == "%" || s == ".*" || strings.Contains(s, "%") {
+		return "", false
+	}
+	return s, true
+}
+
+// showColumnsScope returns the narrowest "IN ..." suffix for the SHOW COLUMNS
+// query given the requested catalog/schema/table, avoiding an account-wide
+// column scan whenever concrete names are provided.
+func showColumnsScope(catalog, dbSchema, tableName *string) string {
+	cat, ok := scopeIdentifier(catalog)
+	if !ok {
+		return " IN ACCOUNT"
+	}
+	sch, ok := scopeIdentifier(dbSchema)
+	if !ok {
+		return " IN DATABASE " + quoteIdentifier(cat)
+	}
+	tbl, ok := scopeIdentifier(tableName)
+	if !ok {
+		return " IN SCHEMA " + quoteIdentifier(cat) + "." + quoteIdentifier(sch)
+	}
+	return " IN TABLE " + quoteIdentifier(cat) + "." + quoteIdentifier(sch) + "." + quoteIdentifier(tbl)
 }
 
 func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog, dbSchema, tableName, columnName *string, tableType []string) (reader array.RecordReader, err error) {
@@ -295,8 +334,9 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			return err
 		})
 
+		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName)
 		gQueryIDs.Go(func() (err error) {
-			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+suffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT")
+			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+columnsSuffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT")
 			return err
 		})
 
