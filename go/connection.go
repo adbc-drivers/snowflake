@@ -39,6 +39,7 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
@@ -502,9 +503,7 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	case "TEXT":
 		field.Type = arrow.BinaryTypes.String
 	case "UUID":
-		// Snowflake delivers UUID values as text over the wire, so the result
-		// schema for a UUID column is utf8; keep metadata discovery consistent.
-		field.Type = arrow.BinaryTypes.String
+		field.Type = extensions.NewUUIDType()
 	case "BINARY":
 		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
@@ -605,9 +604,7 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
 		case "UUID":
-			// Snowflake delivers UUID values as text, so the result schema for a
-			// UUID column is utf8; keep DESC-based discovery consistent with it.
-			field.Type = arrow.BinaryTypes.String
+			field.Type = extensions.NewUUIDType()
 		case "GEOGRAPHY":
 			if geographyOutputFormat == "GEOJSON" {
 				field.Type = arrow.BinaryTypes.String

@@ -42,6 +42,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/snowflakedb/gosnowflake/v2"
@@ -161,6 +162,53 @@ func stripEWKBSRIDColumn(_ context.Context, a arrow.Array) (arrow.Array, error) 
 			continue
 		}
 		bldr.Append(stripEWKBSRID(ba.Value(i)))
+	}
+	return bldr.NewArray(), nil
+}
+
+// isUUIDResultColumn reports whether a result column carries Snowflake UUID
+// values. Snowflake result metadata does not surface a dedicated "uuid" type
+// today: UUID columns are reported as "text" but with length 0, which no real
+// text column can have (VARCHAR's minimum length is 1, and even SHOW commands
+// report the maximum length for their text columns). The explicit "uuid"
+// match future-proofs against the server reporting the logical type directly.
+//
+// The only other columns reported as length-0 text are untyped NULL literals
+// (e.g. SELECT NULL); on the Arrow data path callers can rule those out with
+// isUntypedNullField.
+func isUUIDResultColumn(typ string, length int64) bool {
+	return strings.EqualFold(typ, "uuid") ||
+		(strings.EqualFold(typ, "text") && length == 0)
+}
+
+// isUntypedNullField reports whether the server-provided Arrow field metadata
+// identifies a length-0 text column as an untyped NULL literal rather than a
+// UUID column: NULL literals carry an explicit byteLength of "0", while UUID
+// columns carry their 16-byte storage width or omit the key entirely.
+func isUntypedNullField(f arrow.Field) bool {
+	v, ok := f.Metadata.GetValue("byteLength")
+	return ok && v == "0"
+}
+
+// uuidStringsToUUIDColumn returns a column transformer that parses the utf8
+// UUID text Snowflake sends on the wire into an arrow.uuid extension array
+// (fixed_size_binary[16] storage).
+func uuidStringsToUUIDColumn(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+	sa, ok := a.(*array.String)
+	if !ok {
+		return nil, fmt.Errorf("expected utf8 data for UUID column, got %s", a.DataType())
+	}
+	bldr := extensions.NewUUIDBuilder(compute.GetAllocator(ctx))
+	defer bldr.Release()
+	bldr.Reserve(sa.Len())
+	for i := range sa.Len() {
+		if sa.IsNull(i) {
+			bldr.AppendNull()
+			continue
+		}
+		if err := bldr.AppendValueFromString(sa.Value(i)); err != nil {
+			return nil, err
+		}
 	}
 	return bldr.NewArray(), nil
 }
@@ -294,6 +342,15 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 			}
 			f.Metadata = arrow.MetadataFrom(meta)
 			transformers[i] = stripEWKBSRIDColumn
+			fields[i] = f
+			continue
+		}
+
+		// Snowflake delivers UUID values as utf8 text on the wire; decode
+		// them into the canonical arrow.uuid extension type.
+		if isUUIDResultColumn(srcMeta.Type, srcMeta.Length) && !isUntypedNullField(f) {
+			f.Type = extensions.NewUUIDType()
+			transformers[i] = uuidStringsToUUIDColumn
 			fields[i] = f
 			continue
 		}
@@ -599,6 +656,13 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 				[]string{MetadataKeySnowflakeType},
 				[]string{srcMeta.Type},
 			),
+		}
+		if isUUIDResultColumn(srcMeta.Type, srcMeta.Length) {
+			// jsonDataToArrow appends the JSON UUID text through the
+			// extension builder's AppendValueFromString, which parses it
+			// into the fixed_size_binary[16] storage.
+			fields[i].Type = extensions.NewUUIDType()
+			continue
 		}
 		switch srcMeta.Type {
 		case "fixed":
