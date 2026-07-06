@@ -1944,6 +1944,61 @@ func (suite *SnowflakeTests) TestUUIDType() {
 		"SELECT NULL: expected utf8, got %s", nullRdr.Schema().Field(0).Type)
 }
 
+func (suite *SnowflakeTests) TestSqlIngestUUIDType() {
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, "bulk_ingest_uuid"))
+
+	uuidType := extensions.NewUUIDType()
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "col_int64", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "col_uuid", Type: uuidType, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	uuids := []string{
+		"01234567-89ab-cdef-0123-456789abcdef",
+		"6ca7f4a6-e4e4-4fd8-9d4c-6e2f2df4a7e1",
+	}
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2, 3}, nil)
+	uuidBldr := bldr.Field(1).(*extensions.UUIDBuilder)
+	uuidBldr.Append(uuid.MustParse(uuids[0]))
+	uuidBldr.Append(uuid.MustParse(uuids[1]))
+	uuidBldr.AppendNull()
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	suite.Require().NoError(suite.stmt.Bind(suite.ctx, rec))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, "bulk_ingest_uuid"))
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.EqualValues(3, n)
+
+	// The ingested column must be a native UUID column, so the metadata path
+	// (DESC TABLE) reports it as arrow.uuid.
+	cat, sch := suite.Quirks.catalogName, suite.Quirks.schemaName
+	tableSchema, err := suite.cnxn.GetTableSchema(suite.ctx, &cat, &sch, "bulk_ingest_uuid")
+	suite.Require().NoError(err)
+	suite.Truef(arrow.TypeEqual(uuidType, tableSchema.Field(1).Type),
+		"ingested col_uuid: expected arrow.uuid, got %s", tableSchema.Field(1).Type)
+
+	// Values must round-trip, including the NULL.
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `SELECT * FROM "bulk_ingest_uuid" ORDER BY "col_int64" ASC`))
+	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.EqualValues(3, n)
+	suite.True(rdr.Next())
+	result := rdr.RecordBatch()
+	uuidCol, ok := result.Column(1).(*extensions.UUIDArray)
+	suite.Require().Truef(ok, "col_uuid: expected *extensions.UUIDArray, got %T", result.Column(1))
+	suite.Equal(uuids[0], uuidCol.ValueStr(0))
+	suite.Equal(uuids[1], uuidCol.ValueStr(1))
+	suite.True(uuidCol.IsNull(2))
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = "microseconds"

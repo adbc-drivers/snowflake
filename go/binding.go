@@ -32,6 +32,7 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 )
 
 // decimalToString converts an arrow Decimal128 or Decimal256 value to its string
@@ -183,11 +184,32 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 				params[i].Value = nil
 			}
 		case *array.FixedSizeBinary:
+			// arrow.uuid columns may arrive over the C Data Interface as
+			// their fixed_size_binary[16] storage with only field metadata
+			// identifying the extension; bind those as canonical UUID text,
+			// which Snowflake converts to UUID implicitly.
+			if extName, ok := field.Metadata.GetValue("ARROW:extension:name"); ok &&
+				extName == "arrow.uuid" && column.DataType().(*arrow.FixedSizeBinaryType).ByteWidth == 16 {
+				if column.IsValid(index) {
+					b := column.Value(index)
+					params[i].Value = fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+				} else {
+					params[i].Value = nil
+				}
+				continue
+			}
 			// Same as Binary — see comment above.
 			if column.IsValid(index) {
 				params[i].Value = hex.EncodeToString(column.Value(index))
 			} else {
 				params[i].Value = nil
+			}
+		case *extensions.UUIDArray:
+			// Bind UUID values in their canonical text form; Snowflake
+			// converts TEXT to UUID implicitly.
+			params[i].Value = sql.NullString{
+				String: column.Value(index).String(),
+				Valid:  column.IsValid(index),
 			}
 		case *array.Decimal128:
 			params[i].Value = sql.NullString{
