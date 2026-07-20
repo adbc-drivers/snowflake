@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -121,12 +122,23 @@ func escapeSingleQuoteForLike(arg string) string {
 	}
 }
 
-func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string) (string, error) {
+const (
+	// Snowflake error numbers signalling a SHOW produced no usable result set.
+	errShowNoMatch    = 2043 // the SHOW command matched nothing
+	errObjectNotFound = 2003 // the scoped object does not exist or is not authorized
+)
+
+func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string, alsoEmptyOn ...int) (string, error) {
 	rows, err := driverConn.QueryContext(ctx, query, nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
-		// No results. Generate a dummy result set instead
-		if emptyQuery != "" && errors.As(err, &sfErr) && sfErr.Number == 2043 {
+		// errShowNoMatch always maps to an empty result. Callers running an
+		// optional, narrowly-scoped SHOW may also pass errObjectNotFound so a
+		// missing scoped object degrades to an empty result instead of failing
+		// the whole GetObjects call. Substitute emptyQuery so RESULT_SCAN has a
+		// valid (empty) source to read from.
+		if emptyQuery != "" && errors.As(err, &sfErr) &&
+			(sfErr.Number == errShowNoMatch || slices.Contains(alsoEmptyOn, sfErr.Number)) {
 			return getQueryID(ctx, emptyQuery, driverConn, "")
 		}
 		return "", err
@@ -191,6 +203,51 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 
 func isWildcardStr(ident string) bool {
 	return strings.ContainsAny(ident, "_%")
+}
+
+// scopeIdentifier reports whether ident can be used as a concrete object name to
+// narrow the scope of the SHOW COLUMNS enrichment query (IN DATABASE/SCHEMA/
+// TABLE). It deliberately treats '_' as a literal character rather than an ADBC
+// single-character wildcard: only '%', the match-all sentinels, and nil force a
+// broader scope. See showColumnsScope for why treating '_' literally here is
+// safe despite the ADBC pattern semantics.
+func scopeIdentifier(ident *string) (string, bool) {
+	if ident == nil {
+		return "", false
+	}
+	s := *ident
+	if s == "" || s == "%" || s == ".*" || strings.Contains(s, "%") {
+		return "", false
+	}
+	return s, true
+}
+
+// showColumnsScope returns the narrowest "IN ..." suffix for the SHOW COLUMNS
+// query. SHOW COLUMNS cannot be filtered by table, so an IN ACCOUNT scope scans
+// every column in the account (80+ seconds on large accounts).
+//
+// The result feeds get_objects_all.sql ONLY as a best-effort source for BINARY
+// xdbc_column_size enrichment; the authoritative column list comes from
+// information_schema.columns filtered by ILIKE, so a narrower scope here can
+// never drop columns or alter non-BINARY metadata. The sole consequence of
+// treating '_' as a literal (see scopeIdentifier) is that a BINARY column
+// reached only through '_'-as-wildcard matches, or through a case-insensitive
+// pattern that differs from the stored identifier, may report a NULL
+// xdbc_column_size, matching the behavior before this enrichment was added.
+func showColumnsScope(catalog, dbSchema, tableName *string) string {
+	cat, ok := scopeIdentifier(catalog)
+	if !ok {
+		return " IN ACCOUNT"
+	}
+	sch, ok := scopeIdentifier(dbSchema)
+	if !ok {
+		return " IN DATABASE " + quoteIdentifier(cat)
+	}
+	tbl, ok := scopeIdentifier(tableName)
+	if !ok {
+		return " IN SCHEMA " + quoteIdentifier(cat) + "." + quoteIdentifier(sch)
+	}
+	return " IN TABLE " + quoteIdentifier(cat) + "." + quoteIdentifier(sch) + "." + quoteIdentifier(tbl)
 }
 
 func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog, dbSchema, tableName, columnName *string, tableType []string) (reader array.RecordReader, err error) {
@@ -295,8 +352,9 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			return err
 		})
 
+		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName)
 		gQueryIDs.Go(func() (err error) {
-			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+suffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT")
+			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+columnsSuffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT", errObjectNotFound)
 			return err
 		})
 
