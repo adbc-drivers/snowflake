@@ -740,9 +740,7 @@ func (opts *ingestOptions) resolveGeoType(fieldIndex int, fieldName string, extM
 		return opts.geoType, nil
 	}
 	srid, edges := extractSRIDFromMeta(extMeta)
-	if srid == 4326 && edges == "spherical" {
-		return "geography", nil
-	} else if edges == "spherical" {
+	if edges == "spherical" && srid != 0 && srid != 4326 {
 		// Snowflake GEOGRAPHY is always SRID 4326, so if the user
 		// specified spherical edges but a different SRID, we should
 		// error/ask them to explicitly set the geo type
@@ -750,6 +748,14 @@ func (opts *ingestOptions) resolveGeoType(fieldIndex int, fieldName string, extM
 			Msg:  fmt.Sprintf("[snowflake] field #%d (%s) is a GeoArrow array with spherical edges but an SRID of %d; Snowflake GEOGRAPHY is always SRID 4326, so explicitly set %s to choose whether to ingest this as GEOGRAPHY or GEOMETRY", fieldIndex+1, quoteIdentifier(fieldName), srid, OptionStatementIngestGeoType),
 			Code: adbc.StatusInvalidData,
 		}
+	}
+	// Missing CRS, EPSG:4326, or an unparsable CRS defaults to GEOGRAPHY, as
+	// documented above — most GeoArrow producers (e.g. DuckDB) emit a crs but
+	// no "edges" field, and requiring edges == "spherical" would silently
+	// demote WGS84 data to GEOMETRY. Only a concrete non-4326 SRID promotes
+	// the column so the SRID survives the round trip.
+	if srid == 0 || srid == 4326 {
+		return "geography", nil
 	}
 	return "geometry", nil
 }

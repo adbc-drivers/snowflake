@@ -366,7 +366,7 @@ Examples:
 `adbc.snowflake.statement.ingest_geo_type`
 : **Values:** `geography`, `geometry`, or empty string. **Default:** empty string
 
-  Which Snowflake data type to use when ingesting columns of GeoArrow extension types (`geoarrow.wkb`, `geoarrow.wkt`). If empty, then it will be detected: if the SRID is 4326 and `edges:spherical` is set, then it will be ingested as GEOGRAPHY, else GEOMETRY. If explicitly set, the driver will use the specified type.
+  Which Snowflake data type to use when ingesting columns of GeoArrow extension types (`geoarrow.wkb`, `geoarrow.wkt`). If empty, the type is detected per column from the CRS metadata: columns with SRID 4326 (or no CRS at all) are ingested as GEOGRAPHY, columns with any other SRID as GEOMETRY (so the SRID survives the round trip), and `edges:spherical` combined with a non-4326 SRID is an error. Most GeoArrow producers (e.g. DuckDB, GeoPandas) emit a `crs` but no `edges` field, so detection does not require `edges:spherical` for WGS84 data. If explicitly set, the driver uses the specified type for all GeoArrow columns.
 
   Can be set on the statement.
 
