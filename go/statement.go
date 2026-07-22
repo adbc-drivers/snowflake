@@ -498,11 +498,11 @@ func toSnowflakeType(dt arrow.DataType) string {
 
 // initIngest creates the target table for ingestion.
 //
-// geoTypeOverrides maps field names to Snowflake types ("geography" or "geometry")
-// for geo columns that should be created with native types instead of their Arrow
-// storage type (BINARY/TEXT). This is used when COPY transform handles inline
-// conversion, so the table must have native geo columns from the start.
-func (st *statement) initIngest(ctx context.Context, geoTypeOverrides map[string]string) error {
+// typeOverrides maps field names to Snowflake types for extension columns
+// that should be created with native types instead of their Arrow storage
+// type: "geography"/"geometry" for geoarrow columns (BINARY/TEXT storage)
+// and "uuid" for arrow.uuid columns (fixed_size_binary[16] storage).
+func (st *statement) initIngest(ctx context.Context, typeOverrides map[string]string) error {
 	var (
 		createBldr strings.Builder
 	)
@@ -529,14 +529,14 @@ func (st *statement) initIngest(ctx context.Context, geoTypeOverrides map[string
 		createBldr.WriteString(quoteIdentifier(f.Name))
 		createBldr.WriteString(" ")
 
-		// Use geo type override if provided (for COPY transform path).
-		// Geo column detection happens in buildCopyQuery, which checks both
-		// arrow.EXTENSION types and ARROW:extension:name field metadata — the
-		// latter is needed for data arriving over the C Data Interface, where
-		// extension types are not registered. The override map ensures the
-		// CREATE TABLE uses GEOGRAPHY/GEOMETRY for those columns.
+		// Use the type override if provided. Extension column detection
+		// happens in buildCopyQuery, which checks both arrow.EXTENSION types
+		// and ARROW:extension:name field metadata — the latter is needed for
+		// data arriving over the C Data Interface, where extension types are
+		// not registered. The override map ensures the CREATE TABLE uses
+		// GEOGRAPHY/GEOMETRY/UUID for those columns.
 		var ty string
-		if override, ok := geoTypeOverrides[f.Name]; ok {
+		if override, ok := typeOverrides[f.Name]; ok {
 			ty = override
 		} else {
 			ty = toSnowflakeType(f.Type)
@@ -602,12 +602,12 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 	// Build the COPY query. If the schema has geo columns, this is a COPY
 	// transform that converts WKB/WKT → GEOGRAPHY/GEOMETRY inline during
 	// COPY INTO; otherwise it is the plain copy query.
-	copyQ, geoOverrides, err := st.buildCopyQuery(schema)
+	copyQ, typeOverrides, err := st.buildCopyQuery(schema)
 	if err != nil {
 		return -1, err
 	}
 
-	err = st.initIngest(ctx, geoOverrides)
+	err = st.initIngest(ctx, typeOverrides)
 	if err != nil {
 		return -1, err
 	}
@@ -619,14 +619,21 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 }
 
 // buildCopyQuery returns the COPY query to use for ingestion and a map of
-// geo column name → Snowflake type for table creation overrides. When the
+// column name → Snowflake type for table creation overrides. When the
 // schema contains geoarrow columns, a COPY transform is returned that
 // converts WKB/WKT to GEOGRAPHY/GEOMETRY inline during COPY INTO — Snowflake's
 // COPY INTO from Parquet normally cannot load WKB directly into
 // GEOGRAPHY/GEOMETRY columns, and a COPY transform works around this by
 // applying TO_GEOGRAPHY/TO_GEOMETRY in the SELECT clause of the COPY subquery.
 //
-// Geo column detection covers both arrow.EXTENSION types and
+// arrow.uuid columns are created as native UUID columns. No COPY transform
+// is needed for them on the plain path: Snowflake's Parquet reader converts
+// the Parquet UUID logical type (which the writer emits for arrow.uuid's
+// fixed_size_binary[16] storage) natively. On the geo transform path, where
+// every column is read through a `$1:"col"` VARIANT reference instead, the
+// 16 raw bytes are re-encoded as canonical UUID text inline.
+//
+// Extension column detection covers both arrow.EXTENSION types and
 // ARROW:extension:name field metadata so that data arriving over the C Data
 // Interface (where extension types are not registered) is also recognized.
 func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]string, error) {
@@ -642,6 +649,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 		extMeta string
 	}
 	var geoCols []geoCol
+	uuidCols := make(map[string]bool)
 
 	for _, f := range schema.Fields() {
 		var extName, extMeta string
@@ -657,17 +665,29 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 		switch extName {
 		case "geoarrow.wkb", "geoarrow.wkt":
 			geoCols = append(geoCols, geoCol{name: f.Name, extName: extName, extMeta: extMeta})
+		case "arrow.uuid":
+			uuidCols[f.Name] = true
 		}
 	}
 
-	if len(geoCols) == 0 {
+	if len(geoCols) == 0 && len(uuidCols) == 0 {
 		return copyQuery, nil, nil
+	}
+
+	typeOverrides := make(map[string]string, len(geoCols)+len(uuidCols))
+	for name := range uuidCols {
+		typeOverrides[name] = "uuid"
+	}
+
+	if len(geoCols) == 0 {
+		// Only UUID columns: the plain COPY converts the Parquet UUID
+		// logical type natively, so just the CREATE TABLE override applies.
+		return copyQuery, typeOverrides, nil
 	}
 
 	// Build a COPY transform with inline geo conversion. Each geo column's
 	// target type is resolved per-column so a non-4326 CRS can promote that
 	// column to GEOMETRY while sibling 4326 columns stay GEOGRAPHY.
-	geoOverrides := make(map[string]string, len(geoCols))
 	var selectCols []string
 	for fieldIndex, f := range schema.Fields() {
 		quoted := quoteIdentifier(f.Name)
@@ -683,6 +703,15 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 		}
 
 		if gc == nil {
+			if uuidCols[f.Name] {
+				// UUID column: the VARIANT reference yields the 16 raw
+				// storage bytes; re-encode them as canonical UUID text,
+				// which Snowflake casts to the UUID column on load.
+				selectCols = append(selectCols, fmt.Sprintf(
+					`REGEXP_REPLACE(HEX_ENCODE(%s::BINARY, 0), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\\1-\\2-\\3-\\4-\\5') AS %s`,
+					parqRef, quoted))
+				continue
+			}
 			// Non-geo column: reference directly from Parquet, Snowflake auto-casts to target type.
 			selectCols = append(selectCols, fmt.Sprintf("%s AS %s", parqRef, quoted))
 			continue
@@ -695,7 +724,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 			return "", nil, err
 		}
 
-		geoOverrides[gc.name] = geoType
+		typeOverrides[gc.name] = geoType
 		var expr string
 		if geoType == "geography" {
 			if isWKB {
@@ -727,7 +756,7 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, map[string]st
 		strings.Join(selectCols, ", "),
 		bindStageName,
 	)
-	return transformQ, geoOverrides, nil
+	return transformQ, typeOverrides, nil
 }
 
 // resolveGeoType picks the Snowflake target type for a single geoarrow column.

@@ -40,6 +40,7 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
@@ -559,6 +560,8 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 		field.Type = arrow.PrimitiveTypes.Float64
 	case "TEXT":
 		field.Type = arrow.BinaryTypes.String
+	case "UUID":
+		field.Type = extensions.NewUUIDType()
 	case "BINARY":
 		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
@@ -658,6 +661,8 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 			fallthrough
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
+		case "UUID":
+			field.Type = extensions.NewUUIDType()
 		case "GEOGRAPHY":
 			if geographyOutputFormat == "GEOJSON" {
 				field.Type = arrow.BinaryTypes.String

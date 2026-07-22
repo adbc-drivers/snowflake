@@ -53,6 +53,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/google/uuid"
 	"github.com/snowflakedb/gosnowflake/v2"
@@ -1886,6 +1887,116 @@ func (suite *SnowflakeTests) TestGeometryAsText() {
 	// Verify we get actual text data (GeoJSON format)
 	geogCol := rec.Column(0).(*array.String)
 	suite.Contains(geogCol.Value(0), "Point")
+}
+
+func (suite *SnowflakeTests) TestUUIDType() {
+	// Snowflake delivers UUID values as text over the wire; the driver decodes
+	// them into the arrow.uuid extension type (fixed_size_binary[16] storage)
+	// in both the metadata and data paths. Before this was handled, the
+	// metadata paths failed ("Snowflake Data Type UUID not implemented" / nil
+	// field type), which surfaced downstream (e.g. Power BI) as "Unable to
+	// understand the type for column".
+	uuidType := extensions.NewUUIDType()
+
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `CREATE OR REPLACE TABLE UUID_TYPE_TEST (
+		UUID_ID UUID,
+		VARCHAR_ID VARCHAR
+	)`))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx,
+		"INSERT INTO UUID_TYPE_TEST SELECT uuid_string(), uuid_string()"))
+	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	// Metadata path: GetTableSchema (DESC TABLE -> descToField).
+	cat, sch := suite.Quirks.catalogName, suite.Quirks.schemaName
+	tableSchema, err := suite.cnxn.GetTableSchema(suite.ctx, &cat, &sch, "UUID_TYPE_TEST")
+	suite.Require().NoError(err)
+	suite.Truef(arrow.TypeEqual(uuidType, tableSchema.Field(0).Type),
+		"GetTableSchema UUID_ID: expected arrow.uuid, got %s", tableSchema.Field(0).Type)
+
+	// Data path: result schema must match, and values must round-trip.
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT * FROM UUID_TYPE_TEST"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	uuidField := rdr.Schema().Field(0)
+	suite.Truef(arrow.TypeEqual(uuidType, uuidField.Type),
+		"SELECT UUID_ID: expected arrow.uuid, got %s", uuidField.Type)
+
+	suite.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	uuidCol, ok := rec.Column(0).(*extensions.UUIDArray)
+	suite.Require().Truef(ok, "UUID_ID column: expected *extensions.UUIDArray, got %T", rec.Column(0))
+	_, parseErr := uuid.Parse(uuidCol.ValueStr(0))
+	suite.NoErrorf(parseErr, "UUID_ID value %q should parse as a UUID", uuidCol.ValueStr(0))
+
+	// An untyped NULL literal shares UUID's "text, length 0" result metadata;
+	// it must stay utf8 rather than be misclassified as a UUID column.
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT NULL AS N"))
+	nullRdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer nullRdr.Release()
+	suite.Truef(arrow.TypeEqual(arrow.BinaryTypes.String, nullRdr.Schema().Field(0).Type),
+		"SELECT NULL: expected utf8, got %s", nullRdr.Schema().Field(0).Type)
+}
+
+func (suite *SnowflakeTests) TestSqlIngestUUIDType() {
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, "bulk_ingest_uuid"))
+
+	uuidType := extensions.NewUUIDType()
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "col_int64", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "col_uuid", Type: uuidType, Nullable: true},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	uuids := []string{
+		"01234567-89ab-cdef-0123-456789abcdef",
+		"6ca7f4a6-e4e4-4fd8-9d4c-6e2f2df4a7e1",
+	}
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2, 3}, nil)
+	uuidBldr := bldr.Field(1).(*extensions.UUIDBuilder)
+	uuidBldr.Append(uuid.MustParse(uuids[0]))
+	uuidBldr.Append(uuid.MustParse(uuids[1]))
+	uuidBldr.AppendNull()
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	suite.Require().NoError(suite.stmt.Bind(suite.ctx, rec))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, "bulk_ingest_uuid"))
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.EqualValues(3, n)
+
+	// The ingested column must be a native UUID column, so the metadata path
+	// (DESC TABLE) reports it as arrow.uuid.
+	cat, sch := suite.Quirks.catalogName, suite.Quirks.schemaName
+	tableSchema, err := suite.cnxn.GetTableSchema(suite.ctx, &cat, &sch, "bulk_ingest_uuid")
+	suite.Require().NoError(err)
+	suite.Truef(arrow.TypeEqual(uuidType, tableSchema.Field(1).Type),
+		"ingested col_uuid: expected arrow.uuid, got %s", tableSchema.Field(1).Type)
+
+	// Values must round-trip, including the NULL.
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `SELECT * FROM "bulk_ingest_uuid" ORDER BY "col_int64" ASC`))
+	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.EqualValues(3, n)
+	suite.True(rdr.Next())
+	result := rdr.RecordBatch()
+	uuidCol, ok := result.Column(1).(*extensions.UUIDArray)
+	suite.Require().Truef(ok, "col_uuid: expected *extensions.UUIDArray, got %T", result.Column(1))
+	suite.Equal(uuids[0], uuidCol.ValueStr(0))
+	suite.Equal(uuids[1], uuidCol.ValueStr(1))
+	suite.True(uuidCol.IsNull(2))
 }
 
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
