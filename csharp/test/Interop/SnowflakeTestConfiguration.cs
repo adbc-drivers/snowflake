@@ -102,6 +102,8 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
         /// </summary>
         [JsonPropertyName("roleInfo")]
         public RoleInfo? RoleInfo { get; set; }
+
+
     }
 
     public class SnowflakeAuthentication
