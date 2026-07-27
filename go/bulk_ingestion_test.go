@@ -29,7 +29,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/cdata"
@@ -195,10 +194,10 @@ func TestReadRecordsRecoversFromSchemaMismatch(t *testing.T) {
 	err = readRecords(context.Background(), imported, out)
 
 	require.Error(t, err, "expected a clean error from a mismatched stream")
-	var adbcErr adbc.Error
-	require.ErrorAs(t, err, &adbcErr)
-	assert.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
-	assert.Contains(t, adbcErr.Msg, "mismatch")
+	// in some versions arrow-go would panic and we would recover() in
+	// readRecords, but now arrow-go doesn't panic => we don't get an
+	// adbc.Error here
+	require.ErrorContains(t, err, "expected 2 children")
 }
 
 // mismatchedReader advertises one schema but yields a batch with a different
