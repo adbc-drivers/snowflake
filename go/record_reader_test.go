@@ -20,13 +20,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
@@ -473,6 +477,57 @@ func TestFixedToFloat64Transformer(t *testing.T) {
 
 			require.IsType(t, (*array.Float64)(nil), out)
 			assert.InDelta(t, tc.want, out.(*array.Float64).Value(0), 1e-4)
+		})
+	}
+}
+
+func TestDecimalScale0ToInt64(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		wantErr bool
+		want    int64
+	}{
+		{name: "zero", value: "0", want: 0},
+		{name: "positive", value: "1", want: 1},
+		{name: "negative", value: "-1", want: -1},
+		{name: "int64Max", value: "9223372036854775807", want: math.MaxInt64},
+		{name: "int64Min", value: "-9223372036854775808", want: math.MinInt64},
+		{name: "int64MaxPlusOne", value: "9223372036854775808", wantErr: true},
+		{name: "int64MinMinusOne", value: "-9223372036854775809", wantErr: true},
+		{name: "farOverflow", value: "12345678901234567890123456789012345678", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer alloc.AssertSize(t, 0)
+
+			bldr := array.NewDecimal128Builder(alloc, &arrow.Decimal128Type{Precision: 38, Scale: 0})
+			defer bldr.Release()
+			v, err := decimal.Decimal128FromString(tc.value, 38, 0)
+			require.NoError(t, err)
+			bldr.Append(v)
+			bldr.AppendNull()
+			arr := bldr.NewArray()
+			defer arr.Release()
+
+			ctx := compute.WithAllocator(context.Background(), alloc)
+			out, err := decimalScale0ToInt64("col")(ctx, arr)
+			if tc.wantErr {
+				var adbcErr adbc.Error
+				require.ErrorAs(t, err, &adbcErr)
+				assert.Equal(t, adbc.StatusInvalidData, adbcErr.Code)
+				assert.Nil(t, out)
+				return
+			}
+
+			require.NoError(t, err)
+			defer out.Release()
+			require.IsType(t, (*array.Int64)(nil), out)
+			result := out.(*array.Int64)
+			require.Equal(t, 2, result.Len())
+			assert.Equal(t, tc.want, result.Value(0))
+			assert.True(t, result.IsNull(1))
 		})
 	}
 }

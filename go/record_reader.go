@@ -42,6 +42,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/snowflakedb/gosnowflake/v2"
@@ -259,6 +260,10 @@ func getRecTransformer(sc *arrow.Schema, tr []colTransformer) recordTransformer 
 
 		for i, col := range r.Columns() {
 			if cols[i], err = tr[i](ctx, col); err != nil {
+				var adbcErr adbc.Error
+				if errors.As(err, &adbcErr) {
+					return nil, adbcErr
+				}
 				return nil, errToAdbcErr(adbc.StatusInternal, err)
 			}
 		}
@@ -312,12 +317,13 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				} else {
 					if srcMeta.Scale == 0 {
 						f.Type = arrow.PrimitiveTypes.Int64
+						transformers[i] = decimalScale0ToInt64(f.Name)
 					} else {
 						f.Type = arrow.PrimitiveTypes.Float64
-					}
-					dt := f.Type
-					transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-						return compute.CastArray(ctx, a, compute.UnsafeCastOptions(dt))
+						dt := f.Type
+						transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+							return compute.CastArray(ctx, a, compute.UnsafeCastOptions(dt))
+						}
 					}
 				}
 			default:
@@ -562,6 +568,67 @@ func scaledIntToFloat64Transformer(precision, scale int32) colTransformer {
 		}
 		defer result.Release()
 		return compute.CastArray(ctx, result, compute.UnsafeCastOptions(arrow.PrimitiveTypes.Float64))
+	}
+}
+
+// decimalScale0ToInt64 converts a scale-0 Decimal128/Decimal256 column to int64
+// for use_high_precision=false, returning a StatusInvalidData error for any value
+// outside the int64 range instead of silently truncating it (issue #129).
+//
+// The range is checked manually rather than with compute.SafeCastOptions because
+// arrow-go's safe decimal->int kernel tests `value >= MaxInt64` and so rejects
+// math.MaxInt64 itself; a manual check accepts both int64 bounds inclusively.
+func decimalScale0ToInt64(colName string) colTransformer {
+	rangeErr := adbc.Error{
+		Code: adbc.StatusInvalidData,
+		Msg: fmt.Sprintf("[snowflake] column %q contains a NUMBER value outside the int64 range; "+
+			"set %s=true to read it losslessly as decimal128", colName, OptionUseHighPrecision),
+	}
+	min128, errMin128 := decimal.Decimal128FromString("-9223372036854775808", 19, 0)
+	max128, errMax128 := decimal.Decimal128FromString("9223372036854775807", 19, 0)
+	min256, errMin256 := decimal.Decimal256FromString("-9223372036854775808", 19, 0)
+	max256, errMax256 := decimal.Decimal256FromString("9223372036854775807", 19, 0)
+	if err := errors.Join(errMin128, errMax128, errMin256, errMax256); err != nil {
+		return func(context.Context, arrow.Array) (arrow.Array, error) {
+			return nil, errToAdbcErr(adbc.StatusInternal, err)
+		}
+	}
+	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+		bldr := array.NewInt64Builder(compute.GetAllocator(ctx))
+		defer bldr.Release()
+		bldr.Reserve(a.Len())
+		switch arr := a.(type) {
+		case *array.Decimal128:
+			for i := 0; i < arr.Len(); i++ {
+				if arr.IsNull(i) {
+					bldr.AppendNull()
+					continue
+				}
+				v := arr.Value(i)
+				if v.Less(min128) || max128.Less(v) {
+					return nil, rangeErr
+				}
+				bldr.Append(int64(v.LowBits()))
+			}
+		case *array.Decimal256:
+			for i := 0; i < arr.Len(); i++ {
+				if arr.IsNull(i) {
+					bldr.AppendNull()
+					continue
+				}
+				v := arr.Value(i)
+				if v.Less(min256) || max256.Less(v) {
+					return nil, rangeErr
+				}
+				bldr.Append(int64(v.LowBits()))
+			}
+		default:
+			return nil, adbc.Error{
+				Code: adbc.StatusInternal,
+				Msg:  fmt.Sprintf("[snowflake] column %q: expected decimal array for scale-0 NUMBER, got %s", colName, a.DataType()),
+			}
+		}
+		return bldr.NewArray(), nil
 	}
 }
 

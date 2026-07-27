@@ -25,5 +25,5 @@ drop = "test_numeric_low_precision"
 [tags]
 sql-type-name = "NUMERIC (use_high_precision = false)"
 caveats = [
-  "When use_high_precision=false, values exceeding int64 range are silently truncated — the driver discards the upper bits and returns only the lower 64 bits without warning."
+  "When use_high_precision=false, NUMBER values outside the int64 range cannot be represented as int64, so the driver returns an error instead of a value. Set use_high_precision=true to read such columns losslessly as decimal128."
 ]
