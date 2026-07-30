@@ -18,8 +18,8 @@ go 1.26.5
 
 require (
 	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260730083905-1785242bb524
-	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260608002410-49f9e21a1d4a
-	github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260608064711-7f3f9a9f3990
+	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260730083905-1785242bb524
+	github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260730083905-1785242bb524
 	github.com/apache/arrow-adbc/go/adbc v1.12.0
 	github.com/apache/arrow-go/v18 v18.7.0
 	github.com/google/uuid v1.6.0

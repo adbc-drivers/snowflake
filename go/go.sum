@@ -18,10 +18,10 @@ github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk
 github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260730083905-1785242bb524 h1:I4zYVO3ROzlvkHxJdPGxoISzltbwq2dsiLP6ULj3LtI=
 github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260730083905-1785242bb524/go.mod h1:gwIyWFkdk26P9NYprm6chGUCMc7J9q0s4M8u1h1bqS4=
-github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260608002410-49f9e21a1d4a h1:j1a8iNxRTV6ZaHnEuH8/NVlBMrBejVTBPxu4wueB72c=
-github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260608002410-49f9e21a1d4a/go.mod h1:dUNGWra6WmjWWeqEC6WcFZFuw6wrbJNjcZIiS0REizQ=
-github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260608064711-7f3f9a9f3990 h1:pHtKruOLTXwNrK1IJVjt+f00lGPOXFQaWFuUjvISZjQ=
-github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260608064711-7f3f9a9f3990/go.mod h1:UDTbsQIddSqov8hUA+rrchZEyzv9P5pqDOZGZR3kthk=
+github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260730083905-1785242bb524 h1:PEBqVjy9lCbZJ0Z77eg483VrLh4+hujWG2jts/dhKbk=
+github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20260730083905-1785242bb524/go.mod h1:958w1J4jByMlVKfyrv1Uil06T1hkPEeZ/jE3JdKGvnk=
+github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260730083905-1785242bb524 h1:0nLdfp0VD8EF320sLnTKqi4EBv7fb3ziUSiMyofesJU=
+github.com/adbc-drivers/driverbase-go/validation v0.0.0-20260730083905-1785242bb524/go.mod h1:8UerK/TNJJosowmHIJDNkQt89GpWATW37IfzdQpGP2Y=
 github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtnceM=
 github.com/andybalholm/brotli v1.2.2/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/apache/arrow-adbc/go/adbc v1.12.0 h1:1S7h8M12a+JZPuduuBo0kIQIRq+4heUikMnHBQ9seXE=
