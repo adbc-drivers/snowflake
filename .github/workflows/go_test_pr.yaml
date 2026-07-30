@@ -75,6 +75,9 @@ jobs:
     with:
       repository: ${{ needs.setup.outputs.repository }}
       ref: ${{ inputs.ref }}
+    permissions:
+      contents: read
+      packages: read
     secrets:
       # https://github.com/orgs/community/discussions/25238#discussioncomment-3247035
       SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
