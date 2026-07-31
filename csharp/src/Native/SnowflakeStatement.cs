@@ -98,6 +98,10 @@ public sealed class SnowflakeStatement : AdbcStatement
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(schema);
 
+        if (ReferenceEquals(_boundParameters, batch))
+            return;
+
+        _boundParameters?.Dispose();
         _boundParameters = batch;
     }
 
