@@ -43,7 +43,7 @@ internal class PooledConnection : IPooledConnection
     /// Initializes a new instance of the <see cref="PooledConnection"/> class.
     /// </summary>
     /// <param name="connectionId">The connection ID.</param>
-    /// <param name="poolKey">the unique identfier for the connection pool</param>
+    /// <param name="poolKey">the unique identifier for the connection pool</param>
     /// <param name="authToken">The authentication token.</param>
     /// <param name="config">The connection configuration.</param>
     /// <param name="sessionLifecycle">

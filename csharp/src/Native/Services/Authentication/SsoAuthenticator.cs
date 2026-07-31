@@ -43,7 +43,7 @@ namespace AdbcDrivers.Snowflake.Native.Services.Authentication;
 /// 1. Start local HTTP listener on a random port
 /// 2. POST to /session/authenticator-request with the port → get ssoUrl + proofKey
 /// 3. Open browser to ssoUrl
-/// 4. Snowflake redirects back to localhost with ?token=... 
+/// 4. Snowflake redirects back to localhost with ?token=...
 /// 5. Send login request with Token + ProofKey
 /// </summary>
 internal class SsoAuthenticator : ISsoAuthenticator
