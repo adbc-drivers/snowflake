@@ -93,7 +93,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
         var poolKey = GeneratePoolKey(config);
         var poolEntry = _pools.GetOrAdd(poolKey, static (_, cfg) => new ConnectionPoolEntry(cfg), config);
-        
+
         await WaitForCapacityAsync(poolEntry, config, cancellationToken).ConfigureAwait(false);
 
         try
@@ -308,7 +308,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
                     poolEntry.IdleConnections.Push(pooledConnection);
                 }
             }
-            
+
             foreach (var connection in connectionsToRemove)
                 connection.Dispose();
         }

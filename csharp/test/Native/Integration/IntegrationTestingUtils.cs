@@ -1,4 +1,4 @@
-﻿/*
+/*
 * Copyright (c) 2025 ADBC Drivers Contributors
 *
 * This file has been modified from its original version, which is
@@ -157,7 +157,7 @@ internal static class IntegrationTestingUtils
         {
             parameters["adbc.snowflake.sql.role"] = testConfiguration.Role;
         }
-        
+
         if (testConfiguration.TlsSkipVerify)
         {
             parameters["adbc.snowflake.sql.client_option.tls_skip_verify"] = "true";

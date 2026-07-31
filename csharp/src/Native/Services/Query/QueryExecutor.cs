@@ -226,9 +226,9 @@ internal class QueryExecutor : IQueryExecutor
 
         // The session is fatally rejected: 390112 that couldn't be renewed (no master token, or the
         // renewed token was rejected again on retry), or 390114 (master token expired too).
-        if (!IsSessionFatal(response)) 
+        if (!IsSessionFatal(response))
             return response;
-        
+
         _logger.LogDebug("Snowflake session is unrecoverable (code {Code}); faulting the connection.", response.Code);
         _onConnectionFault();
 

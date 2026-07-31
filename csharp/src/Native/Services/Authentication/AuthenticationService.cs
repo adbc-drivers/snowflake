@@ -67,7 +67,7 @@ internal class AuthenticationService : IAuthenticationService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(config);
-        
+
         return config.Authentication.Type switch
         {
             AuthenticationType.UsernamePassword => await _basicAuth.AuthenticateAsync(config, cancellationToken).ConfigureAwait(false),

@@ -1,0 +1,29 @@
+# EditorConfig for the C# workspace: the native Snowflake driver and its tests.
+#
+# Layout rules (whitespace, line endings, brace placement) are enforced so `dotnet format`
+# is deterministic. Semantic style preferences (var, expression bodies) are documented at
+# `silent` severity: they guide the IDE but are intentionally NOT auto-rewritten by
+# `dotnet format`, so the tool never churns hand-written code.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.cs]
+csharp_indent_case_contents = true
+csharp_indent_case_contents_when_block = false
+
+# Preferences the codebase follows, documented but not machine-enforced (silent = no format churn).
+csharp_style_namespace_declarations = file_scoped:silent
+csharp_style_var_for_built_in_types = true:silent
+csharp_style_var_when_type_is_apparent = true:silent
+csharp_style_var_elsewhere = true:silent
+dotnet_style_require_accessibility_modifiers = never:silent

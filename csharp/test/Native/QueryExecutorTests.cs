@@ -44,7 +44,7 @@ public class QueryExecutorTests
 
         var rowSet = new List<List<string>>();
         foreach (string[] row in rows)
-            rowSet.Add([..row]);
+            rowSet.Add([.. row]);
 
         return new SnowflakeQueryResponse { RowType = rowType, RowSet = rowSet };
     }

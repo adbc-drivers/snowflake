@@ -89,7 +89,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
         var apiClient = new RestApiClient(httpClient, config.EnableCompression,
             logger: loggerFactory.CreateLogger<RestApiClient>());
         var typeConverter = TypeConverter.Shared;
-        
+
         var queryExecutor = new QueryExecutor(apiClient, typeConverter, config.Account, config.Network,
             loggerFactory.CreateLogger<QueryExecutor>(), () => pooledConnection.IsFaulted = true);
 
@@ -199,7 +199,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
             Timeout = _config.QueryTimeout,
             AuthToken = _pooledConnection.AuthToken
         };
-        
+
         PreparedStatement prepared = _queryExecutor.DescribeAsync(request).GetAwaiter().GetResult();
 
         return prepared.ResultSchema

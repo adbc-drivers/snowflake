@@ -384,7 +384,7 @@ public sealed partial class SnowflakeConnection
                     new SnowflakeBinding(BindTypeNames.Text, bindValues[i]);
             }
         }
-        
+
         var result = _queryExecutor.ExecuteQueryAsync(request).GetAwaiter().GetResult();
         if (result.Status == QueryStatus.Failed)
         {

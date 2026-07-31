@@ -224,7 +224,7 @@ internal static class ConnectionStringParser
 
         throw new ArgumentException($"Invalid timespan format: {value}. Expected format: number with optional suffix (s, m, h) or plain seconds.");
     }
-    
+
     internal static NetworkConfig ParseNetworkConfig(IReadOnlyDictionary<string, string>? parameters)
     {
         var network = new NetworkConfig();
@@ -262,7 +262,7 @@ internal static class ConnectionStringParser
         parameters.TryGetValue(key, out string? value);
         return string.IsNullOrWhiteSpace(value) ? null : value;
     }
-    
+
     private static int? GetOptionalInt(IReadOnlyDictionary<string, string> parameters, string key)
     {
         var value = GetOptionalParameter(parameters, key);
@@ -291,7 +291,7 @@ internal static class ConnectionStringParser
         var validationContext = new ValidationContext(config);
 
         Validator.TryValidateObject(config, validationContext, validationResults, true);
-        
+
         var poolValidationContext = new ValidationContext(config.PoolConfig);
         Validator.TryValidateObject(config.PoolConfig, poolValidationContext, validationResults, true);
 

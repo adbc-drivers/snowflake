@@ -75,7 +75,7 @@ public sealed class SnowflakeDatabase : AdbcDatabase
         _connectionPool = new ConnectionPoolManager(authService, sessionClient,
             logger: _loggerFactory?.CreateLogger<ConnectionPoolManager>());
     }
-    
+
     private static HttpClient CreateHttpClient(
         IReadOnlyDictionary<string, string>? parameters, HttpMessageHandler? handler, ILoggerFactory? loggerFactory)
     {
