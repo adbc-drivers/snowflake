@@ -100,38 +100,22 @@ internal static class ConnectionStringParser
             Authentication = ParseAuthenticationConfig(parameters)
         };
 
-        if (parameters.TryGetValue("adbc.snowflake.sql.client_option.request_timeout", out string? requestTimeoutStr) &&
-            int.TryParse(requestTimeoutStr, out int requestTimeoutSeconds))
-        {
+        if (GetOptionalInt(parameters, "adbc.snowflake.sql.client_option.request_timeout") is { } requestTimeoutSeconds)
             config.QueryTimeout = TimeSpan.FromSeconds(requestTimeoutSeconds);
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.sql.client_option.login_timeout", out string? loginTimeoutStr) &&
-            int.TryParse(loginTimeoutStr, out int loginTimeoutSeconds))
-        {
+        if (GetOptionalInt(parameters, "adbc.snowflake.sql.client_option.login_timeout") is { } loginTimeoutSeconds)
             config.LoginTimeout = TimeSpan.FromSeconds(loginTimeoutSeconds);
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.rpc.prefetch_concurrency", out string? prefetchStr) &&
-            int.TryParse(prefetchStr, out int prefetch))
-        {
+        if (GetOptionalInt(parameters, "adbc.snowflake.rpc.prefetch_concurrency") is { } prefetch)
             config.PrefetchConcurrency = Math.Max(1, prefetch);
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.sql.client_option.enable_compression", out string? compressionStr) &&
-            bool.TryParse(compressionStr, out bool enableCompression))
-        {
+        if (GetOptionalBool(parameters, "adbc.snowflake.sql.client_option.enable_compression") is { } enableCompression)
             config.EnableCompression = enableCompression;
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.sql.client_option.keep_session_alive", out string? keepAliveStr) &&
-            bool.TryParse(keepAliveStr, out bool keepAlive))
-        {
+        if (GetOptionalBool(parameters, "adbc.snowflake.sql.client_option.keep_session_alive") is { } keepAlive)
             config.ClientSessionKeepAlive = keepAlive;
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.sql.client_option.keep_session_alive_heartbeat_frequency", out string? freqStr) &&
-            int.TryParse(freqStr, out int freqSeconds))
+        if (GetOptionalInt(parameters, "adbc.snowflake.sql.client_option.keep_session_alive_heartbeat_frequency") is { } freqSeconds)
         {
             // Clamp to a safe band: frequent enough to stay under the ~4h master window, but not
             // so frequent it hammers the server. Mirrors gosnowflake's heartbeat-frequency bounds.
@@ -195,26 +179,17 @@ internal static class ConnectionStringParser
 
         // Client-side pooling is our own feature (the ADBC Snowflake/gosnowflake driver has none), so
         // these keys live under our own adbc.snowflake.pool.* namespace for consistency with the rest.
-        if (parameters.TryGetValue("adbc.snowflake.pool.max_size", out string? maxPoolSizeStr) &&
-            int.TryParse(maxPoolSizeStr, out int maxPoolSize))
-        {
+        if (GetOptionalInt(parameters, "adbc.snowflake.pool.max_size") is { } maxPoolSize)
             poolConfig.MaxPoolSize = maxPoolSize;
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.pool.idle_timeout", out string? idleTimeoutStr))
-        {
+        if (GetOptionalParameter(parameters, "adbc.snowflake.pool.idle_timeout") is { } idleTimeoutStr)
             poolConfig.IdleTimeout = ParseTimeSpan(idleTimeoutStr);
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.pool.acquire_timeout", out string? acquireTimeoutStr))
-        {
+        if (GetOptionalParameter(parameters, "adbc.snowflake.pool.acquire_timeout") is { } acquireTimeoutStr)
             poolConfig.AcquireTimeout = ParseTimeSpan(acquireTimeoutStr);
-        }
 
-        if (parameters.TryGetValue("adbc.snowflake.pool.max_lifetime", out string? maxLifetimeStr))
-        {
+        if (GetOptionalParameter(parameters, "adbc.snowflake.pool.max_lifetime") is { } maxLifetimeStr)
             poolConfig.MaxConnectionLifetime = ParseTimeSpan(maxLifetimeStr);
-        }
 
         return poolConfig;
     }
@@ -258,21 +233,17 @@ internal static class ConnectionStringParser
 
         network.Host = GetOptionalParameter(parameters, "adbc.snowflake.sql.uri.host");
 
-        if (parameters.TryGetValue("adbc.snowflake.sql.uri.port", out string? portStr) &&
-            int.TryParse(portStr, out int port))
-        {
+        if (GetOptionalInt(parameters, "adbc.snowflake.sql.uri.port") is { } port)
             network.Port = port;
-        }
 
-        var protocol = GetOptionalParameter(parameters, "adbc.snowflake.sql.uri.protocol");
-        if (protocol != null)
+        if (GetOptionalParameter(parameters, "adbc.snowflake.sql.uri.protocol") is { } protocol)
             network.Protocol = protocol;
 
-        if (IsTrueOption(parameters, "adbc.snowflake.sql.client_option.no_proxy"))
-            network.NoProxy = true;
+        if (GetOptionalBool(parameters, "adbc.snowflake.sql.client_option.no_proxy") is { } noProxy)
+            network.NoProxy = noProxy;
 
-        if (IsTrueOption(parameters, "adbc.snowflake.sql.client_option.tls_skip_verify"))
-            network.TlsSkipVerify = true;
+        if (GetOptionalBool(parameters, "adbc.snowflake.sql.client_option.tls_skip_verify") is { } tlsSkipVerify)
+            network.TlsSkipVerify = tlsSkipVerify;
 
         return network;
     }
@@ -291,9 +262,28 @@ internal static class ConnectionStringParser
         parameters.TryGetValue(key, out string? value);
         return string.IsNullOrWhiteSpace(value) ? null : value;
     }
+    
+    private static int? GetOptionalInt(IReadOnlyDictionary<string, string> parameters, string key)
+    {
+        var value = GetOptionalParameter(parameters, key);
+        if (value is null)
+            return null;
 
-    private static bool IsTrueOption(IReadOnlyDictionary<string, string> parameters, string key) =>
-        parameters.TryGetValue(key, out string? value) && string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+        return !int.TryParse(value, out int parsed)
+            ? throw new ArgumentException($"Parameter '{key}' must be a whole number but was '{value}'.")
+            : parsed;
+    }
+
+    private static bool? GetOptionalBool(IReadOnlyDictionary<string, string> parameters, string key)
+    {
+        var value = GetOptionalParameter(parameters, key);
+        if (value is null)
+            return null;
+
+        return !bool.TryParse(value, out bool parsed)
+            ? throw new ArgumentException($"Parameter '{key}' must be 'true' or 'false' but was '{value}'.")
+            : parsed;
+    }
 
     private static void ValidateConfiguration(ConnectionConfig config)
     {

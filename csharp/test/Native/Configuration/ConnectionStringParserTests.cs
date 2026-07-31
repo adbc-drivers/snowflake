@@ -364,6 +364,37 @@ public class ConnectionStringParserTests
         Assert.True(config.Network.TlsSkipVerify);
     }
 
+    [Theory]
+    [InlineData("adbc.snowflake.sql.client_option.request_timeout", "30x")]
+    [InlineData("adbc.snowflake.sql.client_option.login_timeout", "abc")]
+    [InlineData("adbc.snowflake.rpc.prefetch_concurrency", "lots")]
+    [InlineData("adbc.snowflake.sql.client_option.keep_session_alive_heartbeat_frequency", "soon")]
+    [InlineData("adbc.snowflake.pool.max_size", "20.5")]
+    [InlineData("adbc.snowflake.sql.uri.port", "https")]
+    public void Parse_WithNonNumericValue_ThrowsRatherThanSilentlyIgnoring(string key, string value)
+    {
+        var parameters = ParseConnectionString(
+            $"adbc.snowflake.sql.account=testaccount;username=testuser;password=testpass;{key}={value}");
+
+        var ex = Assert.Throws<ArgumentException>(() => ConnectionStringParser.ParseParameters(parameters));
+        Assert.Contains(key, ex.Message);
+        Assert.Contains("whole number", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("adbc.snowflake.sql.client_option.enable_compression", "yes")]
+    [InlineData("adbc.snowflake.sql.client_option.keep_session_alive", "1")]
+    [InlineData("adbc.snowflake.sql.client_option.tls_skip_verify", "on")]
+    public void Parse_WithNonBooleanValue_ThrowsRatherThanSilentlyIgnoring(string key, string value)
+    {
+        var parameters = ParseConnectionString(
+            $"adbc.snowflake.sql.account=testaccount;username=testuser;password=testpass;{key}={value}");
+
+        var ex = Assert.Throws<ArgumentException>(() => ConnectionStringParser.ParseParameters(parameters));
+        Assert.Contains(key, ex.Message);
+        Assert.Contains("'true' or 'false'", ex.Message);
+    }
+
     [Fact]
     public void Parse_WithNullParameters_ShouldThrowArgumentException()
     {
