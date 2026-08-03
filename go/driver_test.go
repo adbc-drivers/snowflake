@@ -1888,6 +1888,17 @@ func (suite *SnowflakeTests) TestGeometryAsText() {
 	suite.Contains(geogCol.Value(0), "Point")
 }
 
+func (suite *SnowflakeTests) TestUntypedNullLiteral() {
+	// An untyped NULL literal shares UUID's "text, length 0" result metadata;
+	// it must stay utf8 rather than be misclassified as a UUID column.
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT NULL AS N"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+	suite.Truef(arrow.TypeEqual(arrow.BinaryTypes.String, rdr.Schema().Field(0).Type),
+		"SELECT NULL: expected utf8, got %s", rdr.Schema().Field(0).Type)
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = "microseconds"
