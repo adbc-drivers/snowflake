@@ -167,18 +167,16 @@ func stripEWKBSRIDColumn(_ context.Context, a arrow.Array) (arrow.Array, error) 
 }
 
 // isUUIDResultColumn reports whether a result column carries Snowflake UUID
-// values. Snowflake result metadata does not surface a dedicated "uuid" type
-// today: UUID columns are reported as "text" but with length 0, which no real
-// text column can have (VARCHAR's minimum length is 1, and even SHOW commands
-// report the maximum length for their text columns). The explicit "uuid"
-// match future-proofs against the server reporting the logical type directly.
+// values. Snowflake result metadata does not surface a dedicated "uuid" type:
+// UUID columns are reported as "text" but with length 0, which no real text
+// column can have (VARCHAR's minimum length is 1, and even SHOW commands
+// report the maximum length for their text columns).
 //
 // The only other columns reported as length-0 text are untyped NULL literals
 // (e.g. SELECT NULL); on the Arrow data path callers can rule those out with
 // isUntypedNullField.
 func isUUIDResultColumn(typ string, length int64) bool {
-	return strings.EqualFold(typ, "uuid") ||
-		(strings.EqualFold(typ, "text") && length == 0)
+	return strings.EqualFold(typ, "text") && length == 0
 }
 
 // isUntypedNullField reports whether the server-provided Arrow field metadata
