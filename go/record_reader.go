@@ -658,9 +658,6 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 			),
 		}
 		if isUUIDResultColumn(srcMeta.Type, srcMeta.Length) {
-			// jsonDataToArrow appends the JSON UUID text through the
-			// extension builder's AppendValueFromString, which parses it
-			// into the fixed_size_binary[16] storage.
 			fields[i].Type = extensions.NewUUIDType()
 			continue
 		}
