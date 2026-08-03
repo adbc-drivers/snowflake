@@ -41,9 +41,6 @@ INSERT INTO TEST_UUID VALUES
 SELECT RES FROM TEST_UUID ORDER BY IDX ASC
 
 // part: expected_schema
-// Snowflake delivers UUID values as utf8 text on the wire; the driver decodes
-// them into the arrow.uuid extension type (fixed_size_binary[16] storage) and
-// reports the same type from the metadata paths.
 {
     "format": "+s",
     "children": [
