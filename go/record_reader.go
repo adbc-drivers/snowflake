@@ -346,8 +346,6 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 			continue
 		}
 
-		// Snowflake delivers UUID values as utf8 text on the wire; decode
-		// them into the canonical arrow.uuid extension type.
 		if isUUIDResultColumn(srcMeta.Type, srcMeta.Length) && !isUntypedNullField(f) {
 			f.Type = extensions.NewUUIDType()
 			transformers[i] = uuidStringsToUUIDColumn
