@@ -530,13 +530,14 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	case OptionProxyHost:
 		d.cfg.ProxyHost = v
 	case OptionProxyPort:
-		d.cfg.ProxyPort, err = strconv.Atoi(v)
-		if err != nil {
+		port, parseErr := strconv.Atoi(v)
+		if parseErr != nil || port <= 0 || port > 65535 {
 			return adbc.Error{
-				Msg:  "error encountered parsing proxy port option: " + err.Error(),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s' (must be an integer between 1 and 65535)", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
+		d.cfg.ProxyPort = port
 	case OptionProxyUser:
 		d.cfg.ProxyUser = v
 	case OptionProxyPassword:
