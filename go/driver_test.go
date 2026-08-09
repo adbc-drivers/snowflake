@@ -2835,6 +2835,75 @@ func (suite *SnowflakeTests) TestGetSetClientConfigFile() {
 	suite.True(file == result)
 }
 
+func TestProxyOptions(t *testing.T) {
+	ctx := context.Background()
+	adbcDriver := driver.NewDriver(memory.DefaultAllocator)
+	options := map[string]string{
+		driver.OptionProxyHost:     "my.proxy.com",
+		driver.OptionProxyPort:     "8080",
+		driver.OptionProxyUser:     "myProxyUser",
+		driver.OptionProxyPassword: "my_password",
+		driver.OptionProxyProtocol: "HTTPS",
+	}
+
+	db, err := adbcDriver.NewDatabaseWithContext(ctx, options)
+	require.NoError(t, err)
+	defer testutil.CheckedCloseWithContext(t, db, ctx)
+
+	getSetDB, ok := db.(adbc.GetSetOptionsWithContext)
+	require.True(t, ok)
+
+	expected := map[string]string{
+		driver.OptionProxyHost:     "my.proxy.com",
+		driver.OptionProxyPort:     "8080",
+		driver.OptionProxyUser:     "myProxyUser",
+		driver.OptionProxyPassword: "my_password",
+		driver.OptionProxyProtocol: "https",
+	}
+	for key, value := range expected {
+		actual, err := getSetDB.GetOption(ctx, key)
+		require.NoError(t, err)
+		require.Equal(t, value, actual)
+	}
+}
+
+func TestProxyHostDefaultsToEmpty(t *testing.T) {
+	ctx := context.Background()
+	adbcDriver := driver.NewDriver(memory.DefaultAllocator)
+	db, err := adbcDriver.NewDatabaseWithContext(ctx, nil)
+	require.NoError(t, err)
+	defer testutil.CheckedCloseWithContext(t, db, ctx)
+
+	getSetDB, ok := db.(adbc.GetSetOptionsWithContext)
+	require.True(t, ok)
+	host, err := getSetDB.GetOption(ctx, driver.OptionProxyHost)
+	require.NoError(t, err)
+	require.Empty(t, host)
+}
+
+func TestInvalidProxyOptions(t *testing.T) {
+	ctx := context.Background()
+	adbcDriver := driver.NewDriver(memory.DefaultAllocator)
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "port", key: driver.OptionProxyPort, value: "not-a-port"},
+		{name: "protocol", key: driver.OptionProxyProtocol, value: "socks5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := adbcDriver.NewDatabaseWithContext(ctx, map[string]string{tt.key: tt.value})
+			require.Error(t, err)
+			var adbcErr adbc.Error
+			require.ErrorAs(t, err, &adbcErr)
+			require.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
+		})
+	}
+}
+
 func (suite *SnowflakeTests) TestGetObjectsWithNilCatalog() {
 	// this test demonstrates calling GetObjects with the catalog depth and a nil catalog
 	rdr, err := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthCatalogs, nil, nil, nil, nil, nil)

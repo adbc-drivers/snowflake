@@ -225,6 +225,32 @@ Examples:
   The native Okta URL (for example, `https://<org>.okta.com`) used for SSO when
   `adbc.snowflake.sql.auth_type` is `auth_okta`.
 
+`adbc.snowflake.sql.client_option.proxy_host`
+: **Type:** string
+
+  The proxy server hostname or IP address. If omitted, no explicit proxy is
+  configured and gosnowflake uses its default proxy behavior.
+
+`adbc.snowflake.sql.client_option.proxy_port`
+: **Type:** int
+
+  The proxy server port.
+
+`adbc.snowflake.sql.client_option.proxy_protocol`
+: **Values:** `http` or `https`. **Default:** `http`
+
+  The protocol used to connect to the proxy server.
+
+`adbc.snowflake.sql.client_option.proxy_user`
+: **Type:** string
+
+  The username used for proxy authentication.
+
+`adbc.snowflake.sql.client_option.proxy_password`
+: **Type:** string
+
+  The password used for proxy authentication.
+
 `adbc.snowflake.sql.client_option.request_timeout`
 : **Type:** duration string (e.g. `300ms`, `1.5s`, or `1m30s`)
 
