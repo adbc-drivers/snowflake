@@ -168,6 +168,16 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return d.cfg.Tracing, nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
 		return d.cfg.ClientConfigFile, nil
+	case OptionProxyHost:
+		return d.cfg.ProxyHost, nil
+	case OptionProxyPort:
+		return strconv.Itoa(d.cfg.ProxyPort), nil
+	case OptionProxyUser:
+		return d.cfg.ProxyUser, nil
+	case OptionProxyPassword:
+		return d.cfg.ProxyPassword, nil
+	case OptionProxyProtocol:
+		return d.cfg.ProxyProtocol, nil
 	case OptionUseHighPrecision:
 		if d.useHighPrecision {
 			return adbc.OptionValueEnabled, nil
@@ -517,6 +527,31 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		d.cfg.Tracing = v //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
 		d.cfg.ClientConfigFile = v
+	case OptionProxyHost:
+		d.cfg.ProxyHost = v
+	case OptionProxyPort:
+		port, parseErr := strconv.Atoi(v)
+		if parseErr != nil || port <= 0 || port > 65535 {
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s' (must be an integer between 1 and 65535)", k, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		d.cfg.ProxyPort = port
+	case OptionProxyUser:
+		d.cfg.ProxyUser = v
+	case OptionProxyPassword:
+		d.cfg.ProxyPassword = v
+	case OptionProxyProtocol:
+		switch strings.ToLower(v) {
+		case "http", "https":
+			d.cfg.ProxyProtocol = strings.ToLower(v)
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
 	case OptionUseHighPrecision:
 		switch v {
 		case adbc.OptionValueEnabled:
