@@ -23,6 +23,7 @@ use adbc_core::{
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use sf_core::apis::database_driver_v1::{BindingType, DataPtr, Handle};
+use sf_core::config::{param_registry::param_names, settings::Setting};
 
 use crate::driver::{Inner, TimestampPrecision};
 
@@ -119,6 +120,15 @@ impl Optionable for Statement {
             }
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
                 if let OptionValue::String(s) = value {
+                    self.inner
+                        .runtime
+                        .block_on(self.inner.sf.statement_set_option(
+                            self.stmt_handle,
+                            param_names::QUERY_TAG.into(),
+                            Setting::String(s.clone()),
+                        ))
+                        .map_err(crate::error::api_error_to_adbc_error)?;
+                    // Update ADBC-visible storage only after sf_core accepts the option.
                     self.query_tag = Some(s);
                     Ok(())
                 } else {
@@ -207,22 +217,6 @@ impl Statement {
             self.timestamp_precision,
         )))
     }
-
-    fn apply_query_tag(&self) -> Result<()> {
-        if let Some(ref tag) = self.query_tag {
-            let escaped = tag.replace('\'', "''");
-            let set_sql = format!("ALTER SESSION SET QUERY_TAG = '{escaped}'");
-            let tmp_handle = self
-                .inner
-                .sf
-                .statement_new(self.conn_handle)
-                .map_err(crate::error::api_error_to_adbc_error)?;
-            let set_result = self.inner.execute_query(tmp_handle, set_sql, None);
-            let _ = self.inner.sf.statement_release(tmp_handle);
-            set_result?;
-        }
-        Ok(())
-    }
 }
 
 impl adbc_core::Statement for Statement {
@@ -260,8 +254,6 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        self.apply_query_tag()?;
-
         if self.binding_supplied {
             return self.execute_bound(query);
         }
@@ -290,7 +282,7 @@ impl adbc_core::Statement for Statement {
         })?;
 
         // A supplied binding with no rows represents zero executions, so do not
-        // run the statement unbound, send an empty binding, or apply the query tag.
+        // run the statement unbound or send an empty binding.
         if self.binding_supplied {
             let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
             if row_count == 0 {
@@ -298,8 +290,6 @@ impl adbc_core::Statement for Statement {
                 return Ok(Some(0));
             }
         }
-
-        self.apply_query_tag()?;
 
         // Parameterised DML: execute once with JSON bindings.
         if self.binding_supplied {
@@ -313,35 +303,20 @@ impl adbc_core::Statement for Statement {
 
             self.last_query_id = Some(result.descriptor.query_id.clone());
 
-            let rows = if is_ddl(self.query.as_deref().unwrap_or("")) {
-                None
-            } else {
-                result.descriptor.rows_affected
-            };
-            return Ok(rows);
+            return Ok(result.descriptor.rows_affected);
         }
 
         let result = self.inner.execute_query(self.stmt_handle, query, None)?;
 
         self.last_query_id = Some(result.descriptor.query_id.clone());
 
-        // DDL statements (CREATE, DROP, ALTER, TRUNCATE) return a non-meaningful row
-        // count from Snowflake (typically 1 for "success"). Per the ADBC convention,
-        // return None (-1 in Python) for DDL so callers can distinguish it from DML.
-        let rows = if is_ddl(self.query.as_deref().unwrap_or("")) {
-            None
-        } else {
-            result.descriptor.rows_affected
-        };
-        Ok(rows)
+        Ok(result.descriptor.rows_affected)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
         let query = self.query.clone().ok_or_else(|| {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
-
-        self.apply_query_tag()?;
 
         let result = self.inner.execute_query(self.stmt_handle, query, None)?;
 
@@ -1036,7 +1011,7 @@ fn escape_json_string(s: &str) -> String {
     out
 }
 
-fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<String> {
+pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<String> {
     if batches.is_empty() {
         return Ok("{}".to_string());
     }
@@ -1371,58 +1346,6 @@ fn decimal128_to_string(value: i128, scale: i8) -> String {
     )
 }
 
-/// Converts days since Unix epoch (1970-01-01) to a YYYY-MM-DD string.
-pub(crate) fn days_since_epoch_to_date_str(days: i64) -> String {
-    // Algorithm: civil date from days (Gregorian proleptic)
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
-}
-
-/// Strips leading SQL whitespace, line comments (`--…`), and block
-/// comments (`/*…*/`) from `query`, returning the remaining slice.
-fn strip_sql_comments(query: &str) -> &str {
-    let mut s = query.trim_start();
-    loop {
-        if s.starts_with("--") {
-            s = s[s.find('\n').map(|i| i + 1).unwrap_or(s.len())..].trim_start();
-        } else if s.starts_with("/*") {
-            if let Some(end) = s.find("*/") {
-                s = s[end + 2..].trim_start();
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    s
-}
-
-fn is_ddl(query: &str) -> bool {
-    let upper = strip_sql_comments(query).to_uppercase();
-    upper.starts_with("CREATE ")
-        || upper.starts_with("DROP ")
-        || upper.starts_with("ALTER ")
-        || upper.starts_with("TRUNCATE ")
-        || upper.starts_with("RENAME ")
-        || upper.starts_with("COMMENT ")
-        || upper.starts_with("GRANT ")
-        || upper.starts_with("REVOKE ")
-        || upper.starts_with("SHOW ")
-        || upper.starts_with("USE ")
-        || upper.starts_with("DESCRIBE ")
-        || upper.starts_with("DESC ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_update_with_zero_rows_clears_previous_query_id_without_applying_tag() {
+    fn execute_update_with_zero_rows_clears_previous_query_id_without_execution() {
         let mut stmt = make_stmt();
         stmt.set_sql_query("DELETE FROM example WHERE id = ?")
             .unwrap();
@@ -1631,11 +1554,19 @@ mod tests {
     #[test]
     fn set_query_tag_stored_and_readable() {
         let mut stmt = make_stmt();
+        let inner = stmt.inner.clone();
+        let conn_handle = stmt.inner.sf.connection_new();
+        stmt.conn_handle = conn_handle;
+        stmt.stmt_handle = stmt.inner.sf.statement_new(conn_handle).unwrap();
+
+        stmt.set_sql_query("SELECT 1").unwrap();
         stmt.set_option(
             OptionStatement::Other("adbc.snowflake.statement.query_tag".into()),
             OptionValue::String("my_tag".into()),
         )
         .unwrap();
+        stmt.set_sql_query("SELECT 2").unwrap();
+        assert_eq!(stmt.query.as_deref(), Some("SELECT 2"));
         assert_eq!(
             stmt.get_option_string(OptionStatement::Other(
                 "adbc.snowflake.statement.query_tag".into()
@@ -1643,8 +1574,23 @@ mod tests {
             .unwrap(),
             "my_tag"
         );
-        // Verify conn_handle is present on the struct (compile-time check)
-        let _ = stmt.conn_handle;
+
+        drop(stmt);
+        // Statement::drop releases the statement before its connection.
+        inner.sf.connection_release(conn_handle).unwrap();
+    }
+
+    #[test]
+    fn rejected_query_tag_does_not_update_adbc_storage() {
+        let mut stmt = make_stmt();
+        let error = stmt
+            .set_option(
+                OptionStatement::Other("adbc.snowflake.statement.query_tag".into()),
+                OptionValue::String("not_stored".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(stmt.query_tag, None);
     }
 
     #[test]
