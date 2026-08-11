@@ -289,17 +289,20 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        self.apply_query_tag()?;
-
-        // Parameterised DML: execute once with JSON bindings. A supplied binding
-        // with no rows represents zero executions, so do not run the statement
-        // unbound (or send an empty binding to Snowflake).
+        // A supplied binding with no rows represents zero executions, so do not
+        // run the statement unbound, send an empty binding, or apply the query tag.
         if self.binding_supplied {
             let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
             if row_count == 0 {
+                self.last_query_id = None;
                 return Ok(Some(0));
             }
+        }
 
+        self.apply_query_tag()?;
+
+        // Parameterised DML: execute once with JSON bindings.
+        if self.binding_supplied {
             let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let binding = BindingType::Json(data_ptr);
@@ -1509,6 +1512,21 @@ mod tests {
         let mut stmt = make_stmt();
         stmt.set_sql_query("DELETE FROM example WHERE id = ?")
             .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        stmt.bind(RecordBatch::new_empty(schema)).unwrap();
+
+        assert_eq!(stmt.execute_update().unwrap(), Some(0));
+        assert_eq!(stmt.last_query_id, None);
+    }
+
+    #[test]
+    fn execute_update_with_zero_rows_clears_previous_query_id_without_applying_tag() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("DELETE FROM example WHERE id = ?")
+            .unwrap();
+        stmt.query_tag = Some("should_not_be_applied".into());
+        stmt.last_query_id = Some("previous-query-id".into());
+
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         stmt.bind(RecordBatch::new_empty(schema)).unwrap();
 
