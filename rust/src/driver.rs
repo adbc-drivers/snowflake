@@ -23,7 +23,7 @@ use adbc_core::{
 use arrow_array::RecordBatchReader;
 use arrow_schema::TimeUnit;
 use sf_core::apis::database_driver_v1::{
-    BindingType, DatabaseDriverV1, ExecuteQueryResult, Handle, ResultSetDescriptor,
+    BindingType, DatabaseDriverV1, ExecuteQueryResult, Handle, ResultSetDescriptor, ResultSetInfo,
 };
 use tokio::runtime::Runtime;
 
@@ -93,17 +93,31 @@ impl Inner {
                 Status::NotImplemented,
             ));
         };
+        self.acquire_result(result)
+    }
 
+    /// Acquire a core result stream, release its handle on every path, and bridge
+    /// sf_core's Arrow version to the ADBC-facing Arrow version.
+    pub fn acquire_result(&self, result: ResultSetInfo) -> Result<QueryResult> {
         let stream = self
             .runtime
             .block_on(self.sf.result_set_get_stream(result.handle));
         let release = self.sf.result_set_release(result.handle);
-        let reader = stream.map_err(crate::error::api_error_to_adbc_error)?;
-        release.map_err(crate::error::api_error_to_adbc_error)?;
 
-        // sf_core and ADBC currently resolve different Arrow major versions. Export the
-        // native sf_core reader through the stable Arrow C Data Interface once, here, so
-        // every caller receives the driver's Arrow version without duplicating unsafe code.
+        let reader = match stream {
+            Ok(reader) => {
+                release.map_err(crate::error::api_error_to_adbc_error)?;
+                reader
+            }
+            Err(error) => {
+                // The release was attempted above even though stream acquisition failed.
+                let _ = release;
+                return Err(crate::error::api_error_to_adbc_error(error));
+            }
+        };
+
+        // Never transmute Arrow Rust types across versions. Export and import the
+        // stream through the stable Arrow C Data Interface in this one location.
         let stream = Box::new(arrow_sf_core::ffi_stream::FFI_ArrowArrayStream::new(reader));
         let raw = Box::into_raw(stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
         let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }

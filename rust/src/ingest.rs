@@ -12,24 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// src/ingest.rs
-//
-// Bulk ingest implementation using a VALUES-based INSERT pipeline.
-// For each bound batch: CREATE TABLE (if needed) then INSERT … VALUES.
-// Rows are chunked so individual SQL statements stay well under 1 MB.
-
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, TimeUnit};
+use sf_core::apis::database_driver_v1::{BindingType, DataPtr};
 
 use crate::driver::Inner;
-use crate::statement::Statement;
+use crate::statement::{Statement, arrow_batches_to_json_bindings};
 
-const INSERT_CHUNK_ROWS: usize = 500;
+const INGEST_CHUNK_ROWS: usize = 500;
+const INGEST_CHUNK_BYTES: usize = 900_000;
 
-// ── public entry point ────────────────────────────────────────────────────────
+struct EncodedBindingChunk {
+    rows: usize,
+    json: String,
+}
 
 pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
     if stmt.bound_batches.is_empty() {
@@ -47,33 +46,39 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         stmt.ingest_catalog.as_deref(),
         stmt.ingest_schema.as_deref(),
     );
-
-    let mode = stmt
-        .ingest_mode
-        .as_deref()
-        .unwrap_or("adbc.ingest.mode.create");
     let schema = stmt.bound_batches[0].schema();
 
-    match mode {
+    match stmt
+        .ingest_mode
+        .as_deref()
+        .unwrap_or("adbc.ingest.mode.create")
+    {
         "adbc.ingest.mode.create" => {
-            let ddl = build_create_sql(&qname, &schema, false)?;
-            run_sql(&stmt.inner, stmt.conn_handle, &ddl)?;
+            run_sql(
+                &stmt.inner,
+                stmt.conn_handle,
+                &build_create_sql(&qname, &schema, false)?,
+            )?;
         }
-        "adbc.ingest.mode.append" => {
-            // table must already exist — no DDL needed
-        }
+        "adbc.ingest.mode.append" => {}
         "adbc.ingest.mode.replace" => {
             run_sql(
                 &stmt.inner,
                 stmt.conn_handle,
                 &format!("DROP TABLE IF EXISTS {qname}"),
             )?;
-            let ddl = build_create_sql(&qname, &schema, false)?;
-            run_sql(&stmt.inner, stmt.conn_handle, &ddl)?;
+            run_sql(
+                &stmt.inner,
+                stmt.conn_handle,
+                &build_create_sql(&qname, &schema, false)?,
+            )?;
         }
         "adbc.ingest.mode.create_append" => {
-            let ddl = build_create_sql(&qname, &schema, true)?;
-            run_sql(&stmt.inner, stmt.conn_handle, &ddl)?;
+            run_sql(
+                &stmt.inner,
+                stmt.conn_handle,
+                &build_create_sql(&qname, &schema, true)?,
+            )?;
         }
         other => {
             return Err(Error::with_message_and_status(
@@ -83,46 +88,113 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         }
     }
 
-    let mut total = 0i64;
+    let insert_sql = build_insert_sql(&qname, &schema);
+    let mut total = Some(0i64);
     for batch in &stmt.bound_batches {
-        total += insert_batch(&stmt.inner, stmt.conn_handle, &qname, batch)?;
+        for chunk in encode_binding_chunks(batch)? {
+            debug_assert!((1..=INGEST_CHUNK_ROWS).contains(&chunk.rows));
+            let json_len = i64::try_from(chunk.json.len()).map_err(|_| {
+                Error::with_message_and_status(
+                    "JSON binding is too large",
+                    Status::InvalidArguments,
+                )
+            })?;
+            let binding = BindingType::Json(DataPtr::new(chunk.json.as_ptr(), json_len));
+            // The encoded String stays in scope until execute_query's block_on completes.
+            let result =
+                stmt.inner
+                    .execute_query(stmt.stmt_handle, insert_sql.clone(), Some(binding))?;
+
+            total = match (total, result.descriptor.rows_affected) {
+                (Some(acc), Some(rows)) => Some(acc.checked_add(rows).ok_or_else(|| {
+                    Error::with_message_and_status("ingest row count overflow", Status::Internal)
+                })?),
+                _ => None,
+            };
+        }
     }
-    Ok(Some(total))
+    Ok(total)
 }
 
-// ── DDL helpers ───────────────────────────────────────────────────────────────
-
-/// Returns the fully-qualified, double-quoted table name.
-fn qualified_name(table: &str, catalog: Option<&str>, schema: Option<&str>) -> String {
-    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    match (catalog, schema) {
-        (Some(c), Some(s)) => format!("{}.{}.{}", q(c), q(s), q(table)),
-        (None, Some(s)) => format!("{}.{}", q(s), q(table)),
-        (Some(c), None) => format!("{}.{}", q(c), q(table)),
-        (None, None) => q(table),
+fn encode_binding_chunks(batch: &RecordBatch) -> Result<Vec<EncodedBindingChunk>> {
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < batch.num_rows() {
+        let rows = INGEST_CHUNK_ROWS.min(batch.num_rows() - offset);
+        encode_binding_range(batch, offset, rows, &mut chunks)?;
+        offset += rows;
     }
+    Ok(chunks)
 }
 
-/// Builds `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] <name> (cols…)`.
-fn build_create_sql(qname: &str, schema: &Schema, if_not_exists: bool) -> Result<String> {
-    let mut cols = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let sf_type = to_sf_ddl(field.data_type())?;
-        let null_clause = if field.is_nullable() { "" } else { " NOT NULL" };
-        cols.push(format!(
-            "\"{}\" {sf_type}{null_clause}",
-            field.name().replace('"', "\"\"")
+fn encode_binding_range(
+    batch: &RecordBatch,
+    offset: usize,
+    rows: usize,
+    output: &mut Vec<EncodedBindingChunk>,
+) -> Result<()> {
+    let slice = batch.slice(offset, rows);
+    let json = arrow_batches_to_json_bindings(std::slice::from_ref(&slice))?;
+    if json.len() <= INGEST_CHUNK_BYTES {
+        output.push(EncodedBindingChunk { rows, json });
+        return Ok(());
+    }
+    if rows == 1 {
+        return Err(Error::with_message_and_status(
+            format!("single-row JSON binding exceeds the {INGEST_CHUNK_BYTES}-byte ingest limit"),
+            Status::InvalidArguments,
         ));
     }
+
+    let first_rows = rows / 2;
+    encode_binding_range(batch, offset, first_rows, output)?;
+    encode_binding_range(batch, offset + first_rows, rows - first_rows, output)
+}
+
+fn qualified_name(table: &str, catalog: Option<&str>, schema: Option<&str>) -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    match (catalog, schema) {
+        (Some(c), Some(s)) => format!("{}.{}.{}", quote(c), quote(s), quote(table)),
+        (None, Some(s)) => format!("{}.{}", quote(s), quote(table)),
+        (Some(c), None) => format!("{}.{}", quote(c), quote(table)),
+        (None, None) => quote(table),
+    }
+}
+
+fn build_create_sql(qname: &str, schema: &Schema, if_not_exists: bool) -> Result<String> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let sf_type = to_sf_ddl(field.data_type())?;
+            let null_clause = if field.is_nullable() { "" } else { " NOT NULL" };
+            Ok(format!(
+                "\"{}\" {sf_type}{null_clause}",
+                field.name().replace('"', "\"\"")
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let exists = if if_not_exists { " IF NOT EXISTS" } else { "" };
     Ok(format!(
         "CREATE TABLE{exists} {qname} ({})",
-        cols.join(", ")
+        columns.join(", ")
     ))
 }
 
-/// Maps an Arrow DataType to its Snowflake DDL type string.
-/// Matches the Go driver's `toSnowflakeType` function.
+fn build_insert_sql(qname: &str, schema: &Schema) -> String {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| format!("\"{}\"", field.name().replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    let placeholders = vec!["?"; columns.len()];
+    format!(
+        "INSERT INTO {qname} ({}) VALUES ({})",
+        columns.join(", "),
+        placeholders.join(", ")
+    )
+}
+
 fn to_sf_ddl(dt: &DataType) -> Result<String> {
     Ok(match dt {
         DataType::Int8
@@ -133,42 +205,24 @@ fn to_sf_ddl(dt: &DataType) -> Result<String> {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => "integer".to_string(),
-
         DataType::Float16 | DataType::Float32 | DataType::Float64 => "double".to_string(),
-
-        DataType::Decimal128(p, s) => format!("NUMERIC({p},{s})"),
-
+        DataType::Decimal128(precision, scale) => format!("NUMERIC({precision},{scale})"),
         DataType::Utf8 | DataType::LargeUtf8 => "text".to_string(),
-
         DataType::Binary | DataType::LargeBinary => "binary".to_string(),
-
-        DataType::FixedSizeBinary(n) => format!("binary({n})"),
-
+        DataType::FixedSizeBinary(size) => format!("binary({size})"),
         DataType::Boolean => "boolean".to_string(),
-
         DataType::Date32 | DataType::Date64 => "date".to_string(),
-
-        DataType::Time32(u) => {
-            let prec = time_unit_prec(u);
-            format!("time({prec})")
+        DataType::Time32(unit) | DataType::Time64(unit) => {
+            format!("time({})", time_unit_precision(unit))
         }
-        DataType::Time64(u) => {
-            let prec = time_unit_prec(u);
-            format!("time({prec})")
-        }
-
-        DataType::Timestamp(u, tz) => {
-            let prec = time_unit_prec(u);
-            if tz.is_some() {
-                format!("timestamp_ltz({prec})")
+        DataType::Timestamp(unit, timezone) => {
+            let kind = if timezone.is_some() {
+                "timestamp_ltz"
             } else {
-                format!("timestamp_ntz({prec})")
-            }
+                "timestamp_ntz"
+            };
+            format!("{kind}({})", time_unit_precision(unit))
         }
-
-        // List/Struct/Map are intentionally excluded: DDL generation would succeed
-        // but value_to_sql has no handler for these types, causing every data row
-        // to fail.  Return NotImplemented so callers get a clear error up-front.
         DataType::List(_)
         | DataType::LargeList(_)
         | DataType::FixedSizeList(_, _)
@@ -179,7 +233,6 @@ fn to_sf_ddl(dt: &DataType) -> Result<String> {
                 Status::NotImplemented,
             ));
         }
-
         other => {
             return Err(Error::with_message_and_status(
                 format!("unsupported ingest type: {other:?}"),
@@ -189,8 +242,8 @@ fn to_sf_ddl(dt: &DataType) -> Result<String> {
     })
 }
 
-fn time_unit_prec(u: &TimeUnit) -> u8 {
-    match u {
+fn time_unit_precision(unit: &TimeUnit) -> u8 {
+    match unit {
         TimeUnit::Second => 0,
         TimeUnit::Millisecond => 3,
         TimeUnit::Microsecond => 6,
@@ -198,275 +251,117 @@ fn time_unit_prec(u: &TimeUnit) -> u8 {
     }
 }
 
-// ── INSERT helpers ────────────────────────────────────────────────────────────
-
-fn insert_batch(
+fn run_sql(
     inner: &Arc<Inner>,
-    conn: sf_core::handle_manager::Handle,
-    qname: &str,
-    batch: &RecordBatch,
-) -> Result<i64> {
-    if batch.num_rows() == 0 {
-        return Ok(0);
-    }
-
-    let schema = batch.schema();
-    let col_list: Vec<String> = schema
-        .fields()
-        .iter()
-        .map(|f| format!("\"{}\"", f.name().replace('"', "\"\"")))
-        .collect();
-    let col_clause = col_list.join(", ");
-
-    let mut inserted = 0i64;
-    let mut row = 0usize;
-
-    while row < batch.num_rows() {
-        let end = (row + INSERT_CHUNK_ROWS).min(batch.num_rows());
-        let mut rows_sql = Vec::with_capacity(end - row);
-
-        for r in row..end {
-            let mut vals = Vec::with_capacity(schema.fields().len());
-            for (c, field) in schema.fields().iter().enumerate() {
-                vals.push(value_to_sql(
-                    batch.column(c).as_ref(),
-                    r,
-                    field.data_type(),
-                )?);
-            }
-            rows_sql.push(format!("({})", vals.join(", ")));
-        }
-
-        let sql = format!(
-            "INSERT INTO {qname} ({col_clause}) VALUES {}",
-            rows_sql.join(", ")
-        );
-        run_sql(inner, conn, &sql)?;
-        inserted += (end - row) as i64;
-        row = end;
-    }
-
-    Ok(inserted)
-}
-
-// ── SQL execution helper ──────────────────────────────────────────────────────
-
-fn run_sql(inner: &Arc<Inner>, conn: sf_core::handle_manager::Handle, sql: &str) -> Result<()> {
-    let tmp = inner
+    connection: sf_core::handle_manager::Handle,
+    sql: &str,
+) -> Result<()> {
+    let statement = inner
         .sf
-        .statement_new(conn)
+        .statement_new(connection)
         .map_err(crate::error::api_error_to_adbc_error)?;
-    let result = inner.execute_query(tmp, sql.to_string(), None);
-    let _ = inner.sf.statement_release(tmp);
-    result.map(|_| ())
+    let result = inner.execute_query(statement, sql.to_string(), None);
+    let release = inner.sf.statement_release(statement);
+    match result {
+        Ok(_) => release
+            .map_err(crate::error::api_error_to_adbc_error)
+            .map(|_| ()),
+        Err(error) => {
+            let _ = release;
+            Err(error)
+        }
+    }
 }
 
-// ── value formatting ──────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::Field;
 
-/// Formats a single Arrow column value as a Snowflake SQL literal.
-fn value_to_sql(arr: &dyn Array, row: usize, dt: &DataType) -> Result<String> {
-    if arr.is_null(row) {
-        return Ok("NULL".to_string());
-    }
-
-    use arrow_array::{
-        BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-        UInt16Array, UInt32Array, UInt64Array,
-    };
-
-    macro_rules! num {
-        ($T:ty) => {
-            if let Some(a) = arr.as_any().downcast_ref::<$T>() {
-                return Ok(format!("{}", a.value(row)));
-            }
-        };
+    #[test]
+    fn insert_sql_uses_quoted_columns_and_placeholders_only() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("odd\"name", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            build_insert_sql("\"db\".\"table\"", &schema),
+            "INSERT INTO \"db\".\"table\" (\"id\", \"odd\"\"name\") VALUES (?, ?)"
+        );
     }
 
-    num!(Int8Array);
-    num!(Int16Array);
-    num!(Int32Array);
-    num!(Int64Array);
-    num!(UInt8Array);
-    num!(UInt16Array);
-    num!(UInt32Array);
-    num!(UInt64Array);
-    // Floats: use {:?} to always emit a decimal or exponent (avoids huge integer strings).
-    // NaN and ±Inf cannot be represented in SQL; they are mapped to NULL, which is a
-    // deliberate lossy conversion — callers should avoid ingesting non-finite values.
-    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        let v = a.value(row);
-        return if v.is_finite() {
-            Ok(format!("{v:?}"))
-        } else {
-            Ok("NULL".to_string())
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        let v = a.value(row);
-        return if v.is_finite() {
-            Ok(format!("{v:?}"))
-        } else {
-            Ok("NULL".to_string())
-        };
+    #[test]
+    fn ingest_binding_reuses_arrow_json_encoder_for_values_and_nulls() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("not SQL ' text"), None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let sql = build_insert_sql("\"target\"", &schema);
+        let json = arrow_batches_to_json_bindings(&[batch]).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"target\" (\"id\", \"name\") VALUES (?, ?)"
+        );
+        assert!(!sql.contains("not SQL"));
+        assert!(json.contains("\"value\":[\"not SQL ' text\",null]"));
     }
 
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(if a.value(row) { "TRUE" } else { "FALSE" }.to_string());
+    #[test]
+    fn binding_batches_are_chunked_to_at_most_five_hundred_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(0..1_201)) as ArrayRef],
+        )
+        .unwrap();
+
+        let chunks = encode_binding_chunks(&batch).unwrap();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.rows).collect::<Vec<_>>(),
+            vec![500, 500, 201]
+        );
+        assert!(chunks.iter().all(|chunk| chunk.rows <= INGEST_CHUNK_ROWS));
     }
 
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return Ok(sql_str(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(sql_str(a.value(row)));
+    #[test]
+    fn large_json_chunks_are_split_below_the_byte_ceiling() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let values = (0..10).map(|_| "x".repeat(100_000)).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(values)) as ArrayRef],
+        )
+        .unwrap();
+
+        let chunks = encode_binding_chunks(&batch).unwrap();
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.iter().map(|chunk| chunk.rows).sum::<usize>(), 10);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.json.len() <= INGEST_CHUNK_BYTES)
+        );
     }
 
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(sql_binary(a.value(row)));
+    #[test]
+    fn empty_schema_still_generates_a_parameterized_shape() {
+        assert_eq!(
+            build_insert_sql("\"target\"", &Schema::empty()),
+            "INSERT INTO \"target\" () VALUES ()"
+        );
     }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(sql_binary(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-        return Ok(sql_binary(a.value(row)));
-    }
-
-    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
-        let days = a.value(row) as i64;
-        return Ok(format!("'{}'::DATE", days_to_date(days)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Date64Array>() {
-        // Date64 stores milliseconds since epoch; divide to get days.
-        let days = a.value(row).div_euclid(86_400_000);
-        return Ok(format!("'{}'::DATE", days_to_date(days)));
-    }
-
-    // TIME
-    if let Some(a) = arr.as_any().downcast_ref::<Time64NanosecondArray>() {
-        return Ok(format!("'{}'::TIME(9)", ns_to_time(a.value(row))));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Time64MicrosecondArray>() {
-        return Ok(format!("'{}'::TIME(6)", us_to_time(a.value(row))));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Time32MillisecondArray>() {
-        return Ok(format!("'{}'::TIME(3)", ms_to_time(a.value(row) as i64)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Time32SecondArray>() {
-        return Ok(format!("'{}'::TIME(0)", s_to_time(a.value(row) as i64)));
-    }
-
-    // TIMESTAMP — use TO_TIMESTAMP_NTZ / TO_TIMESTAMP_LTZ with epoch + precision
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        let v = a.value(row);
-        return Ok(match dt {
-            DataType::Timestamp(_, Some(_)) => format!("TO_TIMESTAMP_LTZ({v}, 9)"),
-            _ => format!("TO_TIMESTAMP_NTZ({v}, 9)"),
-        });
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        let v = a.value(row);
-        return Ok(match dt {
-            DataType::Timestamp(_, Some(_)) => format!("TO_TIMESTAMP_LTZ({v}, 6)"),
-            _ => format!("TO_TIMESTAMP_NTZ({v}, 6)"),
-        });
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        let v = a.value(row);
-        return Ok(match dt {
-            DataType::Timestamp(_, Some(_)) => format!("TO_TIMESTAMP_LTZ({v}, 3)"),
-            _ => format!("TO_TIMESTAMP_NTZ({v}, 3)"),
-        });
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
-        let v = a.value(row);
-        return Ok(match dt {
-            DataType::Timestamp(_, Some(_)) => format!("TO_TIMESTAMP_LTZ({v}, 0)"),
-            _ => format!("TO_TIMESTAMP_NTZ({v}, 0)"),
-        });
-    }
-
-    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>()
-        && let DataType::Decimal128(_, scale) = dt
-    {
-        return Ok(decimal128_to_str(a.value(row), *scale));
-    }
-
-    Err(Error::with_message_and_status(
-        format!("unsupported ingest value type: {dt:?}"),
-        Status::NotImplemented,
-    ))
-}
-
-// ── value formatting helpers ──────────────────────────────────────────────────
-
-fn sql_str(s: &str) -> String {
-    // Double backslashes before doubling single quotes — see statement.rs sql_str_lit.
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
-}
-
-fn sql_binary(b: &[u8]) -> String {
-    let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("TO_BINARY('{hex}', 'HEX')")
-}
-
-/// Thin wrapper so ingest.rs shares the single implementation in statement.rs.
-fn days_to_date(days: i64) -> String {
-    crate::statement::days_since_epoch_to_date_str(days)
-}
-
-fn ns_to_time(ns: i64) -> String {
-    let h = ns / 3_600_000_000_000;
-    let r = ns % 3_600_000_000_000;
-    let m = r / 60_000_000_000;
-    let r = r % 60_000_000_000;
-    let s = r / 1_000_000_000;
-    let f = r % 1_000_000_000;
-    format!("{h:02}:{m:02}:{s:02}.{f:09}")
-}
-
-fn us_to_time(us: i64) -> String {
-    let h = us / 3_600_000_000;
-    let r = us % 3_600_000_000;
-    let m = r / 60_000_000;
-    let r = r % 60_000_000;
-    let s = r / 1_000_000;
-    let f = r % 1_000_000;
-    format!("{h:02}:{m:02}:{s:02}.{f:06}")
-}
-
-fn ms_to_time(ms: i64) -> String {
-    let h = ms / 3_600_000;
-    let r = ms % 3_600_000;
-    let m = r / 60_000;
-    let r = r % 60_000;
-    let s = r / 1_000;
-    let f = r % 1_000;
-    format!("{h:02}:{m:02}:{s:02}.{f:03}")
-}
-
-fn s_to_time(s: i64) -> String {
-    let h = s / 3600;
-    let r = s % 3600;
-    let m = r / 60;
-    let s = r % 60;
-    format!("{h:02}:{m:02}:{s:02}")
-}
-
-fn decimal128_to_str(raw: i128, scale: i8) -> String {
-    if scale <= 0 {
-        // Negative scale means multiply by 10^(-scale); just format as integer
-        // (Arrow guarantees the stored value is already the scaled integer).
-        return format!("{raw}");
-    }
-    let scale = scale as usize;
-    let neg = raw < 0;
-    let abs = raw.unsigned_abs();
-    let s = format!("{abs:0>width$}", width = scale + 1);
-    let int_part = &s[..s.len() - scale];
-    let frac_part = &s[s.len() - scale..];
-    format!("{}{int_part}.{frac_part}", if neg { "-" } else { "" })
 }

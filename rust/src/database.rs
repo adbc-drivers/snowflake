@@ -471,6 +471,20 @@ impl Database {
     }
 }
 
+fn order_post_connect_options(
+    mut options: Vec<(OptionConnection, OptionValue)>,
+) -> Vec<(OptionConnection, OptionValue)> {
+    // Stable sorting preserves caller order among duplicate options while making
+    // the database/schema dependency deterministic. Autocommit and any future
+    // standard options are still applied exactly once after both context names.
+    options.sort_by_key(|(key, _)| match key {
+        OptionConnection::CurrentCatalog => 0,
+        OptionConnection::CurrentSchema => 1,
+        _ => 2,
+    });
+    options
+}
+
 impl adbc_core::Database for Database {
     type ConnectionType = Connection;
 
@@ -484,40 +498,22 @@ impl adbc_core::Database for Database {
     ) -> Result<Self::ConnectionType> {
         let conn_handle = self.inner.sf.connection_new();
 
-        // Propagate all database-level settings to the connection
-        for (param, setting) in &self.sf_settings {
-            self.inner
-                .runtime
-                .block_on(self.inner.sf.connection_set_option(
-                    conn_handle,
-                    param.clone(),
-                    setting.clone(),
-                ))
-                .map_err(crate::error::api_error_to_adbc_error)?;
-        }
+        let setup = (|| -> Result<Vec<(OptionConnection, OptionValue)>> {
+            // Propagate all database-level settings to the connection.
+            for (param, setting) in &self.sf_settings {
+                self.inner
+                    .runtime
+                    .block_on(self.inner.sf.connection_set_option(
+                        conn_handle,
+                        param.clone(),
+                        setting.clone(),
+                    ))
+                    .map_err(crate::error::api_error_to_adbc_error)?;
+            }
 
-        let mut post_autocommit: Option<bool> = None;
-        let mut post_catalog: Option<String> = None;
-        let mut post_schema: Option<String> = None;
-
-        for (key, value) in opts {
-            match &key {
-                OptionConnection::AutoCommit => {
-                    if let OptionValue::String(s) = &value {
-                        post_autocommit = Some(s == "true" || s == "1");
-                    }
-                }
-                OptionConnection::CurrentCatalog => {
-                    if let OptionValue::String(s) = &value {
-                        post_catalog = Some(s.clone());
-                    }
-                }
-                OptionConnection::CurrentSchema => {
-                    if let OptionValue::String(s) = &value {
-                        post_schema = Some(s.clone());
-                    }
-                }
-                OptionConnection::Other(k) => {
+            let mut post_connect_options = Vec::new();
+            for (key, value) in opts {
+                if let OptionConnection::Other(k) = &key {
                     let sf_setting = match &value {
                         OptionValue::String(s) => Setting::String(s.clone()),
                         OptionValue::Int(i) => Setting::Int(*i),
@@ -538,57 +534,40 @@ impl adbc_core::Database for Database {
                             sf_setting,
                         ))
                         .map_err(crate::error::api_error_to_adbc_error)?;
+                } else {
+                    post_connect_options.push((key, value));
                 }
-                _ => {}
             }
-        }
 
-        // If neither host nor server_url was provided, derive host from account.
-        if !self.sf_settings.contains_key(param_names::HOST.as_str())
-            && !self
-                .sf_settings
-                .contains_key(param_names::SERVER_URL.as_str())
-            && let Some(Setting::String(account)) =
-                self.sf_settings.get(param_names::ACCOUNT.as_str())
-        {
-            let host = format!("{}.snowflakecomputing.com", account);
             self.inner
                 .runtime
-                .block_on(self.inner.sf.connection_set_option(
-                    conn_handle,
-                    param_names::HOST.into(),
-                    Setting::String(host),
-                ))
+                .block_on(
+                    self.inner
+                        .sf
+                        .connection_init(None, conn_handle, self.db_handle),
+                )
                 .map_err(crate::error::api_error_to_adbc_error)?;
-        }
+            Ok(order_post_connect_options(post_connect_options))
+        })();
 
-        // Authenticate
-        self.inner
-            .runtime
-            .block_on(
-                self.inner
-                    .sf
-                    .connection_init(None, conn_handle, self.db_handle),
-            )
-            .map_err(crate::error::api_error_to_adbc_error)?;
+        let post_connect_options = match setup {
+            Ok(options) => options,
+            Err(error) => {
+                let _ = self.inner.sf.connection_release(conn_handle);
+                return Err(error);
+            }
+        };
 
         let mut conn = Connection {
             inner: self.inner.clone(),
             conn_handle,
             autocommit: true,
-            active_transaction: false,
             use_high_precision: self.use_high_precision,
             timestamp_precision: self.timestamp_precision,
         };
-
-        if let Some(ac) = post_autocommit {
-            conn.set_autocommit(ac)?;
-        }
-        if let Some(cat) = post_catalog {
-            conn.execute_simple(&format!(r#"USE DATABASE "{}""#, cat.replace('"', "\"\"")))?;
-        }
-        if let Some(sch) = post_schema {
-            conn.execute_simple(&format!(r#"USE SCHEMA "{}""#, sch.replace('"', "\"\"")))?;
+        // From this point Connection::drop owns cleanup on every error path.
+        for (key, value) in post_connect_options {
+            conn.set_option(key, value)?;
         }
 
         Ok(conn)
@@ -607,6 +586,46 @@ mod tests {
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
         driver.new_database().unwrap()
+    }
+
+    #[test]
+    fn post_connect_options_always_apply_catalog_before_schema() {
+        let options = vec![
+            (
+                OptionConnection::CurrentSchema,
+                OptionValue::String("schema_one".into()),
+            ),
+            (
+                OptionConnection::AutoCommit,
+                OptionValue::String("false".into()),
+            ),
+            (
+                OptionConnection::CurrentCatalog,
+                OptionValue::String("database".into()),
+            ),
+            (
+                OptionConnection::CurrentSchema,
+                OptionValue::String("schema_two".into()),
+            ),
+        ];
+        let ordered = order_post_connect_options(options);
+        let keys = ordered
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                OptionConnection::CurrentCatalog,
+                OptionConnection::CurrentSchema,
+                OptionConnection::CurrentSchema,
+                OptionConnection::AutoCommit,
+            ]
+        );
+        assert!(matches!(
+            &ordered[3].1,
+            OptionValue::String(value) if value == "false"
+        ));
     }
 
     #[test]

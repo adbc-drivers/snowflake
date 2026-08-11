@@ -33,7 +33,7 @@ use arrow_array::{
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema};
-use sf_core::apis::database_driver_v1::Handle;
+use sf_core::apis::database_driver_v1::{ConnectionInfo, Handle};
 
 use crate::driver::{Inner, TimestampPrecision};
 use crate::statement::Statement;
@@ -42,7 +42,6 @@ pub struct Connection {
     pub(crate) inner: Arc<Inner>,
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
-    pub(crate) active_transaction: bool,
     pub(crate) use_high_precision: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
 }
@@ -56,6 +55,26 @@ impl Drop for Connection {
 pub(crate) struct SingleBatchReader {
     batch: Option<RecordBatch>,
     schema: std::sync::Arc<Schema>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionIdentifierKind {
+    Database,
+    Schema,
+}
+
+/// sf_core f9175f07 trims identifiers before quoting them. Keep the standard
+/// core path unless trimming would change the identifier, in which case an
+/// exactly quoted USE statement is required to preserve Snowflake semantics.
+fn exact_identifier_sql(kind: SessionIdentifierKind, name: &str) -> Option<String> {
+    if name == name.trim() {
+        return None;
+    }
+    let keyword = match kind {
+        SessionIdentifierKind::Database => "DATABASE",
+        SessionIdentifierKind::Schema => "SCHEMA",
+    };
+    Some(format!("USE {keyword} \"{}\"", name.replace('"', "\"\"")))
 }
 
 impl SingleBatchReader {
@@ -82,54 +101,67 @@ impl RecordBatchReader for SingleBatchReader {
 }
 
 impl Connection {
-    pub(crate) fn execute_simple(&self, sql: &str) -> Result<()> {
-        let stmt_handle = self
+    fn context_names(&self) -> Result<(Option<String>, Option<String>)> {
+        // Deliberately extract only cached context names. ConnectionInfo also carries
+        // sensitive tokens, which must never be surfaced through ADBC options.
+        let ConnectionInfo {
+            database, schema, ..
+        } = self
             .inner
-            .sf
-            .statement_new(self.conn_handle)
+            .runtime
+            .block_on(self.inner.sf.connection_get_info(self.conn_handle))
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.execute_query(stmt_handle, sql.to_string(), None);
-        let _ = self.inner.sf.statement_release(stmt_handle);
-        result.map(|_| ())
-    }
-
-    fn query_scalar(&self, sql: &str) -> Result<String> {
-        let stmt_handle = self
-            .inner
-            .sf
-            .statement_new(self.conn_handle)
-            .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.execute_query(stmt_handle, sql.to_string(), None);
-        let _ = self.inner.sf.statement_release(stmt_handle);
-        let mut reader = result?.reader;
-
-        use arrow_array::cast::AsArray;
-        let batch = reader
-            .next()
-            .ok_or_else(|| {
-                Error::with_message_and_status("empty result from scalar query", Status::IO)
-            })?
-            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
-        Ok(batch.column(0).as_string::<i32>().value(0).to_string())
+        Ok((database, schema))
     }
 
     pub(crate) fn set_autocommit(&mut self, enabled: bool) -> Result<()> {
-        if enabled {
-            if self.active_transaction {
-                self.execute_simple("COMMIT")?;
-                self.active_transaction = false;
-            }
-            self.execute_simple("ALTER SESSION SET AUTOCOMMIT = true")?;
-            self.autocommit = true;
-        } else {
-            self.execute_simple("ALTER SESSION SET AUTOCOMMIT = false")?;
-            if !self.active_transaction {
-                self.execute_simple("BEGIN")?;
-                self.active_transaction = true;
-            }
-            self.autocommit = false;
-        }
+        self.inner
+            .runtime
+            .block_on(
+                self.inner
+                    .sf
+                    .connection_set_autocommit(self.conn_handle, enabled),
+            )
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        self.autocommit = enabled;
         Ok(())
+    }
+
+    fn set_current_identifier(&self, kind: SessionIdentifierKind, name: &str) -> Result<()> {
+        if let Some(sql) = exact_identifier_sql(kind, name) {
+            return self.execute_session_sql(sql);
+        }
+        let result = match kind {
+            SessionIdentifierKind::Database => self.inner.runtime.block_on(
+                self.inner
+                    .sf
+                    .connection_use_database(self.conn_handle, name),
+            ),
+            SessionIdentifierKind::Schema => self
+                .inner
+                .runtime
+                .block_on(self.inner.sf.connection_use_schema(self.conn_handle, name)),
+        };
+        result.map_err(crate::error::api_error_to_adbc_error)
+    }
+
+    fn execute_session_sql(&self, sql: String) -> Result<()> {
+        let statement = self
+            .inner
+            .sf
+            .statement_new(self.conn_handle)
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self.inner.execute_query(statement, sql, None);
+        let release = self.inner.sf.statement_release(statement);
+        match result {
+            Ok(_) => release
+                .map_err(crate::error::api_error_to_adbc_error)
+                .map(|_| ()),
+            Err(error) => {
+                let _ = release;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -152,7 +184,7 @@ impl Optionable for Connection {
             }
             OptionConnection::CurrentCatalog => {
                 if let OptionValue::String(s) = &value {
-                    self.execute_simple(&format!(r#"USE DATABASE "{}""#, s.replace('"', "\"\"")))
+                    self.set_current_identifier(SessionIdentifierKind::Database, s)
                 } else {
                     Err(Error::with_message_and_status(
                         "current_catalog value must be a string",
@@ -162,7 +194,7 @@ impl Optionable for Connection {
             }
             OptionConnection::CurrentSchema => {
                 if let OptionValue::String(s) = &value {
-                    self.execute_simple(&format!(r#"USE SCHEMA "{}""#, s.replace('"', "\"\"")))
+                    self.set_current_identifier(SessionIdentifierKind::Schema, s)
                 } else {
                     Err(Error::with_message_and_status(
                         "current_schema value must be a string",
@@ -182,8 +214,12 @@ impl Optionable for Connection {
             OptionConnection::AutoCommit => {
                 Ok(if self.autocommit { "true" } else { "false" }.to_string())
             }
-            OptionConnection::CurrentCatalog => self.query_scalar("SELECT CURRENT_DATABASE()"),
-            OptionConnection::CurrentSchema => self.query_scalar("SELECT CURRENT_SCHEMA()"),
+            OptionConnection::CurrentCatalog => self.context_names()?.0.ok_or_else(|| {
+                Error::with_message_and_status("current catalog is not set", Status::NotFound)
+            }),
+            OptionConnection::CurrentSchema => self.context_names()?.1.ok_or_else(|| {
+                Error::with_message_and_status("current schema is not set", Status::NotFound)
+            }),
             _ => Err(Error::with_message_and_status(
                 format!("option not found: {}", key.as_ref()),
                 Status::NotFound,
@@ -253,7 +289,15 @@ impl adbc_core::Connection for Connection {
             .as_ref()
             .is_none_or(|s| s.contains(&InfoCode::VendorVersion));
         let vendor_version = if need_vendor_version {
-            self.query_scalar("SELECT CURRENT_VERSION()")?
+            self.inner
+                .runtime
+                .block_on(
+                    self.inner
+                        .sf
+                        .connection_get_server_version(self.conn_handle),
+                )
+                .map_err(crate::error::api_error_to_adbc_error)?
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -541,11 +585,10 @@ impl adbc_core::Connection for Connection {
                 Status::InvalidState,
             ));
         }
-        self.execute_simple("COMMIT")?;
-        self.active_transaction = false;
-        self.execute_simple("BEGIN")?;
-        self.active_transaction = true;
-        Ok(())
+        self.inner
+            .runtime
+            .block_on(self.inner.sf.connection_commit(self.conn_handle))
+            .map_err(crate::error::api_error_to_adbc_error)
     }
 
     fn rollback(&mut self) -> Result<()> {
@@ -555,11 +598,10 @@ impl adbc_core::Connection for Connection {
                 Status::InvalidState,
             ));
         }
-        self.execute_simple("ROLLBACK")?;
-        self.active_transaction = false;
-        self.execute_simple("BEGIN")?;
-        self.active_transaction = true;
-        Ok(())
+        self.inner
+            .runtime
+            .block_on(self.inner.sf.connection_rollback(self.conn_handle))
+            .map_err(crate::error::api_error_to_adbc_error)
     }
 
     #[allow(refining_impl_trait)]
@@ -662,13 +704,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_identifier_fallback_is_narrow_and_quotes_without_trimming() {
+        assert_eq!(
+            exact_identifier_sql(SessionIdentifierKind::Database, " db\" name "),
+            Some("USE DATABASE \" db\"\" name \"".into())
+        );
+        assert_eq!(
+            exact_identifier_sql(SessionIdentifierKind::Schema, " schema "),
+            Some("USE SCHEMA \" schema \"".into())
+        );
+        assert_eq!(
+            exact_identifier_sql(SessionIdentifierKind::Database, "normal_name"),
+            None
+        );
+    }
+
+    #[test]
     fn get_option_string_returns_not_found_for_unknown_key() {
         let driver = crate::driver::Driver::default();
         let conn = Connection {
             inner: driver.inner.clone(),
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             autocommit: true,
-            active_transaction: false,
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
         };
@@ -781,7 +838,6 @@ mod tests {
             inner: driver.inner.clone(),
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             autocommit: true,
-            active_transaction: false,
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
         };

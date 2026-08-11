@@ -12,780 +12,837 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// src/get_objects.rs
-
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use adbc_core::{
-    error::{Error, Result, Status},
+    error::{Error, Result as AdbcResult, Status},
     options::ObjectDepth,
     schemas,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, ListArray, RecordBatch,
-    RecordBatchReader, StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, LargeListArray, ListArray,
+    RecordBatch, RecordBatchReader, StringArray, StructArray, new_empty_array, new_null_array,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Field, Fields};
+use arrow_schema::{ArrowError, DataType, Field, Fields};
+use sf_core::apis::database_driver_v1::{
+    DEPTH_CATALOGS, DEPTH_COLUMNS, DEPTH_DB_SCHEMAS, DEPTH_TABLES, GetObjectsRequest,
+};
 
 use crate::connection::{Connection, SingleBatchReader};
 
-// ── SQL helpers ───────────────────────────────────────────────────────────────
-
-fn sql_esc(s: &str) -> String {
-    s.replace('\'', "''")
+#[derive(Default)]
+struct ObjectTree {
+    catalogs: BTreeMap<String, CatalogEntry>,
 }
 
-/// Converts an optional filter into a SQL ILIKE pattern. None → match-all.
-fn ilike(p: Option<&str>) -> String {
-    match p {
-        None | Some("") | Some("%") | Some(".*") => "%".to_string(),
-        Some(s) => sql_esc(s),
-    }
+#[derive(Default)]
+struct CatalogEntry {
+    schemas: BTreeMap<String, SchemaEntry>,
 }
 
-/// Returns an `information_schema.` prefix, optionally qualified by a specific
-/// catalog when the filter is an exact name (not a wildcard).
-fn info_prefix(catalog_filter: Option<&str>) -> String {
-    match catalog_filter {
-        Some(c) if !c.is_empty() && !c.contains('%') && !c.contains('_') => {
-            format!("\"{}\".information_schema.", c.replace('"', "\"\""))
-        }
-        _ => "information_schema.".to_string(),
-    }
+#[derive(Default)]
+struct SchemaEntry {
+    tables: BTreeMap<String, TableEntry>,
 }
 
-/// Builds a table-type WHERE fragment, mapping ADBC 'TABLE' → Snowflake 'BASE TABLE'.
-fn type_clause(filter: &Option<Vec<&str>>) -> String {
-    let Some(types) = filter else {
-        return String::new();
-    };
-    if types.is_empty() {
-        return String::new();
-    }
-    let quoted: Vec<String> = types
-        .iter()
-        .map(|t| {
-            let up = t.to_uppercase();
-            let sf = if up == "TABLE" { "BASE TABLE" } else { t };
-            format!("'{}'", sql_esc(sf))
-        })
-        .collect();
-    format!(" AND table_type IN ({})", quoted.join(", "))
+#[derive(Default)]
+struct TableEntry {
+    table_type: String,
+    columns: Vec<ColumnEntry>,
 }
 
-// ── query execution ───────────────────────────────────────────────────────────
-
-/// Runs a SQL query and returns all rows as `Vec<Vec<Option<String>>>`.
-fn run_query(conn: &Connection, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-    let stmt = conn
-        .inner
-        .sf
-        .statement_new(conn.conn_handle)
-        .map_err(crate::error::api_error_to_adbc_error)?;
-
-    let result = conn.inner.execute_query(stmt, sql.to_string(), None);
-    let _ = conn.inner.sf.statement_release(stmt);
-    let reader = result?.reader;
-
-    let mut rows = Vec::new();
-    for batch_res in reader {
-        let batch =
-            batch_res.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
-        let ncols = batch.num_columns();
-        for row_idx in 0..batch.num_rows() {
-            let row = (0..ncols)
-                .map(|c| cell_to_string(batch.column(c).as_ref(), row_idx))
-                .collect();
-            rows.push(row);
-        }
-    }
-    Ok(rows)
-}
-
-fn cell_to_string(arr: &dyn Array, i: usize) -> Option<String> {
-    if arr.is_null(i) {
-        return None;
-    }
-    if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
-        return Some(s.value(i).to_string());
-    }
-    if let Some(s) = arr.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
-        return Some(s.value(i).to_string());
-    }
-    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
-        return Some(n.value(i).to_string());
-    }
-    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int32Array>() {
-        return Some(n.value(i).to_string());
-    }
-    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Int16Array>() {
-        return Some(n.value(i).to_string());
-    }
-    // Some NUMBER(p,0) columns (like ordinal_position) arrive as Float64 in the
-    // sf_core Arrow stream for metadata queries; truncate to integer string.
-    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Float64Array>() {
-        let v = n.value(i);
-        return if v.is_finite() {
-            Some((v as i64).to_string())
-        } else {
-            None
-        };
-    }
-    if let Some(n) = arr.as_any().downcast_ref::<arrow_array::Float32Array>() {
-        let v = n.value(i);
-        return if v.is_finite() {
-            Some((v as i64).to_string())
-        } else {
-            None
-        };
-    }
-    // Snowflake NUMBER(p,0) columns (like ordinal_position) arrive as Decimal128
-    // when sf_core applies high-precision type mapping.  Extract the integer part
-    // by dividing by 10^scale (scale is typically 0 for integer metadata columns).
-    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>() {
-        let scale = match a.data_type() {
-            DataType::Decimal128(_, s) => *s,
-            _ => 0i8,
-        };
-        let raw = a.value(i);
-        let value = if scale > 0 && scale <= 38 {
-            raw / 10i128.pow(scale as u32)
-        } else {
-            // scale == 0: no adjustment; scale > 38: i128 exponent would overflow,
-            // return the raw representation rather than panicking.
-            raw
-        };
-        return Some(value.to_string());
-    }
-    None
-}
-
-// ── data holders ─────────────────────────────────────────────────────────────
-
-struct ColEntry {
+struct ColumnEntry {
     name: String,
     ordinal_position: i32,
     remarks: Option<String>,
     xdbc_type_name: Option<String>,
     xdbc_column_size: Option<i32>,
-    xdbc_char_octet_length: Option<i32>,
     xdbc_decimal_digits: Option<i16>,
     xdbc_num_prec_radix: Option<i16>,
     xdbc_nullable: Option<i16>,
+    column_default: Option<String>,
+    xdbc_char_octet_length: Option<i32>,
     xdbc_is_nullable: Option<String>,
-    xdbc_datetime_sub: Option<i16>,
 }
-
-struct TableEntry {
-    name: String,
-    table_type: String,
-    columns: Vec<ColEntry>,
-}
-
-struct SchemaEntry {
-    name: String,
-    tables: Vec<TableEntry>,
-}
-
-struct CatalogEntry {
-    name: String,
-    schemas: Vec<SchemaEntry>,
-}
-
-// ── data collection ───────────────────────────────────────────────────────────
 
 pub(crate) fn execute_get_objects(
-    conn: &Connection,
+    connection: &Connection,
     depth: &ObjectDepth,
-    catalog_filter: Option<&str>,
-    db_schema_filter: Option<&str>,
-    table_name_filter: Option<&str>,
-    table_type_filter: Option<Vec<&str>>,
-    column_name_filter: Option<&str>,
-) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-    let entries = collect(
-        conn,
+    catalog: Option<&str>,
+    db_schema: Option<&str>,
+    table_name: Option<&str>,
+    table_type: Option<Vec<&str>>,
+    column_name: Option<&str>,
+) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+    let table_types = table_type
+        .unwrap_or_default()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut objects = ObjectTree::default();
+
+    let catalogs = fetch_core_objects(connection, DEPTH_CATALOGS, catalog, None, None, &[], None)?;
+    merge_catalogs(&mut objects, catalogs);
+
+    if !matches!(depth, ObjectDepth::Catalogs) {
+        let db_schemas = fetch_core_objects(
+            connection,
+            DEPTH_DB_SCHEMAS,
+            catalog,
+            db_schema,
+            None,
+            &[],
+            None,
+        )?;
+        merge_schemas(&mut objects, db_schemas);
+    }
+
+    if matches!(
         depth,
-        catalog_filter,
-        db_schema_filter,
-        table_name_filter,
-        table_type_filter,
-        column_name_filter,
-    )?;
-    let batch = build_batch(&entries, depth)?;
+        ObjectDepth::Tables | ObjectDepth::Columns | ObjectDepth::All
+    ) {
+        // DEPTH_TABLES is the authoritative source for table identity and type.
+        // In sf_core f9175f07 DEPTH_COLUMNS neither applies table_type nor fills
+        // table_type, so columns are only merged into this filtered table set.
+        let tables = fetch_core_objects(
+            connection,
+            DEPTH_TABLES,
+            catalog,
+            db_schema,
+            table_name,
+            &table_types,
+            None,
+        )?;
+        merge_tables(&mut objects, tables);
+    }
+
+    if matches!(depth, ObjectDepth::Columns | ObjectDepth::All) {
+        let columns = fetch_core_objects(
+            connection,
+            DEPTH_COLUMNS,
+            catalog,
+            db_schema,
+            table_name,
+            &[],
+            column_name,
+        )?;
+        merge_columns(&mut objects, columns);
+    }
+
+    let batch = build_batch(&objects, depth).map_err(arrow_to_adbc_error)?;
     Ok(Box::new(SingleBatchReader::new(batch)))
 }
 
-fn collect(
-    conn: &Connection,
-    depth: &ObjectDepth,
-    catalog_filter: Option<&str>,
-    db_schema_filter: Option<&str>,
-    table_name_filter: Option<&str>,
-    table_type_filter: Option<Vec<&str>>,
-    column_name_filter: Option<&str>,
-) -> Result<Vec<CatalogEntry>> {
-    let cat_pat = ilike(catalog_filter);
-    let sch_pat = ilike(db_schema_filter);
-    let tbl_pat = ilike(table_name_filter);
-    let col_pat = ilike(column_name_filter);
-
-    // 1. Catalogs — always from information_schema.databases (account-wide)
-    let cat_rows = run_query(
-        conn,
-        &format!(
-            "SELECT database_name FROM information_schema.databases \
-             WHERE database_name ILIKE '{}' ORDER BY database_name",
-            cat_pat
-        ),
-    )?;
-    let catalog_names: Vec<String> = cat_rows
-        .into_iter()
-        .filter_map(|r| r.into_iter().next().flatten())
-        .collect();
-
-    if catalog_names.is_empty() || matches!(depth, ObjectDepth::Catalogs) {
-        return Ok(catalog_names
-            .into_iter()
-            .map(|name| CatalogEntry {
-                name,
-                schemas: vec![],
-            })
-            .collect());
+#[allow(clippy::too_many_arguments)]
+fn fetch_core_objects(
+    connection: &Connection,
+    depth: i32,
+    catalog: Option<&str>,
+    db_schema: Option<&str>,
+    table_name: Option<&str>,
+    table_type: &[String],
+    column_name: Option<&str>,
+) -> AdbcResult<ObjectTree> {
+    let request = GetObjectsRequest {
+        conn_handle: connection.conn_handle,
+        depth,
+        catalog: catalog.map(str::to_owned),
+        db_schema: db_schema.map(str::to_owned),
+        table_name: table_name.map(str::to_owned),
+        table_type: table_type.to_vec(),
+        column_name: column_name.map(str::to_owned),
+    };
+    let result = connection
+        .inner
+        .runtime
+        .block_on(connection.inner.sf.connection_get_objects(request))
+        .map_err(crate::error::api_error_to_adbc_error)?;
+    let mut reader = connection.inner.acquire_result(result)?.reader;
+    let mut objects = ObjectTree::default();
+    for batch in &mut reader {
+        let batch = batch.map_err(arrow_to_adbc_error)?;
+        merge_all(
+            &mut objects,
+            parse_core_batch(&batch).map_err(arrow_to_adbc_error)?,
+        );
     }
+    Ok(objects)
+}
 
-    // 2. Schemas — scoped to the catalog(s) in view
-    // When catalog_filter is a specific database we qualify the prefix; otherwise
-    // information_schema resolves to the current database.
-    let prefix = info_prefix(catalog_filter);
-    let sch_rows = run_query(
-        conn,
-        &format!(
-            "SELECT catalog_name, schema_name FROM {}schemata \
-             WHERE catalog_name ILIKE '{}' AND schema_name ILIKE '{}' \
-             ORDER BY catalog_name, schema_name",
-            prefix, cat_pat, sch_pat
-        ),
-    )?;
+fn merge_catalogs(target: &mut ObjectTree, source: ObjectTree) {
+    for name in source.catalogs.into_keys() {
+        target.catalogs.entry(name).or_default();
+    }
+}
 
-    // Group schemas by catalog
-    let mut schemas_by_cat: std::collections::BTreeMap<String, Vec<String>> =
-        catalog_names.iter().map(|n| (n.clone(), vec![])).collect();
-    for row in &sch_rows {
-        if row.len() < 2 {
+fn merge_schemas(target: &mut ObjectTree, source: ObjectTree) {
+    for (catalog_name, catalog) in source.catalogs {
+        let target_catalog = target.catalogs.entry(catalog_name).or_default();
+        for schema_name in catalog.schemas.into_keys() {
+            target_catalog.schemas.entry(schema_name).or_default();
+        }
+    }
+}
+
+fn merge_tables(target: &mut ObjectTree, source: ObjectTree) {
+    for (catalog_name, catalog) in source.catalogs {
+        let target_catalog = target.catalogs.entry(catalog_name).or_default();
+        for (schema_name, schema) in catalog.schemas {
+            let target_schema = target_catalog.schemas.entry(schema_name).or_default();
+            for (table_name, table) in schema.tables {
+                target_schema.tables.insert(
+                    table_name,
+                    TableEntry {
+                        table_type: table.table_type,
+                        columns: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn merge_columns(target: &mut ObjectTree, source: ObjectTree) {
+    for (catalog_name, catalog) in source.catalogs {
+        let Some(target_catalog) = target.catalogs.get_mut(&catalog_name) else {
             continue;
-        }
-        if let (Some(cat), Some(sch)) = (&row[0], &row[1]) {
-            schemas_by_cat
-                .entry(cat.clone())
-                .or_default()
-                .push(sch.clone());
-        }
-    }
-
-    if matches!(depth, ObjectDepth::Schemas) {
-        return Ok(catalog_names
-            .into_iter()
-            .map(|cat| {
-                let schemas = schemas_by_cat
-                    .remove(&cat)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|sch| SchemaEntry {
-                        name: sch,
-                        tables: vec![],
-                    })
-                    .collect();
-                CatalogEntry { name: cat, schemas }
-            })
-            .collect());
-    }
-
-    // 3. Tables
-    let tc = type_clause(&table_type_filter);
-    let tbl_rows = run_query(
-        conn,
-        &format!(
-            "SELECT table_catalog, table_schema, table_name, \
-             CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END \
-             FROM {}tables \
-             WHERE table_catalog ILIKE '{}' AND table_schema ILIKE '{}' \
-             AND table_name ILIKE '{}'{} \
-             ORDER BY table_catalog, table_schema, table_name",
-            prefix, cat_pat, sch_pat, tbl_pat, tc
-        ),
-    )?;
-
-    // Group tables by (catalog, schema)
-    let mut tables_by_key: std::collections::BTreeMap<(String, String), Vec<TableEntry>> =
-        std::collections::BTreeMap::new();
-    for row in &tbl_rows {
-        if row.len() < 4 {
-            continue;
-        }
-        if let (Some(cat), Some(sch), Some(tbl), Some(tt)) = (&row[0], &row[1], &row[2], &row[3]) {
-            tables_by_key
-                .entry((cat.clone(), sch.clone()))
-                .or_default()
-                .push(TableEntry {
-                    name: tbl.clone(),
-                    table_type: tt.clone(),
-                    columns: vec![],
-                });
+        };
+        for (schema_name, schema) in catalog.schemas {
+            let Some(target_schema) = target_catalog.schemas.get_mut(&schema_name) else {
+                continue;
+            };
+            for (table_name, table) in schema.tables {
+                if let Some(target_table) = target_schema.tables.get_mut(&table_name) {
+                    target_table.columns = table.columns;
+                }
+            }
         }
     }
+}
 
-    if matches!(depth, ObjectDepth::Tables) {
-        return Ok(assemble(catalog_names, schemas_by_cat, tables_by_key));
-    }
-
-    // 4. Columns (All / Columns depth)
-    let col_rows = run_query(
-        conn,
-        &format!(
-            "SELECT table_catalog, table_schema, table_name, column_name, \
-             ordinal_position::INTEGER, comment, data_type, is_nullable, \
-             COALESCE(character_maximum_length, numeric_precision)::INTEGER, \
-             character_octet_length::INTEGER, numeric_scale::INTEGER, \
-             numeric_precision_radix::INTEGER, datetime_precision::INTEGER \
-             FROM {}columns \
-             WHERE table_catalog ILIKE '{}' AND table_schema ILIKE '{}' \
-             AND table_name ILIKE '{}' AND column_name ILIKE '{}' \
-             ORDER BY table_catalog, table_schema, table_name, ordinal_position",
-            prefix, cat_pat, sch_pat, tbl_pat, col_pat
-        ),
-    )?;
-
-    // Track 1-based column position per (catalog, schema, table).
-    // The query is already sorted by ordinal_position so the rows arrive in
-    // column order; we count them ourselves rather than trusting the database
-    // value, which varies across Snowflake environments.
-    let mut col_counter: std::collections::HashMap<(String, String, String), i32> =
-        Default::default();
-
-    for row in &col_rows {
-        if row.len() < 13 {
-            continue;
+fn merge_all(target: &mut ObjectTree, source: ObjectTree) {
+    for (catalog_name, catalog) in source.catalogs {
+        let target_catalog = target.catalogs.entry(catalog_name).or_default();
+        for (schema_name, schema) in catalog.schemas {
+            let target_schema = target_catalog.schemas.entry(schema_name).or_default();
+            for (table_name, table) in schema.tables {
+                target_schema.tables.insert(table_name, table);
+            }
         }
-        let (Some(cat), Some(sch), Some(tbl), Some(col_name)) =
-            (&row[0], &row[1], &row[2], &row[3])
+    }
+}
+
+fn parse_core_batch(batch: &RecordBatch) -> Result<ObjectTree, ArrowError> {
+    if batch.num_columns() != 2 {
+        return Err(schema_error(format!(
+            "sf_core get_objects returned {} top-level columns; expected 2",
+            batch.num_columns()
+        )));
+    }
+    let catalog_names = expect_array::<StringArray>(batch.column(0), "catalog_name")?;
+    let schema_lists = expect_array::<LargeListArray>(batch.column(1), "catalog_db_schemas")?;
+    let schema_values = expect_array::<StructArray>(schema_lists.values(), "schema list values")?;
+    if schema_values.num_columns() != 2 {
+        return Err(schema_error("sf_core schema struct must have 2 fields"));
+    }
+    let schema_names = expect_array::<StringArray>(schema_values.column(0), "db_schema_name")?;
+    let table_lists = expect_array::<LargeListArray>(schema_values.column(1), "db_schema_tables")?;
+    let table_values = expect_array::<StructArray>(table_lists.values(), "table list values")?;
+    if table_values.num_columns() != 4 {
+        return Err(schema_error("sf_core table struct must have 4 fields"));
+    }
+    let table_names = expect_array::<StringArray>(table_values.column(0), "table_name")?;
+    let table_types = expect_array::<StringArray>(table_values.column(1), "table_type")?;
+    let column_lists = expect_array::<LargeListArray>(table_values.column(2), "table_columns")?;
+    let column_values = expect_array::<StructArray>(column_lists.values(), "column list values")?;
+    let column_arrays = CoreColumnArrays::try_new(column_values)?;
+
+    let mut objects = ObjectTree::default();
+    for catalog_index in 0..batch.num_rows() {
+        let catalog_name = required_string(catalog_names, catalog_index, "catalog_name")?;
+        let catalog = objects.catalogs.entry(catalog_name.to_owned()).or_default();
+        let Some(schema_range) = list_range(schema_lists, catalog_index, "catalog_db_schemas")?
         else {
             continue;
         };
-        let key = (cat.clone(), sch.clone());
-        if let Some(tables) = tables_by_key.get_mut(&key)
-            && let Some(table) = tables.iter_mut().find(|t| &t.name == tbl)
-        {
-            let nullable_str = row[7].clone();
-            let nullable_int = nullable_str.as_deref().map(|s| {
-                if s.eq_ignore_ascii_case("YES") {
-                    1i16
-                } else {
-                    0
-                }
-            });
-            let ordinal = {
-                let c = col_counter
-                    .entry((cat.clone(), sch.clone(), tbl.clone()))
-                    .or_insert(0);
-                *c += 1;
-                *c
+        for schema_index in schema_range {
+            let schema_name = required_string(schema_names, schema_index, "db_schema_name")?;
+            let schema = catalog.schemas.entry(schema_name.to_owned()).or_default();
+            let Some(table_range) = list_range(table_lists, schema_index, "db_schema_tables")?
+            else {
+                continue;
             };
-            table.columns.push(ColEntry {
-                name: col_name.clone(),
-                ordinal_position: ordinal,
-                remarks: row[5].clone(),
-                xdbc_type_name: row[6].clone(),
-                xdbc_column_size: row[8].as_deref().and_then(|s| s.parse().ok()),
-                xdbc_char_octet_length: row[9].as_deref().and_then(|s| s.parse().ok()),
-                xdbc_decimal_digits: row[10].as_deref().and_then(|s| s.parse().ok()),
-                xdbc_num_prec_radix: row[11].as_deref().and_then(|s| s.parse().ok()),
-                xdbc_nullable: nullable_int,
-                xdbc_is_nullable: nullable_str,
-                xdbc_datetime_sub: row[12].as_deref().and_then(|s| s.parse().ok()),
-            });
+            for table_index in table_range {
+                let table_name = required_string(table_names, table_index, "table_name")?;
+                let table_type = if table_types.is_null(table_index) {
+                    String::new()
+                } else {
+                    table_types.value(table_index).to_owned()
+                };
+                let mut table = TableEntry {
+                    table_type,
+                    columns: Vec::new(),
+                };
+                if let Some(column_range) = list_range(column_lists, table_index, "table_columns")?
+                {
+                    table.columns.reserve(column_range.len());
+                    for column_index in column_range {
+                        table.columns.push(column_arrays.column(column_index)?);
+                    }
+                }
+                schema.tables.insert(table_name.to_owned(), table);
+            }
         }
     }
-
-    Ok(assemble(catalog_names, schemas_by_cat, tables_by_key))
+    Ok(objects)
 }
 
-fn assemble(
-    catalog_names: Vec<String>,
-    mut schemas_by_cat: std::collections::BTreeMap<String, Vec<String>>,
-    mut tables_by_key: std::collections::BTreeMap<(String, String), Vec<TableEntry>>,
-) -> Vec<CatalogEntry> {
-    catalog_names
-        .into_iter()
-        .map(|cat| {
-            let schema_names = schemas_by_cat.remove(&cat).unwrap_or_default();
-            let schemas = schema_names
-                .into_iter()
-                .map(|sch| {
-                    let tables = tables_by_key
-                        .remove(&(cat.clone(), sch.clone()))
-                        .unwrap_or_default();
-                    SchemaEntry { name: sch, tables }
-                })
-                .collect();
-            CatalogEntry { name: cat, schemas }
+struct CoreColumnArrays<'a> {
+    names: &'a StringArray,
+    ordinals: &'a Int32Array,
+    logical_types: &'a StringArray,
+    precisions: &'a Int32Array,
+    scales: &'a Int32Array,
+    char_lengths: &'a Int64Array,
+    byte_lengths: &'a Int64Array,
+    nullables: &'a BooleanArray,
+    defaults: &'a StringArray,
+    remarks: &'a StringArray,
+}
+
+impl<'a> CoreColumnArrays<'a> {
+    fn try_new(values: &'a StructArray) -> Result<Self, ArrowError> {
+        if values.num_columns() != 10 {
+            return Err(schema_error("sf_core column struct must have 10 fields"));
+        }
+        Ok(Self {
+            names: expect_array::<StringArray>(values.column(0), "column_name")?,
+            ordinals: expect_array::<Int32Array>(values.column(1), "ordinal_position")?,
+            logical_types: expect_array::<StringArray>(values.column(2), "logical_type")?,
+            precisions: expect_array::<Int32Array>(values.column(3), "precision")?,
+            scales: expect_array::<Int32Array>(values.column(4), "scale")?,
+            char_lengths: expect_array::<Int64Array>(values.column(5), "char_length")?,
+            byte_lengths: expect_array::<Int64Array>(values.column(6), "byte_length")?,
+            nullables: expect_array::<BooleanArray>(values.column(7), "nullable")?,
+            defaults: expect_array::<StringArray>(values.column(8), "column_def")?,
+            remarks: expect_array::<StringArray>(values.column(9), "remarks")?,
         })
-        .collect()
+    }
+
+    fn column(&self, index: usize) -> Result<ColumnEntry, ArrowError> {
+        let logical_type = optional_string(self.logical_types, index);
+        let nullable = (!self.nullables.is_null(index)).then(|| self.nullables.value(index));
+        Ok(ColumnEntry {
+            name: required_string(self.names, index, "column_name")?.to_owned(),
+            ordinal_position: if self.ordinals.is_null(index) {
+                return Err(schema_error("sf_core ordinal_position is null"));
+            } else {
+                self.ordinals.value(index)
+            },
+            remarks: optional_string(self.remarks, index).map(str::to_owned),
+            xdbc_type_name: logical_type.map(public_snowflake_type_name),
+            xdbc_column_size: if !self.char_lengths.is_null(index) {
+                Some(checked_i64_to_i32(
+                    self.char_lengths.value(index),
+                    "char_length",
+                )?)
+            } else {
+                optional_i32(self.precisions, index)
+            },
+            xdbc_decimal_digits: optional_i32(self.scales, index)
+                .map(|value| {
+                    i16::try_from(value)
+                        .map_err(|_| schema_error("sf_core scale does not fit in Int16"))
+                })
+                .transpose()?,
+            xdbc_num_prec_radix: logical_type.and_then(|logical_type| match logical_type {
+                "FIXED" => Some(10),
+                "REAL" => Some(2),
+                _ => None,
+            }),
+            xdbc_nullable: nullable.map(|value| if value { 1 } else { 0 }),
+            column_default: optional_string(self.defaults, index).map(str::to_owned),
+            xdbc_char_octet_length: optional_i64(self.byte_lengths, index)
+                .map(|value| checked_i64_to_i32(value, "byte_length"))
+                .transpose()?,
+            xdbc_is_nullable: nullable.map(|value| if value { "YES" } else { "NO" }.to_owned()),
+        })
+    }
 }
 
-// ── Arrow output construction ─────────────────────────────────────────────────
+fn public_snowflake_type_name(logical_type: &str) -> String {
+    match logical_type.to_ascii_uppercase().as_str() {
+        "FIXED" => "NUMBER".to_owned(),
+        "REAL" => "DOUBLE".to_owned(),
+        "TEXT" => "VARCHAR".to_owned(),
+        "BINARY" => "BINARY".to_owned(),
+        "BOOLEAN" => "BOOLEAN".to_owned(),
+        "DATE" => "DATE".to_owned(),
+        "TIME" => "TIME".to_owned(),
+        "TIMESTAMP_NTZ" => "TIMESTAMP_NTZ".to_owned(),
+        "TIMESTAMP_LTZ" => "TIMESTAMP_LTZ".to_owned(),
+        "TIMESTAMP_TZ" => "TIMESTAMP_TZ".to_owned(),
+        "TIMESTAMP" => "TIMESTAMP_NTZ".to_owned(),
+        _ => logical_type.to_owned(),
+    }
+}
 
-fn build_batch(entries: &[CatalogEntry], depth: &ObjectDepth) -> Result<RecordBatch> {
+fn build_batch(objects: &ObjectTree, depth: &ObjectDepth) -> Result<RecordBatch, ArrowError> {
     let schemas_null = matches!(depth, ObjectDepth::Catalogs);
     let tables_null = matches!(depth, ObjectDepth::Catalogs | ObjectDepth::Schemas);
-    let cols_null = !matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
+    let columns_null = !matches!(depth, ObjectDepth::Columns | ObjectDepth::All);
 
-    // Flatten counts
-    let n_cats = entries.len();
-    let n_schemas: usize = entries.iter().map(|c| c.schemas.len()).sum();
-    let n_tables: usize = entries
+    let catalogs = objects.catalogs.iter().collect::<Vec<_>>();
+    let db_schemas = catalogs
         .iter()
-        .flat_map(|c| &c.schemas)
-        .map(|s| s.tables.len())
-        .sum();
-
-    // ── columns ───────────────────────────────────────────────────────────────
-    let all_cols: Vec<&ColEntry> = entries
+        .flat_map(|(_, catalog)| catalog.schemas.iter())
+        .collect::<Vec<_>>();
+    let tables = db_schemas
         .iter()
-        .flat_map(|c| &c.schemas)
-        .flat_map(|s| &s.tables)
-        .flat_map(|t| &t.columns)
-        .collect();
-    let col_struct = build_col_struct(&all_cols);
+        .flat_map(|(_, schema)| schema.tables.iter())
+        .collect::<Vec<_>>();
+    let columns = tables
+        .iter()
+        .flat_map(|(_, table)| table.columns.iter())
+        .collect::<Vec<_>>();
 
-    // col offsets per table
-    let (col_offsets, col_null_buf) = if cols_null {
-        (
-            vec![0i32; n_tables + 1],
-            Some(NullBuffer::new_null(n_tables)),
-        )
-    } else {
-        let mut offs = Vec::with_capacity(n_tables + 1);
-        offs.push(0i32);
-        for c in entries
-            .iter()
-            .flat_map(|c| &c.schemas)
-            .flat_map(|s| &s.tables)
-        {
-            let last = *offs.last().unwrap();
-            offs.push(last + c.columns.len() as i32);
-        }
-        (offs, None)
-    };
-    let col_item_field = Arc::new(item_field_of(&schemas::COLUMN_SCHEMA));
-    let col_list = make_list(
-        col_item_field,
-        col_offsets,
-        Arc::new(col_struct),
-        col_null_buf,
-    )?;
-
-    // ── table_constraints (always null in our impl) ───────────────────────────
-    let constraint_item_field = Arc::new(item_field_of(&schemas::CONSTRAINT_SCHEMA));
-    let constraint_list = make_all_null_list(constraint_item_field, n_tables)?;
-
-    // ── table struct ──────────────────────────────────────────────────────────
-    let tbl_struct = build_table_struct(entries, col_list, constraint_list)?;
-
-    // table offsets per schema
-    let (tbl_offsets, tbl_null_buf) = if tables_null {
-        (
-            vec![0i32; n_schemas + 1],
-            Some(NullBuffer::new_null(n_schemas)),
-        )
-    } else {
-        let mut offs = Vec::with_capacity(n_schemas + 1);
-        offs.push(0i32);
-        for s in entries.iter().flat_map(|c| &c.schemas) {
-            let last = *offs.last().unwrap();
-            offs.push(last + s.tables.len() as i32);
-        }
-        (offs, None)
-    };
-    let tbl_item_field = Arc::new(item_field_of(&schemas::TABLE_SCHEMA));
-    let tbl_list = make_list(
-        tbl_item_field,
-        tbl_offsets,
-        Arc::new(tbl_struct),
-        tbl_null_buf,
-    )?;
-
-    // ── schema struct ─────────────────────────────────────────────────────────
-    let sch_struct = build_schema_struct(entries, tbl_list)?;
-
-    // schema offsets per catalog
-    let (sch_offsets, sch_null_buf) = if schemas_null {
-        (vec![0i32; n_cats + 1], Some(NullBuffer::new_null(n_cats)))
-    } else {
-        let mut offs = Vec::with_capacity(n_cats + 1);
-        offs.push(0i32);
-        for c in entries {
-            let last = *offs.last().unwrap();
-            offs.push(last + c.schemas.len() as i32);
-        }
-        (offs, None)
-    };
-    let sch_item_field = Arc::new(item_field_of(&schemas::OBJECTS_DB_SCHEMA_SCHEMA));
-    let sch_list = make_list(
-        sch_item_field,
-        sch_offsets,
-        Arc::new(sch_struct),
-        sch_null_buf,
-    )?;
-
-    // ── top-level batch ───────────────────────────────────────────────────────
-    let cat_names: Vec<Option<&str>> = entries.iter().map(|c| Some(c.name.as_str())).collect();
-    RecordBatch::try_new(
-        schemas::GET_OBJECTS_SCHEMA.clone(),
+    let column_fields = struct_fields(&schemas::COLUMN_SCHEMA)?;
+    let column_values = StructArray::try_new(
+        column_fields.clone(),
         vec![
-            Arc::new(StringArray::from(cat_names)) as ArrayRef,
-            Arc::new(sch_list) as ArrayRef,
-        ],
-    )
-    .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))
-}
-
-// ── struct array builders ─────────────────────────────────────────────────────
-
-fn build_col_struct(cols: &[&ColEntry]) -> StructArray {
-    let n = cols.len();
-    let mut col_name = StringBuilder::with_capacity(n, n * 16);
-    let mut ordinal = Int32Builder::with_capacity(n);
-    let mut remarks = StringBuilder::with_capacity(n, n * 8);
-    let mut xdbc_data_type = Int16Builder::with_capacity(n);
-    let mut xdbc_type_name = StringBuilder::with_capacity(n, n * 8);
-    let mut xdbc_col_size = Int32Builder::with_capacity(n);
-    let mut xdbc_dec_digits = Int16Builder::with_capacity(n);
-    let mut xdbc_radix = Int16Builder::with_capacity(n);
-    let mut xdbc_nullable = Int16Builder::with_capacity(n);
-    let mut xdbc_col_def = StringBuilder::with_capacity(n, 0);
-    let mut xdbc_sql_dt = Int16Builder::with_capacity(n);
-    let mut xdbc_dt_sub = Int16Builder::with_capacity(n);
-    let mut xdbc_octet_len = Int32Builder::with_capacity(n);
-    let mut xdbc_is_nullable = StringBuilder::with_capacity(n, n * 4);
-    let mut xdbc_scope_cat = StringBuilder::with_capacity(n, 0);
-    let mut xdbc_scope_sch = StringBuilder::with_capacity(n, 0);
-    let mut xdbc_scope_tbl = StringBuilder::with_capacity(n, 0);
-    let mut xdbc_auto_inc = BooleanBuilder::with_capacity(n);
-    let mut xdbc_gen_col = BooleanBuilder::with_capacity(n);
-
-    for c in cols {
-        col_name.append_value(&c.name);
-        ordinal.append_value(c.ordinal_position);
-        append_opt_str(&mut remarks, c.remarks.as_deref());
-        xdbc_data_type.append_null(); // computed from Arrow type — not available here
-        append_opt_str(&mut xdbc_type_name, c.xdbc_type_name.as_deref());
-        append_opt_i32(&mut xdbc_col_size, c.xdbc_column_size);
-        append_opt_i16(&mut xdbc_dec_digits, c.xdbc_decimal_digits);
-        append_opt_i16(&mut xdbc_radix, c.xdbc_num_prec_radix);
-        append_opt_i16(&mut xdbc_nullable, c.xdbc_nullable);
-        xdbc_col_def.append_null();
-        xdbc_sql_dt.append_null();
-        append_opt_i16(&mut xdbc_dt_sub, c.xdbc_datetime_sub);
-        append_opt_i32(&mut xdbc_octet_len, c.xdbc_char_octet_length);
-        append_opt_str(&mut xdbc_is_nullable, c.xdbc_is_nullable.as_deref());
-        xdbc_scope_cat.append_null();
-        xdbc_scope_sch.append_null();
-        xdbc_scope_tbl.append_null();
-        xdbc_auto_inc.append_null();
-        xdbc_gen_col.append_null();
-    }
-
-    let fields = struct_fields(&schemas::COLUMN_SCHEMA);
-    StructArray::try_new(
-        fields,
-        vec![
-            Arc::new(col_name.finish()) as ArrayRef,
-            Arc::new(ordinal.finish()),
-            Arc::new(remarks.finish()),
-            Arc::new(xdbc_data_type.finish()),
-            Arc::new(xdbc_type_name.finish()),
-            Arc::new(xdbc_col_size.finish()),
-            Arc::new(xdbc_dec_digits.finish()),
-            Arc::new(xdbc_radix.finish()),
-            Arc::new(xdbc_nullable.finish()),
-            Arc::new(xdbc_col_def.finish()),
-            Arc::new(xdbc_sql_dt.finish()),
-            Arc::new(xdbc_dt_sub.finish()),
-            Arc::new(xdbc_octet_len.finish()),
-            Arc::new(xdbc_is_nullable.finish()),
-            Arc::new(xdbc_scope_cat.finish()),
-            Arc::new(xdbc_scope_sch.finish()),
-            Arc::new(xdbc_scope_tbl.finish()),
-            Arc::new(xdbc_auto_inc.finish()),
-            Arc::new(xdbc_gen_col.finish()),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int32Array::from(
+                columns
+                    .iter()
+                    .map(|column| column.ordinal_position)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|column| column.remarks.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            new_null_array(column_fields[3].data_type(), columns.len()),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_type_name.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_column_size)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int16Array::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_decimal_digits)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int16Array::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_num_prec_radix)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int16Array::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_nullable)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|column| column.column_default.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            new_null_array(column_fields[10].data_type(), columns.len()),
+            new_null_array(column_fields[11].data_type(), columns.len()),
+            Arc::new(Int32Array::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_char_octet_length)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|column| column.xdbc_is_nullable.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            new_null_array(column_fields[14].data_type(), columns.len()),
+            new_null_array(column_fields[15].data_type(), columns.len()),
+            new_null_array(column_fields[16].data_type(), columns.len()),
+            new_null_array(column_fields[17].data_type(), columns.len()),
+            new_null_array(column_fields[18].data_type(), columns.len()),
         ],
         None,
-    )
-    .expect("column StructArray construction")
-}
+    )?;
 
-fn build_table_struct(
-    entries: &[CatalogEntry],
-    col_list: ListArray,
-    constraint_list: ListArray,
-) -> Result<StructArray> {
-    let n_tables: usize = entries
-        .iter()
-        .flat_map(|c| &c.schemas)
-        .map(|s| s.tables.len())
-        .sum();
+    let column_item = list_item_from_type(&schemas::TABLE_SCHEMA, 2)?;
+    let column_list = if columns_null {
+        all_null_list(column_item, tables.len())
+    } else {
+        let offsets = offsets_from_counts(
+            tables.iter().map(|(_, table)| table.columns.len()),
+            "table_columns",
+        )?;
+        ListArray::try_new(
+            column_item,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(column_values),
+            None,
+        )?
+    };
+    let constraint_list = all_null_list(
+        list_item_from_type(&schemas::TABLE_SCHEMA, 3)?,
+        tables.len(),
+    );
 
-    let mut tbl_name = StringBuilder::with_capacity(n_tables, n_tables * 16);
-    let mut tbl_type = StringBuilder::with_capacity(n_tables, n_tables * 8);
-
-    for t in entries
-        .iter()
-        .flat_map(|c| &c.schemas)
-        .flat_map(|s| &s.tables)
-    {
-        tbl_name.append_value(&t.name);
-        tbl_type.append_value(&t.table_type);
-    }
-
-    let fields = struct_fields(&schemas::TABLE_SCHEMA);
-    StructArray::try_new(
-        fields,
+    let table_values = StructArray::try_new(
+        struct_fields(&schemas::TABLE_SCHEMA)?,
         vec![
-            Arc::new(tbl_name.finish()) as ArrayRef,
-            Arc::new(tbl_type.finish()),
-            Arc::new(col_list),
+            Arc::new(StringArray::from(
+                tables
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                tables
+                    .iter()
+                    .map(|(_, table)| table.table_type.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(column_list),
             Arc::new(constraint_list),
         ],
         None,
-    )
-    .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))
-}
+    )?;
 
-fn build_schema_struct(entries: &[CatalogEntry], tbl_list: ListArray) -> Result<StructArray> {
-    let n_schemas: usize = entries.iter().map(|c| c.schemas.len()).sum();
-    let mut sch_name = StringBuilder::with_capacity(n_schemas, n_schemas * 16);
-
-    for s in entries.iter().flat_map(|c| &c.schemas) {
-        sch_name.append_value(&s.name);
-    }
-
-    let fields = struct_fields(&schemas::OBJECTS_DB_SCHEMA_SCHEMA);
-    StructArray::try_new(
-        fields,
-        vec![Arc::new(sch_name.finish()) as ArrayRef, Arc::new(tbl_list)],
-        None,
-    )
-    .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))
-}
-
-// ── list array helpers ────────────────────────────────────────────────────────
-
-fn make_list(
-    item_field: Arc<Field>,
-    offsets: Vec<i32>,
-    values: ArrayRef,
-    null_buf: Option<NullBuffer>,
-) -> Result<ListArray> {
-    let offs = OffsetBuffer::new(ScalarBuffer::from(offsets));
-    ListArray::try_new(item_field, offs, values, null_buf)
-        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))
-}
-
-/// Creates a ListArray where every entry is null (for table_constraints).
-fn make_all_null_list(item_field: Arc<Field>, n: usize) -> Result<ListArray> {
-    let null_buf = if n > 0 {
-        Some(NullBuffer::new_null(n))
+    let table_item = list_item_from_type(&schemas::OBJECTS_DB_SCHEMA_SCHEMA, 1)?;
+    let table_list = if tables_null {
+        all_null_list(table_item, db_schemas.len())
     } else {
-        None
+        let offsets = offsets_from_counts(
+            db_schemas.iter().map(|(_, schema)| schema.tables.len()),
+            "db_schema_tables",
+        )?;
+        ListArray::try_new(
+            table_item,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(table_values),
+            None,
+        )?
     };
-    let offsets = vec![0i32; n + 1];
-    // Empty values StructArray matching the item field's struct type
-    let values: ArrayRef = match item_field.data_type() {
-        DataType::Struct(fields) => {
-            let empty_arrays: Vec<ArrayRef> = fields
-                .iter()
-                .map(|f| empty_array_for(f.data_type()))
-                .collect();
-            Arc::new(
-                StructArray::try_new(fields.clone(), empty_arrays, None)
-                    .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?,
-            )
-        }
-        _ => {
-            return Err(Error::with_message_and_status(
-                "expected struct item type",
-                Status::Internal,
-            ));
-        }
+
+    let schema_values = StructArray::try_new(
+        struct_fields(&schemas::OBJECTS_DB_SCHEMA_SCHEMA)?,
+        vec![
+            Arc::new(StringArray::from(
+                db_schemas
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(table_list),
+        ],
+        None,
+    )?;
+
+    let schema_item = list_item(schemas::GET_OBJECTS_SCHEMA.field(1).data_type())?;
+    let schema_list = if schemas_null {
+        all_null_list(schema_item, catalogs.len())
+    } else {
+        let offsets = offsets_from_counts(
+            catalogs.iter().map(|(_, catalog)| catalog.schemas.len()),
+            "catalog_db_schemas",
+        )?;
+        ListArray::try_new(
+            schema_item,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(schema_values),
+            None,
+        )?
     };
-    make_list(item_field, offsets, values, null_buf)
+
+    RecordBatch::try_new(
+        schemas::GET_OBJECTS_SCHEMA.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                catalogs
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(schema_list),
+        ],
+    )
 }
 
-// ── type extraction helpers ───────────────────────────────────────────────────
+fn offsets_from_counts(
+    counts: impl IntoIterator<Item = usize>,
+    field: &str,
+) -> Result<Vec<i32>, ArrowError> {
+    let mut offsets = vec![0i32];
+    for count in counts {
+        let count = i32::try_from(count).map_err(|_| {
+            schema_error(format!(
+                "get_objects {field} count {count} exceeds ADBC List capacity"
+            ))
+        })?;
+        let next = offsets
+            .last()
+            .copied()
+            .and_then(|offset| offset.checked_add(count))
+            .ok_or_else(|| schema_error(format!("get_objects {field} offset overflow")))?;
+        offsets.push(next);
+    }
+    Ok(offsets)
+}
 
-/// Extracts the `Fields` from a DataType::Struct stored in an adbc_core schema static.
-fn struct_fields(dt: &DataType) -> Fields {
-    match dt {
-        DataType::Struct(f) => f.clone(),
-        _ => panic!("expected DataType::Struct"),
+fn list_range(
+    list: &LargeListArray,
+    index: usize,
+    field: &str,
+) -> Result<Option<Range<usize>>, ArrowError> {
+    if list.is_null(index) {
+        return Ok(None);
+    }
+    let offsets = list.value_offsets();
+    let start = usize::try_from(offsets[index])
+        .map_err(|_| schema_error(format!("sf_core {field} has a negative offset")))?;
+    let end = usize::try_from(offsets[index + 1])
+        .map_err(|_| schema_error(format!("sf_core {field} has a negative offset")))?;
+    if start > end || end > list.values().len() {
+        return Err(schema_error(format!(
+            "sf_core {field} offsets are out of bounds"
+        )));
+    }
+    Ok(Some(start..end))
+}
+
+fn all_null_list(item: Arc<Field>, len: usize) -> ListArray {
+    ListArray::new(
+        item.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32; len + 1])),
+        new_empty_array(item.data_type()),
+        (len > 0).then(|| NullBuffer::new_null(len)),
+    )
+}
+
+fn required_string<'a>(
+    array: &'a StringArray,
+    index: usize,
+    field: &str,
+) -> Result<&'a str, ArrowError> {
+    if array.is_null(index) {
+        Err(schema_error(format!("sf_core {field} is null")))
+    } else {
+        Ok(array.value(index))
     }
 }
 
-/// Returns a `Field { name: "item", data_type: <struct fields>, nullable: true }`
-/// that matches what `DataType::new_list(dt, nullable)` produces internally.
-fn item_field_of(dt: &DataType) -> Field {
-    Field::new("item", dt.clone(), true)
+fn optional_string(array: &StringArray, index: usize) -> Option<&str> {
+    (!array.is_null(index)).then(|| array.value(index))
 }
 
-/// Returns an empty (zero-length) array for the given DataType, used when
-/// building all-null list arrays that still need a correctly-typed values array.
-fn empty_array_for(dt: &DataType) -> ArrayRef {
-    match dt {
-        DataType::Utf8 => Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
-        DataType::Int16 => Arc::new(Int16Array::from(Vec::<Option<i16>>::new())),
-        DataType::Int32 => Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
-        DataType::Boolean => Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())),
-        DataType::Struct(fields) => {
-            let children: Vec<ArrayRef> = fields
-                .iter()
-                .map(|f| empty_array_for(f.data_type()))
-                .collect();
-            Arc::new(
-                StructArray::try_new(fields.clone(), children, None).expect("empty struct array"),
-            )
+fn optional_i32(array: &Int32Array, index: usize) -> Option<i32> {
+    (!array.is_null(index)).then(|| array.value(index))
+}
+
+fn optional_i64(array: &Int64Array, index: usize) -> Option<i64> {
+    (!array.is_null(index)).then(|| array.value(index))
+}
+
+fn checked_i64_to_i32(value: i64, field: &str) -> Result<i32, ArrowError> {
+    i32::try_from(value)
+        .map_err(|_| schema_error(format!("sf_core {field} value {value} exceeds Int32")))
+}
+
+fn expect_array<'a, T: 'static>(array: &'a dyn Array, field: &str) -> Result<&'a T, ArrowError> {
+    array
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| schema_error(format!("sf_core get_objects field {field} has wrong type")))
+}
+
+fn struct_fields(data_type: &DataType) -> Result<Fields, ArrowError> {
+    match data_type {
+        DataType::Struct(fields) => Ok(fields.clone()),
+        _ => Err(schema_error("expected ADBC struct type")),
+    }
+}
+
+fn list_item(data_type: &DataType) -> Result<Arc<Field>, ArrowError> {
+    match data_type {
+        DataType::List(item) => Ok(item.clone()),
+        _ => Err(schema_error("expected ADBC List type")),
+    }
+}
+
+fn list_item_from_type(data_type: &DataType, field_index: usize) -> Result<Arc<Field>, ArrowError> {
+    let fields = struct_fields(data_type)?;
+    list_item(fields[field_index].data_type())
+}
+
+fn schema_error(message: impl Into<String>) -> ArrowError {
+    ArrowError::SchemaError(message.into())
+}
+
+fn arrow_to_adbc_error(error: ArrowError) -> Error {
+    Error::with_message_and_status(error.to_string(), Status::Internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::cast::AsArray;
+
+    fn parent_tree() -> ObjectTree {
+        let mut objects = ObjectTree::default();
+        objects
+            .catalogs
+            .entry("database".into())
+            .or_default()
+            .schemas
+            .entry("public".into())
+            .or_default();
+        objects
+    }
+
+    fn column(name: &str, logical_type: &str) -> ColumnEntry {
+        ColumnEntry {
+            name: name.into(),
+            ordinal_position: 1,
+            remarks: None,
+            xdbc_type_name: Some(public_snowflake_type_name(logical_type)),
+            xdbc_column_size: Some(38),
+            xdbc_decimal_digits: Some(0),
+            xdbc_num_prec_radix: Some(10),
+            xdbc_nullable: Some(1),
+            column_default: None,
+            xdbc_char_octet_length: None,
+            xdbc_is_nullable: Some("YES".into()),
         }
-        DataType::List(f) => {
-            let values = empty_array_for(f.data_type());
-            let offs = OffsetBuffer::<i32>::new(ScalarBuffer::from(vec![0i32]));
-            Arc::new(ListArray::try_new(f.clone(), offs, values, None).expect("empty list array"))
-        }
-        _ => Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
     }
-}
 
-// ── builder shorthand ─────────────────────────────────────────────────────────
-
-use arrow_array::builder::{BooleanBuilder, Int16Builder, Int32Builder, StringBuilder};
-
-fn append_opt_str(b: &mut StringBuilder, v: Option<&str>) {
-    match v {
-        Some(s) => b.append_value(s),
-        None => b.append_null(),
+    #[test]
+    fn public_xdbc_type_names_use_snowflake_sql_names() {
+        assert_eq!(public_snowflake_type_name("FIXED"), "NUMBER");
+        assert_eq!(public_snowflake_type_name("TEXT"), "VARCHAR");
+        assert_eq!(public_snowflake_type_name("REAL"), "DOUBLE");
+        assert_eq!(public_snowflake_type_name("TIMESTAMP_LTZ"), "TIMESTAMP_LTZ");
     }
-}
 
-fn append_opt_i16(b: &mut Int16Builder, v: Option<i16>) {
-    match v {
-        Some(n) => b.append_value(n),
-        None => b.append_null(),
+    #[test]
+    fn column_depth_keeps_filtered_table_types_and_ignores_other_column_tables() {
+        let mut objects = parent_tree();
+        let mut filtered_tables = parent_tree();
+        filtered_tables
+            .catalogs
+            .get_mut("database")
+            .unwrap()
+            .schemas
+            .get_mut("public")
+            .unwrap()
+            .tables
+            .insert(
+                "wanted_view".into(),
+                TableEntry {
+                    table_type: "VIEW".into(),
+                    columns: Vec::new(),
+                },
+            );
+        merge_tables(&mut objects, filtered_tables);
+
+        let mut column_results = parent_tree();
+        let tables = &mut column_results
+            .catalogs
+            .get_mut("database")
+            .unwrap()
+            .schemas
+            .get_mut("public")
+            .unwrap()
+            .tables;
+        tables.insert(
+            "wanted_view".into(),
+            TableEntry {
+                table_type: String::new(),
+                columns: vec![column("amount", "FIXED"), column("label", "TEXT")],
+            },
+        );
+        tables.insert(
+            "filtered_out_table".into(),
+            TableEntry {
+                table_type: String::new(),
+                columns: vec![column("hidden", "FIXED")],
+            },
+        );
+        merge_columns(&mut objects, column_results);
+
+        let batch = build_batch(&objects, &ObjectDepth::Columns).unwrap();
+        assert_eq!(batch.schema(), schemas::GET_OBJECTS_SCHEMA.clone());
+        let schemas = batch.column(1).as_list::<i32>();
+        let schema_values = schemas.values().as_struct();
+        let table_lists = schema_values.column(1).as_list::<i32>();
+        assert_eq!(table_lists.value_length(0), 1);
+        let table_values = table_lists.values().as_struct();
+        assert_eq!(
+            table_values.column(0).as_string::<i32>().value(0),
+            "wanted_view"
+        );
+        assert_eq!(table_values.column(1).as_string::<i32>().value(0), "VIEW");
+        let column_values = table_values.column(2).as_list::<i32>().values().as_struct();
+        let type_names = column_values.column(4).as_string::<i32>();
+        assert_eq!(type_names.value(0), "NUMBER");
+        assert_eq!(type_names.value(1), "VARCHAR");
+        assert!(table_values.column(3).as_list::<i32>().is_null(0));
     }
-}
 
-fn append_opt_i32(b: &mut Int32Builder, v: Option<i32>) {
-    match v {
-        Some(n) => b.append_value(n),
-        None => b.append_null(),
+    #[test]
+    fn deeper_filter_with_no_matches_retains_catalog_and_schema_parents() {
+        let objects = parent_tree();
+        let batch = build_batch(&objects, &ObjectDepth::Columns).unwrap();
+        let schema_lists = batch.column(1).as_list::<i32>();
+        assert!(!schema_lists.is_null(0));
+        assert_eq!(schema_lists.value_length(0), 1);
+        let schema_values = schema_lists.values().as_struct();
+        assert_eq!(
+            schema_values.column(0).as_string::<i32>().value(0),
+            "public"
+        );
+        let table_lists = schema_values.column(1).as_list::<i32>();
+        assert!(!table_lists.is_null(0));
+        assert_eq!(table_lists.value_length(0), 0);
+    }
+
+    #[test]
+    fn shallower_depths_use_null_child_lists() {
+        let objects = parent_tree();
+        let catalogs = build_batch(&objects, &ObjectDepth::Catalogs).unwrap();
+        assert!(catalogs.column(1).as_list::<i32>().is_null(0));
+
+        let db_schemas = build_batch(&objects, &ObjectDepth::Schemas).unwrap();
+        let schema_values = db_schemas.column(1).as_list::<i32>().values().as_struct();
+        assert!(schema_values.column(1).as_list::<i32>().is_null(0));
+    }
+
+    #[test]
+    fn list_offset_overflow_is_rejected() {
+        let error = offsets_from_counts([i32::MAX as usize, 1], "test").unwrap_err();
+        assert!(error.to_string().contains("offset overflow"));
     }
 }
