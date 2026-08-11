@@ -98,13 +98,31 @@ impl Inner {
         })
     }
 
-    pub fn execute_query<'a>(
+    /// Execute SQL using a temporary sf_core statement and release the
+    /// statement on every execution path. Execution errors take precedence over
+    /// cleanup errors; a release error is returned only after successful execution.
+    pub(crate) fn execute_temporary_statement(
         &self,
-        statement: Handle,
-        query: String,
-        bindings: Option<BindingType<'a>>,
-    ) -> Result<QueryResult> {
-        self.execute_query_with_timeout(statement, query, bindings, None)
+        connection: Handle,
+        query: impl Into<String>,
+        timeout_seconds: Option<u32>,
+    ) -> Result<()> {
+        let statement = self
+            .sf
+            .statement_new(connection)
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result =
+            self.execute_query_with_timeout(statement, query.into(), None, timeout_seconds);
+        let release = self.sf.statement_release(statement);
+        match result {
+            Ok(_) => release
+                .map_err(crate::error::api_error_to_adbc_error)
+                .map(|_| ()),
+            Err(error) => {
+                let _ = release;
+                Err(error)
+            }
+        }
     }
 
     /// Execute a query while forwarding a per-statement timeout to sf_core.
