@@ -40,6 +40,8 @@ pub struct Statement {
     pub(crate) timestamp_precision: TimestampPrecision,
     /// Parameter batches stored by bind() / bind_stream(). Each row is one execution.
     pub(crate) bound_batches: Vec<RecordBatch>,
+    /// Whether bind() / bind_stream() was called, including with an empty stream.
+    pub(crate) binding_supplied: bool,
     pub(crate) last_query_id: Option<String>,
 }
 
@@ -226,6 +228,7 @@ impl Statement {
 impl adbc_core::Statement for Statement {
     fn bind(&mut self, batch: RecordBatch) -> Result<()> {
         self.bound_batches = vec![batch];
+        self.binding_supplied = true;
         Ok(())
     }
 
@@ -237,6 +240,7 @@ impl adbc_core::Statement for Statement {
             batches.push(batch);
         }
         self.bound_batches = batches;
+        self.binding_supplied = true;
         Ok(())
     }
 
@@ -246,6 +250,7 @@ impl adbc_core::Statement for Statement {
             // Ingest via execute() — run the ingest and return an empty reader.
             let result = crate::ingest::execute_ingest(self);
             self.bound_batches.clear();
+            self.binding_supplied = false;
             result?;
             let batch =
                 arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
@@ -257,7 +262,7 @@ impl adbc_core::Statement for Statement {
 
         self.apply_query_tag()?;
 
-        if !self.bound_batches.is_empty() {
+        if self.binding_supplied {
             return self.execute_bound(query);
         }
 
@@ -277,6 +282,7 @@ impl adbc_core::Statement for Statement {
         if self.target_table.is_some() {
             let result = crate::ingest::execute_ingest(self);
             self.bound_batches.clear();
+            self.binding_supplied = false;
             return result;
         }
         let query = self.query.clone().ok_or_else(|| {
@@ -362,6 +368,7 @@ impl adbc_core::Statement for Statement {
         self.query = Some(query.as_ref().to_string());
         self.target_table = None;
         self.bound_batches.clear();
+        self.binding_supplied = false;
         Ok(())
     }
 
@@ -1426,6 +1433,7 @@ mod tests {
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
+            binding_supplied: false,
             last_query_id: None,
         }
     }
@@ -1443,6 +1451,30 @@ mod tests {
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
             Ok(_) => panic!("execute should have returned an error"),
+        }
+    }
+
+    #[test]
+    fn execute_with_empty_bind_stream_rejects_zero_rows() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("SELECT ?").unwrap();
+
+        let reader = ConcatReader {
+            batches: vec![].into_iter(),
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+        };
+        stmt.bind_stream(Box::new(reader)).unwrap();
+
+        match stmt.execute() {
+            Err(err) => {
+                assert_eq!(err.status, Status::NotImplemented);
+                assert!(err.message.contains("received 0"));
+            }
+            Ok(_) => panic!("execute should have rejected the empty binding"),
         }
     }
 
@@ -1471,6 +1503,7 @@ mod tests {
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
+            binding_supplied: false,
             last_query_id: None,
         };
         match stmt.execute() {
@@ -1495,6 +1528,7 @@ mod tests {
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
+            binding_supplied: false,
             last_query_id: None,
         };
         stmt.set_sql_query("SELECT 1").unwrap();
