@@ -25,6 +25,7 @@ package snowflake
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,17 +42,241 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
 
 const MetadataKeySnowflakeType = "SNOWFLAKE_TYPE"
 
+// EWKB extension flags. The high four bits of the geometry-type word in the
+// PostGIS-style EWKB encoding carry SRID/Z/M information; the low 28 bits are
+// the OGC geometry type (with optional ISO Z/M offsets).
+const (
+	ewkbSRIDFlag uint32 = 0x20000000
+	ewkbMFlag    uint32 = 0x40000000
+	ewkbZFlag    uint32 = 0x80000000
+)
+
+// geoColumnInfo captures what the EWKB peek learned about a binary column.
+// A zero srid means "looks like WKB/EWKB but no usable column-level CRS"
+// (either every value was plain WKB without an SRID prefix, or rows disagreed
+// on SRID); the column is still tagged as geoarrow.wkb.
+type geoColumnInfo struct {
+	srid int
+}
+
 func identCol(_ context.Context, a arrow.Array) (arrow.Array, error) {
 	a.Retain()
 	return a, nil
+}
+
+// peekEWKBGeo inspects the first bytes of a value and returns whether they
+// look like a valid OGC/EWKB geometry header. When the EWKB SRID flag is set,
+// the embedded SRID is returned with hasSRID=true.
+func peekEWKBGeo(b []byte) (srid uint32, hasSRID bool, ok bool) {
+	if len(b) < 5 {
+		return 0, false, false
+	}
+	var bo binary.ByteOrder
+	switch b[0] {
+	case 0x00:
+		bo = binary.BigEndian
+	case 0x01:
+		bo = binary.LittleEndian
+	default:
+		return 0, false, false
+	}
+	typeWord := bo.Uint32(b[1:5])
+	base := typeWord & 0x0FFFFFFF
+	if !validGeoTypeCode(base) {
+		return 0, false, false
+	}
+	if typeWord&ewkbSRIDFlag == 0 {
+		return 0, false, true
+	}
+	if len(b) < 9 {
+		return 0, false, false
+	}
+	return bo.Uint32(b[5:9]), true, true
+}
+
+// validGeoTypeCode reports whether t is one of the 28 OGC/ISO geometry type
+// codes (Point..GeometryCollection, optionally with Z/M/ZM extensions).
+func validGeoTypeCode(t uint32) bool {
+	switch {
+	case t >= 1 && t <= 7,
+		t >= 1001 && t <= 1007,
+		t >= 2001 && t <= 2007,
+		t >= 3001 && t <= 3007:
+		return true
+	}
+	return false
+}
+
+// stripEWKBSRID converts an EWKB geometry that carries an SRID prefix into
+// plain ISO/OGC WKB by clearing the SRID flag and removing the four SRID
+// bytes. Bytes that do not have the SRID flag set are returned unchanged.
+func stripEWKBSRID(b []byte) []byte {
+	if len(b) < 9 {
+		return b
+	}
+	var bo binary.ByteOrder
+	switch b[0] {
+	case 0x00:
+		bo = binary.BigEndian
+	case 0x01:
+		bo = binary.LittleEndian
+	default:
+		return b
+	}
+	typeWord := bo.Uint32(b[1:5])
+	if typeWord&ewkbSRIDFlag == 0 {
+		return b
+	}
+	out := make([]byte, len(b)-4)
+	out[0] = b[0]
+	bo.PutUint32(out[1:5], typeWord&^ewkbSRIDFlag)
+	copy(out[5:], b[9:])
+	return out
+}
+
+// stripEWKBSRIDColumn returns a column transformer that rewrites every
+// non-null value through stripEWKBSRID, producing standard WKB on the wire.
+func stripEWKBSRIDColumn(_ context.Context, a arrow.Array) (arrow.Array, error) {
+	ba, ok := a.(*array.Binary)
+	if !ok {
+		a.Retain()
+		return a, nil
+	}
+	bldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	defer bldr.Release()
+	bldr.Reserve(ba.Len())
+	for i := range ba.Len() {
+		if ba.IsNull(i) {
+			bldr.AppendNull()
+			continue
+		}
+		bldr.Append(stripEWKBSRID(ba.Value(i)))
+	}
+	return bldr.NewArray(), nil
+}
+
+// isUUIDResultColumn reports whether a result column carries Snowflake UUID
+// values. Snowflake result metadata does not surface a dedicated "uuid" type:
+// UUID columns are reported as "text" but with length 0, which no real text
+// column can have (VARCHAR's minimum length is 1, and even SHOW commands
+// report the maximum length for their text columns).
+//
+// The only other columns reported as length-0 text are untyped NULL literals
+// (e.g. SELECT NULL); on the Arrow data path callers can rule those out with
+// isUntypedNullField.
+func isUUIDResultColumn(typ string, length int64) bool {
+	return strings.EqualFold(typ, "text") && length == 0
+}
+
+// isUntypedNullField reports whether the server-provided Arrow field metadata
+// identifies a length-0 text column as an untyped NULL literal rather than a
+// UUID column: NULL literals carry an explicit byteLength of "0", while UUID
+// columns carry their 16-byte storage width or omit the key entirely.
+func isUntypedNullField(f arrow.Field) bool {
+	v, ok := f.Metadata.GetValue("byteLength")
+	return ok && v == "0"
+}
+
+// uuidStringsToUUIDColumn returns a column transformer that parses the utf8
+// UUID text Snowflake sends on the wire into an arrow.uuid extension array
+// (fixed_size_binary[16] storage).
+func uuidStringsToUUIDColumn(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+	sa, ok := a.(*array.String)
+	if !ok {
+		return nil, fmt.Errorf("expected utf8 data for UUID column, got %s", a.DataType())
+	}
+	bldr := extensions.NewUUIDBuilder(compute.GetAllocator(ctx))
+	defer bldr.Release()
+	bldr.Reserve(sa.Len())
+	for i := range sa.Len() {
+		if sa.IsNull(i) {
+			bldr.AppendNull()
+			continue
+		}
+		if err := bldr.AppendValueFromString(sa.Value(i)); err != nil {
+			return nil, err
+		}
+	}
+	return bldr.NewArray(), nil
+}
+
+// analyzeGeoFromBatch walks the binary columns of a record batch and returns
+// a map of column-name → geoColumnInfo for any column whose first non-null
+// value parses as an OGC/EWKB geometry header. The first SRID seen is taken
+// as the column-level SRID; columns whose subsequent rows disagree are still
+// tagged as geo but without column-level CRS metadata.
+func analyzeGeoFromBatch(rec arrow.RecordBatch) map[string]geoColumnInfo {
+	if rec == nil || rec.NumRows() == 0 {
+		return nil
+	}
+	out := make(map[string]geoColumnInfo)
+	sc := rec.Schema()
+	for i, col := range rec.Columns() {
+		ba, ok := col.(*array.Binary)
+		if !ok {
+			continue
+		}
+		var (
+			firstSRID  uint32
+			haveSRID   bool
+			mixed      bool
+			isGeo      bool
+			classified bool
+		)
+		for j := range ba.Len() {
+			if ba.IsNull(j) {
+				continue
+			}
+			srid, has, ok := peekEWKBGeo(ba.Value(j))
+			if !classified {
+				classified = true
+				if !ok {
+					break
+				}
+				isGeo = true
+				if has {
+					firstSRID = srid
+					haveSRID = true
+				}
+				continue
+			}
+			if !ok {
+				mixed = true
+				continue
+			}
+			if has {
+				if !haveSRID {
+					firstSRID = srid
+					haveSRID = true
+				} else if srid != firstSRID {
+					mixed = true
+				}
+			}
+		}
+		if !isGeo {
+			continue
+		}
+		info := geoColumnInfo{}
+		if haveSRID && !mixed {
+			info.srid = int(firstSRID)
+		}
+		out[sc.Field(i).Name] = info
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 type recordTransformer = func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
@@ -69,18 +295,25 @@ func getRecTransformer(sc *arrow.Schema, tr []colTransformer) recordTransformer 
 			err  error
 			cols = make([]arrow.Array, r.NumCols())
 		)
+		defer func() {
+			for _, col := range cols {
+				if col != nil {
+					col.Release()
+				}
+			}
+		}()
+
 		for i, col := range r.Columns() {
 			if cols[i], err = tr[i](ctx, col); err != nil {
 				return nil, errToAdbcErr(adbc.StatusInternal, err)
 			}
-			defer cols[i].Release()
 		}
 
 		return array.NewRecordBatch(sc, cols, r.NumRows()), nil
 	}
 }
 
-func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (*arrow.Schema, recordTransformer) {
+func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnInfo) (*arrow.Schema, recordTransformer) {
 	loc, types := ld.Location(), ld.RowTypes()
 
 	fields := make([]arrow.Field, len(sc.Fields()))
@@ -88,7 +321,42 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 	for i, f := range sc.Fields() {
 		srcMeta := types[i]
 		originalArrowUnit := arrow.TimeUnit(srcMeta.Scale / 3)
+
+		// Snowflake reports GEOGRAPHY/GEOMETRY columns as srcMeta.Type "binary"
+		// when the GEO*_OUTPUT_FORMAT session option is WKB or EWKB. The geoCols
+		// map is built by analyzeGeoFromBatch on the first record batch — any
+		// binary column whose values look like an OGC/EWKB geometry header lands
+		// here, with the column-level SRID lifted out of the EWKB prefix. Each
+		// row goes through stripEWKBSRID so the value on the Arrow wire is
+		// standard ISO/OGC WKB.
+		if geoCol, ok := geoCols[f.Name]; ok {
+			f.Type = arrow.BinaryTypes.Binary
+			meta := map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
+			}
+			if geoCol.srid != 0 {
+				// We also can't know whether this is a geography or geometry column, so we can't set "edges":"spherical"
+				meta["ARROW:extension:metadata"] = fmt.Sprintf(`{"crs":"EPSG:%d","crs_type":"authority_code"}`, geoCol.srid)
+			}
+			f.Metadata = arrow.MetadataFrom(meta)
+			transformers[i] = stripEWKBSRIDColumn
+			fields[i] = f
+			continue
+		}
+
+		if isUUIDResultColumn(srcMeta.Type, srcMeta.Length) && !isUntypedNullField(f) {
+			f.Type = extensions.NewUUIDType()
+			transformers[i] = uuidStringsToUUIDColumn
+			fields[i] = f
+			continue
+		}
+
 		switch strings.ToUpper(srcMeta.Type) {
+		case "ARRAY":
+			f.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
+			transformers[i] = identCol
 		case "FIXED":
 			switch f.Type.ID() {
 			case arrow.DECIMAL, arrow.DECIMAL256:
@@ -118,33 +386,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				} else {
 					if srcMeta.Scale != 0 {
 						f.Type = arrow.PrimitiveTypes.Float64
-						// For precisions of 16, 17 and 18, a conversion from int64 to float64 fails with an error
-						// So for these precisions, we instead convert first to a decimal128 and then to a float64.
-						if srcMeta.Precision > 15 && srcMeta.Precision < 19 {
-							transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-								result, err := integerToDecimal128(ctx, a, &arrow.Decimal128Type{
-									Precision: int32(srcMeta.Precision),
-									Scale:     int32(srcMeta.Scale),
-								})
-								if err != nil {
-									return nil, err
-								}
-								defer result.Release()
-								return compute.CastArray(ctx, result, compute.UnsafeCastOptions(f.Type))
-							}
-						} else {
-							// For precisions less than 16, we can simply scale the integer value appropriately
-							transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-								result, err := compute.Divide(ctx, compute.ArithmeticOptions{NoCheckOverflow: true},
-									&compute.ArrayDatum{Value: a.Data()},
-									compute.NewDatum(math.Pow10(int(srcMeta.Scale))))
-								if err != nil {
-									return nil, err
-								}
-								defer result.Release()
-								return result.(*compute.ArrayDatum).MakeArray(), nil
-							}
-						}
+						transformers[i] = fixedToFloat64Transformer(int32(srcMeta.Precision), int32(srcMeta.Scale))
 					} else {
 						f.Type = arrow.PrimitiveTypes.Int64
 						transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
@@ -167,6 +409,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		case "TIMESTAMP_NTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
+			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
 			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
 
 				if a.DataType().ID() != arrow.STRUCT {
@@ -186,8 +429,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 						continue
 					}
 
-					// Convert fraction to nanoseconds based on the scale
-					nanoseconds := int64(fraction[i]) * int64(math.Pow10(9-int(srcMeta.Scale)))
+					nanoseconds := int64(fraction[i]) * fractionMultiplier
 					v, err := getArrowTimestampFromTime(time.Unix(epoch[i], nanoseconds), dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
 					if err != nil {
 						return nil, err
@@ -199,6 +441,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		case "TIMESTAMP_LTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision), TimeZone: loc.String()}
 			f.Type = dt
+			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
 			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
 				pool := compute.GetAllocator(ctx)
 				tb := array.NewTimestampBuilder(pool, dt)
@@ -214,8 +457,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 							continue
 						}
 
-						// Convert fraction to nanoseconds based on the scale
-						nanoseconds := int64(fraction[i]) * int64(math.Pow10(9-int(srcMeta.Scale)))
+						nanoseconds := int64(fraction[i]) * fractionMultiplier
 						v, err := getArrowTimestampFromTime(time.Unix(epoch[i], nanoseconds), dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
 						if err != nil {
 							return nil, err
@@ -239,6 +481,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 			// with the data that lets us do so.
 			dt := &arrow.TimestampType{TimeZone: "UTC", Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
+			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
 			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
 				pool := compute.GetAllocator(ctx)
 				tb := array.NewTimestampBuilder(pool, dt)
@@ -286,8 +529,7 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 							continue
 						}
 
-						// Convert fraction to nanoseconds based on the scale
-						nanoseconds := int64(fraction[i]) * int64(math.Pow10(9-int(srcMeta.Scale)))
+						nanoseconds := int64(fraction[i]) * fractionMultiplier
 						loc := gosnowflake.Location(int(tzoffset[i]) - 1440)
 						v, err := getArrowTimestampFromTime(time.Unix(epoch[i], nanoseconds).In(loc), dt.Unit, originalArrowUnit, maxTimestampPrecision)
 						if err != nil {
@@ -335,6 +577,47 @@ func getArrowTimestampFromTime(val time.Time, unit arrow.TimeUnit, originalArrow
 	return arrow.TimestampFromTime(val, unit)
 }
 
+// fixedToFloat64Transformer returns the column transformer used by getTransformer
+// for FIXED Snowflake columns when useHighPrecision=false and scale != 0.
+//
+// Snowflake transmits FIXED columns as int64 on the wire. For precisions > 15 the
+// unscaled value can exceed 2^53, so the simple compute.Divide path (which performs
+// a safe int64->float64 cast) fails. In that case we widen to Decimal128 first.
+// For precisions <= 15 the unscaled value safely fits in float64, so we just scale
+// the integer directly.
+func fixedToFloat64Transformer(precision, scale int32) colTransformer {
+	if precision > 15 {
+		return scaledIntToFloat64Transformer(precision, scale)
+	}
+	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+		result, err := compute.Divide(ctx, compute.ArithmeticOptions{NoCheckOverflow: true},
+			&compute.ArrayDatum{Value: a.Data()},
+			compute.NewDatum(math.Pow10(int(scale))))
+		if err != nil {
+			return nil, err
+		}
+		defer result.Release()
+		return result.(*compute.ArrayDatum).MakeArray(), nil
+	}
+}
+
+// scaledIntToFloat64Transformer returns the column transformer used by
+// fixedToFloat64Transformer when precision > 15. It converts a Snowflake
+// scaled-integer column (transmitted as int64) to float64 by first widening to
+// Decimal128, avoiding the int64->float64 safe cast failure that occurs when the
+// unscaled value exceeds 2^53.
+func scaledIntToFloat64Transformer(precision, scale int32) colTransformer {
+	dt := &arrow.Decimal128Type{Precision: precision, Scale: scale}
+	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+		result, err := integerToDecimal128(ctx, a, dt)
+		if err != nil {
+			return nil, err
+		}
+		defer result.Release()
+		return compute.CastArray(ctx, result, compute.UnsafeCastOptions(arrow.PrimitiveTypes.Float64))
+	}
+}
+
 func integerToDecimal128(ctx context.Context, a arrow.Array, dt *arrow.Decimal128Type) (arrow.Array, error) {
 	// We can't do a cast directly into the destination type because the numbers we get from Snowflake
 	// are scaled integers. So not only would the cast produce the wrong value, it also risks producing
@@ -365,9 +648,14 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 		fields[i] = arrow.Field{
 			Name:     srcMeta.Name,
 			Nullable: srcMeta.Nullable,
-			Metadata: arrow.MetadataFrom(map[string]string{
-				MetadataKeySnowflakeType: srcMeta.Type,
-			}),
+			Metadata: arrow.NewMetadata(
+				[]string{MetadataKeySnowflakeType},
+				[]string{srcMeta.Type},
+			),
+		}
+		if isUUIDResultColumn(srcMeta.Type, srcMeta.Length) {
+			fields[i].Type = extensions.NewUUIDType()
+			continue
 		}
 		switch srcMeta.Type {
 		case "fixed":
@@ -407,6 +695,11 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 			fields[i].Type = arrow.BinaryTypes.Binary
 		case "boolean":
 			fields[i].Type = arrow.FixedWidthTypes.Boolean
+		case "array":
+			fields[i].Type = arrow.BinaryTypes.String
+			fields[i].Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
 		default:
 			fields[i].Type = arrow.BinaryTypes.String
 		}
@@ -546,12 +839,348 @@ type reader struct {
 	curChIndex int
 	rec        arrow.RecordBatch
 	err        error
+	errMu      sync.Mutex
+	errOnce    sync.Once
 
 	cancelFn context.CancelFunc
 	done     chan struct{} // signals all producer goroutines have finished
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (array.RecordReader, error) {
+func (r *reader) setErr(err error) {
+	if err == nil {
+		return
+	}
+	r.errOnce.Do(func() {
+		r.errMu.Lock()
+		r.err = err
+		r.errMu.Unlock()
+	})
+}
+
+func (r *reader) getErr() error {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	return r.err
+}
+
+const defaultStreamMaxRetries = 3
+
+// batchStreamer is the subset of gosnowflake.ArrowStreamBatch needed for reading.
+type batchStreamer interface {
+	GetStream(ctx context.Context) (io.ReadCloser, error)
+	NumRows() int64
+}
+
+// countingReadCloser wraps an io.ReadCloser and counts bytes read.
+// Used for diagnosing truncated Arrow IPC streams.
+type countingReadCloser struct {
+	inner     io.ReadCloser
+	bytesRead int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.inner.Read(p)
+	c.bytesRead += int64(n)
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error {
+	return c.inner.Close()
+}
+
+func rowCountMismatchError(scope string, expectedRows, actualRows int64) error {
+	return errToAdbcErr(adbc.StatusInvalidData, fmt.Errorf(
+		"%s row count mismatch: expected %d rows, got %d",
+		scope,
+		expectedRows,
+		actualRows,
+	))
+}
+
+func validateRowCount(scope string, expectedRows, actualRows int64) error {
+	if expectedRows != actualRows {
+		return rowCountMismatchError(scope, expectedRows, actualRows)
+	}
+	return nil
+}
+
+func finalizeBatchRead(ctx context.Context, scope string, expectedRows, actualRows int64, readerErr error) error {
+	if readerErr != nil {
+		return readerErr
+	}
+	// rr.Next() performs one more read after the last emitted record to confirm
+	// stream completion. If cancellation lands during that final probe after at
+	// least one row was already emitted, an exact row-count match still means the
+	// batch completed successfully.
+	rowCountErr := validateRowCount(scope, expectedRows, actualRows)
+	if rowCountErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && actualRows == 0 {
+			return ctxErr
+		}
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && actualRows < expectedRows {
+		return ctxErr
+	}
+	return rowCountErr
+}
+
+type batchStreamTarget struct {
+	scope           string
+	expectedRows    int64
+	initialRowsRead int64
+	out             chan<- arrow.RecordBatch
+	totalRowsRead   *atomic.Int64
+}
+
+func newBatchStreamTarget(batchIdx int, batch batchStreamer, out chan<- arrow.RecordBatch, totalRowsRead *atomic.Int64) batchStreamTarget {
+	return batchStreamTarget{
+		scope:         fmt.Sprintf("batch[%d]", batchIdx),
+		expectedRows:  batch.NumRows(),
+		out:           out,
+		totalRowsRead: totalRowsRead,
+	}
+}
+
+// readBatchRecords reads all Arrow records from a Snowflake batch with retries.
+// It does not buffer the raw byte stream; instead it reads Arrow IPC messages
+// directly from the network and accumulates transformed record batches in memory.
+// If a stream fails mid-read, all partial records are released and the entire
+// batch is re-downloaded. Records are only returned on full success, preventing
+// partial results from entering channels.
+func readBatchRecords(ctx context.Context, batch batchStreamer, alloc memory.Allocator, transform recordTransformer, maxRetries int) ([]arrow.RecordBatch, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		recs, err := tryReadBatch(ctx, batch, alloc, transform)
+		if err == nil {
+			trace.SpanFromContext(ctx).AddEvent("readBatchRecords.success", trace.WithAttributes(
+				attribute.Int("attempt", attempt),
+				attribute.Int("records", len(recs)),
+			))
+			return recs, nil
+		}
+		trace.SpanFromContext(ctx).AddEvent("readBatchRecords.failed", trace.WithAttributes(
+			attribute.Int("attempt", attempt),
+			attribute.String("error", err.Error()),
+		))
+		// Release any partial records from the failed attempt
+		for _, r := range recs {
+			r.Release()
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("failed to read Arrow batch after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+func tryReadBatch(ctx context.Context, batch batchStreamer, alloc memory.Allocator, transform recordTransformer) (recs []arrow.RecordBatch, err error) {
+	raw, err := batch.GetStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stream := &countingReadCloser{inner: raw}
+	defer func() {
+		err = errors.Join(err, stream.Close())
+	}()
+
+	rr, err := ipc.NewReader(stream, ipc.WithAllocator(alloc))
+	if err != nil {
+		return nil, fmt.Errorf("ipc.NewReader failed after reading %d bytes: %w", stream.bytesRead, err)
+	}
+	defer rr.Release()
+
+	var rowsRead int64
+	for rr.Next() && ctx.Err() == nil {
+		rec := rr.RecordBatch()
+		rec, err = transform(ctx, rec)
+		if err != nil {
+			return recs, err
+		}
+		recs = append(recs, rec)
+		rowsRead += rec.NumRows()
+	}
+	if err = finalizeBatchRead(ctx, "batch stream", batch.NumRows(), rowsRead, rr.Err()); err != nil {
+		return recs, err
+	}
+	return recs, nil
+}
+
+func streamRecordReaderToChannel(
+	ctx context.Context,
+	rr *ipc.Reader,
+	transform recordTransformer,
+	target batchStreamTarget,
+) error {
+	rowsRead := target.initialRowsRead
+	for rr.Next() && ctx.Err() == nil {
+		rec := rr.RecordBatch()
+		rec, err := transform(ctx, rec)
+		if err != nil {
+			return err
+		}
+		select {
+		case target.out <- rec:
+			rowsRead += rec.NumRows()
+			if target.totalRowsRead != nil {
+				target.totalRowsRead.Add(rec.NumRows())
+			}
+		case <-ctx.Done():
+			rec.Release()
+			return ctx.Err()
+		}
+	}
+	return finalizeBatchRead(ctx, target.scope, target.expectedRows, rowsRead, rr.Err())
+}
+
+func streamBatchToChannel(
+	ctx context.Context,
+	batchIdx int,
+	batch batchStreamer,
+	alloc memory.Allocator,
+	transform recordTransformer,
+	target batchStreamTarget,
+) (err error) {
+	rawStream, err := batch.GetStream(ctx)
+	if err != nil {
+		trace.SpanFromContext(ctx).AddEvent("batch.GetStream.failed", trace.WithAttributes(
+			attribute.Int("batchIndex", batchIdx),
+			attribute.String("error", err.Error()),
+		))
+		return err
+	}
+	countingStream := &countingReadCloser{inner: rawStream}
+	defer func() {
+		err = errors.Join(err, countingStream.Close())
+	}()
+
+	rr, err := ipc.NewReader(countingStream, ipc.WithAllocator(alloc))
+	if err != nil {
+		trace.SpanFromContext(ctx).AddEvent("batch.ipcReader.failed", trace.WithAttributes(
+			attribute.Int("batchIndex", batchIdx),
+			attribute.Int64("bytesRead", countingStream.bytesRead),
+			attribute.String("error", err.Error()),
+		))
+		return fmt.Errorf("batch[%d]: ipc.NewReader failed after reading %d bytes: %w", batchIdx, countingStream.bytesRead, err)
+	}
+	defer rr.Release()
+
+	return streamRecordReaderToChannel(
+		ctx,
+		rr,
+		transform,
+		target,
+	)
+}
+
+// readJSONBatches handles the case where GetBatches() returned downloadable
+// chunks that contain JSON data instead of Arrow IPC. This happens with some
+// Snowflake stored procedures that return JSON-format results even when Arrow
+// was requested, and where the inline JSONData() is empty because all data
+// arrives via downloadable chunks.
+//
+// batch0Data contains the already-read bytes for batches[0] (since its stream
+// was consumed during format detection). Remaining batches are read via GetStream.
+func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool) (array.RecordReader, error) {
+	trace.SpanFromContext(ctx).AddEvent("readJSONBatches", trace.WithAttributes(
+		attribute.Int("batches", len(batches)),
+	))
+
+	schema, err := rowTypesToArrowSchema(ctx, ld, useHighPrecision, maxTimestampPrecision)
+	if err != nil {
+		return nil, adbc.Error{
+			Msg:  err.Error(),
+			Code: adbc.StatusInternal,
+		}
+	}
+
+	if ld.TotalRows() == 0 && len(batches) == 0 {
+		return array.NewRecordReader(schema, []arrow.RecordBatch{})
+	}
+
+	bldr := array.NewRecordBuilder(alloc, schema)
+	defer bldr.Release()
+
+	var results []arrow.RecordBatch
+	var rawData [][]*string
+	var totalRowsRead int64
+	for batchIdx, b := range batches {
+		var data []byte
+		if batchIdx == 0 {
+			// Use the already-read data for batch[0]
+			data = batch0Data
+		} else {
+			rdr, err := b.GetStream(ctx)
+			if err != nil {
+				return nil, adbc.Error{
+					Msg:  fmt.Sprintf("batch[%d]: GetStream failed: %s", batchIdx, err.Error()),
+					Code: adbc.StatusInternal,
+				}
+			}
+
+			data, err = io.ReadAll(rdr)
+			rdrErr := rdr.Close()
+			if err != nil {
+				return nil, adbc.Error{
+					Msg:  fmt.Sprintf("batch[%d]: ReadAll failed: %s", batchIdx, err.Error()),
+					Code: adbc.StatusInternal,
+				}
+			} else if rdrErr != nil {
+				return nil, rdrErr
+			}
+		}
+
+		trace.SpanFromContext(ctx).AddEvent("readJSONBatches.batch", trace.WithAttributes(
+			attribute.Int("batchIndex", batchIdx),
+			attribute.Int("bytes", len(data)),
+			attribute.Int64("numRows", b.NumRows()),
+		))
+
+		if cap(rawData) >= int(b.NumRows()) {
+			rawData = rawData[:b.NumRows()]
+		} else {
+			rawData = make([][]*string, b.NumRows())
+		}
+		bldr.Reserve(int(b.NumRows()))
+
+		offset, buf := int64(0), bytes.NewReader(data)
+		for i := range b.NumRows() {
+			dec := json.NewDecoder(buf)
+			if err = dec.Decode(&rawData[i]); err != nil {
+				return nil, adbc.Error{
+					Msg:  fmt.Sprintf("batch[%d] row[%d]: JSON decode failed: %s", batchIdx, i, err.Error()),
+					Code: adbc.StatusInternal,
+				}
+			}
+
+			offset += dec.InputOffset() + 1
+			if _, err = buf.Seek(offset, 0); err != nil {
+				return nil, adbc.Error{
+					Msg:  fmt.Sprintf("batch[%d] row[%d]: seek failed: %s", batchIdx, i, err.Error()),
+					Code: adbc.StatusInternal,
+				}
+			}
+		}
+
+		rec, err := jsonDataToArrow(ctx, bldr, rawData, maxTimestampPrecision)
+		if err != nil {
+			return nil, err
+		}
+		defer rec.Release()
+
+		results = append(results, rec)
+		totalRowsRead += rec.NumRows()
+	}
+
+	if err := validateRowCount("result set", ld.TotalRows(), totalRowsRead); err != nil {
+		return nil, err
+	}
+	return array.NewRecordReader(schema, results)
+}
+
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision, streamRetryEnabled bool, maxTimestampPrecision MaxTimestampPrecision, useGeoArrow bool) (array.RecordReader, error) {
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
@@ -571,7 +1200,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			}
 		}
 
-		if ld.TotalRows() == 0 {
+		if ld.TotalRows() == 0 && len(rawData) == 0 && len(batches) == 0 {
 			return array.NewRecordReader(schema, []arrow.RecordBatch{})
 		}
 
@@ -585,6 +1214,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		defer rec.Release()
 
 		results := []arrow.RecordBatch{rec}
+		totalRowsRead := rec.NumRows()
 		for _, b := range batches {
 			rdr, err := b.GetStream(ctx)
 			if err != nil {
@@ -651,13 +1281,20 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			defer rec.Release()
 
 			results = append(results, rec)
+			totalRowsRead += rec.NumRows()
 		}
 
+		if err := validateRowCount("result set", ld.TotalRows(), totalRowsRead); err != nil {
+			return nil, err
+		}
 		return array.NewRecordReader(schema, results)
 	}
 
 	// Handle empty batches case early
 	if len(batches) == 0 {
+		if err := validateRowCount("result set", ld.TotalRows(), 0); err != nil {
+			return nil, err
+		}
 		schema, err := rowTypesToArrowSchema(ctx, ld, useHighPrecision, maxTimestampPrecision)
 		if err != nil {
 			return nil, err
@@ -671,23 +1308,70 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			done:     make(chan struct{}),
 		}
 		close(rdr.done) // No goroutines to wait for
-		rdr.schema, _ = getTransformer(schema, ld, useHighPrecision, maxTimestampPrecision)
+		rdr.schema, _ = getTransformer(schema, ld, useHighPrecision, maxTimestampPrecision, nil)
 		return rdr, nil
 	}
 
-	// Do all error-prone initialization first, before starting goroutines
-	r, err := batches[0].GetStream(ctx)
+	trace.SpanFromContext(ctx).AddEvent("newRecordReader", trace.WithAttributes(
+		attribute.Int("batches", len(batches)),
+		attribute.Int64("totalRows", ld.TotalRows()),
+		attribute.Bool("streamRetryEnabled", streamRetryEnabled),
+		attribute.Int("jsonDataLen", len(ld.JSONData())),
+	))
+
+	raw0, err := batches[0].GetStream(ctx)
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusIO, err)
 	}
 
+	// Use the QueryResultFormatProvider interface (added in gosnowflake 2.0.2)
+	// to detect when the server returned JSON-formatted chunks instead of
+	// Arrow IPC. Some statements such as `CALL stored_procedure() RETURNS
+	// TABLE(...)` always come back as JSON regardless of the Arrow request.
+	if fp, ok := ld.(gosnowflake.QueryResultFormatProvider); ok && fp.QueryResultFormat() == "json" {
+		raw0Data, err := io.ReadAll(raw0)
+		_ = raw0.Close()
+		if err != nil {
+			return nil, errToAdbcErr(adbc.StatusIO, fmt.Errorf("batch[0]: ReadAll failed: %w", err))
+		}
+		trace.SpanFromContext(ctx).AddEvent("newRecordReader.jsonFormat", trace.WithAttributes(
+			attribute.Int("batch0Bytes", len(raw0Data)),
+		))
+		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, maxTimestampPrecision, useHighPrecision)
+	}
+
+	r := &countingReadCloser{inner: raw0}
+
 	rr, err := ipc.NewReader(r, ipc.WithAllocator(alloc))
 	if err != nil {
-		_ = r.Close() // Clean up the stream
+		trace.SpanFromContext(ctx).AddEvent("newRecordReader.ipcReaderFailed", trace.WithAttributes(
+			attribute.Int64("bytesRead", r.bytesRead),
+			attribute.String("error", err.Error()),
+		))
+		_ = r.Close()
 		return nil, adbc.Error{
-			Msg:  err.Error(),
+			Msg:  fmt.Sprintf("batch[0]: ipc.NewReader failed after reading %d bytes: %s", r.bytesRead, err.Error()),
 			Code: adbc.StatusInvalidState,
 		}
+	}
+	trace.SpanFromContext(ctx).AddEvent("newRecordReader.schemaOK", trace.WithAttributes(
+		attribute.Int64("bytesRead", r.bytesRead),
+		attribute.String("schema", rr.Schema().String()),
+	))
+
+	// When useGeoArrow is true (at least one geo output format is EWKB), peek
+	// the first record from the first IPC batch so we can identify any binary
+	// columns that carry EWKB geometries (and lift their SRID into
+	// geoarrow.wkb field metadata) before fixing the result schema. When
+	// useGeoArrow is false, skip the peek — geography/geometry columns arrive
+	// as text strings.
+	var firstRec arrow.RecordBatch
+	var geoCols map[string]geoColumnInfo
+	if useGeoArrow {
+		if rr.Next() {
+			firstRec = rr.RecordBatch()
+		}
+		geoCols = analyzeGeoFromBatch(firstRec)
 	}
 
 	// Now setup concurrency primitives after error-prone operations
@@ -710,89 +1394,109 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	}
 
 	var recTransform recordTransformer
-	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision)
+	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision, geoCols)
+	var totalRowsRead atomic.Int64
+	batch0Target := newBatchStreamTarget(0, &batches[0], chs[0], &totalRowsRead)
+
+	if firstRec != nil {
+		transformed, err := recTransform(ctx, firstRec)
+		if err != nil {
+			rr.Release()
+			_ = r.Close()
+			cancelFn()
+			return nil, errToAdbcErr(adbc.StatusInternal, err)
+		}
+		// chs[0] is buffered (bufferSize >= 1), so this never blocks.
+		chs[0] <- transformed
+		rows := transformed.NumRows()
+		totalRowsRead.Add(rows)
+		batch0Target.initialRowsRead = rows
+	}
 
 	group.Go(func() (err error) {
 		defer rr.Release()
 		defer func() {
+			rdr.setErr(err)
 			err = errors.Join(err, r.Close())
 		}()
 		if len(batches) > 1 {
 			defer close(chs[0])
 		}
-
-		for rr.Next() && ctx.Err() == nil {
-			rec := rr.RecordBatch()
-			rec, err = recTransform(ctx, rec)
-			if err != nil {
-				return err
-			}
-
-			// Use context-aware send to prevent deadlock
-			select {
-			case chs[0] <- rec:
-				// Successfully sent
-			case <-ctx.Done():
-				// Context cancelled, clean up and exit
-				rec.Release()
-				return ctx.Err()
-			}
-		}
-		return rr.Err()
+		return streamRecordReaderToChannel(
+			ctx,
+			rr,
+			recTransform,
+			batch0Target,
+		)
 	})
 
 	lastChannelIndex := len(chs) - 1
 	go func() {
-		for i, b := range batches[1:] {
-			batch, batchIdx := b, i+1
+		for i := range batches[1:] {
+			batch, batchIdx := &batches[i+1], i+1
 			// Channels already initialized above, no need to create them here
-			group.Go(func() (err error) {
-				// close channels (except the last) so that Next can move on to the next channel properly
-				if batchIdx != lastChannelIndex {
-					defer close(chs[batchIdx])
-				}
-
-				rdr, err := batch.GetStream(ctx)
-				if err != nil {
-					return err
-				}
-				defer func() {
-					err = errors.Join(err, rdr.Close())
-				}()
-
-				rr, err := ipc.NewReader(rdr, ipc.WithAllocator(alloc))
-				if err != nil {
-					return err
-				}
-				defer rr.Release()
-
-				for rr.Next() && ctx.Err() == nil {
-					rec := rr.RecordBatch()
-					rec, err = recTransform(ctx, rec)
-					if err != nil {
-						return err
+			group.Go(func(batch batchStreamer, batchIdx int) func() error {
+				return func() (err error) {
+					defer func() {
+						rdr.setErr(err)
+					}()
+					// close channels (except the last) so that Next can move on to the next channel properly
+					if batchIdx != lastChannelIndex {
+						defer close(chs[batchIdx])
 					}
 
-					// Use context-aware send to prevent deadlock
-					select {
-					case chs[batchIdx] <- rec:
-						// Successfully sent
-					case <-ctx.Done():
-						// Context cancelled, clean up and exit
-						rec.Release()
-						return ctx.Err()
+					if streamRetryEnabled {
+						recs, err := readBatchRecords(ctx, batch, alloc, recTransform, defaultStreamMaxRetries)
+						if err != nil {
+							trace.SpanFromContext(ctx).AddEvent("batch.readBatchRecords.failed", trace.WithAttributes(
+								attribute.Int("batchIndex", batchIdx),
+								attribute.String("error", err.Error()),
+							))
+							return err
+						}
+						trace.SpanFromContext(ctx).AddEvent("batch.readBatchRecords.success", trace.WithAttributes(
+							attribute.Int("batchIndex", batchIdx),
+							attribute.Int("records", len(recs)),
+						))
+						for i, rec := range recs {
+							select {
+							case chs[batchIdx] <- rec:
+								totalRowsRead.Add(rec.NumRows())
+								recs[i] = nil // ownership transferred to channel
+							case <-ctx.Done():
+								rec.Release()
+								// Release only unsent records
+								for _, r := range recs[i+1:] {
+									if r != nil {
+										r.Release()
+									}
+								}
+								return ctx.Err()
+							}
+						}
+						return nil
 					}
-				}
 
-				return rr.Err()
-			})
+					return streamBatchToChannel(
+						ctx,
+						batchIdx,
+						batch,
+						alloc,
+						recTransform,
+						newBatchStreamTarget(batchIdx, batch, chs[batchIdx], &totalRowsRead),
+					)
+				}
+			}(batch, batchIdx))
 		}
 
 		// place this here so that we always clean up, but they can't be in a
 		// separate goroutine. Otherwise we'll have a race condition between
 		// the call to wait and the calls to group.Go to kick off the jobs
 		// to perform the pre-fetching (GH-1283).
-		rdr.err = group.Wait()
+		rdr.setErr(group.Wait())
+		if rdr.getErr() == nil {
+			rdr.setErr(validateRowCount("result set", ld.TotalRows(), totalRowsRead.Load()))
+		}
 		// don't close the last channel until after the group is finished,
 		// so that Next() can only return after reader.err may have been set
 		close(chs[lastChannelIndex])
@@ -816,7 +1520,7 @@ func (r *reader) RecordBatch() arrow.RecordBatch {
 }
 
 func (r *reader) Err() error {
-	return r.err
+	return r.getErr()
 }
 
 func (r *reader) Next() bool {
@@ -832,11 +1536,14 @@ func (r *reader) Next() bool {
 	var ok bool
 	for r.curChIndex < len(r.chs) {
 		if r.rec, ok = <-r.chs[r.curChIndex]; ok {
-			break
+			return true
+		}
+		if r.getErr() != nil {
+			return false
 		}
 		r.curChIndex++
 	}
-	return r.rec != nil
+	return false
 }
 
 func (r *reader) Retain() {

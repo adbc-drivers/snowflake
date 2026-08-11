@@ -25,6 +25,7 @@ package snowflake
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"strings"
@@ -32,7 +33,7 @@ import (
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
 )
 
 const (
@@ -88,6 +89,28 @@ const (
 	// `microseconds`: Limits the max Timestamp precision to microseconds, which is safe for all values.
 	OptionMaxTimestampPrecision = "adbc.snowflake.sql.client_option.max_timestamp_precision"
 
+	// OptionStreamRetryEnabled controls whether batch reads from Snowflake
+	// use a retry-based approach that buffers entire batches and retries on
+	// failure, or the original streaming approach that reads directly from
+	// the network. When enabled, transient network errors during reads of
+	// batches[1:] will be retried up to a fixed number of attempts; batch[0]
+	// is always read via the original streaming path because its IPC reader
+	// is shared to discover the schema. When disabled, all batches use the
+	// original inline streaming path. Default is disabled.
+	OptionStreamRetryEnabled = "adbc.snowflake.sql.client_option.stream_retry_enabled"
+
+	// OptionGeographyOutputFormat controls the output format for GEOGRAPHY
+	// columns. Valid values are "EWKB" and "GeoJSON" (default, case-insensitive).
+	// When set to EWKB, GEOGRAPHY columns are returned as geoarrow.wkb binary
+	// with CRS metadata. When set to GeoJSON, they are returned as UTF-8 text.
+	OptionGeographyOutputFormat = "adbc.snowflake.sql.client_option.geography_output_format"
+
+	// OptionGeometryOutputFormat controls the output format for GEOMETRY
+	// columns. Valid values are "EWKB" and "GeoJSON" (default, case-insensitive).
+	// When set to EWKB, GEOMETRY columns are returned as geoarrow.wkb binary
+	// with CRS metadata. When set to GeoJSON, they are returned as UTF-8 text.
+	OptionGeometryOutputFormat = "adbc.snowflake.sql.client_option.geometry_output_format"
+
 	OptionApplicationName  = "adbc.snowflake.sql.client_option.app_name"
 	OptionSSLSkipVerify    = "adbc.snowflake.sql.client_option.tls_skip_verify"
 	OptionOCSPFailOpenMode = "adbc.snowflake.sql.client_option.ocsp_fail_open_mode"
@@ -111,6 +134,12 @@ const (
 	OptionLogTracing = "adbc.snowflake.sql.client_option.tracing"
 	// snowflake driver client logging config file
 	OptionClientConfigFile = "adbc.snowflake.sql.client_option.config_file"
+	// snowflake driver proxy configuration
+	OptionProxyHost     = "adbc.snowflake.sql.client_option.proxy_host"
+	OptionProxyPort     = "adbc.snowflake.sql.client_option.proxy_port"
+	OptionProxyUser     = "adbc.snowflake.sql.client_option.proxy_user"
+	OptionProxyPassword = "adbc.snowflake.sql.client_option.proxy_password"
+	OptionProxyProtocol = "adbc.snowflake.sql.client_option.proxy_protocol"
 	// When true, the MFA token is cached in the credential manager. True by default
 	// on Windows/OSX, false for Linux
 	OptionClientRequestMFAToken = "adbc.snowflake.sql.client_option.cache_mfa_token"
@@ -182,6 +211,11 @@ func errToAdbcErr(code adbc.Status, err error) error {
 		case gosnowflake.SQLStateConnectionRejected:
 			code = adbc.StatusUnauthorized
 		}
+		switch sferr.Number {
+		case 100383:
+			// geometry self-intersection
+			code = adbc.StatusInvalidArgument
+		}
 
 		return adbc.Error{
 			Code:       code,
@@ -197,8 +231,11 @@ func errToAdbcErr(code adbc.Status, err error) error {
 	}
 }
 
-func quoteTblName(name string) string {
-	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
+// quoteIdentifier quotes a Snowflake identifier to handle special characters and preserve case.
+// This is used for table names, schema names, catalog names, and column names.
+func quoteIdentifier(identifier string) string {
+	escaped := strings.ReplaceAll(identifier, `"`, `""`)
+	return fmt.Sprintf(`"%s"`, escaped)
 }
 
 type config struct {
@@ -226,10 +263,11 @@ func WithTransporter(transporter http.RoundTripper) Option {
 // when creating the Snowflake database.
 type Driver interface {
 	adbc.Driver
+	driverbase.DriverWithContext
 
 	// NewDatabaseWithOptions creates a new Snowflake database with the provided options.
-	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.Database, error)
-	NewDatabaseWithOptionsContext(context.Context, map[string]string, ...Option) (adbc.Database, error)
+	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.DatabaseWithContext, error)
+	NewDatabaseWithOptionsContext(context.Context, map[string]string, ...Option) (adbc.DatabaseWithContext, error)
 }
 
 var _ Driver = (*driverImpl)(nil)
@@ -248,17 +286,17 @@ func NewDriver(alloc memory.Allocator) Driver {
 }
 
 func (d *driverImpl) NewDatabase(opts map[string]string) (adbc.Database, error) {
-	return d.NewDatabaseWithContext(context.Background(), opts)
+	return nil, adbc.Error{Code: adbc.StatusNotImplemented, Msg: "use NewDatabaseWithContext"}
 }
 
-func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.Database, error) {
+func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string]string) (adbc.DatabaseWithContext, error) {
 	return d.NewDatabaseWithOptionsContext(ctx, opts)
 }
 
 func (d *driverImpl) NewDatabaseWithOptions(
 	opts map[string]string,
 	optFuncs ...Option,
-) (adbc.Database, error) {
+) (adbc.DatabaseWithContext, error) {
 	return d.NewDatabaseWithOptionsContext(context.Background(), opts, optFuncs...)
 }
 
@@ -266,10 +304,10 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	ctx context.Context,
 	opts map[string]string,
 	optFuncs ...Option,
-) (adbc.Database, error) {
+) (adbc.DatabaseWithContext, error) {
 	opts = maps.Clone(opts)
 
-	dbBase, err := driverbase.NewDatabaseImplBase(ctx, &d.DriverImplBase)
+	dbBase, err := driverbase.NewDatabaseImplBase(ctx, &d.DriverImplBase, driverbase.TracingOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -280,10 +318,13 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	db := &databaseImpl{
 		DatabaseImplBase:      dbBase,
 		useHighPrecision:      true,
+		streamRetryEnabled:    false,
+		geographyOutputFormat: "GEOJSON",
+		geometryOutputFormat:  "GEOJSON",
 		defaultAppName:        defaultAppName,
 		maxTimestampPrecision: Nanoseconds,
 	}
-	if err := db.SetOptions(opts); err != nil {
+	if err := db.SetOptions(ctx, opts); err != nil {
 		return nil, err
 	}
 
@@ -295,4 +336,8 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(
 	}
 
 	return driverbase.NewDatabase(db), nil
+}
+
+func quoteTblName(name string) string {
+	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
 }

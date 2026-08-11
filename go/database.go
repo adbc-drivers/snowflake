@@ -38,9 +38,15 @@ import (
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/snowflakedb/gosnowflake/v2"
+	"github.com/snowflakedb/gosnowflake/v2/arrowbatches"
 	"github.com/youmark/pkcs8"
 )
+
+// clientTelemetryEnabledParam is the Snowflake session parameter used to
+// control telemetry. gosnowflake v2 removed the DisableTelemetry config field
+// in favor of this session parameter.
+const clientTelemetryEnabledParam = "CLIENT_TELEMETRY_ENABLED"
 
 var (
 	drv         = gosnowflake.SnowflakeDriver{}
@@ -82,12 +88,14 @@ type databaseImpl struct {
 	cfg *gosnowflake.Config
 
 	useHighPrecision      bool
+	streamRetryEnabled    bool
+	geographyOutputFormat string
+	geometryOutputFormat  string
 	maxTimestampPrecision MaxTimestampPrecision
 	defaultAppName        string
 }
 
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
-func (d *databaseImpl) GetOption(key string) (string, error) {
+func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error) {
 	switch key {
 	case adbc.OptionKeyUsername:
 		return d.cfg.User, nil
@@ -114,13 +122,13 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 	case OptionAuthType:
 		return d.cfg.Authenticator.String(), nil
 	case OptionLoginTimeout:
-		return strconv.FormatFloat(d.cfg.LoginTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.LoginTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionRequestTimeout:
-		return strconv.FormatFloat(d.cfg.RequestTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.RequestTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionJwtExpireTimeout:
-		return strconv.FormatFloat(d.cfg.JWTExpireTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.JWTExpireTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientTimeout:
-		return strconv.FormatFloat(d.cfg.ClientTimeout.Seconds(), 'f', -1, 64), nil
+		return strconv.FormatFloat(d.cfg.ClientTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionApplicationName:
 		return d.cfg.Application, nil
 	case OptionSSLSkipVerify:
@@ -135,12 +143,14 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 	case OptionAuthOktaUrl:
 		return d.cfg.OktaURL.String(), nil
 	case OptionKeepSessionAlive:
-		if d.cfg.KeepSessionAlive {
+		if d.cfg.ServerSessionKeepAlive {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
 	case OptionDisableTelemetry:
-		if d.cfg.DisableTelemetry {
+		// gosnowflake v2 removed the DisableTelemetry field; use the
+		// CLIENT_TELEMETRY_ENABLED session parameter instead.
+		if v, ok := d.cfg.Params[clientTelemetryEnabledParam]; ok && v != nil && strings.EqualFold(*v, "false") {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
@@ -155,14 +165,33 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 		}
 		return adbc.OptionValueDisabled, nil
 	case OptionLogTracing:
-		return d.cfg.Tracing, nil
+		return d.cfg.Tracing, nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
 		return d.cfg.ClientConfigFile, nil
+	case OptionProxyHost:
+		return d.cfg.ProxyHost, nil
+	case OptionProxyPort:
+		return strconv.Itoa(d.cfg.ProxyPort), nil
+	case OptionProxyUser:
+		return d.cfg.ProxyUser, nil
+	case OptionProxyPassword:
+		return d.cfg.ProxyPassword, nil
+	case OptionProxyProtocol:
+		return d.cfg.ProxyProtocol, nil
 	case OptionUseHighPrecision:
 		if d.useHighPrecision {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
+	case OptionStreamRetryEnabled:
+		if d.streamRetryEnabled {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionGeographyOutputFormat:
+		return d.geographyOutputFormat, nil
+	case OptionGeometryOutputFormat:
+		return d.geometryOutputFormat, nil
 	case OptionMaxTimestampPrecision:
 		switch d.maxTimestampPrecision {
 		case Microseconds:
@@ -180,10 +209,10 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 			return *val, nil
 		}
 	}
-	return d.DatabaseImplBase.GetOption(key)
+	return d.DatabaseImplBase.GetOption(ctx, key)
 }
 
-func (d *databaseImpl) SetOption(key string, value string) error {
+func (d *databaseImpl) SetOption(ctx context.Context, key string, value string) error {
 	return d.SetOptionInternal(key, value, nil)
 }
 
@@ -195,7 +224,7 @@ func ParseSnowflakeURI(uri string) (*gosnowflake.Config, error) {
 	return gosnowflake.ParseDSN(uri)
 }
 
-func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
+func (d *databaseImpl) SetOptions(ctx context.Context, cnOptions map[string]string) error {
 	uri, ok := cnOptions[adbc.OptionKeyURI]
 	if ok {
 		cfg, err := ParseSnowflakeURI(uri)
@@ -212,9 +241,7 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 	}
 	// XXX(https://github.com/apache/arrow-adbc/issues/2792): Snowflake
 	// has a tendency to spam the log by default, so set the log level
-
-	//nolint:staticcheck // ignore snowflake deprecated warnings for now
-	d.cfg.Tracing = "fatal"
+	d.cfg.Tracing = "fatal" //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 
 	// set default application name to track
 	// unless user overrides it
@@ -232,8 +259,6 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 // SetOptionInternal sets the option for the database.
 //
 // cnOptions is nil if the option is being set post-initialiation.
-//
-//nolint:staticcheck // ignore snowflake deprecated warnings for now
 func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[string]string) error {
 	var err error
 	var ok bool
@@ -287,7 +312,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.LoginTimeout = dur
+		d.cfg.LoginTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionRequestTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {
@@ -299,7 +324,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.RequestTimeout = dur
+		d.cfg.RequestTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionJwtExpireTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {
@@ -311,7 +336,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.JWTExpireTimeout = dur
+		d.cfg.JWTExpireTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {
@@ -323,7 +348,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		if dur < 0 {
 			dur = -dur
 		}
-		d.cfg.ClientTimeout = dur
+		d.cfg.ClientTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionApplicationName:
 		if !strings.HasPrefix(v, "[ADBC]") {
 			v = d.defaultAppName + v
@@ -337,7 +362,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			d.cfg.DisableOCSPChecks = false
 		default:
 			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
@@ -349,7 +374,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			d.cfg.OCSPFailOpen = gosnowflake.OCSPFailOpenFalse
 		default:
 			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
@@ -366,24 +391,28 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	case OptionKeepSessionAlive:
 		switch v {
 		case adbc.OptionValueEnabled:
-			d.cfg.KeepSessionAlive = true
+			d.cfg.ServerSessionKeepAlive = true
 		case adbc.OptionValueDisabled:
-			d.cfg.KeepSessionAlive = false
+			d.cfg.ServerSessionKeepAlive = false
 		default:
 			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
 	case OptionDisableTelemetry:
+		// gosnowflake v2 removed the DisableTelemetry field; configure the
+		// CLIENT_TELEMETRY_ENABLED session parameter instead.
 		switch v {
 		case adbc.OptionValueEnabled:
-			d.cfg.DisableTelemetry = true
+			val := "false"
+			d.cfg.Params[clientTelemetryEnabledParam] = &val
 		case adbc.OptionValueDisabled:
-			d.cfg.DisableTelemetry = false
+			val := "true"
+			d.cfg.Params[clientTelemetryEnabledParam] = &val
 		default:
 			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
@@ -478,7 +507,7 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			d.cfg.ClientRequestMfaToken = gosnowflake.ConfigBoolFalse
 		default:
 			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
@@ -490,14 +519,39 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			d.cfg.ClientStoreTemporaryCredential = gosnowflake.ConfigBoolFalse
 		default:
 			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
 	case OptionLogTracing:
-		d.cfg.Tracing = v
+		d.cfg.Tracing = v //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
 		d.cfg.ClientConfigFile = v
+	case OptionProxyHost:
+		d.cfg.ProxyHost = v
+	case OptionProxyPort:
+		port, parseErr := strconv.Atoi(v)
+		if parseErr != nil || port <= 0 || port > 65535 {
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s' (must be an integer between 1 and 65535)", k, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		d.cfg.ProxyPort = port
+	case OptionProxyUser:
+		d.cfg.ProxyUser = v
+	case OptionProxyPassword:
+		d.cfg.ProxyPassword = v
+	case OptionProxyProtocol:
+		switch strings.ToLower(v) {
+		case "http", "https":
+			d.cfg.ProxyProtocol = strings.ToLower(v)
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
 	case OptionUseHighPrecision:
 		switch v {
 		case adbc.OptionValueEnabled:
@@ -510,6 +564,28 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
+	case OptionStreamRetryEnabled:
+		switch v {
+		case adbc.OptionValueEnabled:
+			d.streamRetryEnabled = true
+		case adbc.OptionValueDisabled:
+			d.streamRetryEnabled = false
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionStreamRetryEnabled, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+	case OptionGeographyOutputFormat:
+		if err := validateGeoOutputFormat(k, v); err != nil {
+			return err
+		}
+		d.geographyOutputFormat = strings.ToUpper(v)
+	case OptionGeometryOutputFormat:
+		if err := validateGeoOutputFormat(k, v); err != nil {
+			return err
+		}
+		d.geometryOutputFormat = strings.ToUpper(v)
 	case OptionMaxTimestampPrecision:
 		switch v {
 		case OptionValueNanoseconds, OptionValueNanosecondsNoOverflow, OptionValueMicroseconds:
@@ -528,14 +604,40 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 	return nil
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection, err error) {
+func validateGeoOutputFormat(optionName, value string) error {
+	switch strings.ToUpper(value) {
+	case "EWKB", "GEOJSON":
+		return nil
+	default:
+		return adbc.Error{
+			Msg:  fmt.Sprintf("[snowflake] invalid value for database option '%s': '%s' (must be 'EWKB' or 'GeoJSON')", optionName, value),
+			Code: adbc.StatusInvalidArgument,
+		}
+	}
+}
+
+func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.ConnectionWithContext, err error) {
 	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
 	defer driverbase.EndSpan(span, err)
+
+	// Set the Snowflake session output format for GEOGRAPHY/GEOMETRY based on
+	// the configured option. EWKB enables the GeoArrow path (binary + SRID
+	// peek); GeoJSON returns text strings. Only set the session parameter if
+	// the user hasn't already configured it directly via the Params map.
+	if d.cfg.Params == nil {
+		d.cfg.Params = make(map[string]*string)
+	}
+	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
+		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = new(d.geographyOutputFormat)
+	}
+	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
+		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = new(d.geometryOutputFormat)
+	}
 
 	connector := gosnowflake.NewConnector(drv, *d.cfg)
 
 	ctx = gosnowflake.WithArrowAllocator(
-		gosnowflake.WithArrowBatches(ctx), d.Alloc)
+		arrowbatches.WithArrowBatches(ctx), d.Alloc)
 
 	var cn driver.Conn
 	cn, err = connector.Connect(ctx)
@@ -551,6 +653,9 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 		// SetOption(OptionUseHighPrecision, adbc.OptionValueDisabled) to
 		// get Int64/Float64 instead
 		useHighPrecision:      d.useHighPrecision,
+		streamRetryEnabled:    d.streamRetryEnabled,
+		geographyOutputFormat: d.geographyOutputFormat,
+		geometryOutputFormat:  d.geometryOutputFormat,
 		maxTimestampPrecision: d.maxTimestampPrecision,
 		ConnectionImplBase:    driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 	}
@@ -566,10 +671,10 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 	return adbcConnection, err
 }
 
-func (d *databaseImpl) Close() error {
+func (d *databaseImpl) Close(ctx context.Context) error {
 	return nil
 }
 
 var (
-	_ adbc.PostInitOptions = (*databaseImpl)(nil)
+	_ adbc.GetSetOptionsWithContext = (*databaseImpl)(nil)
 )

@@ -1,0 +1,119 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//         http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// part: metadata
+[tags]
+sql-type-name = "ARRAY"
+
+// part: input_schema
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "smallvalue",
+            "format": "+l",
+            "flags": ["nullable"],
+            "children": [
+                {
+                    "name": "value",
+                    "format": "i",
+                    "flags": ["nullable"]
+                }
+            ]
+        },
+        {
+            "name": "value",
+            "format": "+l",
+            "flags": ["nullable"],
+            "children": [
+                {
+                    "name": "value",
+                    "format": "+s",
+                    "flags": ["nullable"],
+                    "children": [
+                        {
+                            "name": "key",
+                            "format": "U",
+                            "flags": ["nullable"]
+                        },
+                        {
+                            "name": "num",
+                            "format": "g",
+                            "flags": ["nullable"]
+                        },
+                        {
+                            "name": "row",
+                            "format": "g",
+                            "flags": ["nullable"]
+                        },
+                        {
+                            "name": "active",
+                            "format": "b",
+                            "flags": ["nullable"]
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
+
+// part: input
+{"idx": 0, "smallvalue": null, "value": null}
+{"idx": 1, "smallvalue": [], "value": []}
+{"idx": 2, "smallvalue": [null], "value": [null]}
+{"idx": 3, "smallvalue": [1], "value": [{}]}
+{"idx": 4, "smallvalue": [42], "value": [{"key": "foo"}]}
+{"idx": 5, "smallvalue": [1,2,3,4,5], "value": [{"key": "foo", "num": 42.42, "row": 64, "active": false}]}
+
+// part: expected_schema
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "smallvalue",
+            "format": "u",
+            "flags": ["nullable"],
+            "metadata": {
+                "ARROW:extension:name": "arrow.json"
+            }
+        },
+        {
+            "name": "value",
+            "format": "u",
+            "flags": ["nullable"],
+            "metadata": {
+                "ARROW:extension:name": "arrow.json"
+            }
+        }
+    ]
+}
+
+// part: expected
+{"idx": 0, "smallvalue": null, "value": null}
+{"idx": 1, "smallvalue": "[]", "value": "[]"}
+{"idx": 2, "smallvalue": "[\n  null\n]", "value": "[\n  null\n]"}
+{"idx": 3, "smallvalue": "[\n  1\n]", "value": "[\n  {\n    \"active\": null,\n    \"key\": null,\n    \"num\": null,\n    \"row\": null\n  }\n]"}
+{"idx": 4, "smallvalue": "[\n  42\n]", "value": "[\n  {\n    \"active\": null,\n    \"key\": \"foo\",\n    \"num\": null,\n    \"row\": null\n  }\n]"}
+{"idx": 5, "smallvalue": "[\n  1,\n  2,\n  3,\n  4,\n  5\n]", "value": "[\n  {\n    \"active\": false,\n    \"key\": \"foo\",\n    \"num\": 4.242000000000000e+01,\n    \"row\": 6.400000000000000e+01\n  }\n]"}

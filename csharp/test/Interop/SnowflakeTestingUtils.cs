@@ -104,11 +104,49 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 { SnowflakeParameters.USE_HIGH_PRECISION, testConfiguration.UseHighPrecision.ToString().ToLowerInvariant() }
             };
 
-            if (testConfiguration.Authentication.Default is not null)
+            if (testConfiguration.Authentication.Default is not null
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.Default.User)
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.Default.Password))
             {
                 parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthSnowflake;
                 parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.Default.User, "username");
                 parameters[SnowflakeParameters.PASSWORD] = Parameter(testConfiguration.Authentication.Default.Password, "password");
+            }
+            else if (testConfiguration.Authentication.SnowflakeJwt is not null
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.User)
+                && (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKey)
+                    || !string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile)))
+            {
+                parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthJwt;
+                parameters[SnowflakeParameters.USERNAME] = Parameter(testConfiguration.Authentication.SnowflakeJwt.User, "username");
+                if (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKey))
+                {
+                    parameters[SnowflakeParameters.PKCS8_VALUE] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKey, "private_key");
+                }
+                else if (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile)
+                    && File.Exists(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile))
+                {
+                    string privateKey = File.ReadAllText(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyFile);
+                    parameters[SnowflakeParameters.PKCS8_VALUE] = privateKey;
+                }
+                else
+                {
+                    throw new InvalidOperationException("JWT authentication requires either a private key value or a valid private key file path.");
+                }
+                if (!string.IsNullOrEmpty(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase))
+                {
+                    parameters[SnowflakeParameters.PKCS8_PASS] = Parameter(testConfiguration.Authentication.SnowflakeJwt.PrivateKeyPassPhrase, "private_key_passphrase");
+                }
+            }
+            else if (testConfiguration.Authentication.OAuth is not null
+                && !string.IsNullOrWhiteSpace(testConfiguration.Authentication.OAuth.Token))
+            {
+                parameters[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthOAuth;
+                parameters[SnowflakeParameters.AUTH_TOKEN] = Parameter(testConfiguration.Authentication.OAuth.Token, "oauth_token");
+                if (!string.IsNullOrWhiteSpace(testConfiguration.Authentication.OAuth.User))
+                {
+                    parameters[SnowflakeParameters.USERNAME] = testConfiguration.Authentication.OAuth.User;
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(testConfiguration.Host))
@@ -121,7 +159,6 @@ namespace AdbcDrivers.Snowflake.Interop.Tests
                 parameters[SnowflakeParameters.DATABASE] = testConfiguration.Database;
             }
 
-            Dictionary<string, string> options = new Dictionary<string, string>() { };
             AdbcDriver snowflakeDriver = GetSnowflakeAdbcDriver(testConfiguration);
 
             return snowflakeDriver;

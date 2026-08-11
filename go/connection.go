@@ -26,13 +26,12 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"embed"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
-	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -41,22 +40,29 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/snowflakedb/gosnowflake"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
+	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
 	defaultStatementQueueSize  = 100
 	defaultPrefetchConcurrency = 5
-
-	queryTemplateGetObjectsAll           = "get_objects_all.sql"
-	queryTemplateGetObjectsDbSchemas     = "get_objects_dbschemas.sql"
-	queryTemplateGetObjectsTables        = "get_objects_tables.sql"
-	queryTemplateGetObjectsTerseCatalogs = "get_objects_terse_catalogs.sql"
 )
 
-//go:embed queries/*
-var queryTemplates embed.FS
+//go:embed queries/get_objects_all.sql
+var queryGetObjectsAll string
+
+//go:embed queries/get_objects_dbschemas.sql
+var queryGetObjectsDbSchemas string
+
+//go:embed queries/get_objects_tables.sql
+var queryGetObjectsTables string
+
+//go:embed queries/get_objects_terse_catalogs.sql
+var queryGetObjectsTerseCatalogs string
+
+const geographyGeoArrowJson = `{"crs":"EPSG:4326","crs_type":"authority_code","edges":"spherical"}`
 
 type snowflakeConn interface {
 	driver.Conn
@@ -77,7 +83,16 @@ type connectionImpl struct {
 
 	activeTransaction     bool
 	useHighPrecision      bool
+	streamRetryEnabled    bool
+	geographyOutputFormat string
+	geometryOutputFormat  string
 	maxTimestampPrecision MaxTimestampPrecision
+}
+
+// useGeoArrow reports whether the EWKB peek/GeoArrow path should be used.
+// This is true when at least one of the geo output formats is EWKB.
+func (c *connectionImpl) useGeoArrow() bool {
+	return c.geographyOutputFormat == "EWKB" || c.geometryOutputFormat == "EWKB"
 }
 
 func escapeSingleQuoteForLike(arg string) string {
@@ -108,12 +123,23 @@ func escapeSingleQuoteForLike(arg string) string {
 	}
 }
 
-func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string) (string, error) {
+const (
+	// Snowflake error numbers signalling a SHOW produced no usable result set.
+	errShowNoMatch    = 2043 // the SHOW command matched nothing
+	errObjectNotFound = 2003 // the scoped object does not exist or is not authorized
+)
+
+func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string, alsoEmptyOn ...int) (string, error) {
 	rows, err := driverConn.QueryContext(ctx, query, nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
-		// No results. Generate a dummy result set instead
-		if emptyQuery != "" && errors.As(err, &sfErr) && sfErr.Number == 2043 {
+		// errShowNoMatch always maps to an empty result. Callers running an
+		// optional, narrowly-scoped SHOW may also pass errObjectNotFound so a
+		// missing scoped object degrades to an empty result instead of failing
+		// the whole GetObjects call. Substitute emptyQuery so RESULT_SCAN has a
+		// valid (empty) source to read from.
+		if emptyQuery != "" && errors.As(err, &sfErr) &&
+			(sfErr.Number == errShowNoMatch || slices.Contains(alsoEmptyOn, sfErr.Number)) {
 			return getQueryID(ctx, emptyQuery, driverConn, "")
 		}
 		return "", err
@@ -151,7 +177,7 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 			if catalog == nil || isWildcardStr(*catalog) {
 				query += " IN ACCOUNT"
 			} else {
-				query += " IN DATABASE " + quoteTblName(*catalog)
+				query += " IN DATABASE " + quoteIdentifier(*catalog)
 			}
 		case objViews, objTables, objObjects:
 			query = addLike(query, tableName)
@@ -159,11 +185,11 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 			if catalog == nil || isWildcardStr(*catalog) {
 				query += " IN ACCOUNT"
 			} else {
-				escapedCatalog := quoteTblName(*catalog)
+				escapedCatalog := quoteIdentifier(*catalog)
 				if dbSchema == nil || isWildcardStr(*dbSchema) {
 					query += " IN DATABASE " + escapedCatalog
 				} else {
-					query += " IN SCHEMA " + escapedCatalog + "." + quoteTblName(*dbSchema)
+					query += " IN SCHEMA " + escapedCatalog + "." + quoteIdentifier(*dbSchema)
 				}
 			}
 		default:
@@ -180,13 +206,58 @@ func isWildcardStr(ident string) bool {
 	return strings.ContainsAny(ident, "_%")
 }
 
+// scopeIdentifier reports whether ident can be used as a concrete object name to
+// narrow the scope of the SHOW COLUMNS enrichment query (IN DATABASE/SCHEMA/
+// TABLE). It deliberately treats '_' as a literal character rather than an ADBC
+// single-character wildcard: only '%', the match-all sentinels, and nil force a
+// broader scope. See showColumnsScope for why treating '_' literally here is
+// safe despite the ADBC pattern semantics.
+func scopeIdentifier(ident *string) (string, bool) {
+	if ident == nil {
+		return "", false
+	}
+	s := *ident
+	if s == "" || s == "%" || s == ".*" || strings.Contains(s, "%") {
+		return "", false
+	}
+	return s, true
+}
+
+// showColumnsScope returns the narrowest "IN ..." suffix for the SHOW COLUMNS
+// query. SHOW COLUMNS cannot be filtered by table, so an IN ACCOUNT scope scans
+// every column in the account (80+ seconds on large accounts).
+//
+// The result feeds get_objects_all.sql ONLY as a best-effort source for BINARY
+// xdbc_column_size enrichment; the authoritative column list comes from
+// information_schema.columns filtered by ILIKE, so a narrower scope here can
+// never drop columns or alter non-BINARY metadata. The sole consequence of
+// treating '_' as a literal (see scopeIdentifier) is that a BINARY column
+// reached only through '_'-as-wildcard matches, or through a case-insensitive
+// pattern that differs from the stored identifier, may report a NULL
+// xdbc_column_size, matching the behavior before this enrichment was added.
+func showColumnsScope(catalog, dbSchema, tableName *string) string {
+	cat, ok := scopeIdentifier(catalog)
+	if !ok {
+		return " IN ACCOUNT"
+	}
+	sch, ok := scopeIdentifier(dbSchema)
+	if !ok {
+		return " IN DATABASE " + quoteIdentifier(cat)
+	}
+	tbl, ok := scopeIdentifier(tableName)
+	if !ok {
+		return " IN SCHEMA " + quoteIdentifier(cat) + "." + quoteIdentifier(sch)
+	}
+	return " IN TABLE " + quoteIdentifier(cat) + "." + quoteIdentifier(sch) + "." + quoteIdentifier(tbl)
+}
+
 func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog, dbSchema, tableName, columnName *string, tableType []string) (reader array.RecordReader, err error) {
 	ctx, span := driverbase.StartSpan(ctx, "connectionImpl.GetObjects", c)
 	defer driverbase.EndSpan(span, err)
 
 	var (
 		pkQueryID, fkQueryID, uniqueQueryID, terseDbQueryID string
-		showSchemaQueryID, tableQueryID                     string
+		showSchemaQueryID, tableQueryID, columnsQueryID     string
 	)
 
 	conn := c.cn
@@ -209,21 +280,27 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		tableType = []string{"TABLE"}
 	}
 
+	// Optimized path: read SHOW TERSE results directly instead of through
+	// RESULT_SCAN SQL templates, reducing Snowflake round-trips from 3-4 to 1-2.
+	if reader, err = c.getObjectsDirectPath(ctx, depth, catalog, dbSchema, tableName, tableType, hasViews, hasTables); reader != nil || err != nil {
+		return
+	}
+
 	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
-	queryFile := queryTemplateGetObjectsAll
+	query := queryGetObjectsAll
 	switch depth {
 	case adbc.ObjectDepthCatalogs:
-		queryFile = queryTemplateGetObjectsTerseCatalogs
+		query = queryGetObjectsTerseCatalogs
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 	case adbc.ObjectDepthDBSchemas:
-		queryFile = queryTemplateGetObjectsDbSchemas
+		query = queryGetObjectsDbSchemas
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
 			catalog, dbSchema, tableName, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 	case adbc.ObjectDepthTables:
-		queryFile = queryTemplateGetObjectsTables
+		query = queryGetObjectsTables
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
 			catalog, dbSchema, tableName, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
@@ -245,15 +322,15 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		if catalog == nil || isWildcardStr(*catalog) {
 			suffix = " IN ACCOUNT"
 		} else {
-			escapedCatalog := quoteTblName(*catalog)
+			escapedCatalog := quoteIdentifier(*catalog)
 			if dbSchema == nil || isWildcardStr(*dbSchema) {
 				suffix = " IN DATABASE " + escapedCatalog
 			} else {
-				escapedSchema := quoteTblName(*dbSchema)
+				escapedSchema := quoteIdentifier(*dbSchema)
 				if tableName == nil || isWildcardStr(*tableName) {
 					suffix = " IN SCHEMA " + escapedCatalog + "." + escapedSchema
 				} else {
-					escapedTable := quoteTblName(*tableName)
+					escapedTable := quoteIdentifier(*tableName)
 					suffix = " IN TABLE " + escapedCatalog + "." + escapedSchema + "." + escapedTable
 				}
 			}
@@ -276,6 +353,12 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			return err
 		})
 
+		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName)
+		gQueryIDs.Go(func() (err error) {
+			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+columnsSuffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT", errObjectNotFound)
+			return err
+		})
+
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
 			catalog, dbSchema, tableName, &terseDbQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
@@ -291,12 +374,6 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		}
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
 			catalog, dbSchema, tableName, &tableQueryID)
-	}
-
-	var queryBytes []byte
-	queryBytes, err = fs.ReadFile(queryTemplates, path.Join("queries", queryFile))
-	if err != nil {
-		return nil, err
 	}
 
 	// Need constraint subqueries to complete before we can query GetObjects
@@ -319,6 +396,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		sql.Named("SHOW_DB_QUERY_ID", terseDbQueryID),
 		sql.Named("SHOW_SCHEMA_QUERY_ID", showSchemaQueryID),
 		sql.Named("SHOW_TABLE_QUERY_ID", tableQueryID),
+		sql.Named("SHOW_COLUMNS_QUERY_ID", columnsQueryID),
 	}
 
 	nvargs := make([]driver.NamedValue, len(args))
@@ -330,7 +408,6 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		}
 	}
 
-	query := string(queryBytes)
 	var rows driver.Rows
 	rows, err = conn.QueryContext(ctx, query, nvargs)
 	if err != nil {
@@ -407,49 +484,49 @@ func (*connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
 }
 
 // GetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentCatalog() (string, error) {
+func (c *connectionImpl) GetCurrentCatalog(ctx context.Context) (string, error) {
 	return c.getStringQuery("SELECT CURRENT_DATABASE()")
 }
 
 // GetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
+func (c *connectionImpl) GetCurrentDbSchema(ctx context.Context) (string, error) {
 	return c.getStringQuery("SELECT CURRENT_SCHEMA()")
 }
 
 // SetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentCatalog(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE DATABASE %s;", quoteTblName(value)), nil)
+func (c *connectionImpl) SetCurrentCatalog(ctx context.Context, value string) error {
+	_, err := c.cn.ExecContext(ctx, fmt.Sprintf("USE DATABASE %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentDbSchema(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE SCHEMA %s;", quoteTblName(value)), nil)
+func (c *connectionImpl) SetCurrentDbSchema(ctx context.Context, value string) error {
+	_, err := c.cn.ExecContext(ctx, fmt.Sprintf("USE SCHEMA %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetAutocommit implements driverbase.AutocommitSetter.
-func (c *connectionImpl) SetAutocommit(enabled bool) error {
+func (c *connectionImpl) SetAutocommit(ctx context.Context, enabled bool) error {
 	if enabled {
 		if c.activeTransaction {
-			_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
+			_, err := c.cn.ExecContext(ctx, "COMMIT", nil)
 			if err != nil {
 				return errToAdbcErr(adbc.StatusInternal, err)
 			}
 			c.activeTransaction = false
 		}
-		_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = true", nil)
+		_, err := c.cn.ExecContext(ctx, "ALTER SESSION SET AUTOCOMMIT = true", nil)
 		return err
 	}
 
 	if !c.activeTransaction {
-		_, err := c.cn.ExecContext(context.Background(), "BEGIN", nil)
+		_, err := c.cn.ExecContext(ctx, "BEGIN", nil)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInternal, err)
 		}
 		c.activeTransaction = true
 	}
-	_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = false", nil)
+	_, err := c.cn.ExecContext(ctx, "ALTER SESSION SET AUTOCOMMIT = false", nil)
 	return err
 }
 
@@ -459,6 +536,11 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	field := arrow.Field{Name: columnInfo.ColumnName, Nullable: driverbase.ValueOrZero(columnInfo.XdbcNullable) != 0}
 
 	switch driverbase.ValueOrZero(columnInfo.XdbcTypeName) {
+	case "ARRAY":
+		field.Type = arrow.BinaryTypes.String
+		field.Metadata = arrow.MetadataFrom(map[string]string{
+			"ARROW:extension:name": "arrow.json",
+		})
 	case "NUMBER":
 		if c.useHighPrecision {
 			field.Type = &arrow.Decimal128Type{
@@ -478,12 +560,12 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 		field.Type = arrow.PrimitiveTypes.Float64
 	case "TEXT":
 		field.Type = arrow.BinaryTypes.String
+	case "UUID":
+		field.Type = extensions.NewUUIDType()
 	case "BINARY":
 		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
 		field.Type = arrow.FixedWidthTypes.Boolean
-	case "ARRAY":
-		fallthrough
 	case "VARIANT":
 		fallthrough
 	case "OBJECT":
@@ -514,9 +596,27 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 			field.Type = arrow.FixedWidthTypes.Timestamp_ns
 		}
 	case "GEOGRAPHY":
-		fallthrough
+		if c.geographyOutputFormat == "GEOJSON" {
+			field.Type = arrow.BinaryTypes.String
+		} else {
+			// With GEOGRAPHY_OUTPUT_FORMAT=EWKB, data arrives as binary WKB.
+			// GEOGRAPHY is always WGS84 (SRID 4326).
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name":     "geoarrow.wkb",
+				"ARROW:extension:metadata": geographyGeoArrowJson,
+			})
+		}
 	case "GEOMETRY":
-		field.Type = arrow.BinaryTypes.String
+		if c.geometryOutputFormat == "GEOJSON" {
+			field.Type = arrow.BinaryTypes.String
+		} else {
+			// With GEOMETRY_OUTPUT_FORMAT=EWKB, data arrives as binary WKB.
+			field.Type = arrow.BinaryTypes.Binary
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
+			})
+		}
 	case "VECTOR":
 		// despite the fact that Snowflake *does* support returning data
 		// for VECTOR typed columns as Arrow FixedSizeLists, there's no way
@@ -527,18 +627,18 @@ func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Fi
 	return field
 }
 
-func descToField(name, typ, isnull, primary string, comment sql.NullString, maxTimestampPrecision MaxTimestampPrecision) (field arrow.Field, err error) {
+func descToField(name, typ, isnull, primary string, comment sql.NullString, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geographyOutputFormat, geometryOutputFormat string) (field arrow.Field, err error) {
 	field.Name = name
 	if isnull == "Y" {
 		field.Nullable = true
 	}
-	md := make(map[string]string)
-	md["DATA_TYPE"] = typ
-	md["PRIMARY_KEY"] = primary
+	keys := []string{"DATA_TYPE", "PRIMARY_KEY"}
+	vals := []string{typ, primary}
 	if comment.Valid {
-		md["COMMENT"] = comment.String
+		keys = append(keys, "COMMENT")
+		vals = append(vals, comment.String)
 	}
-	field.Metadata = arrow.MetadataFrom(md)
+	field.Metadata = arrow.NewMetadata(keys, vals)
 
 	paren := strings.Index(typ, "(")
 	if paren == -1 {
@@ -553,15 +653,35 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 		// array, object and variant are all represented as strings by
 		// snowflake's return
 		case "ARRAY":
-			fallthrough
+			field.Type = arrow.BinaryTypes.String
+			field.Metadata = arrow.MetadataFrom(map[string]string{
+				"ARROW:extension:name": "arrow.json",
+			})
 		case "OBJECT":
 			fallthrough
 		case "VARIANT":
 			field.Type = arrow.BinaryTypes.String
+		case "UUID":
+			field.Type = extensions.NewUUIDType()
 		case "GEOGRAPHY":
-			fallthrough
+			if geographyOutputFormat == "GEOJSON" {
+				field.Type = arrow.BinaryTypes.String
+			} else {
+				field.Type = arrow.BinaryTypes.Binary
+				field.Metadata = arrow.MetadataFrom(map[string]string{
+					"ARROW:extension:name":     "geoarrow.wkb",
+					"ARROW:extension:metadata": geographyGeoArrowJson,
+				})
+			}
 		case "GEOMETRY":
-			field.Type = arrow.BinaryTypes.String
+			if geometryOutputFormat == "GEOJSON" {
+				field.Type = arrow.BinaryTypes.String
+			} else {
+				field.Type = arrow.BinaryTypes.Binary
+				field.Metadata = arrow.MetadataFrom(map[string]string{
+					"ARROW:extension:name": "geoarrow.wkb",
+				})
+			}
 		case "BOOLEAN":
 			field.Type = arrow.FixedWidthTypes.Boolean
 		default:
@@ -588,10 +708,25 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 				Code: adbc.StatusInvalidData,
 			}
 		}
-		if scale == 0 {
-			field.Type = arrow.PrimitiveTypes.Int64
+		if useHighPrecision {
+			paren := strings.Index(typ, "(")
+			precision, err := strconv.ParseInt(typ[paren+1:comma], 10, 32)
+			if err != nil {
+				return field, adbc.Error{
+					Msg:  "[snowflake] could not parse precision from type '" + typ + "'",
+					Code: adbc.StatusInvalidData,
+				}
+			}
+			field.Type = &arrow.Decimal128Type{
+				Precision: int32(precision),
+				Scale:     int32(scale),
+			}
 		} else {
-			field.Type = arrow.PrimitiveTypes.Float64
+			if scale == 0 {
+				field.Type = arrow.PrimitiveTypes.Int64
+			} else {
+				field.Type = arrow.PrimitiveTypes.Float64
+			}
 		}
 	case "TIME":
 		field.Type = arrow.FixedWidthTypes.Time64ns
@@ -639,8 +774,8 @@ func (c *connectionImpl) getStringQuery(query string) (value string, err error) 
 		}
 	}
 
-	dest := make([]driver.Value, 1)
-	err = result.Next(dest)
+	var dest [1]driver.Value
+	err = result.Next(dest[:])
 	if err == io.EOF {
 		return "", adbc.Error{
 			Msg:  "[Snowflake] Internal query returned no rows",
@@ -667,12 +802,12 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 
 	tblParts := make([]string, 0, 3)
 	if catalog != nil {
-		tblParts = append(tblParts, quoteTblName(*catalog))
+		tblParts = append(tblParts, quoteIdentifier(*catalog))
 	}
 	if dbSchema != nil {
-		tblParts = append(tblParts, quoteTblName(*dbSchema))
+		tblParts = append(tblParts, quoteIdentifier(*dbSchema))
 	}
-	tblParts = append(tblParts, quoteTblName(tableName))
+	tblParts = append(tblParts, quoteIdentifier(tableName))
 	fullyQualifiedTable := strings.Join(tblParts, ".")
 
 	var rows driver.Rows
@@ -688,7 +823,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	var (
 		name, typ, isnull, primary string
 		comment                    sql.NullString
-		fields                     = []arrow.Field{}
+		fields                     []arrow.Field
 	)
 
 	// columns are:
@@ -714,7 +849,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		}
 
 		var f arrow.Field
-		f, err = descToField(name, typ, isnull, primary, comment, c.maxTimestampPrecision)
+		f, err = descToField(name, typ, isnull, primary, comment, c.useHighPrecision, c.maxTimestampPrecision, c.geographyOutputFormat, c.geometryOutputFormat)
 		if err != nil {
 			return nil, err
 		}
@@ -754,8 +889,7 @@ func (c *connectionImpl) Rollback(_ context.Context) error {
 }
 
 // NewStatement initializes a new statement object tied to this connection
-func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
-	defaultIngestOptions := DefaultIngestOptions()
+func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithContext, error) {
 	stmtBase := driverbase.NewStatementImplBase(c.Base(), c.ErrorHelper)
 	stmt := &statement{
 		StatementImplBase:     stmtBase,
@@ -764,15 +898,16 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 		queueSize:             defaultStatementQueueSize,
 		prefetchConcurrency:   defaultPrefetchConcurrency,
 		useHighPrecision:      c.useHighPrecision,
+		streamRetryEnabled:    c.streamRetryEnabled,
 		maxTimestampPrecision: c.maxTimestampPrecision,
-		ingestOptions:         defaultIngestOptions,
+		ingestOptions:         DefaultIngestOptions(),
 	}
 	return driverbase.NewStatement(stmt), nil
 }
 
 // Close closes this connection and releases any associated resources.
-func (c *connectionImpl) Close() (err error) {
-	_, span := driverbase.StartSpan(context.Background(), "connectionImpl.Close", c)
+func (c *connectionImpl) Close(ctx context.Context) (err error) {
+	_, span := driverbase.StartSpan(ctx, "connectionImpl.Close", c)
 	defer driverbase.EndSpan(span, err)
 
 	if c.cn == nil {
@@ -797,7 +932,14 @@ func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition 
 	}
 }
 
-func (c *connectionImpl) SetOption(key, value string) error {
+func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
+	switch key {
+	default:
+		return c.Base().GetOption(ctx, key)
+	}
+}
+
+func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
 	switch key {
 	case OptionUseHighPrecision:
 		// statements will inherit the value of the OptionUseHighPrecision
@@ -815,7 +957,40 @@ func (c *connectionImpl) SetOption(key, value string) error {
 			}
 		}
 		return nil
+	case OptionStreamRetryEnabled:
+		switch value {
+		case adbc.OptionValueEnabled:
+			c.streamRetryEnabled = true
+		case adbc.OptionValueDisabled:
+			c.streamRetryEnabled = false
+		default:
+			return adbc.Error{
+				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return nil
+	case OptionGeographyOutputFormat:
+		if err := validateGeoOutputFormat(key, value); err != nil {
+			return err
+		}
+		_, err := c.cn.ExecContext(ctx, fmt.Sprintf("ALTER SESSION SET GEOGRAPHY_OUTPUT_FORMAT = '%s'", value), nil)
+		if err != nil {
+			return errToAdbcErr(adbc.StatusInternal, err)
+		}
+		c.geographyOutputFormat = value
+		return nil
+	case OptionGeometryOutputFormat:
+		if err := validateGeoOutputFormat(key, value); err != nil {
+			return err
+		}
+		_, err := c.cn.ExecContext(ctx, fmt.Sprintf("ALTER SESSION SET GEOMETRY_OUTPUT_FORMAT = '%s'", value), nil)
+		if err != nil {
+			return errToAdbcErr(adbc.StatusInternal, err)
+		}
+		c.geometryOutputFormat = value
+		return nil
 	default:
-		return c.Base().SetOption(key, value)
+		return c.Base().SetOption(ctx, key, value)
 	}
 }

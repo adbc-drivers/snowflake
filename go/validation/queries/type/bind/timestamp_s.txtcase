@@ -13,4 +13,24 @@
 // limitations under the License.
 
 // part: metadata
-skip = "timestamp_s parameter binding not supported by Snowflake driver"
+
+[setup]
+drop = "test_timestamp_s"
+
+[tags]
+sql-type-name = "TIMESTAMP_NTZ(0)"
+
+// part: setup_query
+
+CREATE TABLE "test_timestamp_s" (
+    "idx" INT,
+    "res" TIMESTAMP_NTZ(0)
+);
+
+// part: bind_query
+
+INSERT INTO "test_timestamp_s" VALUES ($1, $2)
+
+// part: query
+
+SELECT "res" FROM "test_timestamp_s" ORDER BY "idx"

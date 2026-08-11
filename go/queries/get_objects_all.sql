@@ -20,27 +20,42 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-WITH columns AS (
+WITH show_columns AS (
     SELECT
-        table_catalog,
-        table_schema,
-        table_name,
+        "database_name" table_catalog,
+        "schema_name" table_schema,
+        "table_name" table_name,
+        "column_name" column_name,
+        TRY_PARSE_JSON("data_type"):"byteLength"::int AS byte_length
+    FROM TABLE(RESULT_SCAN(:SHOW_COLUMNS_QUERY_ID))
+    WHERE "database_name" ILIKE :CATALOG AND "schema_name" ILIKE :DB_SCHEMA AND "table_name" ILIKE :TABLE AND "column_name" ILIKE :COLUMN
+),
+columns AS (
+    SELECT
+        c.table_catalog,
+        c.table_schema,
+        c.table_name,
         ARRAY_AGG({
-        	'column_name': column_name,
+        	'column_name': c.column_name,
         	'ordinal_position': ordinal_position,
         	'remarks': comment,
         	'xdbc_type_name': data_type,
         	'xdbc_is_nullable': is_nullable,
         	'xdbc_nullable': is_nullable::boolean::int,
-        	'xdbc_column_size': coalesce(character_maximum_length, numeric_precision),
+        	'xdbc_column_size': coalesce(character_maximum_length, numeric_precision, IFF(data_type = 'BINARY', sc.byte_length, NULL)),
         	'xdbc_char_octet_length': character_octet_length,
         	'xdbc_decimal_digits': numeric_scale,
         	'xdbc_num_prec_radix': numeric_precision_radix,
         	'xdbc_datetime_sub': datetime_precision
         }) WITHIN GROUP (ORDER BY ordinal_position) table_columns,
-    FROM information_schema.columns
-    WHERE table_catalog ILIKE :CATALOG AND table_schema ILIKE :DB_SCHEMA AND table_name ILIKE :TABLE AND column_name ILIKE :COLUMN
-    GROUP BY table_catalog, table_schema, table_name
+    FROM information_schema.columns c
+    LEFT JOIN show_columns sc
+      ON c.table_catalog = sc.table_catalog
+     AND c.table_schema = sc.table_schema
+     AND c.table_name = sc.table_name
+     AND c.column_name = sc.column_name
+    WHERE c.table_catalog ILIKE :CATALOG AND c.table_schema ILIKE :DB_SCHEMA AND c.table_name ILIKE :TABLE AND c.column_name ILIKE :COLUMN
+    GROUP BY c.table_catalog, c.table_schema, c.table_name
 ),
 pk_constraints AS (
     SELECT

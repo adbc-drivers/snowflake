@@ -12,14 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from adbc_drivers_validation.tests.connection import (
-    TestConnection,  # noqa: F401
-    generate_tests,
-)
+import adbc_driver_manager
+import adbc_drivers_validation.tests.connection
+import pytest
 
 from . import snowflake
 
 
 def pytest_generate_tests(metafunc) -> None:
     quirks = [snowflake.get_quirks(metafunc.config.getoption("vendor_version"))]
-    return generate_tests(quirks, metafunc)
+    return adbc_drivers_validation.tests.connection.generate_tests(quirks, metafunc)
+
+
+class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
+    def test_unknown_option(self, subtests, driver, conn) -> None:
+        # database impl here accepts all options as extra connection options, so override this test
+        with conn.cursor() as cursor:
+            for handle in [
+                conn.adbc_database,
+                conn.adbc_connection,
+                cursor.adbc_statement,
+            ]:
+                with subtests.test(name=handle.__class__.__name__):
+                    for getter in (
+                        "get_option",
+                        "get_option_int",
+                        "get_option_float",
+                        "get_option_bytes",
+                    ):
+                        with pytest.raises(conn.ProgrammingError) as excinfo:
+                            getattr(handle, getter)("this_option_does_not_exist")
+                        assert (
+                            excinfo.value.status_code
+                            == adbc_driver_manager.AdbcStatusCode.NOT_FOUND
+                        )
+
+                    if handle is conn.adbc_database:
+                        continue
+
+                    for v in [
+                        "value",
+                        4,
+                        4.0,
+                        b"value",
+                    ]:
+                        with pytest.raises(conn.NotSupportedError) as excinfo:
+                            handle.set_options(
+                                **{
+                                    "this_option_does_not_exist": v,
+                                }
+                            )
+                        assert (
+                            excinfo.value.status_code
+                            == adbc_driver_manager.AdbcStatusCode.NOT_IMPLEMENTED
+                        )
