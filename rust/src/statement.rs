@@ -291,8 +291,15 @@ impl adbc_core::Statement for Statement {
 
         self.apply_query_tag()?;
 
-        // Parameterised DML: execute once with JSON bindings.
-        if !self.bound_batches.is_empty() {
+        // Parameterised DML: execute once with JSON bindings. A supplied binding
+        // with no rows represents zero executions, so do not run the statement
+        // unbound (or send an empty binding to Snowflake).
+        if self.binding_supplied {
+            let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
+            if row_count == 0 {
+                return Ok(Some(0));
+            }
+
             let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let binding = BindingType::Json(data_ptr);
@@ -1476,6 +1483,37 @@ mod tests {
             }
             Ok(_) => panic!("execute should have rejected the empty binding"),
         }
+    }
+
+    #[test]
+    fn execute_update_with_empty_bind_stream_returns_zero_rows() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("DELETE FROM example").unwrap();
+
+        let reader = ConcatReader {
+            batches: vec![].into_iter(),
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+        };
+        stmt.bind_stream(Box::new(reader)).unwrap();
+
+        assert_eq!(stmt.execute_update().unwrap(), Some(0));
+        assert_eq!(stmt.last_query_id, None);
+    }
+
+    #[test]
+    fn execute_update_with_zero_row_batch_returns_zero_rows() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("DELETE FROM example WHERE id = ?")
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        stmt.bind(RecordBatch::new_empty(schema)).unwrap();
+
+        assert_eq!(stmt.execute_update().unwrap(), Some(0));
+        assert_eq!(stmt.last_query_id, None);
     }
 
     #[test]
