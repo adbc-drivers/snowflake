@@ -336,7 +336,7 @@ fn test_high_precision_get_table_schema() {
     // Create a permanent table so a second connection can also DESC it.
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query(&format!(
+        stmt.set_sql_query(format!(
             "CREATE OR REPLACE TABLE {} (INT_COL NUMBER(10,0), DEC_COL NUMBER(15,2))",
             table_name
         ))
@@ -389,7 +389,7 @@ fn test_high_precision_get_table_schema() {
     // Cleanup
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query(&format!("DROP TABLE IF EXISTS {}", table_name))
+        stmt.set_sql_query(format!("DROP TABLE IF EXISTS {}", table_name))
             .unwrap();
         stmt.execute_update().expect("drop precision test table");
     }
@@ -418,7 +418,7 @@ fn test_timestamp_precision_get_table_schema() {
 
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query(&format!(
+        stmt.set_sql_query(format!(
             "CREATE OR REPLACE TABLE {} (NTZ_COL TIMESTAMP_NTZ, TZ_COL TIMESTAMP_TZ)",
             table_name
         ))
@@ -474,7 +474,7 @@ fn test_timestamp_precision_get_table_schema() {
     // Cleanup
     {
         let mut stmt = conn.new_statement().unwrap();
-        stmt.set_sql_query(&format!("DROP TABLE IF EXISTS {}", table_name))
+        stmt.set_sql_query(format!("DROP TABLE IF EXISTS {}", table_name))
             .unwrap();
         stmt.execute_update().expect("drop ts precision test table");
     }
