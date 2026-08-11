@@ -217,7 +217,8 @@ fn test_execute_ddl_and_dml() {
         let mut stmt = conn.new_statement().unwrap();
         stmt.set_sql_query("CREATE OR REPLACE TEMP TABLE adbc_rust_test (id INTEGER, name TEXT)")
             .unwrap();
-        stmt.execute_update().expect("create table");
+        let rows = stmt.execute_update().expect("create table");
+        assert_eq!(rows, None, "sf_core should classify DDL as no-result");
     }
 
     {
@@ -240,7 +241,8 @@ fn test_execute_ddl_and_dml() {
         let mut stmt = conn.new_statement().unwrap();
         stmt.set_sql_query("DROP TABLE IF EXISTS adbc_rust_test")
             .unwrap();
-        stmt.execute_update().expect("drop table");
+        let rows = stmt.execute_update().expect("drop table");
+        assert_eq!(rows, None, "sf_core should classify DDL as no-result");
     }
 }
 
