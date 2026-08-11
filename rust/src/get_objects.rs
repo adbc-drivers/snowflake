@@ -352,12 +352,10 @@ impl<'a> CoreColumnArrays<'a> {
             } else {
                 optional_i32(self.precisions, index)
             },
-            xdbc_decimal_digits: optional_i32(self.scales, index)
-                .map(|value| {
-                    i16::try_from(value)
-                        .map_err(|_| schema_error("sf_core scale does not fit in Int16"))
-                })
-                .transpose()?,
+            xdbc_decimal_digits: xdbc_decimal_digits(
+                logical_type,
+                optional_i32(self.scales, index),
+            )?,
             xdbc_num_prec_radix: logical_type.and_then(|logical_type| match logical_type {
                 "FIXED" => Some(10),
                 "REAL" => Some(2),
@@ -371,6 +369,21 @@ impl<'a> CoreColumnArrays<'a> {
             xdbc_is_nullable: nullable.map(|value| if value { "YES" } else { "NO" }.to_owned()),
         })
     }
+}
+
+fn xdbc_decimal_digits(
+    logical_type: Option<&str>,
+    scale: Option<i32>,
+) -> Result<Option<i16>, ArrowError> {
+    if !matches!(logical_type, Some("FIXED" | "REAL")) {
+        return Ok(None);
+    }
+
+    scale
+        .map(|value| {
+            i16::try_from(value).map_err(|_| schema_error("sf_core scale does not fit in Int16"))
+        })
+        .transpose()
 }
 
 fn public_snowflake_type_name(logical_type: &str) -> String {
@@ -745,6 +758,21 @@ mod tests {
         assert_eq!(public_snowflake_type_name("TEXT"), "VARCHAR");
         assert_eq!(public_snowflake_type_name("REAL"), "DOUBLE");
         assert_eq!(public_snowflake_type_name("TIMESTAMP_LTZ"), "TIMESTAMP_LTZ");
+    }
+
+    #[test]
+    fn decimal_digits_only_use_numeric_scales() {
+        assert_eq!(
+            xdbc_decimal_digits(Some("FIXED"), Some(2)).unwrap(),
+            Some(2)
+        );
+        assert_eq!(xdbc_decimal_digits(Some("REAL"), Some(7)).unwrap(), Some(7));
+        assert_eq!(xdbc_decimal_digits(Some("TIME"), Some(9)).unwrap(), None);
+        assert_eq!(
+            xdbc_decimal_digits(Some("TIMESTAMP_NTZ"), Some(9)).unwrap(),
+            None
+        );
+        assert_eq!(xdbc_decimal_digits(Some("TEXT"), Some(0)).unwrap(), None);
     }
 
     #[test]
