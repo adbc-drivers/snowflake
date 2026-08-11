@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // src/database.rs
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use adbc_core::{
@@ -21,11 +21,13 @@ use adbc_core::{
     error::{Error, Result, Status},
     options::{OptionConnection, OptionDatabase, OptionValue},
 };
-use sf_core::apis::database_driver_v1::Handle;
-use sf_core::config::param_registry::param_names;
+use sf_core::apis::database_driver_v1::{
+    Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
+};
+use sf_core::config::param_registry::{param_names, registry};
 use sf_core::config::settings::Setting;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, cleanup_connection_handle};
 use crate::driver::{Inner, TimestampPrecision};
 
 use percent_encoding::percent_decode_str;
@@ -67,28 +69,35 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
         "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password" => {
             param_names::PRIVATE_KEY_PASSWORD.into()
         }
-        // Account geography
-        "adbc.snowflake.sql.region" => "region".to_string(),
         // Auth extras
         // The Okta authenticator URL is the authenticator value in sf_core.
         "adbc.snowflake.sql.client_option.okta_url" => param_names::AUTHENTICATOR.into(),
-        "adbc.snowflake.sql.client_option.identity_provider" => "identity_provider".to_string(),
+        "adbc.snowflake.sql.client_option.identity_provider" => {
+            param_names::WORKLOAD_IDENTITY_PROVIDER.into()
+        }
         // Connection timeouts (normalized to sf_core integer seconds below)
         "adbc.snowflake.sql.client_option.login_timeout" => "login_timeout".to_string(),
         "adbc.snowflake.sql.client_option.request_timeout" => "request_timeout".to_string(),
         "adbc.snowflake.sql.client_option.jwt_expire_timeout" => "jwt_expire_timeout".to_string(),
         "adbc.snowflake.sql.client_option.client_timeout" => "client_timeout".to_string(),
-        // TLS — tls_skip_verify compound effect is applied separately in set_option
-        "adbc.snowflake.sql.client_option.tls_skip_verify" => "tls_skip_verify".to_string(),
+        // TLS
+        "adbc.snowflake.sql.client_option.tls_skip_verify" => param_names::TLS_SKIP_VERIFY.into(),
         "adbc.snowflake.sql.client_option.tls_root_cert" => {
             param_names::CUSTOM_ROOT_STORE_PATH.into()
         }
-        // OCSP — ocsp_fail_open_mode compound effect is applied separately in set_option
-        "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" => "ocsp_fail_open_mode".to_string(),
         // Session behaviour
-        "adbc.snowflake.sql.client_option.keep_session_alive" => "keep_session_alive".to_string(),
-        "adbc.snowflake.sql.client_option.disable_telemetry" => "disable_telemetry".to_string(),
-        "adbc.snowflake.sql.client_option.cache_mfa_token" => "cache_mfa_token".to_string(),
+        "adbc.snowflake.sql.client_option.keep_session_alive" => {
+            param_names::CLIENT_SESSION_KEEP_ALIVE.into()
+        }
+        "adbc.snowflake.sql.client_option.disable_telemetry" => {
+            param_names::CLIENT_TELEMETRY_ENABLED.into()
+        }
+        // sf_core's temporary-credential setting explicitly controls MFA-token
+        // caching. The Go/ADBC store_temp_creds option instead controls ID-token
+        // storage, so retain that raw name and let sf_core report it as unknown.
+        "adbc.snowflake.sql.client_option.cache_mfa_token" => {
+            param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.into()
+        }
         "adbc.snowflake.sql.client_option.store_temp_creds" => "store_temp_creds".to_string(),
         // Config / logging
         "adbc.snowflake.sql.client_option.config_file" => "config_file".to_string(),
@@ -142,13 +151,14 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
             };
             Setting::Int(seconds)
         }
-        "adbc.snowflake.sql.client_option.tls_skip_verify" => {
-            let enabled = match value {
-                OptionValue::String(value) => matches!(value.as_str(), "enabled" | "true" | "1"),
-                OptionValue::Int(value) => *value != 0,
-                _ => false,
-            };
-            Setting::Bool(enabled)
+        "adbc.snowflake.sql.client_option.tls_skip_verify"
+        | "adbc.snowflake.sql.client_option.keep_session_alive"
+        | "adbc.snowflake.sql.client_option.cache_mfa_token"
+        | "adbc.snowflake.sql.client_option.store_temp_creds" => {
+            Setting::Bool(adbc_option_enabled(value)?)
+        }
+        "adbc.snowflake.sql.client_option.disable_telemetry" => {
+            Setting::Bool(!adbc_option_enabled(value)?)
         }
         _ => setting,
     };
@@ -156,12 +166,33 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
     Ok(Some((param, setting)))
 }
 
+fn adbc_option_enabled(value: &OptionValue) -> Result<bool> {
+    match value {
+        OptionValue::String(value) => match value.to_ascii_lowercase().as_str() {
+            "enabled" | "true" | "1" => Ok(true),
+            "disabled" | "false" | "0" => Ok(false),
+            _ => Err(Error::with_message_and_status(
+                "boolean option must be enabled, true, 1, disabled, false, or 0",
+                Status::InvalidArguments,
+            )),
+        },
+        OptionValue::Int(value) => Ok(*value != 0),
+        _ => Err(Error::with_message_and_status(
+            "boolean option must be a string or int",
+            Status::InvalidArguments,
+        )),
+    }
+}
+
 pub struct Database {
     pub(crate) inner: Arc<Inner>,
     pub(crate) db_handle: Handle,
-    /// Local copy of sf_core settings keyed by canonical param name.
+    /// Local copy of sf_core settings, using canonical parameter names when an
+    /// equivalent exists and preserving original raw names otherwise.
     /// Propagated to each new connection before connection_init.
     pub(crate) sf_settings: HashMap<String, Setting>,
+    /// Database-level warning messages already surfaced to the application logger.
+    pub(crate) surfaced_warnings: HashSet<String>,
     /// Map NUMBER(p,s) with s>0 to Decimal128 instead of Float64.
     pub(crate) use_high_precision: bool,
     /// Arrow time unit used for TIMESTAMP columns.
@@ -175,12 +206,19 @@ impl Drop for Database {
 }
 
 impl Database {
-    fn set_sf_options(&self, options: HashMap<String, Setting>) -> Result<()> {
-        self.inner
+    fn set_sf_options(&mut self, options: HashMap<String, Setting>) -> Result<()> {
+        let warnings = self
+            .inner
             .runtime
             .block_on(self.inner.sf.database_set_options(self.db_handle, options))
-            .map(|_| ())
-            .map_err(crate::error::api_error_to_adbc_error)
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        for warning in warnings {
+            let rendered = warning.to_string();
+            if self.surfaced_warnings.insert(rendered.clone()) {
+                log::warn!("Snowflake database option warning: {rendered}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -216,45 +254,9 @@ impl Optionable for Database {
             }
             return Ok(());
         }
-        let mut tls_skip_verify = None;
         if let Some((param, setting)) = adbc_db_opt_to_sf(key_str, &value)? {
-            if key_str == "adbc.snowflake.sql.client_option.tls_skip_verify"
-                && let Setting::Bool(skip) = &setting
-            {
-                tls_skip_verify = Some(*skip);
-            }
-            self.sf_settings.insert(param.clone(), setting.clone());
-            self.set_sf_options(HashMap::from([(param, setting)]))?;
-        }
-
-        // tls_skip_verify: also drive the underlying verify_certificates / verify_hostname
-        // params so sf_core skips certificate and hostname checks when enabled.
-        if let Some(skip) = tls_skip_verify {
-            let verify = Setting::Bool(!skip);
-            self.sf_settings.insert(
-                param_names::VERIFY_CERTIFICATES.as_str().to_string(),
-                verify.clone(),
-            );
-            self.sf_settings.insert(
-                param_names::VERIFY_HOSTNAME.as_str().to_string(),
-                verify.clone(),
-            );
-            self.set_sf_options(HashMap::from([
-                (param_names::VERIFY_CERTIFICATES.into(), verify.clone()),
-                (param_names::VERIFY_HOSTNAME.into(), verify),
-            ]))?;
-        }
-
-        // ocsp_fail_open_mode: map to sf_core's crl_check_mode
-        // enabled (fail-open / advisory) → ADVISORY; disabled (strict) → ENABLED.
-        if key_str == "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" {
-            let fail_open = matches!(&value, OptionValue::String(s) if s == "enabled");
-            let mode = Setting::String(if fail_open { "ADVISORY" } else { "ENABLED" }.to_string());
-            self.sf_settings.insert(
-                param_names::CRL_CHECK_MODE.as_str().to_string(),
-                mode.clone(),
-            );
-            self.set_sf_options(HashMap::from([(param_names::CRL_CHECK_MODE.into(), mode)]))?;
+            self.set_sf_options(HashMap::from([(param.clone(), setting.clone())]))?;
+            self.sf_settings.insert(param, setting);
         }
 
         Ok(())
@@ -277,8 +279,19 @@ impl Optionable for Database {
             }
             .to_string());
         }
-        if let Ok(Some((param, _))) =
-            adbc_db_opt_to_sf(key_str, &OptionValue::String(String::new()))
+        let lookup_value = if matches!(
+            key_str,
+            "adbc.snowflake.sql.client_option.tls_skip_verify"
+                | "adbc.snowflake.sql.client_option.keep_session_alive"
+                | "adbc.snowflake.sql.client_option.cache_mfa_token"
+                | "adbc.snowflake.sql.client_option.store_temp_creds"
+                | "adbc.snowflake.sql.client_option.disable_telemetry"
+        ) {
+            OptionValue::String("disabled".into())
+        } else {
+            OptionValue::String(String::new())
+        };
+        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &lookup_value)
             && let Some(setting) = self.sf_settings.get(&param)
         {
             return match setting {
@@ -294,6 +307,11 @@ impl Optionable for Database {
                 }
                 Setting::Int(value) => Ok(value.to_string()),
                 Setting::Double(value) => Ok(value.to_string()),
+                Setting::Bool(value)
+                    if key_str == "adbc.snowflake.sql.client_option.disable_telemetry" =>
+                {
+                    Ok(if *value { "disabled" } else { "enabled" }.into())
+                }
                 Setting::Bool(value) => Ok(if *value { "enabled" } else { "disabled" }.into()),
                 Setting::Bytes(_) => Err(Error::with_message_and_status(
                     format!("option is not a string: {key_str}"),
@@ -471,6 +489,100 @@ impl Database {
     }
 }
 
+fn connection_option_to_setting(value: &OptionValue) -> Result<Setting> {
+    match value {
+        OptionValue::String(value) => Ok(Setting::String(value.clone())),
+        OptionValue::Int(value) => Ok(Setting::Int(*value)),
+        OptionValue::Double(value) => Ok(Setting::Double(*value)),
+        OptionValue::Bytes(value) => Ok(Setting::Bytes(value.clone())),
+        _ => Err(Error::with_message_and_status(
+            "unsupported option value type",
+            Status::InvalidArguments,
+        )),
+    }
+}
+
+struct AccumulatedConnectionOptions {
+    sf_options: HashMap<String, Setting>,
+    post_connect_options: Vec<(OptionConnection, OptionValue)>,
+    no_connection_details: bool,
+}
+
+fn accumulate_connection_options(
+    database_options: &HashMap<String, Setting>,
+    opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
+) -> Result<AccumulatedConnectionOptions> {
+    let mut sf_options = database_options.clone();
+    // This mirrors sf_core peers' raw-kwargs contract: only a call with no
+    // database settings and no raw connection options is a bare connection.
+    let mut no_connection_details = database_options.is_empty();
+    let mut post_connect_options = Vec::new();
+
+    for (key, value) in opts {
+        no_connection_details = false;
+        if let OptionConnection::Other(name) = &key {
+            // Canonicalize only known registry parameters so a connection-level
+            // alias/case variant replaces the database-level canonical value.
+            // Unknown wrapper/vendor options retain their original spelling.
+            let name = registry()
+                .resolve(name)
+                .map(|param| param.canonical_name.to_owned())
+                .unwrap_or_else(|| name.clone());
+            sf_options.insert(name, connection_option_to_setting(&value)?);
+        } else {
+            post_connect_options.push((key, value));
+        }
+    }
+
+    Ok(AccumulatedConnectionOptions {
+        sf_options,
+        post_connect_options: order_post_connect_options(post_connect_options),
+        no_connection_details,
+    })
+}
+
+fn wrapper_identity() -> WrapperIdentity {
+    WrapperIdentity {
+        driver_name: "ADBC Snowflake Driver (Rust)".into(),
+        driver_version: env!("CARGO_PKG_VERSION").into(),
+        language_runtime: "Rust".into(),
+        language_version: String::new(),
+        language_compiler: None,
+        release_type: None,
+    }
+}
+
+fn process_validation_issues(
+    issues: impl IntoIterator<Item = ValidationIssue>,
+    seen_warnings: &mut HashSet<String>,
+    database_warnings: &HashSet<String>,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    for issue in issues {
+        match issue.severity {
+            ValidationSeverity::Error => errors.push(issue.to_string()),
+            ValidationSeverity::Warning => {
+                let rendered = issue.to_string();
+                if seen_warnings.insert(rendered.clone()) && !database_warnings.contains(&rendered)
+                {
+                    log::warn!("Snowflake connection option warning: {rendered}");
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::with_message_and_status(
+            format!(
+                "invalid Snowflake connection options: {}",
+                errors.join("; ")
+            ),
+            Status::InvalidArguments,
+        ))
+    }
+}
+
 fn order_post_connect_options(
     mut options: Vec<(OptionConnection, OptionValue)>,
 ) -> Vec<(OptionConnection, OptionValue)> {
@@ -496,48 +608,46 @@ impl adbc_core::Database for Database {
         &self,
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> Result<Self::ConnectionType> {
+        let AccumulatedConnectionOptions {
+            sf_options,
+            post_connect_options,
+            no_connection_details,
+        } = accumulate_connection_options(&self.sf_settings, opts)?;
         let conn_handle = self.inner.sf.connection_new();
 
-        let setup = (|| -> Result<Vec<(OptionConnection, OptionValue)>> {
-            // Propagate all database-level settings to the connection.
-            for (param, setting) in &self.sf_settings {
-                self.inner
-                    .runtime
-                    .block_on(self.inner.sf.connection_set_option(
-                        conn_handle,
-                        param.clone(),
-                        setting.clone(),
-                    ))
-                    .map_err(crate::error::api_error_to_adbc_error)?;
-            }
+        let setup = (|| -> Result<()> {
+            // Batch all pre-connect options in one validation/resolution pass.
+            let warnings = self
+                .inner
+                .runtime
+                .block_on(self.inner.sf.connection_set_options(
+                    conn_handle,
+                    sf_options,
+                    no_connection_details,
+                ))
+                .map_err(crate::error::api_error_to_adbc_error)?;
+            let mut seen_warnings = HashSet::new();
+            process_validation_issues(warnings, &mut seen_warnings, &self.surfaced_warnings)?;
 
-            let mut post_connect_options = Vec::new();
-            for (key, value) in opts {
-                if let OptionConnection::Other(k) = &key {
-                    let sf_setting = match &value {
-                        OptionValue::String(s) => Setting::String(s.clone()),
-                        OptionValue::Int(i) => Setting::Int(*i),
-                        OptionValue::Double(d) => Setting::Double(*d),
-                        OptionValue::Bytes(b) => Setting::Bytes(b.clone()),
-                        _ => {
-                            return Err(Error::with_message_and_status(
-                                "unsupported option value type",
-                                Status::InvalidArguments,
-                            ));
-                        }
-                    };
+            self.inner
+                .runtime
+                .block_on(
                     self.inner
-                        .runtime
-                        .block_on(self.inner.sf.connection_set_option(
-                            conn_handle,
-                            k.clone(),
-                            sf_setting,
-                        ))
-                        .map_err(crate::error::api_error_to_adbc_error)?;
-                } else {
-                    post_connect_options.push((key, value));
-                }
-            }
+                        .sf
+                        .set_wrapper_identity(conn_handle, wrapper_identity()),
+                )
+                .map_err(crate::error::api_error_to_adbc_error)?;
+
+            let validation_issues = self
+                .inner
+                .runtime
+                .block_on(self.inner.sf.connection_validate_options(conn_handle))
+                .map_err(crate::error::api_error_to_adbc_error)?;
+            process_validation_issues(
+                validation_issues,
+                &mut seen_warnings,
+                &self.surfaced_warnings,
+            )?;
 
             self.inner
                 .runtime
@@ -546,17 +656,15 @@ impl adbc_core::Database for Database {
                         .sf
                         .connection_init(None, conn_handle, self.db_handle),
                 )
-                .map_err(crate::error::api_error_to_adbc_error)?;
-            Ok(order_post_connect_options(post_connect_options))
+                .map_err(crate::error::api_error_to_adbc_error)
         })();
 
-        let post_connect_options = match setup {
-            Ok(options) => options,
-            Err(error) => {
-                let _ = self.inner.sf.connection_release(conn_handle);
-                return Err(error);
-            }
-        };
+        if let Err(error) = setup {
+            // Initialization may have established a partial session. Attempt
+            // close before release, while still guaranteeing release on error.
+            cleanup_connection_handle(&self.inner, conn_handle);
+            return Err(error);
+        }
 
         let mut conn = Connection {
             inner: self.inner.clone(),
@@ -586,6 +694,120 @@ mod tests {
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
         driver.new_database().unwrap()
+    }
+
+    #[test]
+    fn connection_options_accumulate_once_with_connection_values_winning() {
+        let database_options = HashMap::from([
+            ("account".to_string(), Setting::String("db-account".into())),
+            (
+                "warehouse".to_string(),
+                Setting::String("db-warehouse".into()),
+            ),
+        ]);
+        let accumulated = accumulate_connection_options(
+            &database_options,
+            [
+                (
+                    OptionConnection::Other("account".into()),
+                    OptionValue::String("connection-account".into()),
+                ),
+                (
+                    OptionConnection::CurrentSchema,
+                    OptionValue::String("schema".into()),
+                ),
+                (
+                    OptionConnection::AutoCommit,
+                    OptionValue::String("false".into()),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            accumulated.sf_options.get("account"),
+            Some(&Setting::String("connection-account".into()))
+        );
+        assert_eq!(
+            accumulated.sf_options.get("warehouse"),
+            Some(&Setting::String("db-warehouse".into()))
+        );
+        assert!(!accumulated.no_connection_details);
+        assert!(matches!(
+            accumulated.post_connect_options.as_slice(),
+            [
+                (OptionConnection::CurrentSchema, _),
+                (OptionConnection::AutoCommit, _)
+            ]
+        ));
+    }
+
+    #[test]
+    fn only_no_database_settings_and_no_raw_options_is_bare() {
+        let bare = accumulate_connection_options(&HashMap::new(), []).unwrap();
+        assert!(bare.no_connection_details);
+
+        let database_options = HashMap::from([(
+            param_names::ACCOUNT.to_string(),
+            Setting::String("account".into()),
+        )]);
+        let with_database_setting = accumulate_connection_options(&database_options, []).unwrap();
+        assert!(!with_database_setting.no_connection_details);
+    }
+
+    #[test]
+    fn any_raw_option_makes_the_connection_non_bare() {
+        let accumulated = accumulate_connection_options(
+            &HashMap::new(),
+            [(
+                OptionConnection::AutoCommit,
+                OptionValue::String("false".into()),
+            )],
+        )
+        .unwrap();
+        assert!(!accumulated.no_connection_details);
+        assert!(accumulated.sf_options.is_empty());
+    }
+
+    #[test]
+    fn known_connection_alias_overrides_database_canonical_option() {
+        let database_options = HashMap::from([(
+            param_names::USER.to_string(),
+            Setting::String("database-user".into()),
+        )]);
+        let accumulated = accumulate_connection_options(
+            &database_options,
+            [(
+                OptionConnection::Other("uId".into()),
+                OptionValue::String("connection-user".into()),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            accumulated.sf_options,
+            HashMap::from([(
+                param_names::USER.to_string(),
+                Setting::String("connection-user".into()),
+            )])
+        );
+    }
+
+    #[test]
+    fn unknown_connection_option_preserves_original_key() {
+        let accumulated = accumulate_connection_options(
+            &HashMap::new(),
+            [(
+                OptionConnection::Other("Vendor.CustomOption".into()),
+                OptionValue::String("value".into()),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            accumulated.sf_options.get("Vendor.CustomOption"),
+            Some(&Setting::String("value".into()))
+        );
     }
 
     #[test]
@@ -671,14 +893,11 @@ mod tests {
     }
 
     #[test]
-    fn tls_skip_verify_enabled_clears_verify_flags() {
-        use sf_core::config::settings::Setting;
-        for value in [
-            OptionValue::String("enabled".into()),
-            OptionValue::String("true".into()),
-            OptionValue::String("1".into()),
-            OptionValue::Int(1),
-            OptionValue::Int(-1),
+    fn tls_skip_verify_passes_only_the_canonical_bool() {
+        for (value, expected) in [
+            (OptionValue::String("enabled".into()), true),
+            (OptionValue::String("disabled".into()), false),
+            (OptionValue::Int(-1), true),
         ] {
             let mut db = make_db();
             db.set_option(
@@ -686,95 +905,233 @@ mod tests {
                 value,
             )
             .unwrap();
-            // Round-trip
             assert_eq!(
-                db.get_option_string(OptionDatabase::Other(
-                    "adbc.snowflake.sql.client_option.tls_skip_verify".into()
-                ))
-                .unwrap(),
-                "enabled"
-            );
-            // Compound: verify_certificates and verify_hostname must be false
-            assert_eq!(
-                db.sf_settings
-                    .get(param_names::VERIFY_CERTIFICATES.as_str()),
-                Some(&Setting::Bool(false))
-            );
-            assert_eq!(
-                db.sf_settings.get(param_names::VERIFY_HOSTNAME.as_str()),
-                Some(&Setting::Bool(false))
+                db.sf_settings,
+                HashMap::from([(
+                    param_names::TLS_SKIP_VERIFY.to_string(),
+                    Setting::Bool(expected),
+                )])
             );
         }
     }
 
     #[test]
-    fn tls_skip_verify_disabled_restores_verify_flags() {
-        use sf_core::config::settings::Setting;
-        let mut db = make_db();
-        // First enable, then disable
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
-            OptionValue::String("enabled".into()),
-        )
-        .unwrap();
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
-            OptionValue::String("disabled".into()),
-        )
-        .unwrap();
-        assert_eq!(
-            db.get_option_string(OptionDatabase::Other(
-                "adbc.snowflake.sql.client_option.tls_skip_verify".into()
-            ))
-            .unwrap(),
-            "disabled"
-        );
-        assert_eq!(
-            db.sf_settings
-                .get(param_names::VERIFY_CERTIFICATES.as_str()),
-            Some(&Setting::Bool(true))
-        );
-        assert_eq!(
-            db.sf_settings.get(param_names::VERIFY_HOSTNAME.as_str()),
-            Some(&Setting::Bool(true))
-        );
+    fn boolean_option_parser_accepts_documented_strings_and_integers() {
+        for (value, expected) in [
+            (OptionValue::String("enabled".into()), true),
+            (OptionValue::String("TRUE".into()), true),
+            (OptionValue::String("1".into()), true),
+            (OptionValue::String("DISABLED".into()), false),
+            (OptionValue::String("false".into()), false),
+            (OptionValue::String("0".into()), false),
+            (OptionValue::Int(-1), true),
+            (OptionValue::Int(0), false),
+            (OptionValue::Int(2), true),
+        ] {
+            assert_eq!(adbc_option_enabled(&value).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn ocsp_fail_open_mode_enabled_maps_to_crl_advisory() {
-        use sf_core::config::settings::Setting;
+    fn boolean_options_reject_invalid_values_without_changing_state() {
+        for (key, param, enabled_setting) in [
+            (
+                "adbc.snowflake.sql.client_option.tls_skip_verify",
+                param_names::TLS_SKIP_VERIFY.as_str(),
+                true,
+            ),
+            (
+                "adbc.snowflake.sql.client_option.keep_session_alive",
+                param_names::CLIENT_SESSION_KEEP_ALIVE.as_str(),
+                true,
+            ),
+            (
+                "adbc.snowflake.sql.client_option.cache_mfa_token",
+                param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str(),
+                true,
+            ),
+            (
+                "adbc.snowflake.sql.client_option.store_temp_creds",
+                "store_temp_creds",
+                true,
+            ),
+            (
+                "adbc.snowflake.sql.client_option.disable_telemetry",
+                param_names::CLIENT_TELEMETRY_ENABLED.as_str(),
+                false,
+            ),
+        ] {
+            let mut db = make_db();
+            let option = OptionDatabase::Other(key.into());
+            db.set_option(option.clone(), OptionValue::String("enabled".into()))
+                .unwrap();
+
+            for invalid in [
+                OptionValue::String("ambiguous".into()),
+                OptionValue::Double(1.0),
+                OptionValue::Bytes(vec![1]),
+            ] {
+                let error = db.set_option(option.clone(), invalid).unwrap_err();
+                assert_eq!(error.status, Status::InvalidArguments);
+                assert_eq!(
+                    db.sf_settings.get(param),
+                    Some(&Setting::Bool(enabled_setting)),
+                    "invalid value changed {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_options_use_equivalent_core_parameters_or_original_raw_names() {
+        let cases = [
+            (
+                "adbc.snowflake.sql.client_option.keep_session_alive",
+                param_names::CLIENT_SESSION_KEEP_ALIVE.as_str(),
+                Setting::Bool(true),
+            ),
+            (
+                "adbc.snowflake.sql.client_option.cache_mfa_token",
+                param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str(),
+                Setting::Bool(true),
+            ),
+            // sf_core has no ID-token-storage equivalent. Preserving the Go
+            // option name keeps it distinct and produces an explicit unknown-
+            // parameter validation warning rather than changing its meaning.
+            (
+                "adbc.snowflake.sql.client_option.store_temp_creds",
+                "store_temp_creds",
+                Setting::Bool(true),
+            ),
+            (
+                "adbc.snowflake.sql.client_option.identity_provider",
+                param_names::WORKLOAD_IDENTITY_PROVIDER.as_str(),
+                Setting::String("AWS".into()),
+            ),
+            (
+                "adbc.snowflake.sql.client_option.disable_telemetry",
+                param_names::CLIENT_TELEMETRY_ENABLED.as_str(),
+                Setting::Bool(false),
+            ),
+        ];
+        for (key, expected_name, expected_setting) in cases {
+            let value = if key.ends_with("identity_provider") {
+                OptionValue::String("AWS".into())
+            } else {
+                OptionValue::String("enabled".into())
+            };
+            let (name, setting) = adbc_db_opt_to_sf(key, &value).unwrap().unwrap();
+            assert_eq!(name, expected_name);
+            assert_eq!(setting, expected_setting);
+        }
+    }
+
+    #[test]
+    fn cache_mfa_token_and_store_temp_creds_are_independent() {
+        let cache_mfa_token =
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.cache_mfa_token".into());
+        let store_temp_creds =
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.store_temp_creds".into());
         let mut db = make_db();
+
         db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
+            cache_mfa_token.clone(),
             OptionValue::String("enabled".into()),
         )
         .unwrap();
+        db.set_option(
+            store_temp_creds.clone(),
+            OptionValue::String("disabled".into()),
+        )
+        .unwrap();
+
         assert_eq!(
-            db.get_option_string(OptionDatabase::Other(
-                "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()
-            ))
-            .unwrap(),
+            db.sf_settings,
+            HashMap::from([
+                (
+                    param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.to_string(),
+                    Setting::Bool(true),
+                ),
+                ("store_temp_creds".to_string(), Setting::Bool(false)),
+            ])
+        );
+        assert_eq!(
+            db.get_option_string(cache_mfa_token.clone()).unwrap(),
             "enabled"
         );
         assert_eq!(
-            db.sf_settings.get(param_names::CRL_CHECK_MODE.as_str()),
-            Some(&Setting::String("ADVISORY".into()))
+            db.get_option_string(store_temp_creds.clone()).unwrap(),
+            "disabled"
         );
+
+        db.set_option(cache_mfa_token.clone(), OptionValue::Int(0))
+            .unwrap();
+        db.set_option(store_temp_creds.clone(), OptionValue::Int(1))
+            .unwrap();
+
+        assert_eq!(
+            db.sf_settings
+                .get(param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str()),
+            Some(&Setting::Bool(false))
+        );
+        assert_eq!(
+            db.sf_settings.get("store_temp_creds"),
+            Some(&Setting::Bool(true))
+        );
+        assert_eq!(db.get_option_string(cache_mfa_token).unwrap(), "disabled");
+        assert_eq!(db.get_option_string(store_temp_creds).unwrap(), "enabled");
     }
 
     #[test]
-    fn ocsp_fail_open_mode_disabled_maps_to_crl_enabled() {
-        use sf_core::config::settings::Setting;
-        let mut db = make_db();
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
-            OptionValue::String("disabled".into()),
+    fn region_and_ocsp_are_not_translated_to_non_equivalent_core_options() {
+        for key in [
+            "adbc.snowflake.sql.region",
+            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode",
+        ] {
+            let (name, _) = adbc_db_opt_to_sf(key, &OptionValue::String("enabled".into()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(name, key);
+        }
+    }
+
+    #[test]
+    fn wrapper_identity_is_stable_and_does_not_claim_a_rust_version() {
+        let identity = wrapper_identity();
+        assert_eq!(identity.driver_name, "ADBC Snowflake Driver (Rust)");
+        assert_eq!(identity.driver_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(identity.language_runtime, "Rust");
+        assert!(identity.language_version.is_empty());
+        assert!(identity.language_compiler.is_none());
+    }
+
+    #[test]
+    fn validation_errors_are_invalid_arguments_and_warnings_are_deduplicated() {
+        use sf_core::apis::database_driver_v1::ValidationCode;
+
+        let warning = ValidationIssue {
+            severity: ValidationSeverity::Warning,
+            parameter: "unknown".into(),
+            message: "warning".into(),
+            code: ValidationCode::UnknownParameter,
+        };
+        let mut seen = HashSet::new();
+        process_validation_issues([warning.clone(), warning], &mut seen, &HashSet::new()).unwrap();
+        assert_eq!(seen.len(), 1);
+
+        let error = process_validation_issues(
+            [ValidationIssue {
+                severity: ValidationSeverity::Error,
+                parameter: "account".into(),
+                message: "missing".into(),
+                code: ValidationCode::MissingRequired,
+            }],
+            &mut seen,
+            &HashSet::new(),
         )
-        .unwrap();
-        assert_eq!(
-            db.sf_settings.get(param_names::CRL_CHECK_MODE.as_str()),
-            Some(&Setting::String("ENABLED".into()))
-        );
+        .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("account"));
     }
 
     #[test]

@@ -538,8 +538,7 @@ fn test_database_options_round_trip() {
     }
 }
 
-/// Verify tls_skip_verify round-trips and that the compound TLS flags are
-/// readable back through their own option keys.
+/// Verify the canonical tls_skip_verify option round-trips.
 #[test]
 fn test_tls_skip_verify_option() {
     let Some(mut db) = make_db() else {
@@ -576,7 +575,7 @@ fn test_tls_skip_verify_option() {
     );
 }
 
-/// Verify ocsp_fail_open_mode round-trips correctly.
+/// Verify the legacy OCSP option remains an opaque round-trippable option.
 #[test]
 fn test_ocsp_fail_open_mode_option() {
     let Some(mut db) = make_db() else {
@@ -654,6 +653,64 @@ fn test_execute_schema() {
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
     }
+}
+
+#[test]
+fn test_prepare_parameter_schema_and_describe_only_execution() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let table_name = format!("ADBC_RUST_PREPARE_TEST_{}", std::process::id());
+
+    let mut ddl = conn.new_statement().unwrap();
+    ddl.set_sql_query(format!(
+        "CREATE OR REPLACE TEMP TABLE {table_name} (VALUE NUMBER(10,2))"
+    ))
+    .unwrap();
+    ddl.execute_update().expect("create prepare test table");
+
+    let mut parameterized = conn.new_statement().unwrap();
+    parameterized
+        .set_sql_query("SELECT ?::NUMBER(10,2) AS VALUE")
+        .unwrap();
+    parameterized
+        .prepare()
+        .expect("prepare parameterized query");
+    let parameter_schema = parameterized
+        .get_parameter_schema()
+        .expect("parameter metadata");
+    assert_eq!(parameter_schema.fields().len(), 1);
+    assert_eq!(
+        parameter_schema.field(0).data_type(),
+        &DataType::Decimal128(10, 2)
+    );
+
+    let mut insert = conn.new_statement().unwrap();
+    insert
+        .set_sql_query(format!("INSERT INTO {table_name} VALUES (1.25)"))
+        .unwrap();
+    let schema = insert.execute_schema().expect("describe insert");
+    assert!(schema.fields().is_empty());
+
+    let mut count = conn.new_statement().unwrap();
+    count
+        .set_sql_query(format!("SELECT COUNT(*) FROM {table_name}"))
+        .unwrap();
+    let batch = count
+        .execute()
+        .expect("count rows")
+        .next()
+        .expect("count batch")
+        .expect("count result");
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        0,
+        "execute_schema must not execute the INSERT"
+    );
 }
 
 #[test]

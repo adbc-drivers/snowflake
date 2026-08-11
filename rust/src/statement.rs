@@ -22,10 +22,42 @@ use adbc_core::{
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use sf_core::apis::database_driver_v1::{BindingType, DataPtr, Handle};
+use sf_core::apis::database_driver_v1::{BindingType, ColumnMetadata, DataPtr, Handle};
 use sf_core::config::{param_registry::param_names, settings::Setting};
+use sf_core::rest::snowflake::AbortOutcome;
 
-use crate::driver::{Inner, TimestampPrecision};
+use crate::driver::{Inner, QueryResult, TimestampPrecision};
+
+/// Per-statement Snowflake query timeout, in seconds. A value of zero clears
+/// the override and lets the session/core default apply.
+const QUERY_TIMEOUT_OPTION: &str = "adbc.snowflake.statement.query_timeout";
+
+fn parse_query_timeout(value: &OptionValue) -> Result<Option<u32>> {
+    let seconds = match value {
+        OptionValue::Int(value) => u32::try_from(*value).map_err(|_| {
+            Error::with_message_and_status(
+                "query_timeout must be between 0 and 4294967295 seconds",
+                Status::InvalidArguments,
+            )
+        })?,
+        OptionValue::String(value) => {
+            let raw = value.strip_suffix('s').unwrap_or(value);
+            raw.parse::<u32>().map_err(|_| {
+                Error::with_message_and_status(
+                    format!("invalid query_timeout value: {value}"),
+                    Status::InvalidArguments,
+                )
+            })?
+        }
+        _ => {
+            return Err(Error::with_message_and_status(
+                "query_timeout must be a string or int",
+                Status::InvalidArguments,
+            ));
+        }
+    };
+    Ok((seconds != 0).then_some(seconds))
+}
 
 pub struct Statement {
     pub(crate) inner: Arc<Inner>,
@@ -37,6 +69,7 @@ pub struct Statement {
     pub(crate) ingest_schema: Option<String>,
     pub(crate) ingest_mode: Option<String>,
     pub(crate) query_tag: Option<String>,
+    pub(crate) query_timeout_seconds: Option<u32>,
     pub(crate) use_high_precision: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
     /// Parameter batches stored by bind() / bind_stream(). Each row is one execution.
@@ -44,6 +77,8 @@ pub struct Statement {
     /// Whether bind() / bind_stream() was called, including with an empty stream.
     pub(crate) binding_supplied: bool,
     pub(crate) last_query_id: Option<String>,
+    /// Cached only when sf_core's prepare bind count and metadata agree.
+    pub(crate) prepared_parameter_schema: Option<Schema>,
 }
 
 impl Drop for Statement {
@@ -61,6 +96,7 @@ impl Optionable for Statement {
                 if let OptionValue::String(s) = value {
                     self.query = None;
                     self.target_table = Some(s);
+                    self.prepared_parameter_schema = None;
                     Ok(())
                 } else {
                     Err(Error::with_message_and_status(
@@ -72,6 +108,7 @@ impl Optionable for Statement {
             OptionStatement::IngestMode => {
                 if let OptionValue::String(s) = value {
                     self.ingest_mode = Some(s);
+                    self.prepared_parameter_schema = None;
                     Ok(())
                 } else {
                     Err(Error::with_message_and_status(
@@ -86,6 +123,7 @@ impl Optionable for Statement {
                 if let OptionValue::String(s) = value {
                     self.use_high_precision = s == "enabled" || s == "true";
                 }
+                self.prepared_parameter_schema = None;
                 Ok(())
             }
             OptionStatement::Other(ref k)
@@ -100,22 +138,30 @@ impl Optionable for Statement {
                         _ => TimestampPrecision::Nanoseconds,
                     };
                 }
+                self.prepared_parameter_schema = None;
                 Ok(())
             }
             OptionStatement::Temporary => {
                 // Accepted silently; used to select CREATE TEMPORARY TABLE during ingest.
+                self.prepared_parameter_schema = None;
                 Ok(())
             }
             OptionStatement::TargetCatalog => {
                 if let OptionValue::String(s) = value {
                     self.ingest_catalog = Some(s);
                 }
+                self.prepared_parameter_schema = None;
                 Ok(())
             }
             OptionStatement::TargetDbSchema => {
                 if let OptionValue::String(s) = value {
                     self.ingest_schema = Some(s);
                 }
+                self.prepared_parameter_schema = None;
+                Ok(())
+            }
+            OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
+                self.query_timeout_seconds = parse_query_timeout(&value)?;
                 Ok(())
             }
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
@@ -147,6 +193,9 @@ impl Optionable for Statement {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match key {
+            OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
+                Ok(self.query_timeout_seconds.unwrap_or(0).to_string())
+            }
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
                 Ok(self.query_tag.clone().unwrap_or_default())
             }
@@ -172,11 +221,16 @@ impl Optionable for Statement {
         ))
     }
 
-    fn get_option_int(&self, _key: Self::Option) -> Result<i64> {
-        Err(Error::with_message_and_status(
-            "option not found",
-            Status::NotFound,
-        ))
+    fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+        match key {
+            OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
+                Ok(i64::from(self.query_timeout_seconds.unwrap_or(0)))
+            }
+            _ => Err(Error::with_message_and_status(
+                "option not found",
+                Status::NotFound,
+            )),
+        }
     }
 
     fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
@@ -188,6 +242,25 @@ impl Optionable for Statement {
 }
 
 impl Statement {
+    fn execution_timeout_seconds(&self) -> Option<u32> {
+        self.query_timeout_seconds
+    }
+
+    /// Route every user-statement execution through the statement timeout.
+    /// The binding owner must remain alive until this synchronous call returns.
+    pub(crate) fn execute_query<'a>(
+        &self,
+        query: String,
+        bindings: Option<BindingType<'a>>,
+    ) -> Result<QueryResult> {
+        self.inner.execute_query_with_timeout(
+            self.stmt_handle,
+            query,
+            bindings,
+            self.execution_timeout_seconds(),
+        )
+    }
+
     /// Execute a parameterized query with a single bound row.
     ///
     /// Snowflake's JSON binding API treats multiple rows as one batched execution,
@@ -204,9 +277,7 @@ impl Statement {
         let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
         let binding = BindingType::Json(data_ptr);
 
-        let result = self
-            .inner
-            .execute_query(self.stmt_handle, query, Some(binding))?;
+        let result = self.execute_query(query, Some(binding))?;
 
         self.last_query_id = Some(result.descriptor.query_id.clone());
         let reader = result.reader;
@@ -258,7 +329,7 @@ impl adbc_core::Statement for Statement {
             return self.execute_bound(query);
         }
 
-        let result = self.inner.execute_query(self.stmt_handle, query, None)?;
+        let result = self.execute_query(query, None)?;
 
         self.last_query_id = Some(result.descriptor.query_id.clone());
         let reader = result.reader;
@@ -297,16 +368,14 @@ impl adbc_core::Statement for Statement {
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let binding = BindingType::Json(data_ptr);
 
-            let result = self
-                .inner
-                .execute_query(self.stmt_handle, query, Some(binding))?;
+            let result = self.execute_query(query, Some(binding))?;
 
             self.last_query_id = Some(result.descriptor.query_id.clone());
 
             return Ok(result.descriptor.rows_affected);
         }
 
-        let result = self.inner.execute_query(self.stmt_handle, query, None)?;
+        let result = self.execute_query(query, None)?;
 
         self.last_query_id = Some(result.descriptor.query_id.clone());
 
@@ -318,12 +387,17 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        let result = self.inner.execute_query(self.stmt_handle, query, None)?;
-
-        self.last_query_id = Some(result.descriptor.query_id.clone());
-        let reader = result.reader;
+        self.prepared_parameter_schema = None;
+        let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
+        self.last_query_id = Some(prepared.query_id.clone());
+        self.prepared_parameter_schema = parameter_schema_from_prepare(
+            prepared.number_of_binds,
+            &prepared.binds,
+            self.use_high_precision,
+            self.timestamp_precision.time_unit(),
+        );
         Ok(adjust_schema(
-            &reader.schema(),
+            &prepared.reader.schema(),
             self.use_high_precision,
             self.timestamp_precision.time_unit(),
         )
@@ -336,17 +410,31 @@ impl adbc_core::Statement for Statement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
-        Err(crate::error::not_implemented("get_parameter_schema"))
+        self.prepared_parameter_schema.clone().ok_or_else(|| {
+            Error::with_message_and_status(
+                "parameter metadata is unavailable; prepare the statement first",
+                Status::NotImplemented,
+            )
+        })
     }
 
     fn prepare(&mut self) -> Result<()> {
-        if self.query.is_none() {
-            return Err(Error::with_message_and_status(
+        let query = self.query.clone().ok_or_else(|| {
+            Error::with_message_and_status(
                 "cannot prepare statement with no query",
                 Status::InvalidState,
-            ));
-        }
-        Ok(()) // No-op: Snowflake has no server-side prepare
+            )
+        })?;
+        self.prepared_parameter_schema = None;
+        let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
+        self.last_query_id = Some(prepared.query_id);
+        self.prepared_parameter_schema = parameter_schema_from_prepare(
+            prepared.number_of_binds,
+            &prepared.binds,
+            self.use_high_precision,
+            self.timestamp_precision.time_unit(),
+        );
+        Ok(())
     }
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
@@ -354,6 +442,7 @@ impl adbc_core::Statement for Statement {
         self.target_table = None;
         self.bound_batches.clear();
         self.binding_supplied = false;
+        self.prepared_parameter_schema = None;
         Ok(())
     }
 
@@ -364,7 +453,14 @@ impl adbc_core::Statement for Statement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(crate::error::not_implemented("cancel"))
+        match self
+            .inner
+            .runtime
+            .block_on(self.inner.sf.statement_cancel(self.stmt_handle))
+            .map_err(crate::error::api_error_to_adbc_error)?
+        {
+            AbortOutcome::Aborted | AbortOutcome::NotRunning => Ok(()),
+        }
     }
 }
 
@@ -392,6 +488,56 @@ impl RecordBatchReader for ConcatReader {
 }
 
 // ── Schema adjustment and type conversions ────────────────────────────────
+
+fn parameter_schema_from_prepare(
+    number_of_binds: i32,
+    binds: &[ColumnMetadata],
+    use_high_precision: bool,
+    ts_unit: TimeUnit,
+) -> Option<Schema> {
+    let bind_count = usize::try_from(number_of_binds).ok()?;
+    if bind_count != binds.len() || binds.iter().any(|bind| bind.r#type.trim().is_empty()) {
+        return None;
+    }
+
+    let fields = binds
+        .iter()
+        .map(|bind| {
+            let logical_type = bind.r#type.to_ascii_uppercase();
+            let scale = bind.scale.unwrap_or(0);
+            let physical_type = match logical_type.as_str() {
+                "FIXED" => DataType::Int64,
+                "REAL" => DataType::Float64,
+                "BOOLEAN" => DataType::Boolean,
+                "DATE" => DataType::Date32,
+                "TIME" if scale < 6 => DataType::Int32,
+                "TIME" => DataType::Int64,
+                "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => DataType::Int64,
+                "BINARY" => DataType::Binary,
+                "TEXT" | "ARRAY" | "OBJECT" | "VARIANT" | "GEOGRAPHY" | "GEOMETRY" => {
+                    DataType::Utf8
+                }
+                _ => DataType::Null,
+            };
+            let mut metadata = std::collections::HashMap::from([
+                ("logicalType".to_string(), logical_type),
+                ("nullable".to_string(), bind.nullable.to_string()),
+            ]);
+            if let Some(precision) = bind.precision {
+                metadata.insert("precision".into(), precision.to_string());
+            }
+            if let Some(scale) = bind.scale {
+                metadata.insert("scale".into(), scale.to_string());
+            }
+            Field::new(&bind.name, physical_type, bind.nullable).with_metadata(metadata)
+        })
+        .collect::<Vec<_>>();
+    Some(
+        adjust_schema(&Schema::new(fields), use_high_precision, ts_unit)
+            .as_ref()
+            .clone(),
+    )
+}
 
 fn scale_to_time_unit(scale: u32) -> TimeUnit {
     match scale {
@@ -1331,8 +1477,58 @@ fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Opti
     }
 }
 
+/// Format a value for sf_core's CSV/stage binding path. Snowflake bulk DATE
+/// binding uses epoch milliseconds until that representation reaches the
+/// server overflow boundary, then switches to epoch nanoseconds, matching the
+/// universal-driver Python serializer.
+pub(crate) fn format_arrow_value_for_csv(
+    arr: &dyn Array,
+    row: usize,
+    dt: &DataType,
+) -> Result<Option<String>> {
+    use arrow_array::{Date32Array, Date64Array};
+
+    const DATE_BULK_INSERTION_MS_OVERFLOW: i128 = 31_536_000_000_000;
+    let epoch_ms = match dt {
+        DataType::Date32 => {
+            let array = arr.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
+                Error::with_message_and_status(
+                    "Date32 data type is not backed by Date32Array",
+                    Status::InvalidArguments,
+                )
+            })?;
+            Some(i128::from(array.value(row)) * 86_400_000)
+        }
+        DataType::Date64 => {
+            let array = arr.as_any().downcast_ref::<Date64Array>().ok_or_else(|| {
+                Error::with_message_and_status(
+                    "Date64 data type is not backed by Date64Array",
+                    Status::InvalidArguments,
+                )
+            })?;
+            Some(i128::from(array.value(row)))
+        }
+        _ => None,
+    };
+
+    if let Some(epoch_ms) = epoch_ms {
+        return Ok(Some(
+            if epoch_ms < DATE_BULK_INSERTION_MS_OVERFLOW {
+                epoch_ms
+            } else {
+                epoch_ms * 1_000_000
+            }
+            .to_string(),
+        ));
+    }
+    format_arrow_value(arr, row, dt)
+}
+
 fn decimal128_to_string(value: i128, scale: i8) -> String {
-    if scale <= 0 {
+    if scale < 0 {
+        return format!("{value}{}", "0".repeat(scale.unsigned_abs() as usize));
+    }
+    if scale == 0 {
         return value.to_string();
     }
     let sign = if value < 0 { "-" } else { "" };
@@ -1351,6 +1547,31 @@ mod tests {
     use super::*;
     use adbc_core::Statement as _;
 
+    fn bind_metadata(
+        name: &str,
+        logical_type: &str,
+        precision: Option<i64>,
+        scale: Option<i64>,
+    ) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.into(),
+            r#type: logical_type.into(),
+            precision,
+            scale,
+            length: None,
+            byte_length: None,
+            nullable: true,
+            dimension: None,
+            fixed: false,
+            column_src_database: String::new(),
+            column_src_schema: String::new(),
+            column_src_table: String::new(),
+            is_auto_increment: false,
+            ext_col_type_name: String::new(),
+            udt_output_type: String::new(),
+        }
+    }
+
     fn make_stmt() -> Statement {
         let driver = crate::driver::Driver::default();
         Statement {
@@ -1363,11 +1584,13 @@ mod tests {
             ingest_schema: None,
             ingest_mode: None,
             query_tag: None,
+            query_timeout_seconds: None,
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
             binding_supplied: false,
             last_query_id: None,
+            prepared_parameter_schema: None,
         }
     }
 
@@ -1376,6 +1599,62 @@ mod tests {
         let mut stmt = make_stmt();
         stmt.set_sql_query("SELECT 1").unwrap();
         assert_eq!(stmt.query.as_deref(), Some("SELECT 1"));
+    }
+
+    #[test]
+    fn query_timeout_parses_round_trips_and_clears() {
+        let mut stmt = make_stmt();
+        let key = OptionStatement::Other(QUERY_TIMEOUT_OPTION.into());
+
+        stmt.set_option(key.clone(), OptionValue::String("30".into()))
+            .unwrap();
+        assert_eq!(stmt.execution_timeout_seconds(), Some(30));
+        stmt.set_option(key.clone(), OptionValue::String("30s".into()))
+            .unwrap();
+        assert_eq!(stmt.execution_timeout_seconds(), Some(30));
+        assert_eq!(stmt.get_option_string(key.clone()).unwrap(), "30");
+        assert_eq!(stmt.get_option_int(key.clone()).unwrap(), 30);
+
+        stmt.set_option(key.clone(), OptionValue::Int(7)).unwrap();
+        assert_eq!(stmt.execution_timeout_seconds(), Some(7));
+
+        stmt.set_option(key.clone(), OptionValue::String("0".into()))
+            .unwrap();
+        assert_eq!(stmt.execution_timeout_seconds(), None);
+        assert_eq!(stmt.get_option_int(key).unwrap(), 0);
+    }
+
+    #[test]
+    fn query_timeout_rejects_invalid_values_without_changing_state() {
+        let mut stmt = make_stmt();
+        let key = OptionStatement::Other(QUERY_TIMEOUT_OPTION.into());
+        stmt.set_option(key.clone(), OptionValue::Int(5)).unwrap();
+
+        for value in [
+            OptionValue::Int(-1),
+            OptionValue::String(String::new()),
+            OptionValue::String("30ms".into()),
+            OptionValue::Double(30.0),
+        ] {
+            let error = stmt.set_option(key.clone(), value).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert_eq!(stmt.execution_timeout_seconds(), Some(5));
+        }
+    }
+
+    #[test]
+    fn cancel_without_inflight_query_succeeds_on_valid_core_statement() {
+        let mut stmt = make_stmt();
+        let inner = stmt.inner.clone();
+        let conn_handle = inner.sf.connection_new();
+        stmt.conn_handle = conn_handle;
+        stmt.stmt_handle = inner.sf.statement_new(conn_handle).unwrap();
+
+        stmt.cancel().unwrap();
+
+        drop(stmt);
+        // Statement::drop released the statement; release the core connection.
+        inner.sf.connection_release(conn_handle).unwrap();
     }
 
     #[test]
@@ -1479,11 +1758,13 @@ mod tests {
             ingest_schema: None,
             ingest_mode: None,
             query_tag: None,
+            query_timeout_seconds: None,
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
             binding_supplied: false,
             last_query_id: None,
+            prepared_parameter_schema: None,
         };
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
@@ -1504,11 +1785,13 @@ mod tests {
             ingest_schema: None,
             ingest_mode: None,
             query_tag: None,
+            query_timeout_seconds: None,
             use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
             binding_supplied: false,
             last_query_id: None,
+            prepared_parameter_schema: None,
         };
         stmt.set_sql_query("SELECT 1").unwrap();
         assert!(stmt.target_table.is_none());
@@ -1522,10 +1805,106 @@ mod tests {
     }
 
     #[test]
-    fn prepare_with_query_is_noop() {
+    fn valid_prepare_bind_metadata_uses_stable_names_and_existing_conversions() {
+        let schema = parameter_schema_from_prepare(
+            3,
+            &[
+                bind_metadata("", "FIXED", Some(10), Some(2)),
+                bind_metadata("named", "TIMESTAMP_NTZ", None, Some(6)),
+                bind_metadata("unknown", "FUTURE_TYPE", None, None),
+            ],
+            true,
+            TimeUnit::Nanosecond,
+        )
+        .unwrap();
+
+        assert_eq!(schema.field(0).name(), "");
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(10, 2));
+        assert_eq!(schema.field(1).name(), "named");
+        assert_eq!(
+            schema.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(schema.field(2).name(), "unknown");
+        assert_eq!(schema.field(2).data_type(), &DataType::Null);
+    }
+
+    #[test]
+    fn invalid_prepare_bind_metadata_is_not_exposed() {
+        let bind = bind_metadata("", "FIXED", Some(10), Some(0));
+        assert!(
+            parameter_schema_from_prepare(
+                2,
+                std::slice::from_ref(&bind),
+                true,
+                TimeUnit::Nanosecond
+            )
+            .is_none()
+        );
+        let mut missing_type = bind;
+        missing_type.r#type.clear();
+        assert!(
+            parameter_schema_from_prepare(1, &[missing_type], true, TimeUnit::Nanosecond).is_none()
+        );
+        assert!(parameter_schema_from_prepare(-1, &[], true, TimeUnit::Nanosecond).is_none());
+    }
+
+    #[test]
+    fn parameter_schema_requires_valid_prepared_metadata_and_query_reset_clears_it() {
         let mut stmt = make_stmt();
+        assert_eq!(
+            stmt.get_parameter_schema().unwrap_err().status,
+            Status::NotImplemented
+        );
+        stmt.prepared_parameter_schema = Some(Schema::empty());
+        assert!(stmt.get_parameter_schema().unwrap().fields().is_empty());
         stmt.set_sql_query("SELECT 1").unwrap();
-        stmt.prepare().unwrap();
+        assert!(stmt.prepared_parameter_schema.is_none());
+    }
+
+    #[test]
+    fn parameter_schema_cache_is_invalidated_by_conversion_and_ingest_options() {
+        let cases = [
+            (
+                OptionStatement::Other(
+                    "adbc.snowflake.sql.client_option.use_high_precision".into(),
+                ),
+                OptionValue::String("disabled".into()),
+            ),
+            (
+                OptionStatement::Other(
+                    "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
+                ),
+                OptionValue::String("microseconds".into()),
+            ),
+            (
+                OptionStatement::TargetTable,
+                OptionValue::String("target".into()),
+            ),
+            (
+                OptionStatement::IngestMode,
+                OptionValue::String("append".into()),
+            ),
+            (
+                OptionStatement::TargetCatalog,
+                OptionValue::String("catalog".into()),
+            ),
+            (
+                OptionStatement::TargetDbSchema,
+                OptionValue::String("schema".into()),
+            ),
+            (
+                OptionStatement::Temporary,
+                OptionValue::String("true".into()),
+            ),
+        ];
+
+        for (option, value) in cases {
+            let mut stmt = make_stmt();
+            stmt.prepared_parameter_schema = Some(Schema::empty());
+            stmt.set_option(option, value).unwrap();
+            assert!(stmt.prepared_parameter_schema.is_none());
+        }
     }
 
     #[test]
@@ -2372,7 +2751,9 @@ mod tests {
         assert_eq!(decimal128_to_string(150, 2), "1.50");
         // Zero
         assert_eq!(decimal128_to_string(0, 2), "0.00");
-        // No scale
+        // Zero and negative scales
         assert_eq!(decimal128_to_string(-42, 0), "-42");
+        assert_eq!(decimal128_to_string(123, -2), "12300");
+        assert_eq!(decimal128_to_string(-123, -2), "-12300");
     }
 }
