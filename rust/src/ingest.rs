@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, TimeUnit};
 use sf_core::apis::database_driver_v1::{ApiError, BindingType, DataPtr};
 
-use crate::driver::Inner;
 use crate::statement::{Statement, arrow_batches_to_json_bindings, format_arrow_value_for_csv};
 
 const INGEST_CHUNK_ROWS: usize = 500;
@@ -56,33 +53,29 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         .unwrap_or("adbc.ingest.mode.create")
     {
         "adbc.ingest.mode.create" => {
-            run_sql(
-                &stmt.inner,
+            stmt.inner.execute_temporary_statement(
                 stmt.conn_handle,
-                &build_create_sql(&qname, &schema, false)?,
+                build_create_sql(&qname, &schema, false)?,
                 stmt.query_timeout_seconds,
             )?;
         }
         "adbc.ingest.mode.append" => {}
         "adbc.ingest.mode.replace" => {
-            run_sql(
-                &stmt.inner,
+            stmt.inner.execute_temporary_statement(
                 stmt.conn_handle,
-                &format!("DROP TABLE IF EXISTS {qname}"),
+                format!("DROP TABLE IF EXISTS {qname}"),
                 stmt.query_timeout_seconds,
             )?;
-            run_sql(
-                &stmt.inner,
+            stmt.inner.execute_temporary_statement(
                 stmt.conn_handle,
-                &build_create_sql(&qname, &schema, false)?,
+                build_create_sql(&qname, &schema, false)?,
                 stmt.query_timeout_seconds,
             )?;
         }
         "adbc.ingest.mode.create_append" => {
-            run_sql(
-                &stmt.inner,
+            stmt.inner.execute_temporary_statement(
                 stmt.conn_handle,
-                &build_create_sql(&qname, &schema, true)?,
+                build_create_sql(&qname, &schema, true)?,
                 stmt.query_timeout_seconds,
             )?;
         }
@@ -415,32 +408,10 @@ fn time_unit_precision(unit: &TimeUnit) -> u8 {
     }
 }
 
-fn run_sql(
-    inner: &Arc<Inner>,
-    connection: sf_core::handle_manager::Handle,
-    sql: &str,
-    timeout_seconds: Option<u32>,
-) -> Result<()> {
-    let statement = inner
-        .sf
-        .statement_new(connection)
-        .map_err(crate::error::api_error_to_adbc_error)?;
-    let result =
-        inner.execute_query_with_timeout(statement, sql.to_string(), None, timeout_seconds);
-    let release = inner.sf.statement_release(statement);
-    match result {
-        Ok(_) => release
-            .map_err(crate::error::api_error_to_adbc_error)
-            .map(|_| ()),
-        Err(error) => {
-            let _ = release;
-            Err(error)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use arrow_array::{
         ArrayRef, BinaryArray, Date32Array, Decimal128Array, Int64Array, NullArray, RecordBatch,

@@ -194,7 +194,9 @@ impl Connection {
 
     fn set_current_identifier(&self, kind: SessionIdentifierKind, name: &str) -> Result<()> {
         if let Some(sql) = exact_identifier_sql(kind, name) {
-            return self.execute_session_sql(sql);
+            return self
+                .inner
+                .execute_temporary_statement(self.conn_handle, sql, None);
         }
         let result = match kind {
             SessionIdentifierKind::Database => self.inner.runtime.block_on(
@@ -208,25 +210,6 @@ impl Connection {
                 .block_on(self.inner.sf.connection_use_schema(self.conn_handle, name)),
         };
         result.map_err(crate::error::api_error_to_adbc_error)
-    }
-
-    fn execute_session_sql(&self, sql: String) -> Result<()> {
-        let statement = self
-            .inner
-            .sf
-            .statement_new(self.conn_handle)
-            .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.execute_query(statement, sql, None);
-        let release = self.inner.sf.statement_release(statement);
-        match result {
-            Ok(_) => release
-                .map_err(crate::error::api_error_to_adbc_error)
-                .map(|_| ()),
-            Err(error) => {
-                let _ = release;
-                Err(error)
-            }
-        }
     }
 }
 
