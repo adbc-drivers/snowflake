@@ -41,7 +41,7 @@ class SnowflakeQuirks(model.DriverQuirks):
         statement_bulk_ingest_schema=True,
         statement_bulk_ingest_temporary=False,
         statement_execute_schema=True,
-        statement_get_parameter_schema=False,
+        statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
         statement_rows_affected_ddl=False,

@@ -17,13 +17,15 @@ use std::sync::Arc;
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, TimeUnit};
-use sf_core::apis::database_driver_v1::{BindingType, DataPtr};
+use sf_core::apis::database_driver_v1::{ApiError, BindingType, DataPtr};
 
 use crate::driver::Inner;
-use crate::statement::{Statement, arrow_batches_to_json_bindings};
+use crate::statement::{Statement, arrow_batches_to_json_bindings, format_arrow_value_for_csv};
 
 const INGEST_CHUNK_ROWS: usize = 500;
 const INGEST_CHUNK_BYTES: usize = 900_000;
+const DEFAULT_STAGE_ARRAY_BINDING_THRESHOLD: u64 = 65_280;
+const STAGE_ARRAY_BINDING_THRESHOLD_PARAMETER: &str = "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD";
 
 struct EncodedBindingChunk {
     rows: usize,
@@ -58,6 +60,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
                 &stmt.inner,
                 stmt.conn_handle,
                 &build_create_sql(&qname, &schema, false)?,
+                stmt.query_timeout_seconds,
             )?;
         }
         "adbc.ingest.mode.append" => {}
@@ -66,11 +69,13 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
                 &stmt.inner,
                 stmt.conn_handle,
                 &format!("DROP TABLE IF EXISTS {qname}"),
+                stmt.query_timeout_seconds,
             )?;
             run_sql(
                 &stmt.inner,
                 stmt.conn_handle,
                 &build_create_sql(&qname, &schema, false)?,
+                stmt.query_timeout_seconds,
             )?;
         }
         "adbc.ingest.mode.create_append" => {
@@ -78,6 +83,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
                 &stmt.inner,
                 stmt.conn_handle,
                 &build_create_sql(&qname, &schema, true)?,
+                stmt.query_timeout_seconds,
             )?;
         }
         other => {
@@ -89,6 +95,33 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
     }
 
     let insert_sql = build_insert_sql(&qname, &schema);
+    let threshold = stage_binding_threshold(stmt)?;
+    if let Some(csv) = encode_csv_stage_binding(&stmt.bound_batches, threshold)? {
+        let csv_len = i64::try_from(csv.len()).map_err(|_| {
+            Error::with_message_and_status(
+                "CSV stage binding is too large",
+                Status::InvalidArguments,
+            )
+        })?;
+        let binding = BindingType::Csv(DataPtr::new(csv.as_ptr(), csv_len));
+        // Keep the CSV owner in scope until sf_core finishes uploading it. A
+        // StageBinding error occurs before the INSERT is submitted, so it is
+        // the only safe error on which to retry with inline JSON bindings.
+        match stmt.inner.execute_query_raw_with_timeout(
+            stmt.stmt_handle,
+            insert_sql.clone(),
+            Some(binding),
+            stmt.query_timeout_seconds,
+        ) {
+            Ok(result) => {
+                let result = stmt.inner.acquire_execute_result(result)?;
+                return Ok(result.descriptor.rows_affected);
+            }
+            Err(error) if should_fallback_from_stage_binding(&error) => {}
+            Err(error) => return Err(crate::error::api_error_to_adbc_error(error)),
+        }
+    }
+
     let mut total = Some(0i64);
     for batch in &stmt.bound_batches {
         for chunk in encode_binding_chunks(batch)? {
@@ -101,9 +134,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
             })?;
             let binding = BindingType::Json(DataPtr::new(chunk.json.as_ptr(), json_len));
             // The encoded String stays in scope until execute_query's block_on completes.
-            let result =
-                stmt.inner
-                    .execute_query(stmt.stmt_handle, insert_sql.clone(), Some(binding))?;
+            let result = stmt.execute_query(insert_sql.clone(), Some(binding))?;
 
             total = match (total, result.descriptor.rows_affected) {
                 (Some(acc), Some(rows)) => Some(acc.checked_add(rows).ok_or_else(|| {
@@ -114,6 +145,139 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         }
     }
     Ok(total)
+}
+
+fn should_fallback_from_stage_binding(error: &ApiError) -> bool {
+    matches!(error, ApiError::StageBinding { .. })
+}
+
+fn parse_stage_binding_threshold(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse::<u32>().ok())
+        .map(u64::from)
+        .unwrap_or(DEFAULT_STAGE_ARRAY_BINDING_THRESHOLD)
+}
+
+fn stage_binding_threshold(stmt: &Statement) -> Result<u64> {
+    let raw = stmt
+        .inner
+        .runtime
+        .block_on(stmt.inner.sf.connection_get_parameter(
+            stmt.conn_handle,
+            STAGE_ARRAY_BINDING_THRESHOLD_PARAMETER.to_string(),
+        ))
+        .map_err(crate::error::api_error_to_adbc_error)?;
+    Ok(parse_stage_binding_threshold(raw.as_deref()))
+}
+
+fn effective_binding_cells(batches: &[RecordBatch]) -> Option<u64> {
+    batches.iter().try_fold(0u64, |total, batch| {
+        let rows = u64::try_from(batch.num_rows()).ok()?;
+        let columns = u64::try_from(batch.num_columns()).ok()?;
+        total.checked_add(rows.checked_mul(columns)?)
+    })
+}
+
+fn csv_stage_type_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Boolean
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+    )
+}
+
+fn append_csv_cell(output: &mut String, value: &str) {
+    // sf_core's stage COPY uses FIELD_OPTIONALLY_ENCLOSED_BY='"'. Quoting every
+    // non-NULL cell is RFC-4180-compatible and preserves NULL (bare empty) vs
+    // empty string (quoted empty); embedded quotes are doubled.
+    output.push('"');
+    for character in value.chars() {
+        if character == '"' {
+            output.push('"');
+        }
+        output.push(character);
+    }
+    output.push('"');
+}
+
+/// Build one row-major CSV payload for stage binding. Returning `None` is an
+/// intentional signal to retain the existing chunked JSON path.
+fn encode_csv_stage_binding(batches: &[RecordBatch], threshold: u64) -> Result<Option<String>> {
+    let Some(effective_cells) = effective_binding_cells(batches) else {
+        return Ok(None);
+    };
+    if threshold == 0 || effective_cells == 0 || effective_cells < threshold {
+        return Ok(None);
+    }
+
+    let Some(first) = batches.first() else {
+        return Ok(None);
+    };
+    let schema = first.schema();
+    if schema
+        .fields()
+        .iter()
+        .any(|field| !csv_stage_type_supported(field.data_type()))
+        || batches.iter().any(|batch| batch.schema() != schema)
+    {
+        return Ok(None);
+    }
+
+    let mut output = String::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            for column in 0..batch.num_columns() {
+                if column != 0 {
+                    output.push(',');
+                }
+                let array = batch.column(column);
+                if array.is_null(row) {
+                    continue;
+                }
+                let value = format_arrow_value_for_csv(
+                    array.as_ref(),
+                    row,
+                    schema.field(column).data_type(),
+                )?;
+                let Some(value) = value else {
+                    // Non-finite floating point values follow the JSON path's
+                    // NULL behavior but remain explicitly unsupported for CSV.
+                    return Ok(None);
+                };
+                if matches!(
+                    schema.field(column).data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8
+                ) && value == r"\N"
+                {
+                    // sf_core COPY uses NULL_IF=('\\N'); quoting does not make
+                    // this literal distinguishable from NULL on that path.
+                    return Ok(None);
+                }
+                append_csv_cell(&mut output, &value);
+            }
+            output.push('\n');
+        }
+    }
+    Ok(Some(output))
 }
 
 fn encode_binding_chunks(batch: &RecordBatch) -> Result<Vec<EncodedBindingChunk>> {
@@ -255,12 +419,14 @@ fn run_sql(
     inner: &Arc<Inner>,
     connection: sf_core::handle_manager::Handle,
     sql: &str,
+    timeout_seconds: Option<u32>,
 ) -> Result<()> {
     let statement = inner
         .sf
         .statement_new(connection)
         .map_err(crate::error::api_error_to_adbc_error)?;
-    let result = inner.execute_query(statement, sql.to_string(), None);
+    let result =
+        inner.execute_query_with_timeout(statement, sql.to_string(), None, timeout_seconds);
     let release = inner.sf.statement_release(statement);
     match result {
         Ok(_) => release
@@ -276,7 +442,10 @@ fn run_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{
+        ArrayRef, BinaryArray, Date32Array, Decimal128Array, Int64Array, NullArray, RecordBatch,
+        StringArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    };
     use arrow_schema::Field;
 
     #[test]
@@ -314,6 +483,159 @@ mod tests {
         );
         assert!(!sql.contains("not SQL"));
         assert!(json.contains("\"value\":[\"not SQL ' text\",null]"));
+    }
+
+    #[test]
+    fn stage_threshold_defaults_and_preserves_explicit_zero() {
+        assert_eq!(parse_stage_binding_threshold(None), 65_280);
+        assert_eq!(parse_stage_binding_threshold(Some("invalid")), 65_280);
+        assert_eq!(parse_stage_binding_threshold(Some("-1")), 65_280);
+        assert_eq!(parse_stage_binding_threshold(Some("4294967296")), 65_280);
+        assert_eq!(parse_stage_binding_threshold(Some("0")), 0);
+        assert_eq!(parse_stage_binding_threshold(Some("20")), 20);
+    }
+
+    #[test]
+    fn csv_selection_uses_effective_cells_at_exact_threshold() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", DataType::Int64, false),
+            Field::new("right", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..10)) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(10..20)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            encode_csv_stage_binding(std::slice::from_ref(&batch), 20)
+                .unwrap()
+                .is_some()
+        );
+        assert!(encode_csv_stage_binding(&[batch], 21).unwrap().is_none());
+    }
+
+    #[test]
+    fn csv_distinguishes_null_and_empty_and_escapes_rfc4180_hazards() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                None,
+                Some(""),
+                Some("comma, quote \" and\nnewline"),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let csv = encode_csv_stage_binding(&[batch], 1).unwrap().unwrap();
+        assert_eq!(csv, "\n\"\"\n\"comma, quote \"\" and\nnewline\"\n");
+    }
+
+    #[test]
+    fn csv_literal_backslash_n_text_falls_back_to_json() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![r"\N"])) as ArrayRef],
+        )
+        .unwrap();
+
+        assert!(encode_csv_stage_binding(&[batch], 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn only_typed_stage_binding_errors_allow_json_retry() {
+        use sf_core::stage_binding::StageBindingError;
+
+        let stage_error = ApiError::StageBinding {
+            source: Box::new(StageBindingError::Disabled {
+                location: snafu::Location::default(),
+            }),
+            location: snafu::Location::default(),
+        };
+        let submitted_query_error = ApiError::Cancelled {
+            location: snafu::Location::default(),
+        };
+
+        assert!(should_fallback_from_stage_binding(&stage_error));
+        assert!(!should_fallback_from_stage_binding(&submitted_query_error));
+    }
+
+    #[test]
+    fn csv_preserves_decimal_binary_and_temporal_wire_values() {
+        let decimal = Decimal128Array::from(vec![12345i128])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("decimal", DataType::Decimal128(10, 2), false),
+            Field::new("binary", DataType::Binary, false),
+            Field::new("date", DataType::Date32, false),
+            Field::new("time", DataType::Time64(TimeUnit::Nanosecond), false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![&b"\x00\xff"[..]])) as ArrayRef,
+                Arc::new(Date32Array::from(vec![365_000])) as ArrayRef,
+                Arc::new(Time64NanosecondArray::from(vec![123])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![1_234_567])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            encode_csv_stage_binding(&[batch], 1).unwrap().unwrap(),
+            "\"123.45\",\"00ff\",\"31536000000000000000\",\"123\",\"1234567000\"\n"
+        );
+    }
+
+    #[test]
+    fn csv_combines_all_compatible_batches_into_one_payload() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![3])) as ArrayRef],
+        )
+        .unwrap();
+
+        assert_eq!(
+            encode_csv_stage_binding(&[first, second], 3)
+                .unwrap()
+                .unwrap(),
+            "\"1\"\n\"2\"\n\"3\"\n"
+        );
+    }
+
+    #[test]
+    fn unsupported_csv_type_deliberately_falls_back_to_json_path() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "unsupported",
+            DataType::Null,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(1)) as ArrayRef]).unwrap();
+
+        assert!(encode_csv_stage_binding(&[batch], 1).unwrap().is_none());
     }
 
     #[test]

@@ -28,15 +28,15 @@ use adbc_core::{
     schemas,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray,
-    UInt32Array, UnionArray,
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
+    UnionArray,
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use sf_core::apis::database_driver_v1::{ConnectionInfo, Handle};
 
 use crate::driver::{Inner, TimestampPrecision};
-use crate::statement::Statement;
+use crate::statement::{Statement, adjust_schema};
 
 pub struct Connection {
     pub(crate) inner: Arc<Inner>,
@@ -46,9 +46,51 @@ pub struct Connection {
     pub(crate) timestamp_precision: TimestampPrecision,
 }
 
+type CleanupTask = Box<dyn FnOnce() + Send + 'static>;
+
+fn attempt_connection_cleanup(
+    close: impl FnOnce() + Send + 'static,
+    release: impl FnOnce(),
+    spawn: impl FnOnce(CleanupTask) -> std::io::Result<std::thread::JoinHandle<()>>,
+) {
+    // Runtime::block_on panics when entered from some Tokio runtime contexts.
+    // Always run close on a dedicated OS thread, wait for sf_core's bounded
+    // close behavior, then release the handle. Drop remains infallible even if
+    // spawning, closing, joining, or releasing fails or panics.
+    let close = Box::new(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(close));
+    });
+    let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| spawn(close)));
+    if let Ok(Ok(thread)) = spawned {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = thread.join();
+        }));
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(release));
+}
+
+pub(crate) fn cleanup_connection_handle(inner: &Arc<Inner>, conn_handle: Handle) {
+    let close_inner = Arc::clone(inner);
+    attempt_connection_cleanup(
+        move || {
+            let _ = close_inner
+                .runtime
+                .block_on(close_inner.sf.connection_close(conn_handle));
+        },
+        || {
+            let _ = inner.sf.connection_release(conn_handle);
+        },
+        |close| {
+            std::thread::Builder::new()
+                .name("snowflake-connection-close".into())
+                .spawn(close)
+        },
+    );
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.inner.sf.connection_release(self.conn_handle);
+        cleanup_connection_handle(&self.inner, self.conn_handle);
     }
 }
 
@@ -75,6 +117,29 @@ fn exact_identifier_sql(kind: SessionIdentifierKind, name: &str) -> Option<Strin
         SessionIdentifierKind::Schema => "SCHEMA",
     };
     Some(format!("USE {keyword} \"{}\"", name.replace('"', "\"\"")))
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn qualified_table_identifier(
+    catalog: Option<&str>,
+    db_schema: Option<&str>,
+    table_name: &str,
+) -> String {
+    let table_name = quote_identifier(table_name);
+    match (catalog, db_schema) {
+        (Some(catalog), Some(db_schema)) => format!(
+            "{}.{}.{}",
+            quote_identifier(catalog),
+            quote_identifier(db_schema),
+            table_name
+        ),
+        (None, Some(db_schema)) => format!("{}.{}", quote_identifier(db_schema), table_name),
+        (Some(catalog), None) => format!("{}..{}", quote_identifier(catalog), table_name),
+        (None, None) => table_name,
+    }
 }
 
 impl SingleBatchReader {
@@ -268,11 +333,13 @@ impl adbc_core::Connection for Connection {
             ingest_schema: None,
             ingest_mode: None,
             query_tag: None,
+            query_timeout_seconds: None,
             use_high_precision: self.use_high_precision,
             timestamp_precision: self.timestamp_precision,
             bound_batches: vec![],
             binding_supplied: false,
             last_query_id: None,
+            prepared_parameter_schema: None,
         })
     }
 
@@ -470,88 +537,43 @@ impl adbc_core::Connection for Connection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
-        let quoted = |s: &str| format!(r#""{}""#, s.replace('"', "\"\""));
-        let qualified = match (catalog, db_schema) {
-            (Some(c), Some(s)) => {
-                format!("{}.{}.{}", quoted(c), quoted(s), quoted(table_name))
-            }
-            (None, Some(s)) => format!("{}.{}", quoted(s), quoted(table_name)),
-            (Some(c), None) => format!("{}.{}", quoted(c), quoted(table_name)),
-            (None, None) => quoted(table_name),
-        };
-        let sql = format!("DESC TABLE {qualified}");
+        let qualified = qualified_table_identifier(catalog, db_schema, table_name);
         let stmt_handle = self
             .inner
             .sf
             .statement_new(self.conn_handle)
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.execute_query(stmt_handle, sql, None);
-        let _ = self.inner.sf.statement_release(stmt_handle);
-        let reader = result?.reader;
 
-        let mut fields: Vec<Field> = Vec::new();
-        for batch in reader {
-            let batch =
-                batch.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
-            use arrow_array::cast::AsArray;
-
-            // Resolve column indices by name (case-insensitive) so a future
-            // reordering of DESC TABLE columns doesn't silently shift the mapping.
-            // Known positional defaults from the current Snowflake DESC TABLE schema:
-            //   0=name, 1=type, 2=kind, 3=null?, 4=default, 5=primary key,
-            //   6=unique key, 7=check, 8=expression, 9=comment, …
-            let schema = batch.schema();
-            let find = |name: &str, fallback: usize| {
-                schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name().eq_ignore_ascii_case(name))
-                    .unwrap_or(fallback)
-            };
-            let name_col = find("name", 0);
-            let type_col = find("type", 1);
-            let null_col = find("null?", 3);
-            let pk_col = find("primary key", 5);
-            let comment_col = find("comment", 9);
-
-            if batch.num_columns() <= name_col
-                || batch.num_columns() <= type_col
-                || batch.num_columns() <= null_col
-            {
-                continue;
+        let result = (|| {
+            let prepared = self
+                .inner
+                .prepare_statement(stmt_handle, format!("SELECT * FROM {qualified}"))?;
+            let schema = prepared.reader.schema();
+            if schema.fields().is_empty() {
+                return Err(Error::with_message_and_status(
+                    format!("sf_core prepared an empty schema for table {qualified}"),
+                    Status::Internal,
+                ));
             }
-            let names = batch.column(name_col).as_string::<i32>();
-            let types = batch.column(type_col).as_string::<i32>();
-            let nullables = batch.column(null_col).as_string::<i32>();
-            // primary_key and comment are present only when the result has enough columns.
-            let primary_keys =
-                (batch.num_columns() > pk_col).then(|| batch.column(pk_col).as_string::<i32>());
-            let comments = (batch.num_columns() > comment_col)
-                .then(|| batch.column(comment_col).as_string::<i32>());
-            for i in 0..batch.num_rows() {
-                let type_str = types.value(i);
-                let arrow_type = snowflake_type_to_arrow(
-                    type_str,
-                    self.use_high_precision,
-                    self.timestamp_precision.time_unit(),
-                );
-                let mut md = std::collections::HashMap::new();
-                md.insert("DATA_TYPE".to_string(), type_str.to_string());
-                if let Some(pk) = &primary_keys {
-                    md.insert("PRIMARY_KEY".to_string(), pk.value(i).to_string());
-                }
-                if let Some(cm) = &comments
-                    && !cm.is_null(i)
-                {
-                    md.insert("COMMENT".to_string(), cm.value(i).to_string());
-                }
-                fields.push(
-                    Field::new(names.value(i), arrow_type, nullables.value(i) == "Y")
-                        .with_metadata(md),
-                );
+            Ok(adjust_schema(
+                &schema,
+                self.use_high_precision,
+                self.timestamp_precision.time_unit(),
+            )
+            .as_ref()
+            .clone())
+        })();
+        let release = self.inner.sf.statement_release(stmt_handle);
+        match result {
+            Ok(schema) => {
+                release.map_err(crate::error::api_error_to_adbc_error)?;
+                Ok(schema)
+            }
+            Err(error) => {
+                let _ = release;
+                Err(error)
             }
         }
-        Ok(Schema::new(fields))
     }
 
     #[allow(refining_impl_trait)]
@@ -613,95 +635,43 @@ impl adbc_core::Connection for Connection {
     }
 }
 
-fn ts_scale_to_unit(scale: u32) -> arrow_schema::TimeUnit {
-    match scale {
-        0 => arrow_schema::TimeUnit::Second,
-        1..=3 => arrow_schema::TimeUnit::Millisecond,
-        4..=6 => arrow_schema::TimeUnit::Microsecond,
-        _ => arrow_schema::TimeUnit::Nanosecond,
-    }
-}
-
-fn min_time_unit(a: arrow_schema::TimeUnit, b: arrow_schema::TimeUnit) -> arrow_schema::TimeUnit {
-    use arrow_schema::TimeUnit::*;
-    let rank = |u| match u {
-        Second => 0u8,
-        Millisecond => 1,
-        Microsecond => 2,
-        Nanosecond => 3,
-    };
-    if rank(a) <= rank(b) { a } else { b }
-}
-
-fn snowflake_type_to_arrow(
-    type_str: &str,
-    high_precision: bool,
-    ts_unit: arrow_schema::TimeUnit,
-) -> DataType {
-    let upper = type_str.to_uppercase();
-    let base = upper.split('(').next().unwrap_or(&upper).trim();
-    match base {
-        "FLOAT" | "DOUBLE" | "REAL" | "FLOAT4" | "FLOAT8" => DataType::Float64,
-        "BOOLEAN" => DataType::Boolean,
-        "DATE" => DataType::Date32,
-        "TIME" => DataType::Time64(arrow_schema::TimeUnit::Nanosecond),
-        "TEXT" | "STRING" | "VARCHAR" | "CHAR" | "CHARACTER" | "NCHAR" | "NVARCHAR"
-        | "NVARCHAR2" | "CHAR VARYING" | "NCHAR VARYING" => DataType::Utf8,
-        "BINARY" | "VARBINARY" => DataType::Binary,
-        "ARRAY" | "OBJECT" | "VARIANT" | "GEOGRAPHY" | "GEOMETRY" => DataType::Utf8,
-        "NUMBER" | "NUMERIC" | "DECIMAL" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
-        | "TINYINT" | "BYTEINT" => {
-            if let Some(inner) = type_str
-                .find('(')
-                .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
-            {
-                let mut parts = inner.split(',');
-                let precision = parts
-                    .next()
-                    .and_then(|s| s.trim().parse::<u8>().ok())
-                    .unwrap_or(38);
-                let scale = parts
-                    .next()
-                    .and_then(|s| s.trim().parse::<i8>().ok())
-                    .unwrap_or(0);
-                if scale == 0 {
-                    DataType::Int64
-                } else if high_precision {
-                    DataType::Decimal128(precision, scale)
-                } else {
-                    DataType::Float64
-                }
-            } else {
-                DataType::Int64
-            }
-        }
-        "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => {
-            let scale = type_str
-                .find('(')
-                .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(9);
-            let natural = ts_scale_to_unit(scale);
-            let unit = min_time_unit(natural, ts_unit);
-            DataType::Timestamp(unit, None)
-        }
-        "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
-            let scale = type_str
-                .find('(')
-                .and_then(|s| type_str.rfind(')').map(|e| &type_str[s + 1..e]))
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(9);
-            let natural = ts_scale_to_unit(scale);
-            let unit = min_time_unit(natural, ts_unit);
-            DataType::Timestamp(unit, Some("UTC".into()))
-        }
-        _ => DataType::Utf8,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_cleanup_waits_for_close_before_release_after_close_panic() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let close_calls = Arc::clone(&calls);
+        let release_calls = Arc::clone(&calls);
+        attempt_connection_cleanup(
+            move || {
+                close_calls.lock().unwrap().push("close");
+                panic!("simulated close failure");
+            },
+            move || release_calls.lock().unwrap().push("release"),
+            |close| std::thread::Builder::new().spawn(close),
+        );
+
+        assert_eq!(&*calls.lock().unwrap(), &["close", "release"]);
+    }
+
+    #[test]
+    fn connection_cleanup_releases_when_thread_spawn_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_by_cleanup = Arc::clone(&released);
+        attempt_connection_cleanup(
+            || panic!("close must not run without its dedicated thread"),
+            move || released_by_cleanup.store(true, Ordering::SeqCst),
+            |_close| Err(std::io::Error::other("simulated spawn failure")),
+        );
+
+        assert!(released.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn exact_identifier_fallback_is_narrow_and_quotes_without_trimming() {
@@ -734,98 +704,22 @@ mod tests {
     }
 
     #[test]
-    fn snowflake_type_number_no_scale_is_int64() {
+    fn table_identifier_quoting_preserves_all_components() {
         assert_eq!(
-            snowflake_type_to_arrow("NUMBER(38,0)", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Int64
-        );
-    }
-
-    #[test]
-    fn snowflake_type_number_with_scale_high_precision_is_decimal128() {
-        assert_eq!(
-            snowflake_type_to_arrow("NUMBER(10,2)", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Decimal128(10, 2)
-        );
-    }
-
-    #[test]
-    fn snowflake_type_number_with_scale_low_precision_is_float64() {
-        assert_eq!(
-            snowflake_type_to_arrow("NUMBER(10,2)", false, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Float64
-        );
-    }
-
-    #[test]
-    fn snowflake_type_text_is_utf8() {
-        assert_eq!(
-            snowflake_type_to_arrow("TEXT", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Utf8
+            qualified_table_identifier(Some("db\"name"), Some("schema"), "table"),
+            "\"db\"\"name\".\"schema\".\"table\""
         );
         assert_eq!(
-            snowflake_type_to_arrow(
-                "VARCHAR(16777216)",
-                true,
-                arrow_schema::TimeUnit::Nanosecond
-            ),
-            DataType::Utf8
+            qualified_table_identifier(Some("db"), None, "table"),
+            "\"db\"..\"table\""
         );
-    }
-
-    #[test]
-    fn snowflake_type_boolean_is_boolean() {
         assert_eq!(
-            snowflake_type_to_arrow("BOOLEAN", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Boolean
+            qualified_table_identifier(None, Some("schema"), "table"),
+            "\"schema\".\"table\""
         );
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_ntz_nanosecond() {
         assert_eq!(
-            snowflake_type_to_arrow("TIMESTAMP_NTZ(9)", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
-        );
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_ntz_microsecond() {
-        assert_eq!(
-            snowflake_type_to_arrow(
-                "TIMESTAMP_NTZ(6)",
-                true,
-                arrow_schema::TimeUnit::Microsecond
-            ),
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_ntz_scale6_with_ns_unit_returns_us() {
-        assert_eq!(
-            snowflake_type_to_arrow("TIMESTAMP_NTZ(6)", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_ntz_scale9_capped_by_us_unit() {
-        assert_eq!(
-            snowflake_type_to_arrow(
-                "TIMESTAMP_NTZ(9)",
-                true,
-                arrow_schema::TimeUnit::Microsecond
-            ),
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_ltz_scale6_with_ns_unit_returns_us() {
-        assert_eq!(
-            snowflake_type_to_arrow("TIMESTAMP_LTZ(6)", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+            qualified_table_identifier(None, None, " table "),
+            "\" table \""
         );
     }
 
@@ -850,21 +744,5 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(types, vec!["TABLE", "VIEW"]);
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_tz_scale6_with_ns_unit_returns_us() {
-        assert_eq!(
-            snowflake_type_to_arrow("TIMESTAMP_TZ(6)", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
-        );
-    }
-
-    #[test]
-    fn snowflake_type_timestamp_ntz_no_parens_defaults_to_ns() {
-        assert_eq!(
-            snowflake_type_to_arrow("TIMESTAMP_NTZ", true, arrow_schema::TimeUnit::Nanosecond),
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
-        );
     }
 }

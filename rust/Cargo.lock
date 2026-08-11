@@ -18,6 +18,7 @@ dependencies = [
  "openssl",
  "percent-encoding",
  "sf_core",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
