@@ -180,7 +180,8 @@ impl Statement {
     ///
     /// Snowflake's JSON binding API treats multiple rows as one batched execution,
     /// which is appropriate for DML but does not implement ADBC's execute-once-per-row
-    /// semantics for queries. Reject that case until query results can be concatenated.
+    /// semantics for queries. Zero rows also require an empty-result path. Reject both
+    /// cases until query results can be concatenated or represented without execution.
     fn execute_bound(
         &mut self,
         query: String,
@@ -960,9 +961,11 @@ impl<R: RecordBatchReader> RecordBatchReader for ConvertingReader<R> {
 
 fn ensure_single_query_binding(batches: &[RecordBatch]) -> Result<()> {
     let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    if row_count > 1 {
+    if row_count != 1 {
         return Err(Error::with_message_and_status(
-            "multi-row bindings for query execution are not supported; bind and execute one row at a time",
+            format!(
+                "query execution requires exactly one bound row; received {row_count}; bind and execute one row at a time"
+            ),
             Status::NotImplemented,
         ));
     }
@@ -2268,6 +2271,16 @@ mod tests {
         .unwrap();
 
         ensure_single_query_binding(&[batch]).unwrap();
+    }
+
+    #[test]
+    fn test_zero_row_query_bindings_are_rejected() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::new_empty(schema);
+
+        let err = ensure_single_query_binding(&[batch]).unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(err.message.contains("received 0"));
     }
 
     #[test]
