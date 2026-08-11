@@ -216,15 +216,20 @@ impl Optionable for Database {
             }
             return Ok(());
         }
+        let mut tls_skip_verify = None;
         if let Some((param, setting)) = adbc_db_opt_to_sf(key_str, &value)? {
+            if key_str == "adbc.snowflake.sql.client_option.tls_skip_verify"
+                && let Setting::Bool(skip) = &setting
+            {
+                tls_skip_verify = Some(*skip);
+            }
             self.sf_settings.insert(param.clone(), setting.clone());
             self.set_sf_options(HashMap::from([(param, setting)]))?;
         }
 
         // tls_skip_verify: also drive the underlying verify_certificates / verify_hostname
         // params so sf_core skips certificate and hostname checks when enabled.
-        if key_str == "adbc.snowflake.sql.client_option.tls_skip_verify" {
-            let skip = matches!(&value, OptionValue::String(s) if s == "enabled");
+        if let Some(skip) = tls_skip_verify {
             let verify = Setting::Bool(!skip);
             self.sf_settings.insert(
                 param_names::VERIFY_CERTIFICATES.as_str().to_string(),
@@ -649,30 +654,38 @@ mod tests {
     #[test]
     fn tls_skip_verify_enabled_clears_verify_flags() {
         use sf_core::config::settings::Setting;
-        let mut db = make_db();
-        db.set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+        for value in [
             OptionValue::String("enabled".into()),
-        )
-        .unwrap();
-        // Round-trip
-        assert_eq!(
-            db.get_option_string(OptionDatabase::Other(
-                "adbc.snowflake.sql.client_option.tls_skip_verify".into()
-            ))
-            .unwrap(),
-            "enabled"
-        );
-        // Compound: verify_certificates and verify_hostname must be false
-        assert_eq!(
-            db.sf_settings
-                .get(param_names::VERIFY_CERTIFICATES.as_str()),
-            Some(&Setting::Bool(false))
-        );
-        assert_eq!(
-            db.sf_settings.get(param_names::VERIFY_HOSTNAME.as_str()),
-            Some(&Setting::Bool(false))
-        );
+            OptionValue::String("true".into()),
+            OptionValue::String("1".into()),
+            OptionValue::Int(1),
+            OptionValue::Int(-1),
+        ] {
+            let mut db = make_db();
+            db.set_option(
+                OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
+                value,
+            )
+            .unwrap();
+            // Round-trip
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Other(
+                    "adbc.snowflake.sql.client_option.tls_skip_verify".into()
+                ))
+                .unwrap(),
+                "enabled"
+            );
+            // Compound: verify_certificates and verify_hostname must be false
+            assert_eq!(
+                db.sf_settings
+                    .get(param_names::VERIFY_CERTIFICATES.as_str()),
+                Some(&Setting::Bool(false))
+            );
+            assert_eq!(
+                db.sf_settings.get(param_names::VERIFY_HOSTNAME.as_str()),
+                Some(&Setting::Bool(false))
+            );
+        }
     }
 
     #[test]
