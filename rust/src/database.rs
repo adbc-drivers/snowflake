@@ -73,7 +73,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
         // The Okta authenticator URL is the authenticator value in sf_core.
         "adbc.snowflake.sql.client_option.okta_url" => param_names::AUTHENTICATOR.into(),
         "adbc.snowflake.sql.client_option.identity_provider" => "identity_provider".to_string(),
-        // Connection timeouts (stored as-is; sf_core will use them once supported)
+        // Connection timeouts (normalized to sf_core integer seconds below)
         "adbc.snowflake.sql.client_option.login_timeout" => "login_timeout".to_string(),
         "adbc.snowflake.sql.client_option.request_timeout" => "request_timeout".to_string(),
         "adbc.snowflake.sql.client_option.jwt_expire_timeout" => "jwt_expire_timeout".to_string(),
@@ -115,6 +115,44 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
         other => other.to_string(),
     };
 
+    let setting = match key {
+        "adbc.snowflake.sql.client_option.login_timeout"
+        | "adbc.snowflake.sql.client_option.request_timeout" => {
+            let seconds = match value {
+                OptionValue::Int(value) => *value,
+                OptionValue::String(value) => {
+                    let value = value.strip_suffix('s').unwrap_or(value);
+                    if value.is_empty() {
+                        0
+                    } else {
+                        value.parse::<i64>().map_err(|_| {
+                            Error::with_message_and_status(
+                                format!("invalid timeout value: {value}"),
+                                Status::InvalidArguments,
+                            )
+                        })?
+                    }
+                }
+                _ => {
+                    return Err(Error::with_message_and_status(
+                        "timeout must be a string or int",
+                        Status::InvalidArguments,
+                    ));
+                }
+            };
+            Setting::Int(seconds)
+        }
+        "adbc.snowflake.sql.client_option.tls_skip_verify" => {
+            let enabled = match value {
+                OptionValue::String(value) => matches!(value.as_str(), "enabled" | "true" | "1"),
+                OptionValue::Int(value) => *value != 0,
+                _ => false,
+            };
+            Setting::Bool(enabled)
+        }
+        _ => setting,
+    };
+
     Ok(Some((param, setting)))
 }
 
@@ -133,6 +171,16 @@ pub struct Database {
 impl Drop for Database {
     fn drop(&mut self) {
         let _ = self.inner.sf.database_release(self.db_handle);
+    }
+}
+
+impl Database {
+    fn set_sf_options(&self, options: HashMap<String, Setting>) -> Result<()> {
+        self.inner
+            .runtime
+            .block_on(self.inner.sf.database_set_options(self.db_handle, options))
+            .map(|_| ())
+            .map_err(crate::error::api_error_to_adbc_error)
     }
 }
 
@@ -170,14 +218,7 @@ impl Optionable for Database {
         }
         if let Some((param, setting)) = adbc_db_opt_to_sf(key_str, &value)? {
             self.sf_settings.insert(param.clone(), setting.clone());
-            self.inner
-                .runtime
-                .block_on(
-                    self.inner
-                        .sf
-                        .database_set_option(self.db_handle, param, setting),
-                )
-                .map_err(crate::error::api_error_to_adbc_error)?;
+            self.set_sf_options(HashMap::from([(param, setting)]))?;
         }
 
         // tls_skip_verify: also drive the underlying verify_certificates / verify_hostname
@@ -193,27 +234,10 @@ impl Optionable for Database {
                 param_names::VERIFY_HOSTNAME.as_str().to_string(),
                 verify.clone(),
             );
-            self.inner
-                .runtime
-                .block_on(async {
-                    self.inner
-                        .sf
-                        .database_set_option(
-                            self.db_handle,
-                            param_names::VERIFY_CERTIFICATES.into(),
-                            verify.clone(),
-                        )
-                        .await?;
-                    self.inner
-                        .sf
-                        .database_set_option(
-                            self.db_handle,
-                            param_names::VERIFY_HOSTNAME.into(),
-                            verify,
-                        )
-                        .await
-                })
-                .map_err(crate::error::api_error_to_adbc_error)?;
+            self.set_sf_options(HashMap::from([
+                (param_names::VERIFY_CERTIFICATES.into(), verify.clone()),
+                (param_names::VERIFY_HOSTNAME.into(), verify),
+            ]))?;
         }
 
         // ocsp_fail_open_mode: map to sf_core's crl_check_mode
@@ -225,14 +249,7 @@ impl Optionable for Database {
                 param_names::CRL_CHECK_MODE.as_str().to_string(),
                 mode.clone(),
             );
-            self.inner
-                .runtime
-                .block_on(self.inner.sf.database_set_option(
-                    self.db_handle,
-                    param_names::CRL_CHECK_MODE.into(),
-                    mode,
-                ))
-                .map_err(crate::error::api_error_to_adbc_error)?;
+            self.set_sf_options(HashMap::from([(param_names::CRL_CHECK_MODE.into(), mode)]))?;
         }
 
         Ok(())
@@ -257,9 +274,27 @@ impl Optionable for Database {
         }
         if let Ok(Some((param, _))) =
             adbc_db_opt_to_sf(key_str, &OptionValue::String(String::new()))
-            && let Some(Setting::String(s)) = self.sf_settings.get(&param)
+            && let Some(setting) = self.sf_settings.get(&param)
         {
-            return Ok(s.clone());
+            return match setting {
+                Setting::String(value) => Ok(value.clone()),
+                Setting::Int(value)
+                    if matches!(
+                        key_str,
+                        "adbc.snowflake.sql.client_option.login_timeout"
+                            | "adbc.snowflake.sql.client_option.request_timeout"
+                    ) =>
+                {
+                    Ok(format!("{value}s"))
+                }
+                Setting::Int(value) => Ok(value.to_string()),
+                Setting::Double(value) => Ok(value.to_string()),
+                Setting::Bool(value) => Ok(if *value { "enabled" } else { "disabled" }.into()),
+                Setting::Bytes(_) => Err(Error::with_message_and_status(
+                    format!("option is not a string: {key_str}"),
+                    Status::InvalidArguments,
+                )),
+            };
         }
         Err(Error::with_message_and_status(
             format!("option not found: {key_str}"),
@@ -333,7 +368,7 @@ impl Database {
                     .decode_utf8()
                     .map_err(|e| {
                         Error::with_message_and_status(
-                            &format!("invalid UTF-8 in URI username: {e}"),
+                            format!("invalid UTF-8 in URI username: {e}"),
                             Status::InvalidArguments,
                         )
                     })?;
@@ -341,7 +376,7 @@ impl Database {
                     .decode_utf8()
                     .map_err(|e| {
                         Error::with_message_and_status(
-                            &format!("invalid UTF-8 in URI password: {e}"),
+                            format!("invalid UTF-8 in URI password: {e}"),
                             Status::InvalidArguments,
                         )
                     })?;
@@ -358,7 +393,7 @@ impl Database {
             } else if !info.is_empty() {
                 let user = percent_decode_str(&info).decode_utf8().map_err(|e| {
                     Error::with_message_and_status(
-                        &format!("invalid UTF-8 in URI username: {e}"),
+                        format!("invalid UTF-8 in URI username: {e}"),
                         Status::InvalidArguments,
                     )
                 })?;
@@ -403,7 +438,7 @@ impl Database {
                         .decode_utf8()
                         .map_err(|e| {
                             Error::with_message_and_status(
-                                &format!("invalid UTF-8 in URI query parameter: {e}"),
+                                format!("invalid UTF-8 in URI query parameter: {e}"),
                                 Status::InvalidArguments,
                             )
                         })?;
@@ -525,7 +560,11 @@ impl adbc_core::Database for Database {
         // Authenticate
         self.inner
             .runtime
-            .block_on(self.inner.sf.connection_init(conn_handle, self.db_handle))
+            .block_on(
+                self.inner
+                    .sf
+                    .connection_init(None, conn_handle, self.db_handle),
+            )
             .map_err(crate::error::api_error_to_adbc_error)?;
 
         let mut conn = Connection {

@@ -20,8 +20,11 @@ use adbc_core::{
     error::{Error, Result, Status},
     options::{OptionDatabase, OptionValue},
 };
+use arrow_array::RecordBatchReader;
 use arrow_schema::TimeUnit;
-use sf_core::apis::database_driver_v1::DatabaseDriverV1;
+use sf_core::apis::database_driver_v1::{
+    BindingType, DatabaseDriverV1, ExecuteQueryResult, Handle, ResultSetDescriptor,
+};
 use tokio::runtime::Runtime;
 
 use crate::database::Database;
@@ -52,6 +55,11 @@ pub(crate) struct Inner {
     pub sf: DatabaseDriverV1,
 }
 
+pub(crate) struct QueryResult {
+    pub reader: Box<dyn RecordBatchReader + Send>,
+    pub descriptor: ResultSetDescriptor,
+}
+
 impl Inner {
     fn new() -> Result<Self> {
         let runtime = Runtime::new().map_err(|e| {
@@ -63,6 +71,51 @@ impl Inner {
         Ok(Self {
             runtime,
             sf: DatabaseDriverV1::new(),
+        })
+    }
+
+    pub fn execute_query<'a>(
+        &self,
+        statement: Handle,
+        query: String,
+        bindings: Option<BindingType<'a>>,
+    ) -> Result<QueryResult> {
+        self.runtime
+            .block_on(self.sf.statement_set_sql_query(statement, query))
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self
+            .runtime
+            .block_on(self.sf.statement_execute_query(statement, bindings, None))
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let ExecuteQueryResult::Single(result) = result else {
+            return Err(Error::with_message_and_status(
+                "multi-statement query results are not supported",
+                Status::NotImplemented,
+            ));
+        };
+
+        let stream = self
+            .runtime
+            .block_on(self.sf.result_set_get_stream(result.handle));
+        let release = self.sf.result_set_release(result.handle);
+        let reader = stream.map_err(crate::error::api_error_to_adbc_error)?;
+        release.map_err(crate::error::api_error_to_adbc_error)?;
+
+        // sf_core and ADBC currently resolve different Arrow major versions. Export the
+        // native sf_core reader through the stable Arrow C Data Interface once, here, so
+        // every caller receives the driver's Arrow version without duplicating unsafe code.
+        let stream = Box::new(arrow_sf_core::ffi_stream::FFI_ArrowArrayStream::new(reader));
+        let raw = Box::into_raw(stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
+        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
+            .map_err(|error| {
+                // from_raw does not invoke release on failure, so reclaim the stream.
+                drop(unsafe { Box::from_raw(raw) });
+                Error::with_message_and_status(error.to_string(), Status::IO)
+            })?;
+
+        Ok(QueryResult {
+            reader: Box::new(reader),
+            descriptor: result.descriptor,
         })
     }
 }
