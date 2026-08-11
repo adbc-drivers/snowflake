@@ -256,17 +256,9 @@ fn run_sql(inner: &Arc<Inner>, conn: sf_core::handle_manager::Handle, sql: &str)
         .sf
         .statement_new(conn)
         .map_err(crate::error::api_error_to_adbc_error)?;
-    let result = inner.runtime.block_on(async {
-        inner
-            .sf
-            .statement_set_sql_query(tmp, sql.to_string())
-            .await?;
-        inner.sf.statement_execute_query(tmp, None).await
-    });
+    let result = inner.execute_query(tmp, sql.to_string(), None);
     let _ = inner.sf.statement_release(tmp);
-    result
-        .map(|_| ())
-        .map_err(crate::error::api_error_to_adbc_error)
+    result.map(|_| ())
 }
 
 // ── value formatting ──────────────────────────────────────────────────────────

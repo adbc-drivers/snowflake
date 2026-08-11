@@ -13,6 +13,9 @@
 // limitations under the License.
 
 // src/lib.rs
+// sf_core's query future exceeds rustc's default type-layout query depth in codegen.
+#![recursion_limit = "256"]
+
 mod error;
 
 mod driver;

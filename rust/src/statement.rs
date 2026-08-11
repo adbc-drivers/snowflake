@@ -176,42 +176,27 @@ impl Optionable for Statement {
 }
 
 impl Statement {
-    /// Execute a parameterized query with all bound rows sent as JSON bindings
-    /// in a single round-trip via sf_core's `BindingType::Json` API.
+    /// Execute a parameterized query with a single bound row.
+    ///
+    /// Snowflake's JSON binding API treats multiple rows as one batched execution,
+    /// which is appropriate for DML but does not implement ADBC's execute-once-per-row
+    /// semantics for queries. Reject that case until query results can be concatenated.
     fn execute_bound(
         &mut self,
         query: String,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        ensure_single_query_binding(&self.bound_batches)?;
+
         let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
         let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
         let binding = BindingType::Json(data_ptr);
 
         let result = self
             .inner
-            .runtime
-            .block_on(async {
-                self.inner
-                    .sf
-                    .statement_set_sql_query(self.stmt_handle, query)
-                    .await?;
-                self.inner
-                    .sf
-                    .statement_execute_query(self.stmt_handle, Some(binding))
-                    .await
-            })
-            .map_err(crate::error::api_error_to_adbc_error)?;
+            .execute_query(self.stmt_handle, query, Some(binding))?;
 
-        self.last_query_id = Some(result.query_id.clone());
-
-        // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
-        // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
-        let raw =
-            Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| {
-                drop(unsafe { Box::from_raw(raw) });
-                Error::with_message_and_status(e.to_string(), Status::IO)
-            })?;
+        self.last_query_id = Some(result.descriptor.query_id.clone());
+        let reader = result.reader;
         Ok(Box::new(ConvertingReader::new(
             reader,
             self.use_high_precision,
@@ -229,18 +214,9 @@ impl Statement {
                 .sf
                 .statement_new(self.conn_handle)
                 .map_err(crate::error::api_error_to_adbc_error)?;
-            let set_result = self.inner.runtime.block_on(async {
-                self.inner
-                    .sf
-                    .statement_set_sql_query(tmp_handle, set_sql)
-                    .await?;
-                self.inner
-                    .sf
-                    .statement_execute_query(tmp_handle, None)
-                    .await
-            });
+            let set_result = self.inner.execute_query(tmp_handle, set_sql, None);
             let _ = self.inner.sf.statement_release(tmp_handle);
-            set_result.map_err(crate::error::api_error_to_adbc_error)?;
+            set_result?;
         }
         Ok(())
     }
@@ -284,33 +260,10 @@ impl adbc_core::Statement for Statement {
             return self.execute_bound(query);
         }
 
-        let result = self
-            .inner
-            .runtime
-            .block_on(async {
-                self.inner
-                    .sf
-                    .statement_set_sql_query(self.stmt_handle, query)
-                    .await?;
-                self.inner
-                    .sf
-                    .statement_execute_query(self.stmt_handle, None)
-                    .await
-            })
-            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self.inner.execute_query(self.stmt_handle, query, None)?;
 
-        self.last_query_id = Some(result.query_id.clone());
-
-        // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
-        // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
-        let raw =
-            Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| {
-                // Safety: on failure, from_raw does NOT call the stream's release callback.
-                drop(unsafe { Box::from_raw(raw) });
-                Error::with_message_and_status(e.to_string(), Status::IO)
-            })?;
+        self.last_query_id = Some(result.descriptor.query_id.clone());
+        let reader = result.reader;
         Ok(Box::new(ConvertingReader::new(
             reader,
             self.use_high_precision,
@@ -339,45 +292,21 @@ impl adbc_core::Statement for Statement {
 
             let result = self
                 .inner
-                .runtime
-                .block_on(async {
-                    self.inner
-                        .sf
-                        .statement_set_sql_query(self.stmt_handle, query)
-                        .await?;
-                    self.inner
-                        .sf
-                        .statement_execute_query(self.stmt_handle, Some(binding))
-                        .await
-                })
-                .map_err(crate::error::api_error_to_adbc_error)?;
+                .execute_query(self.stmt_handle, query, Some(binding))?;
 
-            self.last_query_id = Some(result.query_id.clone());
+            self.last_query_id = Some(result.descriptor.query_id.clone());
 
             let rows = if is_ddl(self.query.as_deref().unwrap_or("")) {
                 None
             } else {
-                result.rows_affected
+                result.descriptor.rows_affected
             };
             return Ok(rows);
         }
 
-        let result = self
-            .inner
-            .runtime
-            .block_on(async {
-                self.inner
-                    .sf
-                    .statement_set_sql_query(self.stmt_handle, query)
-                    .await?;
-                self.inner
-                    .sf
-                    .statement_execute_query(self.stmt_handle, None)
-                    .await
-            })
-            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self.inner.execute_query(self.stmt_handle, query, None)?;
 
-        self.last_query_id = Some(result.query_id.clone());
+        self.last_query_id = Some(result.descriptor.query_id.clone());
 
         // DDL statements (CREATE, DROP, ALTER, TRUNCATE) return a non-meaningful row
         // count from Snowflake (typically 1 for "success"). Per the ADBC convention,
@@ -385,7 +314,7 @@ impl adbc_core::Statement for Statement {
         let rows = if is_ddl(self.query.as_deref().unwrap_or("")) {
             None
         } else {
-            result.rows_affected
+            result.descriptor.rows_affected
         };
         Ok(rows)
     }
@@ -397,32 +326,10 @@ impl adbc_core::Statement for Statement {
 
         self.apply_query_tag()?;
 
-        let result = self
-            .inner
-            .runtime
-            .block_on(async {
-                self.inner
-                    .sf
-                    .statement_set_sql_query(self.stmt_handle, query)
-                    .await?;
-                self.inner
-                    .sf
-                    .statement_execute_query(self.stmt_handle, None)
-                    .await
-            })
-            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = self.inner.execute_query(self.stmt_handle, query, None)?;
 
-        self.last_query_id = Some(result.query_id.clone());
-
-        // Safety: result.stream is a valid FFI stream from sf_core. Ownership is transferred
-        // to ArrowArrayStreamReader. The C ABI layout is stable per the Arrow C Data Interface.
-        let raw =
-            Box::into_raw(result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| {
-                drop(unsafe { Box::from_raw(raw) });
-                Error::with_message_and_status(e.to_string(), Status::IO)
-            })?;
+        self.last_query_id = Some(result.descriptor.query_id.clone());
+        let reader = result.reader;
         Ok(adjust_schema(
             &reader.schema(),
             self.use_high_precision,
@@ -1051,6 +958,17 @@ impl<R: RecordBatchReader> RecordBatchReader for ConvertingReader<R> {
 
 // ── JSON parameter bindings ───────────────────────────────────────────────────
 
+fn ensure_single_query_binding(batches: &[RecordBatch]) -> Result<()> {
+    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if row_count > 1 {
+        return Err(Error::with_message_and_status(
+            "multi-row bindings for query execution are not supported; bind and execute one row at a time",
+            Status::NotImplemented,
+        ));
+    }
+    Ok(())
+}
+
 fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
     match dt {
         DataType::Int8
@@ -1116,16 +1034,16 @@ fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<String> {
     let mut col_values: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(total_rows); num_cols];
 
     for batch in batches {
-        for col_idx in 0..num_cols {
+        for (col_idx, values) in col_values.iter_mut().enumerate() {
             let col = batch.column(col_idx);
             let dt = col.data_type();
             for row in 0..batch.num_rows() {
                 if col.is_null(row) {
-                    col_values[col_idx].push(None);
+                    values.push(None);
                     continue;
                 }
                 let val = format_arrow_value(col.as_ref(), row, dt)?;
-                col_values[col_idx].push(val);
+                values.push(val);
             }
         }
     }
@@ -2156,7 +2074,7 @@ mod tests {
     fn test_build_timestamp_from_epoch_fraction_negative_scale_clamps() {
         let epoch = arrow_array::Int64Array::from(vec![1i64]);
         let fraction = arrow_array::Int32Array::from(vec![5i32]);
-        let fields = vec![
+        let fields = [
             Field::new("epoch", DataType::Int64, true),
             Field::new("fraction", DataType::Int32, true),
         ];
@@ -2192,7 +2110,7 @@ mod tests {
     fn test_build_timestamp_from_epoch_fraction_oversized_scale_clamps() {
         let epoch = arrow_array::Int64Array::from(vec![1i64]);
         let fraction = arrow_array::Int32Array::from(vec![5i32]);
-        let fields = vec![
+        let fields = [
             Field::new("epoch", DataType::Int64, true),
             Field::new("fraction", DataType::Int32, true),
         ];
@@ -2229,7 +2147,7 @@ mod tests {
         let epoch = arrow_array::Int64Array::from(vec![1i64]);
         let fraction = arrow_array::Int32Array::from(vec![5i32]);
         let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
-        let fields = vec![
+        let fields = [
             Field::new("epoch", DataType::Int64, true),
             Field::new("fraction", DataType::Int32, true),
             Field::new("tzoffset", DataType::Int32, true),
@@ -2270,7 +2188,7 @@ mod tests {
         let epoch = arrow_array::Int64Array::from(vec![1i64]);
         let fraction = arrow_array::Int32Array::from(vec![5i32]);
         let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
-        let fields = vec![
+        let fields = [
             Field::new("epoch", DataType::Int64, true),
             Field::new("fraction", DataType::Int32, true),
             Field::new("tzoffset", DataType::Int32, true),
@@ -2327,6 +2245,32 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_row_query_bindings_are_rejected() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .unwrap();
+
+        let err = ensure_single_query_binding(&[batch]).unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(err.message.contains("bind and execute one row at a time"));
+    }
+
+    #[test]
+    fn test_single_row_query_binding_is_accepted() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+
+        ensure_single_query_binding(&[batch]).unwrap();
+    }
+
+    #[test]
     fn test_arrow_batches_to_json_bindings_with_nulls() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -2355,7 +2299,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow_array::Float64Array::from(vec![3.141592653589793])) as ArrayRef],
+            vec![Arc::new(arrow_array::Float64Array::from(vec![std::f64::consts::PI])) as ArrayRef],
         )
         .unwrap();
 

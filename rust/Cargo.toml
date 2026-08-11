@@ -23,14 +23,20 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 adbc_core = ">=0.22.0"
-adbc_ffi  = ">=0.22.0"
-sf_core   = { git = "https://github.com/snowflakedb/universal-driver", subdirectory = "sf_core", rev = "1b8fc700c6fc10464851407da90ac5f9645758f7" }
-arrow-array  = { version = "58.1.0", default-features = false, features = ["ffi", "chrono-tz"] }
+adbc_ffi = ">=0.22.0"
+sf_core = { git = "https://github.com/snowflakedb/universal-driver", rev = "f9175f07e7784c45907dffca9d0738fccbaf37d1" }
+arrow-array = { version = "58.1.0", default-features = false, features = [
+  "ffi",
+  "chrono-tz",
+] }
+arrow-sf-core = { package = "arrow", version = "=56.2.0", default-features = false, features = [
+  "ffi",
+] }
 arrow-buffer = { version = "58.1.0", default-features = false }
 arrow-schema = { version = "58.1.0", default-features = false }
-arrow-cast   = { version = "58.1.0", default-features = false }
-log          = "0.4.22"
-tokio        = { version = "1", features = ["rt-multi-thread"] }
+arrow-cast = { version = "58.1.0", default-features = false }
+log = "0.4.22"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 percent-encoding = "2.3.2"
 # Force vendored (static) OpenSSL for manylinux compatibility.
 # This crate doesn't call openssl APIs directly; it exists to ensure

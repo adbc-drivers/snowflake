@@ -16,7 +16,7 @@
 
 /// Arrow library version reported via get_info(DriverArrowVersion).
 /// Must be kept in sync with the `arrow-array` dependency version in Cargo.toml.
-const ARROW_VERSION: &str = "v57.3.0";
+const ARROW_VERSION: &str = "v58.1.0";
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -88,20 +88,9 @@ impl Connection {
             .sf
             .statement_new(self.conn_handle)
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.runtime.block_on(async {
-            self.inner
-                .sf
-                .statement_set_sql_query(stmt_handle, sql.to_string())
-                .await?;
-            self.inner
-                .sf
-                .statement_execute_query(stmt_handle, None)
-                .await
-        });
+        let result = self.inner.execute_query(stmt_handle, sql.to_string(), None);
         let _ = self.inner.sf.statement_release(stmt_handle);
-        result
-            .map(|_| ())
-            .map_err(crate::error::api_error_to_adbc_error)
+        result.map(|_| ())
     }
 
     fn query_scalar(&self, sql: &str) -> Result<String> {
@@ -110,29 +99,9 @@ impl Connection {
             .sf
             .statement_new(self.conn_handle)
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.runtime.block_on(async {
-            self.inner
-                .sf
-                .statement_set_sql_query(stmt_handle, sql.to_string())
-                .await?;
-            self.inner
-                .sf
-                .statement_execute_query(stmt_handle, None)
-                .await
-        });
+        let result = self.inner.execute_query(stmt_handle, sql.to_string(), None);
         let _ = self.inner.sf.statement_release(stmt_handle);
-        let exec_result = result.map_err(crate::error::api_error_to_adbc_error)?;
-
-        let raw =
-            Box::into_raw(exec_result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-        let mut reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| {
-                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
-                // does NOT call the stream's release callback, so reconstructing the
-                // Box here is the only release path — no double-free risk.
-                drop(unsafe { Box::from_raw(raw) });
-                Error::with_message_and_status(e.to_string(), Status::IO)
-            })?;
+        let mut reader = result?.reader;
 
         use arrow_array::cast::AsArray;
         let batch = reader
@@ -471,32 +440,9 @@ impl adbc_core::Connection for Connection {
             .sf
             .statement_new(self.conn_handle)
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.inner.runtime.block_on(async {
-            self.inner
-                .sf
-                .statement_set_sql_query(stmt_handle, sql)
-                .await?;
-            self.inner
-                .sf
-                .statement_execute_query(stmt_handle, None)
-                .await
-        });
+        let result = self.inner.execute_query(stmt_handle, sql, None);
         let _ = self.inner.sf.statement_release(stmt_handle);
-        let exec_result = result.map_err(crate::error::api_error_to_adbc_error)?;
-
-        // Safety: exec_result.stream is a valid FFI stream from sf_core. We take ownership
-        // via Box::into_raw and transfer it to ArrowArrayStreamReader. The C ABI layout is
-        // stable across arrow versions per the Arrow C Data Interface specification.
-        let raw =
-            Box::into_raw(exec_result.stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-        let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-            .map_err(|e| {
-                // Safety: Arrow's C Data Interface specifies that on failure, from_raw
-                // does NOT call the stream's release callback, so reconstructing the
-                // Box here is the only release path — no double-free risk.
-                drop(unsafe { Box::from_raw(raw) });
-                Error::with_message_and_status(e.to_string(), Status::IO)
-            })?;
+        let reader = result?.reader;
 
         let mut fields: Vec<Field> = Vec::new();
         for batch in reader {
