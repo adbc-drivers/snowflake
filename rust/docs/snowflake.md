@@ -15,6 +15,7 @@
 ---
 
 {{ cross_reference|safe }}
+
 # Snowflake Driver {{ version }}
 
 {{ heading|safe }}
@@ -95,6 +96,10 @@ Examples:
 - `snowflake://jane.doe:MyS3cr3t!@myorg-account1/ANALYTICS_DB/SALES_DATA?warehouse=WH_XL&role=ANALYST`
 - `snowflake://service_user@myorg-account2/RAW_DATA_LAKE?authenticator=oauth&application=ADBC_APP`
 - `snowflake://sys_admin@private.network.com:443/OPS_MONITOR/DBA?account=vpc-id-1234&insecureMode=true&client_session_keep_alive=true` (Uses full hostname, requires explicit account parameter)
+
+## Statement Options
+
+- `adbc.snowflake.statement.query_timeout`: per-statement query timeout in seconds. Accepts a non-negative integer or a string such as `"30"` or `"30s"`. Set it to `0` to clear the override and use the Snowflake session/default timeout.
 
 ## Feature & Type Support
 
