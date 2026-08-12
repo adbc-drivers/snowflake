@@ -58,14 +58,14 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          python adbc_drivers_dev/title_check.py $(pwd) "$PR_TITLE"
+          python adbc_drivers_dev/title_check.py "$(pwd)" "$PR_TITLE"
 <% else %>
       - name: Check PR title format
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           git clone --depth 1 https://github.com/adbc-drivers/dev
-          python dev/adbc_drivers_dev/title_check.py $(pwd) "$PR_TITLE"
+          python dev/adbc_drivers_dev/title_check.py "$(pwd)" "$PR_TITLE"
 <% endif %>
 
       # TODO: assign milestone

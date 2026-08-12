@@ -13,13 +13,13 @@
 # limitations under the License.
 
 driver = "snowflake"
+environment = "Snowflake CI"
 private = false
 
 [lang.go.build]
 additional-make-args = ["BUILD_TAGS=minicore_disabled"]
 
 [[lang.go.validation.configs]]
-environment = "Snowflake CI"
 
 [secrets]
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["validate"] }
