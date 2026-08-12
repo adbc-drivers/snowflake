@@ -16,9 +16,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use adbc_core::{
+    Optionable, PartitionedResult,
     error::{Error, Result, Status},
     options::{OptionStatement, OptionValue},
-    Optionable, PartitionedResult,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -147,10 +147,23 @@ impl Optionable for Statement {
                 self.prepared_result_schema = None;
                 Ok(())
             }
-            OptionStatement::Temporary => Err(Error::with_message_and_status(
-                "temporary ingestion is not supported",
-                Status::NotImplemented,
-            )),
+            OptionStatement::Temporary => match value {
+                OptionValue::String(value) => match value.as_str() {
+                    "false" | "0" | "disabled" => Ok(()),
+                    "true" | "1" | "enabled" => Err(Error::with_message_and_status(
+                        "temporary ingestion is not supported",
+                        Status::NotImplemented,
+                    )),
+                    _ => Err(Error::with_message_and_status(
+                        "temporary ingestion must be enabled or disabled",
+                        Status::InvalidArguments,
+                    )),
+                },
+                _ => Err(Error::with_message_and_status(
+                    "temporary ingestion must be a string",
+                    Status::InvalidArguments,
+                )),
+            },
             OptionStatement::TargetCatalog => {
                 if let OptionValue::String(s) = value {
                     self.ingest_catalog = Some(s);
@@ -1938,13 +1951,15 @@ mod tests {
     #[test]
     fn invalid_prepare_bind_metadata_is_not_exposed() {
         let bind = bind_metadata("", "FIXED", Some(10), Some(0));
-        assert!(parameter_schema_from_prepare(
-            2,
-            std::slice::from_ref(&bind),
-            true,
-            TimeUnit::Nanosecond
-        )
-        .is_none());
+        assert!(
+            parameter_schema_from_prepare(
+                2,
+                std::slice::from_ref(&bind),
+                true,
+                TimeUnit::Nanosecond
+            )
+            .is_none()
+        );
         let mut missing_type = bind;
         missing_type.r#type.clear();
         assert!(
@@ -2008,15 +2023,46 @@ mod tests {
     }
 
     #[test]
-    fn temporary_ingestion_returns_not_implemented() {
+    fn temporary_ingestion_rejects_enabled_values() {
+        for value in ["true", "1", "enabled"] {
+            let mut stmt = make_stmt();
+            let error = stmt
+                .set_option(
+                    OptionStatement::Temporary,
+                    OptionValue::String(value.into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.status, Status::NotImplemented, "value {value}");
+        }
+    }
+
+    #[test]
+    fn temporary_ingestion_accepts_disabled_values() {
+        for value in ["false", "0", "disabled"] {
+            let mut stmt = make_stmt();
+            stmt.set_option(
+                OptionStatement::Temporary,
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn temporary_ingestion_rejects_invalid_values() {
         let mut stmt = make_stmt();
         let error = stmt
             .set_option(
                 OptionStatement::Temporary,
-                OptionValue::String("true".into()),
+                OptionValue::String("sometimes".into()),
             )
             .unwrap_err();
-        assert_eq!(error.status, Status::NotImplemented);
+        assert_eq!(error.status, Status::InvalidArguments);
+
+        let error = stmt
+            .set_option(OptionStatement::Temporary, OptionValue::Int(0))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]
@@ -2205,7 +2251,7 @@ mod tests {
 
     #[test]
     fn test_converting_reader_multiple_batches_different_widths() {
-        use arrow_array::{Int32Array, Int8Array};
+        use arrow_array::{Int8Array, Int32Array};
         struct TwoBatchReader {
             batches: std::vec::IntoIter<RecordBatch>,
             schema: Arc<Schema>,
