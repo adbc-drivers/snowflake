@@ -27,5 +27,6 @@ Included scope: the complete installable `adbc_drivers_dev` package, `pyproject.
 Local modifications:
 
 1. `adbc_drivers_dev/make.py` prefixes the development-version git revision with `g`, producing SemVer-compatible versions such as `v1.2.3-dev.1.g0747374`.
-2. Linux Go builds use writable `/tmp` build, module, and checksum caches when the manylinux container runs with the host UID.
-3. `tests/test_detect_version.py` includes deterministic regressions for both changes.
+2. Linux Go and Rust builds use writable `/tmp` caches when manylinux containers run with the host UID.
+3. The manylinux Rust image uses Rust 1.94.0, matching `sf_core`'s declared minimum supported Rust version, installs the Perl IPC and time modules required by vendored OpenSSL builds, and uses a project-specific image suffix so Compose builds the modified image instead of reusing the upstream image.
+4. `tests/test_detect_version.py` includes deterministic regressions for the build-script changes.
