@@ -609,10 +609,19 @@ impl adbc_core::Database for Database {
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> Result<Self::ConnectionType> {
         let AccumulatedConnectionOptions {
-            sf_options,
+            mut sf_options,
             post_connect_options,
             no_connection_details,
         } = accumulate_connection_options(&self.sf_settings, opts)?;
+        // Snowflake currently gates Arrow result transport on this protocol ID.
+        // Keep the visible application and wrapper telemetry driver-specific.
+        sf_options.insert(
+            "client_app_id".to_string(),
+            Setting::String("PythonConnector".to_string()),
+        );
+        sf_options
+            .entry("application".to_string())
+            .or_insert_with(|| Setting::String("ADBC Snowflake Driver (Rust)".to_string()));
         let conn_handle = self.inner.sf.connection_new();
 
         let setup = (|| -> Result<()> {
@@ -638,6 +647,19 @@ impl adbc_core::Database for Database {
                 )
                 .map_err(crate::error::api_error_to_adbc_error)?;
 
+            // Seed Arrow format in the login payload; the backend requires this in
+            // addition to the post-login ARROW_FORCE switch below.
+            self.inner
+                .runtime
+                .block_on(self.inner.sf.connection_set_session_parameters(
+                    conn_handle,
+                    HashMap::from([(
+                        "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".to_string(),
+                        "ARROW".to_string(),
+                    )]),
+                ))
+                .map_err(crate::error::api_error_to_adbc_error)?;
+
             let validation_issues = self
                 .inner
                 .runtime
@@ -656,7 +678,15 @@ impl adbc_core::Database for Database {
                         .sf
                         .connection_init(None, conn_handle, self.db_handle),
                 )
-                .map_err(crate::error::api_error_to_adbc_error)
+                .map_err(crate::error::api_error_to_adbc_error)?;
+
+            // Complete the backend's Arrow handshake after login. Without the
+            // connector-specific forced value, query responses remain JSON.
+            self.inner.execute_temporary_statement(
+                conn_handle,
+                "ALTER SESSION SET PYTHON_CONNECTOR_QUERY_RESULT_FORMAT = 'ARROW_FORCE'",
+                None,
+            )
         })();
 
         if let Err(error) = setup {

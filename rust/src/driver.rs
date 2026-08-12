@@ -16,9 +16,9 @@
 use std::sync::Arc;
 
 use adbc_core::{
-    Optionable,
     error::{Error, Result, Status},
     options::{OptionDatabase, OptionValue},
+    Optionable,
 };
 use arrow_array::RecordBatchReader;
 use arrow_schema::TimeUnit;
