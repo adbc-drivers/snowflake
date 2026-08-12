@@ -17,7 +17,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, TimeUnit};
 use sf_core::apis::database_driver_v1::{ApiError, BindingType, DataPtr};
 
-use crate::statement::{Statement, arrow_batches_to_json_bindings, format_arrow_value_for_csv};
+use crate::statement::{arrow_batches_to_json_bindings, format_arrow_value_for_csv, Statement};
 
 const INGEST_CHUNK_ROWS: usize = 500;
 const INGEST_CHUNK_BYTES: usize = 900_000;
@@ -313,7 +313,7 @@ fn qualified_name(table: &str, catalog: Option<&str>, schema: Option<&str>) -> S
     match (catalog, schema) {
         (Some(c), Some(s)) => format!("{}.{}.{}", quote(c), quote(s), quote(table)),
         (None, Some(s)) => format!("{}.{}", quote(s), quote(table)),
-        (Some(c), None) => format!("{}.{}", quote(c), quote(table)),
+        (Some(c), None) => format!("{}..{}", quote(c), quote(table)),
         (None, None) => quote(table),
     }
 }
@@ -420,6 +420,14 @@ mod tests {
     use arrow_schema::Field;
 
     #[test]
+    fn catalog_without_schema_uses_snowflake_double_dot_qualification() {
+        assert_eq!(
+            qualified_name("table", Some("catalog"), None),
+            "\"catalog\"..\"table\""
+        );
+    }
+
+    #[test]
     fn insert_sql_uses_quoted_columns_and_placeholders_only() {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -481,11 +489,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            encode_csv_stage_binding(std::slice::from_ref(&batch), 20)
-                .unwrap()
-                .is_some()
-        );
+        assert!(encode_csv_stage_binding(std::slice::from_ref(&batch), 20)
+            .unwrap()
+            .is_some());
         assert!(encode_csv_stage_binding(&[batch], 21).unwrap().is_none());
     }
 
@@ -643,11 +649,9 @@ mod tests {
         let chunks = encode_binding_chunks(&batch).unwrap();
         assert!(chunks.len() > 1);
         assert_eq!(chunks.iter().map(|chunk| chunk.rows).sum::<usize>(), 10);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.json.len() <= INGEST_CHUNK_BYTES)
-        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.json.len() <= INGEST_CHUNK_BYTES));
     }
 
     #[test]

@@ -22,7 +22,7 @@ sql-type-name = "TIMESTAMP_TZ"
 
 // part: setup_query
 
-CREATE OR REPLACE TABLE "test_timestamptz" ("idx" INT, "res" TIMESTAMPLTZ(6), "res2" TIMESTAMPLTZ(6));
+CREATE OR REPLACE TABLE "test_timestamptz" ("idx" INT, "res" TIMESTAMP_LTZ(6), "res2" TIMESTAMP_LTZ(6));
 
 // part: bind_query
 

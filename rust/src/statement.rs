@@ -16,9 +16,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use adbc_core::{
-    Optionable, PartitionedResult,
     error::{Error, Result, Status},
     options::{OptionStatement, OptionValue},
+    Optionable, PartitionedResult,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -147,12 +147,10 @@ impl Optionable for Statement {
                 self.prepared_result_schema = None;
                 Ok(())
             }
-            OptionStatement::Temporary => {
-                // Accepted silently; used to select CREATE TEMPORARY TABLE during ingest.
-                self.prepared_parameter_schema = None;
-                self.prepared_result_schema = None;
-                Ok(())
-            }
+            OptionStatement::Temporary => Err(Error::with_message_and_status(
+                "temporary ingestion is not supported",
+                Status::NotImplemented,
+            )),
             OptionStatement::TargetCatalog => {
                 if let OptionValue::String(s) = value {
                     self.ingest_catalog = Some(s);
@@ -1077,7 +1075,7 @@ fn build_timestamp_from_epoch_fraction(
 
 fn build_timestamp_tz_2field(
     epoch: &arrow_array::Int64Array,
-    tzoffset: &arrow_array::Int32Array,
+    _tzoffset: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
     check_overflow: bool,
@@ -1095,13 +1093,17 @@ fn build_timestamp_tz_2field(
         if struct_arr.is_null(i) {
             values.push(None);
         } else {
-            let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
-            let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
-
-            let epoch_ns: i128 = epoch.value(i) as i128
-                * 10i128.pow((9u32).saturating_sub(scale.clamp(0, 9) as u32));
-
-            let utc_ns = epoch_ns - tz_offset_ns;
+            // Snowflake stores two-field TIMESTAMP_TZ epochs in physical unit groups:
+            // seconds for scale 0, milliseconds for 1-3, microseconds for 4-6,
+            // and nanoseconds for 7-9. The timezone offset is display metadata; the
+            // epoch already identifies the UTC instant.
+            let epoch_to_ns = match scale.clamp(0, 9) {
+                0 => 1_000_000_000,
+                1..=3 => 1_000_000,
+                4..=6 => 1_000,
+                _ => 1,
+            };
+            let utc_ns = epoch.value(i) as i128 * epoch_to_ns;
             if check_overflow {
                 check_ns_overflow(utc_ns)?;
             }
@@ -1123,7 +1125,7 @@ fn build_timestamp_tz_2field(
 fn build_timestamp_tz_3field(
     epoch: &arrow_array::Int64Array,
     fraction: &arrow_array::Int32Array,
-    tzoffset: &arrow_array::Int32Array,
+    _tzoffset: &arrow_array::Int32Array,
     struct_arr: &arrow_array::StructArray,
     scale: i64,
     check_overflow: bool,
@@ -1143,13 +1145,10 @@ fn build_timestamp_tz_3field(
         if struct_arr.is_null(i) {
             values.push(None);
         } else {
-            let tz_offset_minutes: i128 = (tzoffset.value(i) as i128) - 1440;
-            let tz_offset_ns: i128 = tz_offset_minutes * 60 * 1_000_000_000;
-
-            let epoch_ns: i128 =
+            // The epoch/fraction pair is already a UTC instant. The timezone offset
+            // only preserves the original display offset and must not shift the value.
+            let utc_ns: i128 =
                 epoch.value(i) as i128 * 1_000_000_000 + fraction.value(i) as i128 * frac_to_ns;
-
-            let utc_ns = epoch_ns - tz_offset_ns;
             if check_overflow {
                 check_ns_overflow(utc_ns)?;
             }
@@ -1939,15 +1938,13 @@ mod tests {
     #[test]
     fn invalid_prepare_bind_metadata_is_not_exposed() {
         let bind = bind_metadata("", "FIXED", Some(10), Some(0));
-        assert!(
-            parameter_schema_from_prepare(
-                2,
-                std::slice::from_ref(&bind),
-                true,
-                TimeUnit::Nanosecond
-            )
-            .is_none()
-        );
+        assert!(parameter_schema_from_prepare(
+            2,
+            std::slice::from_ref(&bind),
+            true,
+            TimeUnit::Nanosecond
+        )
+        .is_none());
         let mut missing_type = bind;
         missing_type.r#type.clear();
         assert!(
@@ -2000,10 +1997,6 @@ mod tests {
                 OptionStatement::TargetDbSchema,
                 OptionValue::String("schema".into()),
             ),
-            (
-                OptionStatement::Temporary,
-                OptionValue::String("true".into()),
-            ),
         ];
 
         for (option, value) in cases {
@@ -2012,6 +2005,18 @@ mod tests {
             stmt.set_option(option, value).unwrap();
             assert!(stmt.prepared_parameter_schema.is_none());
         }
+    }
+
+    #[test]
+    fn temporary_ingestion_returns_not_implemented() {
+        let mut stmt = make_stmt();
+        let error = stmt
+            .set_option(
+                OptionStatement::Temporary,
+                OptionValue::String("true".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
     }
 
     #[test]
@@ -2200,7 +2205,7 @@ mod tests {
 
     #[test]
     fn test_converting_reader_multiple_batches_different_widths() {
-        use arrow_array::{Int8Array, Int32Array};
+        use arrow_array::{Int32Array, Int8Array};
         struct TwoBatchReader {
             batches: std::vec::IntoIter<RecordBatch>,
             schema: Arc<Schema>,
@@ -2596,6 +2601,44 @@ mod tests {
     }
 
     #[test]
+    fn test_build_timestamp_tz_2field_uses_storage_unit_groups_and_ignores_offset() {
+        use arrow_array::{Int32Array, Int64Array, StructArray};
+
+        for (scale, epoch, expected_ns) in [
+            (1, 1_234i64, 1_234_000_000i64),
+            (4, 1_234_567i64, 1_234_567_000i64),
+            (7, 1_234_567_890i64, 1_234_567_890i64),
+        ] {
+            let epoch = Int64Array::from(vec![epoch]);
+            let offset = Int32Array::from(vec![960]); // -08:00 display offset
+            let struct_arr = StructArray::from(vec![
+                (
+                    Arc::new(Field::new("epoch", DataType::Int64, false)),
+                    Arc::new(epoch.clone()) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("offset", DataType::Int32, false)),
+                    Arc::new(offset.clone()) as ArrayRef,
+                ),
+            ]);
+            let result = build_timestamp_tz_2field(
+                &epoch,
+                &offset,
+                &struct_arr,
+                scale,
+                false,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+            )
+            .unwrap();
+            let timestamps = result
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(timestamps.value(0), expected_ns, "scale {scale}");
+        }
+    }
+
+    #[test]
     fn test_build_timestamp_from_epoch_fraction_negative_scale_clamps() {
         let epoch = arrow_array::Int64Array::from(vec![1i64]);
         let fraction = arrow_array::Int32Array::from(vec![5i32]);
@@ -2665,6 +2708,42 @@ mod tests {
         // scale 10 clamps to 9. frac_to_ns = 10^0 = 1.
         // ns = 1 * 10^9 + 5 * 1 = 1000000005.
         assert_eq!(ts.value(0), 1_000_000_005);
+    }
+
+    #[test]
+    fn test_build_timestamp_tz_3field_ignores_display_offset() {
+        let epoch = arrow_array::Int64Array::from(vec![1i64]);
+        let fraction = arrow_array::Int32Array::from(vec![500_000_000i32]);
+        let offset = arrow_array::Int32Array::from(vec![960i32]); // -08:00
+        let struct_arr = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("epoch", DataType::Int64, false)),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("fraction", DataType::Int32, false)),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("offset", DataType::Int32, false)),
+                Arc::new(offset.clone()) as ArrayRef,
+            ),
+        ]);
+        let result = build_timestamp_tz_3field(
+            &epoch,
+            &fraction,
+            &offset,
+            &struct_arr,
+            9,
+            false,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        )
+        .unwrap();
+        let timestamps = result
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), 1_500_000_000);
     }
 
     #[test]
