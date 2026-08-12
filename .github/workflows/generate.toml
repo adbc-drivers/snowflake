@@ -23,6 +23,7 @@ github-stack-behavior = "top"
 environment = "Snowflake CI"
 timeout-minutes = 40
 
+[lang.rust]
 [[lang.go.validation.configs]]
 
 [secrets]

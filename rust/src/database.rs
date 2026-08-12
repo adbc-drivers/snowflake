@@ -367,15 +367,13 @@ impl Optionable for Database {
 
 impl Database {
     /// Parse a Snowflake URI and apply each component as an individual option.
-    /// Format: snowflake://[user[:password]@]account[/database[/schema]][?param=value&...]
-    /// Recognized query params: warehouse, role, host, port, protocol, authenticator
+    /// Format: snowflake://[user[:password]@]host[/database[/schema]][?param=value&...]
+    /// Recognized query params: account, warehouse, role, host, port, protocol, authenticator
     ///
     /// Limitations: passwords containing `@` are not supported; use `set_option` for
     /// Username/Password directly when credentials contain special characters.
-    /// Query parameter values are not URL-decoded.
     fn apply_uri(&mut self, uri: String) -> Result<()> {
         let stripped = uri.strip_prefix("snowflake://").unwrap_or(&uri).to_string();
-
         let (user_info, rest) = if let Some(at) = stripped.find('@') {
             (
                 Some(stripped[..at].to_string()),
@@ -428,17 +426,39 @@ impl Database {
         }
 
         let (path, query) = if let Some(q) = rest.find('?') {
-            (rest[..q].to_string(), Some(rest[q + 1..].to_string()))
+            (&rest[..q], Some(&rest[q + 1..]))
         } else {
-            (rest, None)
+            (rest.as_str(), None)
         };
+        let explicit_account = query.is_some_and(|query| {
+            query.split('&').any(|pair| {
+                pair.split_once('=')
+                    .is_some_and(|(key, _)| key == "account")
+            })
+        });
 
         let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if let Some(account) = parts.first().filter(|s| !s.is_empty()) {
-            self.set_option(
-                OptionDatabase::Other("adbc.snowflake.sql.account".into()),
-                OptionValue::String(account.to_string()),
-            )?;
+        if let Some(authority) = parts.first().filter(|s| !s.is_empty()) {
+            if explicit_account {
+                let (host, port) = authority
+                    .rsplit_once(':')
+                    .map_or((*authority, None), |(host, port)| (host, Some(port)));
+                self.set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.uri.host".into()),
+                    OptionValue::String(host.to_string()),
+                )?;
+                if let Some(port) = port {
+                    self.set_option(
+                        OptionDatabase::Other("adbc.snowflake.sql.uri.port".into()),
+                        OptionValue::String(port.to_string()),
+                    )?;
+                }
+            } else {
+                self.set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                    OptionValue::String(authority.to_string()),
+                )?;
+            }
         }
         if let Some(database) = parts.get(1).filter(|s| !s.is_empty()) {
             self.set_option(
@@ -455,9 +475,8 @@ impl Database {
 
         if let Some(q) = query {
             for pair in q.split('&') {
-                if let Some(eq) = pair.find('=') {
-                    let k = &pair[..eq];
-                    let v = percent_decode_str(&pair[eq + 1..])
+                if let Some((key, encoded_value)) = pair.split_once('=') {
+                    let value = percent_decode_str(encoded_value)
                         .decode_utf8()
                         .map_err(|e| {
                             Error::with_message_and_status(
@@ -465,7 +484,8 @@ impl Database {
                                 Status::InvalidArguments,
                             )
                         })?;
-                    let adbc_key = match k {
+                    let adbc_key = match key {
+                        "account" => "adbc.snowflake.sql.account",
                         "warehouse" => "adbc.snowflake.sql.warehouse",
                         "role" => "adbc.snowflake.sql.role",
                         "host" => "adbc.snowflake.sql.uri.host",
@@ -480,7 +500,7 @@ impl Database {
                     };
                     self.set_option(
                         OptionDatabase::Other(adbc_key.into()),
-                        OptionValue::String(v.into_owned()),
+                        OptionValue::String(value.into_owned()),
                     )?;
                 }
             }
@@ -1196,6 +1216,31 @@ mod tests {
                 .unwrap_or_else(|e| panic!("get_option_string({key}) failed: {e}"));
             assert_eq!(got, val, "round-trip failed for {key}");
         }
+    }
+
+    #[test]
+    fn uri_full_hostname_parses_host_port_and_explicit_account() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String(
+                "snowflake://sys_admin@private.network.com:443/OPS_MONITOR/DBA?account=vpc-id-1234"
+                    .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::HOST.as_str()).unwrap(),
+            &Setting::String("private.network.com".into())
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::PORT.as_str()).unwrap(),
+            &Setting::Int(443)
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::ACCOUNT.as_str()).unwrap(),
+            &Setting::String("vpc-id-1234".into())
+        );
     }
 
     #[test]
