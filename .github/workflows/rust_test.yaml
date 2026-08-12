@@ -192,6 +192,10 @@ jobs:
   validate:
     name: "Validate/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
+    # Go and Rust validation use fixed table names in the same live schema.
+    concurrency:
+      group: snowflake-live-validation
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -471,9 +475,8 @@ jobs:
 
           pixi run adbc-gen-package \
             --name snowflake \
-            --root $(pwd) \
-            --manifest-template $(pwd)/manifest.toml \
-            ${{ (inputs.release && '--release') || '' }}\
+            --root "$(pwd)" \
+            --manifest-template "$(pwd)/manifest.toml" \
             -o ~/packages \
             ~/drivers/drivers-*-*/
 
@@ -608,5 +611,7 @@ jobs:
           git tag go/v1000.0.0
           tag=go/v1000.0.0
 
-          pixi run release --dry-run $(pwd) $tag
-          echo gh release upload $tag $(find ~/packages -name '*.tar.gz') $(find ~/packages -name 'manifest.yaml') $(find ~/packages -name '*.md')
+          pixi run release --dry-run "$(pwd)" "$tag"
+          find ~/packages -type f \
+            \( -name '*.tar.gz' -o -name 'manifest.yaml' -o -name '*.md' \) \
+            -print0 | xargs -0 echo gh release upload "$tag"
