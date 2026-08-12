@@ -197,6 +197,10 @@ jobs:
   validate:
     name: "Validate snowflake ${{ matrix.vendor_version }}/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
+    # Go and Rust validation use fixed table names in the same live schema.
+    concurrency:
+      group: snowflake-live-validation
+      cancel-in-progress: false
     strategy:
       fail-fast: true
       max-parallel: 4
