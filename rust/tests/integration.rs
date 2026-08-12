@@ -14,12 +14,12 @@
 
 // tests/integration.rs
 use adbc_core::{
-    Connection as _, Database as _, Driver as _, Optionable, Statement as _,
     options::{OptionConnection, OptionDatabase, OptionValue},
+    Connection as _, Database as _, Driver as _, Optionable, Statement as _,
 };
 use adbc_driver_snowflake::{Database, Driver};
-use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use arrow_array::Array;
 use arrow_schema::{DataType, TimeUnit};
 
 fn get_env(key: &str) -> Option<String> {
@@ -662,7 +662,6 @@ fn test_prepare_parameter_schema_and_describe_only_execution() {
         return;
     };
     let table_name = format!("ADBC_RUST_PREPARE_TEST_{}", std::process::id());
-
     let mut ddl = conn.new_statement().unwrap();
     ddl.set_sql_query(format!(
         "CREATE OR REPLACE TEMP TABLE {table_name} (VALUE NUMBER(10,2))"
@@ -670,9 +669,12 @@ fn test_prepare_parameter_schema_and_describe_only_execution() {
     .unwrap();
     ddl.execute_update().expect("create prepare test table");
 
+    // A typed target column gives Snowflake a fully describable statement.
+    // Snowflake still truthfully reports JSON bind transport as TEXT rather
+    // than inventing the target column's logical NUMBER type.
     let mut parameterized = conn.new_statement().unwrap();
     parameterized
-        .set_sql_query("SELECT ?::NUMBER(10,2) AS VALUE")
+        .set_sql_query(format!("INSERT INTO {table_name} (VALUE) VALUES (?)"))
         .unwrap();
     parameterized
         .prepare()
@@ -681,17 +683,16 @@ fn test_prepare_parameter_schema_and_describe_only_execution() {
         .get_parameter_schema()
         .expect("parameter metadata");
     assert_eq!(parameter_schema.fields().len(), 1);
-    assert_eq!(
-        parameter_schema.field(0).data_type(),
-        &DataType::Decimal128(10, 2)
-    );
+    assert_eq!(parameter_schema.field(0).data_type(), &DataType::Utf8);
 
     let mut insert = conn.new_statement().unwrap();
     insert
         .set_sql_query(format!("INSERT INTO {table_name} VALUES (1.25)"))
         .unwrap();
     let schema = insert.execute_schema().expect("describe insert");
-    assert!(schema.fields().is_empty());
+    assert_eq!(schema.fields().len(), 1);
+    assert_eq!(schema.field(0).name(), "number of rows inserted");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
 
     let mut count = conn.new_statement().unwrap();
     count

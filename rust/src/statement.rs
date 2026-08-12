@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // src/statement.rs
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use adbc_core::{
     Optionable, PartitionedResult,
@@ -79,6 +79,8 @@ pub struct Statement {
     pub(crate) last_query_id: Option<String>,
     /// Cached only when sf_core's prepare bind count and metadata agree.
     pub(crate) prepared_parameter_schema: Option<Schema>,
+    /// Truthful result schema returned by Snowflake's describe-only prepare.
+    pub(crate) prepared_result_schema: Option<Schema>,
 }
 
 impl Drop for Statement {
@@ -97,6 +99,7 @@ impl Optionable for Statement {
                     self.query = None;
                     self.target_table = Some(s);
                     self.prepared_parameter_schema = None;
+                    self.prepared_result_schema = None;
                     Ok(())
                 } else {
                     Err(Error::with_message_and_status(
@@ -109,6 +112,7 @@ impl Optionable for Statement {
                 if let OptionValue::String(s) = value {
                     self.ingest_mode = Some(s);
                     self.prepared_parameter_schema = None;
+                    self.prepared_result_schema = None;
                     Ok(())
                 } else {
                     Err(Error::with_message_and_status(
@@ -124,6 +128,7 @@ impl Optionable for Statement {
                     self.use_high_precision = s == "enabled" || s == "true";
                 }
                 self.prepared_parameter_schema = None;
+                self.prepared_result_schema = None;
                 Ok(())
             }
             OptionStatement::Other(ref k)
@@ -139,11 +144,13 @@ impl Optionable for Statement {
                     };
                 }
                 self.prepared_parameter_schema = None;
+                self.prepared_result_schema = None;
                 Ok(())
             }
             OptionStatement::Temporary => {
                 // Accepted silently; used to select CREATE TEMPORARY TABLE during ingest.
                 self.prepared_parameter_schema = None;
+                self.prepared_result_schema = None;
                 Ok(())
             }
             OptionStatement::TargetCatalog => {
@@ -151,6 +158,7 @@ impl Optionable for Statement {
                     self.ingest_catalog = Some(s);
                 }
                 self.prepared_parameter_schema = None;
+                self.prepared_result_schema = None;
                 Ok(())
             }
             OptionStatement::TargetDbSchema => {
@@ -158,6 +166,7 @@ impl Optionable for Statement {
                     self.ingest_schema = Some(s);
                 }
                 self.prepared_parameter_schema = None;
+                self.prepared_result_schema = None;
                 Ok(())
             }
             OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
@@ -261,32 +270,65 @@ impl Statement {
         )
     }
 
-    /// Execute a parameterized query with a single bound row.
-    ///
-    /// Snowflake's JSON binding API treats multiple rows as one batched execution,
-    /// which is appropriate for DML but does not implement ADBC's execute-once-per-row
-    /// semantics for queries. Zero rows also require an empty-result path. Reject both
-    /// cases until query results can be concatenated or represented without execution.
+    /// Execute a parameterized query once per bound row and concatenate results.
     fn execute_bound(
         &mut self,
         query: String,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        ensure_single_query_binding(&self.bound_batches)?;
+        let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
+        if row_count == 0 {
+            // ADBC defines this as zero executions. Describe-only prepare provides
+            // the result schema without accidentally running the SQL unbound.
+            self.last_query_id = None;
+            let schema = if let Some(schema) = &self.prepared_result_schema {
+                Arc::new(schema.clone())
+            } else {
+                let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
+                self.prepared_parameter_schema = parameter_schema_from_prepare(
+                    prepared.number_of_binds,
+                    &prepared.binds,
+                    self.use_high_precision,
+                    self.timestamp_precision.time_unit(),
+                );
+                let schema = adjust_schema(
+                    &prepared.reader.schema(),
+                    self.use_high_precision,
+                    self.timestamp_precision.time_unit(),
+                );
+                self.prepared_result_schema = Some(schema.as_ref().clone());
+                schema
+            };
+            return execute_bound_rows(&self.bound_batches, schema, |_| {
+                unreachable!("zero-row bindings must not execute")
+            });
+        }
 
-        let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
-        let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
-        let binding = BindingType::Json(data_ptr);
-
-        let result = self.execute_query(query, Some(binding))?;
-
-        self.last_query_id = Some(result.descriptor.query_id.clone());
-        let reader = result.reader;
-        Ok(Box::new(ConvertingReader::new(
-            reader,
-            self.use_high_precision,
-            self.timestamp_precision.time_unit(),
-            self.timestamp_precision,
-        )))
+        let inner = self.inner.clone();
+        let stmt_handle = self.stmt_handle;
+        let timeout_seconds = self.execution_timeout_seconds();
+        let use_high_precision = self.use_high_precision;
+        let timestamp_precision = self.timestamp_precision;
+        let mut last_query_id = self.last_query_id.clone();
+        let result = execute_bound_rows(&self.bound_batches, Arc::new(Schema::empty()), |row| {
+            let json_bytes = arrow_batches_to_json_bindings(&[row])?;
+            let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
+            let result = inner.execute_query_with_timeout(
+                stmt_handle,
+                query.clone(),
+                Some(BindingType::Json(data_ptr)),
+                timeout_seconds,
+            )?;
+            last_query_id = Some(result.descriptor.query_id.clone());
+            Ok(Box::new(ConvertingReader::new(
+                result.reader,
+                use_high_precision,
+                timestamp_precision.time_unit(),
+                timestamp_precision,
+            )))
+        });
+        // On a later-row failure, retain the ID of the last successful execution.
+        self.last_query_id = last_query_id;
+        result
     }
 }
 
@@ -388,6 +430,7 @@ impl adbc_core::Statement for Statement {
         })?;
 
         self.prepared_parameter_schema = None;
+        self.prepared_result_schema = None;
         let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
         self.last_query_id = Some(prepared.query_id.clone());
         self.prepared_parameter_schema = parameter_schema_from_prepare(
@@ -396,13 +439,15 @@ impl adbc_core::Statement for Statement {
             self.use_high_precision,
             self.timestamp_precision.time_unit(),
         );
-        Ok(adjust_schema(
+        let schema = adjust_schema(
             &prepared.reader.schema(),
             self.use_high_precision,
             self.timestamp_precision.time_unit(),
         )
         .as_ref()
-        .clone())
+        .clone();
+        self.prepared_result_schema = Some(schema.clone());
+        Ok(schema)
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -426,6 +471,7 @@ impl adbc_core::Statement for Statement {
             )
         })?;
         self.prepared_parameter_schema = None;
+        self.prepared_result_schema = None;
         let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
         self.last_query_id = Some(prepared.query_id);
         self.prepared_parameter_schema = parameter_schema_from_prepare(
@@ -433,6 +479,15 @@ impl adbc_core::Statement for Statement {
             &prepared.binds,
             self.use_high_precision,
             self.timestamp_precision.time_unit(),
+        );
+        self.prepared_result_schema = Some(
+            adjust_schema(
+                &prepared.reader.schema(),
+                self.use_high_precision,
+                self.timestamp_precision.time_unit(),
+            )
+            .as_ref()
+            .clone(),
         );
         Ok(())
     }
@@ -443,6 +498,7 @@ impl adbc_core::Statement for Statement {
         self.bound_batches.clear();
         self.binding_supplied = false;
         self.prepared_parameter_schema = None;
+        self.prepared_result_schema = None;
         Ok(())
     }
 
@@ -464,8 +520,71 @@ impl adbc_core::Statement for Statement {
     }
 }
 
-// ── ConcatReader: chains multiple RecordBatches into a single reader ──────────
+// ── Bound query result concatenation ─────────────────────────────────────────
 
+struct ChainedReader {
+    readers: VecDeque<Box<dyn RecordBatchReader + Send>>,
+    schema: Arc<Schema>,
+}
+
+impl Iterator for ChainedReader {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let reader = self.readers.front_mut()?;
+            if let Some(batch) = reader.next() {
+                return Some(batch);
+            }
+            self.readers.pop_front();
+        }
+    }
+}
+
+impl RecordBatchReader for ChainedReader {
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+}
+
+fn execute_bound_rows<F>(
+    batches: &[RecordBatch],
+    empty_schema: Arc<Schema>,
+    mut execute: F,
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>>
+where
+    F: FnMut(RecordBatch) -> Result<Box<dyn RecordBatchReader + Send + 'static>>,
+{
+    let mut readers = VecDeque::new();
+    let mut result_schema = None;
+
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            let reader = execute(batch.slice(row_index, 1))?;
+            let schema = reader.schema();
+            if let Some(expected) = &result_schema {
+                if schema.as_ref() != expected {
+                    return Err(Error::with_message_and_status(
+                        format!(
+                            "bound query result schema mismatch: expected {expected:?}, got {schema:?}"
+                        ),
+                        Status::InvalidData,
+                    ));
+                }
+            } else {
+                result_schema = Some(schema.as_ref().clone());
+            }
+            readers.push_back(reader);
+        }
+    }
+
+    Ok(Box::new(ChainedReader {
+        readers,
+        schema: Arc::new(result_schema.unwrap_or_else(|| empty_schema.as_ref().clone())),
+    }))
+}
+
+// Test reader for constructing deterministic Arrow streams.
 #[cfg(test)]
 struct ConcatReader {
     batches: std::vec::IntoIter<RecordBatch>,
@@ -1097,19 +1216,6 @@ impl<R: RecordBatchReader> RecordBatchReader for ConvertingReader<R> {
 
 // ── JSON parameter bindings ───────────────────────────────────────────────────
 
-fn ensure_single_query_binding(batches: &[RecordBatch]) -> Result<()> {
-    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    if row_count != 1 {
-        return Err(Error::with_message_and_status(
-            format!(
-                "query execution requires exactly one bound row; received {row_count}; bind and execute one row at a time"
-            ),
-            Status::NotImplemented,
-        ));
-    }
-    Ok(())
-}
-
 fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
     match dt {
         DataType::Int8
@@ -1591,6 +1697,7 @@ mod tests {
             binding_supplied: false,
             last_query_id: None,
             prepared_parameter_schema: None,
+            prepared_result_schema: None,
         }
     }
 
@@ -1667,27 +1774,25 @@ mod tests {
     }
 
     #[test]
-    fn execute_with_empty_bind_stream_rejects_zero_rows() {
+    fn test_zero_row_query_binding() {
         let mut stmt = make_stmt();
         stmt.set_sql_query("SELECT ?").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "VALUE",
+            DataType::Int64,
+            true,
+        )]));
+        stmt.prepared_result_schema = Some(schema.as_ref().clone());
+        stmt.last_query_id = Some("previous-query-id".into());
+        stmt.bind(RecordBatch::new_empty(Arc::new(Schema::new(vec![
+            Field::new("parameter", DataType::Int64, false),
+        ]))))
+        .unwrap();
 
-        let reader = ConcatReader {
-            batches: vec![].into_iter(),
-            schema: Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )])),
-        };
-        stmt.bind_stream(Box::new(reader)).unwrap();
-
-        match stmt.execute() {
-            Err(err) => {
-                assert_eq!(err.status, Status::NotImplemented);
-                assert!(err.message.contains("received 0"));
-            }
-            Ok(_) => panic!("execute should have rejected the empty binding"),
-        }
+        let mut reader = stmt.execute().expect("zero rows should not execute SQL");
+        assert_eq!(reader.schema(), schema);
+        assert!(reader.next().is_none());
+        assert_eq!(stmt.last_query_id, None);
     }
 
     #[test]
@@ -1765,6 +1870,7 @@ mod tests {
             binding_supplied: false,
             last_query_id: None,
             prepared_parameter_schema: None,
+            prepared_result_schema: None,
         };
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
@@ -1792,6 +1898,7 @@ mod tests {
             binding_supplied: false,
             last_query_id: None,
             prepared_parameter_schema: None,
+            prepared_result_schema: None,
         };
         stmt.set_sql_query("SELECT 1").unwrap();
         assert!(stmt.target_table.is_none());
@@ -2663,39 +2770,178 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_row_query_bindings_are_rejected() {
+    fn test_single_row_query_binding() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as ArrayRef],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7])) as ArrayRef],
         )
         .unwrap();
+        let result_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut executions = 0;
 
-        let err = ensure_single_query_binding(&[batch]).unwrap_err();
-        assert_eq!(err.status, Status::NotImplemented);
-        assert!(err.message.contains("bind and execute one row at a time"));
+        let mut reader = execute_bound_rows(&[batch], Arc::new(Schema::empty()), |row| {
+            executions += 1;
+            let value = row
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0);
+            let output = RecordBatch::try_new(
+                result_schema.clone(),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![value]))],
+            )
+            .unwrap();
+            Ok(Box::new(ConcatReader {
+                batches: vec![output].into_iter(),
+                schema: result_schema.clone(),
+            }))
+        })
+        .unwrap();
+
+        assert_eq!(executions, 1);
+        let output = reader.next().unwrap().unwrap();
+        assert_eq!(
+            output
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        assert!(reader.next().is_none());
     }
 
     #[test]
-    fn test_single_row_query_binding_is_accepted() {
+    fn test_multi_row_query_binding() {
+        let parameter_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batches = vec![
+            RecordBatch::try_new(
+                parameter_schema.clone(),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2]))],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                parameter_schema,
+                vec![Arc::new(arrow_array::Int64Array::from(vec![3]))],
+            )
+            .unwrap(),
+        ];
+        let result_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut executed_values = Vec::new();
+
+        let mut reader = execute_bound_rows(&batches, Arc::new(Schema::empty()), |row| {
+            let value = row
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0);
+            executed_values.push(value);
+            let output = RecordBatch::try_new(
+                result_schema.clone(),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![value * 10]))],
+            )
+            .unwrap();
+            Ok(Box::new(ConcatReader {
+                batches: vec![output].into_iter(),
+                schema: result_schema.clone(),
+            }))
+        })
+        .unwrap();
+
+        assert_eq!(executed_values, vec![1, 2, 3]);
+        let values = reader
+            .by_ref()
+            .map(|batch| {
+                batch
+                    .unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_bound_query_schema_mismatch() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2]))],
         )
         .unwrap();
+        let mut execution = 0;
 
-        ensure_single_query_binding(&[batch]).unwrap();
+        let error = match execute_bound_rows(&[batch], Arc::new(Schema::empty()), |_| {
+            execution += 1;
+            let output_schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                if execution == 1 {
+                    DataType::Int64
+                } else {
+                    DataType::Utf8
+                },
+                false,
+            )]));
+            let output = RecordBatch::new_empty(output_schema.clone());
+            Ok(Box::new(ConcatReader {
+                batches: vec![output].into_iter(),
+                schema: output_schema,
+            }))
+        }) {
+            Ok(_) => panic!("incompatible result schemas should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, Status::InvalidData);
+        assert!(error.message.contains("schema mismatch"));
     }
 
     #[test]
-    fn test_zero_row_query_bindings_are_rejected() {
+    fn test_bound_query_stops_after_execution_failure() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::new_empty(schema);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut executions = 0;
 
-        let err = ensure_single_query_binding(&[batch]).unwrap_err();
-        assert_eq!(err.status, Status::NotImplemented);
-        assert!(err.message.contains("received 0"));
+        let error = match execute_bound_rows(&[batch], Arc::new(Schema::empty()), |_| {
+            executions += 1;
+            if executions == 2 {
+                return Err(Error::with_message_and_status(
+                    "injected execution failure",
+                    Status::InvalidData,
+                ));
+            }
+            Ok(Box::new(ConcatReader {
+                batches: Vec::new().into_iter(),
+                schema: schema.clone(),
+            }))
+        }) {
+            Ok(_) => panic!("execution failure should be returned"),
+            Err(error) => error,
+        };
+
+        assert_eq!(executions, 2);
+        assert_eq!(error.status, Status::InvalidData);
+        assert!(error.message.contains("injected execution failure"));
     }
 
     #[test]
