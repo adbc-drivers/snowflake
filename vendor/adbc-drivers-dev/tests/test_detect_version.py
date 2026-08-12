@@ -17,7 +17,6 @@
 import subprocess
 
 import pytest
-
 from adbc_drivers_dev.make import detect_version
 
 
