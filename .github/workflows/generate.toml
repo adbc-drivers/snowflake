@@ -16,6 +16,7 @@ driver = "snowflake"
 environment = "Snowflake CI"
 private = false
 
+[lang.rust]
 [[lang.go.validation.configs]]
 
 [secrets]
