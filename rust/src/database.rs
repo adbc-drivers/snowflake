@@ -60,7 +60,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, S
         "adbc.snowflake.sql.uri.host" => param_names::HOST.into(),
         "adbc.snowflake.sql.uri.protocol" => param_names::PROTOCOL.into(),
         "adbc.snowflake.sql.auth_type" => param_names::AUTHENTICATOR.into(),
-        "adbc.snowflake.sql.client_option.application" => "client_app_id".to_string(),
+        "adbc.snowflake.sql.client_option.application" => "application".to_string(),
         "adbc.snowflake.sql.client_option.auth_token" => param_names::TOKEN.into(),
         "adbc.snowflake.sql.client_option.jwt_private_key" => param_names::PRIVATE_KEY_FILE.into(),
         "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => {

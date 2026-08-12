@@ -1,0 +1,56 @@
+<% if private %>
+# Copyright (c) 2025-2026 Columnar Technologies Inc.  All rights reserved.
+<% else %>
+# Copyright (c) 2025-2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+<% endif %>
+
+# !!!! AUTO-GENERATED FILE.  DO NOT EDIT. !!!!
+# USE adbc-gen-workflow (see adbc-drivers/dev) TO UPDATE THIS FILE.
+
+[workspace]
+<% if private %>
+authors = ["Columnar Technologies"]
+<% else %>
+authors = ["ADBC Drivers Contributors"]
+<% endif %>
+channels = ["conda-forge"]
+name = "adbc-driver-<{driver}>"
+platforms = ["linux-64", "osx-arm64", "win-64", "linux-aarch64"]
+version = "0.1.0"
+
+[tasks]
+<% if lang == "go" %>
+make = "adbc-make run build DRIVER=<{driver}> VERBOSE=true"
+test = "go test -tags assert -v ./..."
+<% elif lang == "rust" %>
+make = "adbc-make run build DRIVER=<{driver}> VERBOSE=true IMPL_LANG=rust"
+test = "cargo test"
+<% endif %>
+release = "adbc-release"
+validate = "pytest -vvs --junit-xml=validation-report.xml -rfEsxX validation/tests/"
+gendocs = "python -m validation.tests.generate_documentation"
+
+[dependencies]
+python = ">=3.14.3,<3.15"
+<% for key, value in validation["extra_dependencies"].items() %>
+<{key}> = "<{value}>"
+<% endfor %>
+
+[pypi-dependencies]
+adbc-drivers-dev = { git = "https://github.com/adbc-drivers/dev" }
+adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation" }
+<% for key, value in validation["extra_pypi_dependencies"].items() %>
+<{key}> = "<{value}>"
+<% endfor %>
