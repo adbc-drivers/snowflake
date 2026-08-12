@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+.github/workflows/dev_issues.yaml
+vendor/adbc-drivers-dev/adbc_drivers_dev/templates/dev_issues.yaml
+vendor/adbc-drivers-dev/adbc_drivers_dev/title_check.py
 
 csharp/Directory.Build.props
 csharp/src/AdbcDrivers.Snowflake.Interop/Build-SnowflakeDriver.ps1
