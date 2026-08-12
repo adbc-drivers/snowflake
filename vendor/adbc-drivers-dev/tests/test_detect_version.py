@@ -52,6 +52,37 @@ def test_manylinux_build_uses_writable_go_caches(tmp_path, monkeypatch):
     ]
 
 
+def test_manylinux_rust_build_uses_writable_platform_cache(tmp_path, monkeypatch):
+    from adbc_drivers_dev import make
+
+    calls = []
+    monkeypatch.setattr(
+        make, "check_call", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(make, "get_var", lambda name, default: default)
+    monkeypatch.setattr(make.platform, "system", lambda: "Linux")
+
+    maybe_build_docker(
+        repo_root=tmp_path,
+        driver_root=tmp_path,
+        env={},
+        args=["cargo", "build", "--release"],
+        ci=True,
+        container="manylinux-rust",
+    )
+
+    command = calls[0][0][0]
+    service_index = command.index("manylinux-rust")
+    assert command[service_index - 6 : service_index] == [
+        "--env",
+        "HOME=/tmp",
+        "--env",
+        "XDG_CACHE_HOME=/tmp/.cache",
+        "--env",
+        "CARGO_HOME=/.cargo",
+    ]
+
+
 @pytest.fixture()
 def repo(tmp_path):
     subprocess.check_call(["git", "init", "--quiet"], cwd=tmp_path)

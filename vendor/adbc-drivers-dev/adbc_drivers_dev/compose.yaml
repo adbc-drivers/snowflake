@@ -42,7 +42,8 @@ services:
       - ${SOURCE_ROOT:-.}:/source:rw
 
   manylinux-rust:
-    image: ghcr.io/adbc-drivers/dev:${MANYLINUX}-rust${RUST}
+    # Local suffix prevents reuse of the upstream image, which lacks IPC::Cmd.
+    image: ghcr.io/adbc-drivers/dev:${MANYLINUX}-rust${RUST}-snowflake2
     build:
       context: ./compose/manylinux-rust
       args:
