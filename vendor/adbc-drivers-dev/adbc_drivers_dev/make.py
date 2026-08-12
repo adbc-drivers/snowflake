@@ -301,6 +301,19 @@ def maybe_build_docker(
                 "GOPATH=/tmp/go",
             ]
         )
+    elif container == "manylinux-rust":
+        # sf_core downloads protoc through the platform cache directory.
+        # Arbitrary host UIDs cannot write to the default root home.
+        command.extend(
+            [
+                "--env",
+                "HOME=/tmp",
+                "--env",
+                "XDG_CACHE_HOME=/tmp/.cache",
+                "--env",
+                "CARGO_HOME=/.cargo",
+            ]
+        )
 
     command.extend(
         [
