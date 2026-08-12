@@ -323,6 +323,7 @@ impl adbc_core::Connection for Connection {
             binding_supplied: false,
             last_query_id: None,
             prepared_parameter_schema: None,
+            prepared_result_schema: None,
         })
     }
 

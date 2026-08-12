@@ -85,9 +85,6 @@ class SnowflakeQuirks(model.DriverQuirks):
         identifier = identifier.replace('"', '""')
         return f'"{identifier}"'
 
-    def bind_parameter(self, index: int) -> str:
-        return f"${index}"
-
     def split_statement(self, statement: str) -> list[str]:
         return quirks.split_statement(statement, dialect=self.name)
 
