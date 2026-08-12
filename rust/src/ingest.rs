@@ -17,7 +17,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, TimeUnit};
 use sf_core::apis::database_driver_v1::{ApiError, BindingType, DataPtr};
 
-use crate::statement::{arrow_batches_to_json_bindings, format_arrow_value_for_csv, Statement};
+use crate::statement::{Statement, arrow_batches_to_json_bindings, format_arrow_value_for_csv};
 
 const INGEST_CHUNK_ROWS: usize = 500;
 const INGEST_CHUNK_BYTES: usize = 900_000;
@@ -489,9 +489,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(encode_csv_stage_binding(std::slice::from_ref(&batch), 20)
-            .unwrap()
-            .is_some());
+        assert!(
+            encode_csv_stage_binding(std::slice::from_ref(&batch), 20)
+                .unwrap()
+                .is_some()
+        );
         assert!(encode_csv_stage_binding(&[batch], 21).unwrap().is_none());
     }
 
@@ -649,9 +651,11 @@ mod tests {
         let chunks = encode_binding_chunks(&batch).unwrap();
         assert!(chunks.len() > 1);
         assert_eq!(chunks.iter().map(|chunk| chunk.rows).sum::<usize>(), 10);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.json.len() <= INGEST_CHUNK_BYTES));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.json.len() <= INGEST_CHUNK_BYTES)
+        );
     }
 
     #[test]
