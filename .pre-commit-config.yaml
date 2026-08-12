@@ -49,6 +49,8 @@ repos:
   - id: check-case-conflict
   - id: check-executables-have-shebangs
   - id: check-yaml
+    # These are Jinja/Mako templates, not standalone YAML documents.
+    exclude: '^vendor/adbc-drivers-dev/adbc_drivers_dev/templates/.*\.yaml$'
   - id: detect-private-key
   - id: end-of-file-fixer
     exclude: '\.sln$'
