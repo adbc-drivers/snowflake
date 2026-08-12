@@ -16,9 +16,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use adbc_core::{
-    Optionable, PartitionedResult,
     error::{Error, Result, Status},
     options::{OptionStatement, OptionValue},
+    Optionable, PartitionedResult,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -1951,15 +1951,13 @@ mod tests {
     #[test]
     fn invalid_prepare_bind_metadata_is_not_exposed() {
         let bind = bind_metadata("", "FIXED", Some(10), Some(0));
-        assert!(
-            parameter_schema_from_prepare(
-                2,
-                std::slice::from_ref(&bind),
-                true,
-                TimeUnit::Nanosecond
-            )
-            .is_none()
-        );
+        assert!(parameter_schema_from_prepare(
+            2,
+            std::slice::from_ref(&bind),
+            true,
+            TimeUnit::Nanosecond
+        )
+        .is_none());
         let mut missing_type = bind;
         missing_type.r#type.clear();
         assert!(
@@ -2251,7 +2249,7 @@ mod tests {
 
     #[test]
     fn test_converting_reader_multiple_batches_different_widths() {
-        use arrow_array::{Int8Array, Int32Array};
+        use arrow_array::{Int32Array, Int8Array};
         struct TwoBatchReader {
             batches: std::vec::IntoIter<RecordBatch>,
             schema: Arc<Schema>,

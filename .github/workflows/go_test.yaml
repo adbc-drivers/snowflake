@@ -94,31 +94,31 @@ jobs:
           # https://github.com/actions/runner-images/issues/2840
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: "checkout remote"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: true
           cache-dependency-path: go/go.sum
           check-latest: true
           go-version-file: go/go.mod
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f  # v0.10.0
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: v0.72.0
           run-install: false
@@ -207,7 +207,17 @@ jobs:
       matrix:
         include:
           # I think we only need to test one platform, but we can change that later
-          - { platform: linux, arch: amd64, runner: ubuntu-latest, service_name: "test-service", vendor_version: "latest", environment: "Snowflake CI", aws: false, azure: false, gcloud: false }
+          - {
+              platform: linux,
+              arch: amd64,
+              runner: ubuntu-latest,
+              service_name: "test-service",
+              vendor_version: "latest",
+              environment: "Snowflake CI",
+              aws: false,
+              azure: false,
+              gcloud: false,
+            }
     environment: ${{ matrix.environment }}
     permissions:
       contents: read
@@ -221,35 +231,34 @@ jobs:
           # https://github.com/actions/runner-images/issues/2840
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: "checkout remote"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: true
           cache-dependency-path: go/go.sum
           check-latest: true
           go-version-file: go/go.mod
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f  # v0.10.0
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: v0.72.0
           run-install: false
-
 
       - name: Log in to ghcr.io
         if: runner.os == 'Linux'
@@ -337,7 +346,7 @@ jobs:
 
           cp validation-report.xml validation-report-${{ matrix.vendor_version }}.xml
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: validation-report-${{ matrix.vendor_version }}
           path: "go/validation-report-${{ matrix.vendor_version }}.xml"
@@ -348,7 +357,7 @@ jobs:
         run: |
           pixi run gendocs --output generated
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docs-${{ matrix.vendor_version }}
           path: "go/generated/snowflake.md"
@@ -371,31 +380,31 @@ jobs:
       packages: read
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: "checkout remote"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: true
           cache-dependency-path: go/go.sum
           check-latest: true
           go-version-file: go/go.mod
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f  # v0.10.0
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: v0.72.0
           run-install: false
@@ -432,7 +441,7 @@ jobs:
             ./ci/scripts/post-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: drivers-${{ matrix.platform }}-${{ matrix.arch }}
           path: "go/build/libadbc_driver_snowflake.*"
@@ -448,35 +457,35 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: "checkout remote"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: true
           check-latest: true
           go-version: "stable"
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f  # v0.10.0
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: v0.72.0
           run-install: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "drivers-*"
           path: "~/drivers"
@@ -505,13 +514,13 @@ jobs:
 
           ls ~/packages
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: all-packages
           path: ~/packages
           retention-days: 7
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "validation-report-*"
           path: "~/validation-report"
@@ -525,7 +534,7 @@ jobs:
           ls *.xml
           pixi run gendocs --output generated
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docs
           path: "go/generated/snowflake.md"
@@ -545,15 +554,15 @@ jobs:
           - { platform: windows, arch: amd64, runner: windows-latest }
     steps:
       # for now, install dbc from main
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: true
-          go-version: 'stable'
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f  # v0.10.0
+          go-version: "stable"
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: v0.72.0
           run-install: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: "all-packages"
           path: "~/packages"
@@ -570,21 +579,21 @@ jobs:
           echo "Installing ${driver_pkg}"
           ./dbc install --no-verify "${driver_pkg}"
           echo "Installed ${driver_pkg}"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 1
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: "checkout remote"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 1
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: load package
         working-directory: go
         run: |
@@ -614,34 +623,34 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: "checkout remote"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f  # v0.10.0
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: v0.72.0
           run-install: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: "all-packages"
           path: "~/packages"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: "docs"
           path: "~/packages"
