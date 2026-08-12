@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LOCAL MODIFICATION: Snowflake vendors this file with a SemVer-safe git revision suffix.
+# LOCAL MODIFICATIONS: Snowflake vendors this file with a SemVer-safe git revision
+# suffix and writable Go caches for arbitrary-UID manylinux builds.
 
 """
 A build script for ADBC drivers using doit.
@@ -285,6 +286,21 @@ def maybe_build_docker(
 
     for volume in volumes:
         command.extend(["-v", volume])
+
+    # The manylinux image runs the host UID, which may not exist in /etc/passwd.
+    # Go then falls back to the root-owned /go module cache. Keep both caches in
+    # /tmp, which is writable for arbitrary UIDs on GitHub-hosted runners.
+    if container == "manylinux":
+        command.extend(
+            [
+                "--env",
+                "GOCACHE=/tmp/go-build",
+                "--env",
+                "GOMODCACHE=/tmp/go-mod",
+                "--env",
+                "GOPATH=/tmp/go",
+            ]
+        )
 
     command.extend(
         [

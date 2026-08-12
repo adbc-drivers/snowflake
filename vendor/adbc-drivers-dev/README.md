@@ -24,7 +24,8 @@ License: Apache-2.0; the upstream license and notice are included as `LICENSE.tx
 
 Included scope: the complete installable `adbc_drivers_dev` package, `pyproject.toml`, `MANIFEST.in`, `LICENSE.txt`, `NOTICE.txt`, and the complete upstream `tests/test_detect_version.py` module from the revision above.
 
-Local modifications (exactly two):
+Local modifications:
 
 1. `adbc_drivers_dev/make.py` prefixes the development-version git revision with `g`, producing SemVer-compatible versions such as `v1.2.3-dev.1.g0747374`.
-2. `tests/test_detect_version.py` adds one deterministic regression test for that `g` prefix.
+2. Linux Go builds use writable `/tmp` build, module, and checksum caches when the manylinux container runs with the host UID.
+3. `tests/test_detect_version.py` includes deterministic regressions for both changes.

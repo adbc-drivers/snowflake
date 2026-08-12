@@ -12,12 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LOCAL MODIFICATION: Snowflake adds one deterministic regression for the vendored suffix fix.
+# LOCAL MODIFICATIONS: Snowflake adds deterministic regressions for the vendored
+# suffix and arbitrary-UID manylinux cache fixes.
 
 import subprocess
 
 import pytest
-from adbc_drivers_dev.make import detect_version
+from adbc_drivers_dev.make import detect_version, maybe_build_docker
+
+
+def test_manylinux_build_uses_writable_go_caches(tmp_path, monkeypatch):
+    from adbc_drivers_dev import make
+
+    calls = []
+    monkeypatch.setattr(
+        make, "check_call", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(make, "get_var", lambda name, default: default)
+    monkeypatch.setattr(make.platform, "system", lambda: "Linux")
+
+    maybe_build_docker(
+        repo_root=tmp_path,
+        driver_root=tmp_path,
+        env={},
+        args=["go", "build", "./pkg"],
+        ci=True,
+        container="manylinux",
+    )
+
+    command = calls[0][0][0]
+    service_index = command.index("manylinux")
+    assert command[service_index - 6 : service_index] == [
+        "--env",
+        "GOCACHE=/tmp/go-build",
+        "--env",
+        "GOMODCACHE=/tmp/go-mod",
+        "--env",
+        "GOPATH=/tmp/go",
+    ]
 
 
 @pytest.fixture()
