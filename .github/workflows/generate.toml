@@ -13,6 +13,7 @@
 # limitations under the License.
 
 driver = "snowflake"
+environment = "Snowflake CI"
 private = false
 
 [lang.go]
@@ -23,7 +24,6 @@ environment = "Snowflake CI"
 timeout-minutes = 40
 
 [[lang.go.validation.configs]]
-environment = "Snowflake CI"
 
 [secrets]
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["test", "validate"] }
