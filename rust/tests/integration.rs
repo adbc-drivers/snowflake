@@ -14,12 +14,12 @@
 
 // tests/integration.rs
 use adbc_core::{
-    options::{OptionConnection, OptionDatabase, OptionValue},
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
+    options::{OptionConnection, OptionDatabase, OptionValue},
 };
 use adbc_driver_snowflake::{Database, Driver};
-use arrow_array::cast::AsArray;
 use arrow_array::Array;
+use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, TimeUnit};
 
 fn get_env(key: &str) -> Option<String> {
