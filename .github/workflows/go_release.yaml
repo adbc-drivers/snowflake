@@ -236,7 +236,7 @@ jobs:
             source .env.test
           fi
           set +a
-          pixi run adbc-make build DEBUG=true VERBOSE=true
+          pixi run adbc-make build DEBUG=true VERBOSE=true DRIVER=snowflake IMPL_LANG=go
       - name: Start Test Dependencies
         # Can't use Docker on macOS AArch64 runners, and Windows containers
         # work but often the container doesn't support Windows
@@ -387,7 +387,7 @@ jobs:
             source .env.release
           fi
           set +a
-          pixi run adbc-make check CI=true VERBOSE=true  RELEASE=true
+          pixi run adbc-make check CI=true VERBOSE=true DRIVER=snowflake IMPL_LANG=go RELEASE=true
           if [[ -f ci/scripts/post-build.sh ]]; then
             ./ci/scripts/post-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
           fi
