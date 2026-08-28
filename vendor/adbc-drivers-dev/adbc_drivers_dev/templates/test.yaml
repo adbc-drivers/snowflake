@@ -1,0 +1,907 @@
+<% if private %>
+# Copyright (c) 2025-2026 Columnar Technologies Inc.  All rights reserved.
+<% else %>
+# Copyright (c) 2025-2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+<% endif %>
+
+# !!!! AUTO-GENERATED FILE.  DO NOT EDIT. !!!!
+# USE adbc-gen-workflow (see adbc-drivers/dev) TO UPDATE THIS FILE.
+
+# This is a common workflow for building & testing drivers:
+#
+# - Build the driver
+# - Start dependencies
+# - Run tests
+# - Build the shared library
+
+name: <{lang_human}> <{workflow_name}>
+
+on:
+<% if not release %>
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "<{lang_path_glob}>"
+<% for path in pull_request_trigger_paths %>
+      - <{path}>
+<% endfor %>
+<% endif %>
+  push:
+<% if release %>
+    tags:
+      - "<{lang_tag_prefix}>v**"
+<% else %>
+    branches:
+      - main
+    paths:
+      - "<{lang_path_glob}>"
+<% for path in pull_request_trigger_paths %>
+      - <{path}>
+<% endfor %>
+<% endif %>
+
+<% if not release and secrets["all"] %>
+  workflow_call:
+    inputs:
+      repository:
+        description: "The repository to checkout (in owner/repo short format)"
+        required: true
+        type: string
+      ref:
+        description: "The ref to checkout"
+        required: true
+        type: string
+    secrets:
+<% for name, val in secrets["all"].items() %>
+      <{val}>:
+        required: true
+<% endfor %>
+<% endif %>
+<% if release %>
+  workflow_dispatch: {}
+<% endif %>
+
+concurrency:
+<% if environment %>
+  # Must share concurrency group with release workflow since it also builds/tests
+  group: ${{ github.repository }}-${{ github.ref }}-<{environment.replace(' ', '-')}>
+<% else %>
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+<% endif %>
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+<% if not lang_config.test.skip %>
+  test:
+    name: "Test/${{ matrix.platform }}_${{ matrix.arch }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: linux, arch: amd64, runner: ubuntu-latest }
+          - { platform: macos, arch: arm64, runner: macos-latest }
+          - { platform: windows, arch: amd64, runner: windows-latest }
+<% if environment and "test" in lang_config.build.environment_contexts or "build:test" in lang_config.build.environment_contexts %>
+    environment: <{environment}>
+<% endif %>
+    permissions:
+      contents: read
+<% if permissions.get("id_token") %>
+      id-token: write
+<% endif %>
+    steps:
+      - name: free up disk space
+        if: runner.os != 'Windows'
+        run: |
+          # Preinstalled tools use a lot of disk space, free up some space
+          # https://github.com/actions/runner-images/issues/2840
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+<% if release or not secrets["all"] %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% else %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: "checkout remote"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% endif %>
+
+<% if "go" in lang_tools %>
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          cache: <{"false" if release else "true"}>
+          cache-dependency-path: <{go_mod_path}>/go.sum
+          check-latest: true
+          go-version-file: <{go_mod_path}>/go.mod
+<% endif %>
+<% if "rust" in lang_tools %>
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+        with:
+          cache: <{"false" if release else "true"}>
+          components: "clippy"
+<% endif %>
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+        with:
+          pixi-version: v0.63.2
+          run-install: false
+
+<% if aws %>
+      - name: AWS Login
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885  # v6.1.1
+        with:
+          aws-region: <{aws.region}>
+          role-to-assume: ${{ secrets.aws_role }}
+          role-session-name: ${{ secrets.aws_role_session_name }}
+<% endif %>
+<% if gcloud %>
+      - name: Google Cloud Login
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          service_account: ${{ secrets.gcloud_service_account }}
+          workload_identity_provider: ${{ secrets.gcloud_workload_identity_provider }}
+<% endif %>
+
+      - name: Build
+<% if secrets["build:test"] %>
+        env:
+<% for name, val in secrets["build:test"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          if [[ -f ci/scripts/pre-build.sh ]]; then
+            echo "Loading pre-build"
+            ./ci/scripts/pre-build.sh test ${{ matrix.platform }} ${{ matrix.arch }}
+          fi
+
+          set -a
+          if [[ -f .env.build ]]; then
+            echo "Loading .env.build"
+            source .env.build
+          fi
+          set +a
+
+<% if lang == "go" %>
+          go build ./...
+<% elif lang == "rust" %>
+          cargo build --locked
+<% elif lang == "script" %>
+          ./ci/scripts/build.sh test ${{ matrix.platform }} ${{ matrix.arch }}
+<% else %>
+<{not_implemented(lang)}>
+<% endif %>
+
+      - name: Start Test Dependencies
+        # Can't use Docker on macOS AArch64 runners, and Windows containers
+        # work but often the container doesn't support Windows
+        if: runner.os == 'Linux'
+        working-directory: <{ lang_subdir }>
+        run: |
+          if [[ -f compose.yaml ]]; then
+            if ! docker compose up --detach --wait <{lang_config.test.service_name}>; then
+              echo "Service failed to start"
+              echo "Logs:"
+              docker compose logs <{lang_config.test.service_name}>
+              exit 1
+            fi
+          fi
+
+      - name: Test
+<% if secrets["test"] %>
+        env:
+<% for name, val in secrets["test"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          set -a
+          if [[ -f .env ]]; then
+            source .env
+          fi
+          if [[ -f .env.${{ matrix.platform }} ]]; then
+            source .env.${{ matrix.platform }}
+          fi
+          if [[ -f .env.ci ]]; then
+            source .env.ci
+          fi
+          set +a
+
+          if [[ -f ci/scripts/pre-test.sh ]]; then
+            echo "Loading pre-test"
+            ./ci/scripts/pre-test.sh ${{ matrix.platform }} ${{ matrix.arch }}
+          fi
+
+<% if lang == "go" %>
+          go test -tags assert -v ./...
+<% elif lang == "rust" %>
+          cargo test
+<% elif lang == "script" %>
+          ./ci/scripts/test.sh ${{ matrix.platform }} ${{ matrix.arch }}
+<% else %>
+<{not_implemented(lang)}>
+<% endif %>
+
+          if [[ -f ci/scripts/post-test.sh ]]; then
+            ./ci/scripts/post-test.sh
+          fi
+
+<% if lang == "go" %>
+      - name: go mod tidy
+        if: runner.os == 'Linux'
+        working-directory: <{ lang_subdir }>
+        run: |
+          go mod tidy --diff
+<% elif lang == "rust" %>
+      - name: clippy
+        working-directory: <{ lang_subdir }>
+        run: |
+          cargo clippy --locked --no-deps -- -A unused_variables -D warnings
+<% endif %>
+<% endif %>
+
+<% if not lang_config.validation.skip %>
+  validate:
+    name: "Validate <{driver}> ${{ matrix.vendor_version }}/${{ matrix.platform }}_${{ matrix.arch }}"
+    runs-on: ${{ matrix.runner }}
+<% if driver == "snowflake" %>
+    # Go and Rust validation use fixed table names in the same live schema.
+    concurrency:
+      group: snowflake-live-validation
+      cancel-in-progress: false
+<% endif %>
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # I think we only need to test one platform, but we can change that later
+<% for config in lang_config.validation.configs %>
+          - { platform: linux, arch: amd64, runner: ubuntu-latest, service_name: "<{config.service_name}>", vendor_version: "<{config.vendor_version}>" }
+<% endfor %>
+<% if environment and "validate" in lang_config.build.environment_contexts or "build:test" in lang_config.build.environment_contexts %>
+    environment: <{environment}>
+<% endif %>
+    permissions:
+      contents: read
+<% if permissions.get("id_token") %>
+      id-token: write
+<% endif %>
+    steps:
+      - name: free up disk space
+        if: runner.os != 'Windows'
+        run: |
+          # Preinstalled tools use a lot of disk space, free up some space
+          # https://github.com/actions/runner-images/issues/2840
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+<% if release or not secrets["all"] %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% else %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: "checkout remote"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% endif %>
+
+<% if "go" in lang_tools %>
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          cache: <{"false" if release else "true"}>
+          cache-dependency-path: <{go_mod_path}>/go.sum
+          check-latest: true
+          go-version-file: <{go_mod_path}>/go.mod
+<% endif %>
+<% if "rust" in lang_tools %>
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+        with:
+          cache: <{"false" if release else "true"}>
+          components: "clippy"
+<% endif %>
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+        with:
+          pixi-version: v0.63.2
+          run-install: false
+
+<% if aws %>
+      - name: AWS Login
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885  # v6.1.1
+        with:
+          aws-region: <{aws.region}>
+          role-to-assume: ${{ secrets.aws_role }}
+          role-session-name: ${{ secrets.aws_role_session_name }}
+<% endif %>
+<% if gcloud %>
+      - name: Google Cloud Login
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          service_account: ${{ secrets.gcloud_service_account }}
+          workload_identity_provider: ${{ secrets.gcloud_workload_identity_provider }}
+<% endif %>
+
+      - name: Log in to ghcr.io
+        if: runner.os == 'Linux'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build Library
+<% if secrets["build:test"] %>
+        env:
+<% for name, val in secrets["build:test"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          if [[ -f ci/scripts/pre-build.sh ]]; then
+            ./ci/scripts/pre-build.sh test ${{ matrix.platform }} ${{ matrix.arch }}
+          fi
+          set -a
+          if [[ -f .env.build ]]; then
+            echo "Loading .env.build"
+            source .env.build
+          fi
+          if [[ -f .env.test ]]; then
+            source .env.test
+          fi
+          set +a
+          pixi run adbc-make build DEBUG=true VERBOSE=true DRIVER=<{driver}> IMPL_LANG=<{lang}> <{' '.join(lang_config.build.additional_make_args) }>
+      - name: Start Test Dependencies
+        # Can't use Docker on macOS AArch64 runners, and Windows containers
+        # work but often the container doesn't support Windows
+        if: runner.os == 'Linux'
+        working-directory: <{ lang_subdir }>
+        run: |
+          if [[ -f compose.yaml ]]; then
+            if ! docker compose up --detach --wait ${{ matrix.service_name }}; then
+              echo "Service failed to start"
+              echo "Logs:"
+              docker compose logs ${{ matrix.service_name }}
+              exit 1
+            fi
+          fi
+
+      - name: Validate
+        if: runner.os == 'Linux'
+<% if secrets["validate"] %>
+        env:
+<% for name, val in secrets["validate"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          set -a
+          if [[ -f .env ]]; then
+            source .env
+          fi
+          if [[ -f .env.${{ matrix.platform }} ]]; then
+            source .env.${{ matrix.platform }}
+          fi
+          if [[ -f .env.ci ]]; then
+            source .env.ci
+          fi
+          set +a
+
+          if [[ -f ci/scripts/pre-test.sh ]]; then
+            echo "Loading pre-test"
+            ./ci/scripts/pre-test.sh ${{ matrix.platform }} ${{ matrix.arch }} ${{ matrix.service_name }}
+          fi
+
+          docker ps
+          if [[ -n "${{ matrix.vendor_version }}" ]]; then
+            pixi run validate --vendor-version "${{ matrix.vendor_version }}"
+          else
+            pixi run validate
+          fi
+
+          if [[ -f ci/scripts/post-test.sh ]]; then
+            ./ci/scripts/post-test.sh
+          fi
+
+          cp validation-report.xml validation-report-${{ matrix.vendor_version }}.xml
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: validation-report-${{ matrix.vendor_version }}
+          path: "<{ lang_subdir }>/validation-report-${{ matrix.vendor_version }}.xml"
+          retention-days: 7
+
+      - name: Generate docs
+        working-directory: <{ lang_subdir }>
+        run: |
+          pixi run gendocs --output generated
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: docs-${{ matrix.vendor_version }}
+          path: "<{ lang_subdir }>/generated/<{driver}>.md"
+          retention-days: 7
+<% endif %>
+
+  build:
+    name: "Build <{driver}>/${{ matrix.platform }}_${{ matrix.arch }}"
+<% if not lang_config.test.skip %>
+    needs: test
+<% endif %>
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: linux, arch: amd64, runner: ubuntu-latest }
+          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
+          - { platform: macos, arch: arm64, runner: macos-latest }
+          - { platform: windows, arch: amd64, runner: windows-latest }
+<% if environment and "build:release" in lang_config.build.environment_contexts %>
+    environment: <{environment}>
+<% endif %>
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+<% if release or not secrets["all"] %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% else %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: "checkout remote"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% endif %>
+
+<% if "go" in lang_tools %>
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          cache: <{"false" if release else "true"}>
+          cache-dependency-path: <{go_mod_path}>/go.sum
+          check-latest: true
+          go-version-file: <{go_mod_path}>/go.mod
+<% endif %>
+<% if "rust" in lang_tools %>
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+        with:
+          cache: <{"false" if release else "true"}>
+          components: "clippy"
+<% endif %>
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+        with:
+          pixi-version: v0.63.2
+          run-install: false
+
+      - name: Install dev tools
+        working-directory: <{ lang_subdir }>
+        run: |
+          pixi install
+
+      - name: Log in to ghcr.io
+        if: runner.os == 'Linux'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build Library
+        working-directory: <{ lang_subdir }>
+<% if secrets["build:release"] %>
+        env:
+<% for name, val in secrets["build:release"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        run: |
+          if [[ -f ci/scripts/pre-build.sh ]]; then
+            ./ci/scripts/pre-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
+          fi
+          set -a
+          if [[ -f .env.build ]]; then
+            echo "Loading .env.build"
+            source .env.build
+          fi
+          if [[ -f .env.release ]]; then
+            source .env.release
+          fi
+          set +a
+          pixi run adbc-make check CI=true VERBOSE=true DRIVER=<{driver}> IMPL_LANG=<{lang}> <{' '.join(lang_config.build.additional_make_args) }><% if release %> RELEASE=true<% endif %>
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: drivers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: "<{ lang_subdir }>/build/libadbc_driver_<{driver}>.*"
+          retention-days: 2
+
+  package:
+    name: "Generate Packages"
+    runs-on: ubuntu-latest
+    needs:
+      - build
+<% if not lang_config.validation.skip %>
+      - validate
+<% endif %>
+    permissions:
+      contents: read
+
+    steps:
+<% if release or not secrets["all"] %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% else %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: "checkout remote"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% endif %>
+
+<% if "go" in lang_tools %>
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          cache: <{"false" if release else "true"}>
+          check-latest: true
+          go-version: "stable"
+<% endif %>
+<% if "rust" in lang_tools %>
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+        with:
+          cache: <{"false" if release else "true"}>
+          components: "clippy"
+<% endif %>
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+        with:
+          pixi-version: v0.63.2
+          run-install: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: "drivers-*"
+          path: "~/drivers"
+
+      - name: Install tools
+        working-directory: <{ lang_subdir }>
+        run: |
+<% if "go" in lang_tools %>
+          # XXX: Google has effectively abandoned go-licenses, and it broke
+          # XXX: can't install go-licenses under go 1.25
+          # Use our fork instead
+          # https://github.com/google/go-licenses/issues/312
+          go install github.com/lidavidm/go-licenses@master
+<% endif %>
+<% if "rust" in lang_tools %>
+          cargo install cargo-about@0.9.0 --locked -F cli
+<% endif %>
+
+      - name: Generate packages
+        working-directory: <{ lang_subdir }>
+        run: |
+          pixi install
+
+          pixi run adbc-gen-package \
+            --name <{driver}> \
+            --root "$(pwd)" \
+            --manifest-template "$(pwd)/manifest.toml" \
+            <% if release %>--release<% endif %> \
+            -o ~/packages \
+            ~/drivers/drivers-*-*/
+
+          ls ~/packages
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: all-packages
+          path: ~/packages
+          retention-days: 7
+
+<% if not lang_config.validation.skip %>
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: "validation-report-*"
+          path: "~/validation-report"
+
+      - name: Generate combined docs
+        working-directory: <{ lang_subdir }>
+        run: |
+          ls -laR ~/validation-report
+          find ~/validation-report -type f -name '*.xml'
+          cp $(find ~/validation-report -type f -name '*.xml') .
+          ls *.xml
+          pixi run gendocs --output generated
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: docs
+          path: "<{ lang_subdir }>/generated/<{driver}>.md"
+          retention-days: 2
+<% endif %>
+
+  test-packages:
+    name: "Test Packages/${{ matrix.platform }}_${{ matrix.arch }}"
+    runs-on: ${{ matrix.runner }}
+    needs:
+      - package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux, arch: amd64, runner: ubuntu-latest }
+          - { platform: macos, arch: arm64, runner: macos-latest }
+          - { platform: windows, arch: amd64, runner: windows-latest }
+<% if environment and "build:test" in lang_config.build.environment_contexts %>
+    environment: <{environment}>
+<% endif %>
+    steps:
+      # for now, install dbc from main
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          cache: <{"false" if release else "true"}>
+          go-version: 'stable'
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+        with:
+          pixi-version: v0.63.2
+          run-install: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: "all-packages"
+          path: "~/packages"
+      - name: install package
+        # dbc uses the filename as the driver name
+        run: |
+          echo "Installing dbc"
+          git clone --depth 1 https://github.com/columnar-tech/dbc
+          cd dbc
+          go build ./cmd/dbc
+          echo "Installed dbc"
+          ls -laR ~/packages
+          driver_pkg=$(find ~/packages -name '*_${{ matrix.platform }}_${{ matrix.arch }}_*.tar.gz')
+          echo "Installing ${driver_pkg}"
+          ./dbc install --no-verify "${driver_pkg}"
+          echo "Installed ${driver_pkg}"
+<% if release or not secrets["all"] %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: 'recursive'
+<% else %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: 'recursive'
+      - name: "checkout remote"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: 'recursive'
+<% endif %>
+      - name: load package
+<% if private or secrets["build:test"] %>
+        env:
+<% if private %>
+          COLUMNAR_CLOUD_API_TOKEN: ${{ secrets.COLUMNAR_CLOUD_API_TOKEN }} # zizmor: ignore[secrets-outside-env]
+<% endif %>
+<% if secrets["build:test"] %>
+<% for name, val in secrets["build:test"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          if [[ -f ci/scripts/pre-build.sh ]]; then
+            echo "Loading pre-build"
+            ./ci/scripts/pre-build.sh test ${{ matrix.platform }} ${{ matrix.arch }}
+          fi
+          set -a
+          if [[ -f .env.build ]]; then
+            echo "Loading .env.build"
+            source .env.build
+          fi
+          if [[ -f .env.ci ]]; then
+            source .env.ci
+          fi
+          set +a
+<% if private %>
+          export COLUMNAR_DRIVER_LICENSE_KEY=$(curl --silent --fail -XGET -H 'Content-Type: application/json' -H "Authorization: Bearer $COLUMNAR_CLOUD_API_TOKEN" https://heimdall.columnar.tech/license)
+<% endif %>
+          pixi exec -s adbc-driver-manager -s pyarrow -s pytest python -m pytest -vs ci/test_package.py
+
+  release:
+<% if release %>
+    name: "Release"
+<% else %>
+    name: "Release (Dry Run)"
+<% endif %>
+    runs-on: ubuntu-latest
+    needs:
+      - package
+      - test-packages
+<% if not lang_config.validation.skip %>
+      - validate
+<% endif %>
+    permissions:
+<% if release %>
+      contents: write
+<% else %>
+      contents: read
+<% endif %>
+
+    steps:
+<% if release or not secrets["all"] %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% else %>
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: "checkout remote"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: 'recursive'
+<% endif %>
+
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+        with:
+          pixi-version: v0.63.2
+          run-install: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: "all-packages"
+          path: "~/packages"
+
+<% if not lang_config.validation.skip %>
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: "docs"
+          path: "~/packages"
+<% endif %>
+
+<% if release %>
+      - name: Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: <{ lang_subdir }>
+        run: |
+          tag="${GITHUB_REF_NAME}"
+<% if lang == "rust" %>
+          declared_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [[ "${declared_version}" != "${tag#*v}" ]]; then
+             echo "Declared driver version in Cargo.toml ${declared_version}"
+             echo "does not match tag ${tag#*v}"
+             echo "Please update the version before release."
+             exit 1
+          fi
+<% endif %>
+          pixi run release $(pwd) $tag
+          gh release upload $tag $(find ~/packages -name '*.tar.gz') $(find ~/packages -name 'manifest.yaml') $(find ~/packages -name '*.md')
+
+      - name: Release (dry-run)
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: <{ lang_subdir }>
+        run: |
+          git tag <{lang_tag_prefix}>v1000.0.0
+          tag=<{lang_tag_prefix}>v1000.0.0
+
+          pixi run release --dry-run $(pwd) $tag
+          echo gh release upload $tag $(find ~/packages -name '*.tar.gz') $(find ~/packages -name 'manifest.yaml') $(find ~/packages -name '*.md')
+<% else %>
+      - name: Release (dry-run)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: <{ lang_subdir }>
+        run: |
+          git tag <{lang_tag_prefix}>v1000.0.0
+          tag=<{lang_tag_prefix}>v1000.0.0
+
+          pixi run release --dry-run $(pwd) $tag
+          echo gh release upload $tag $(find ~/packages -name '*.tar.gz') $(find ~/packages -name 'manifest.yaml') $(find ~/packages -name '*.md')
+<% endif %>

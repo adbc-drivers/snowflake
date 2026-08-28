@@ -63,24 +63,23 @@ jobs:
           # https://github.com/actions/runner-images/issues/2840
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: false
           cache-dependency-path: go/go.sum
           check-latest: true
           go-version-file: go/go.mod
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347  # v0.10.1
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           pixi-version: v0.72.0
           run-install: false
-
 
       - name: Build
         working-directory: go
@@ -153,13 +152,27 @@ jobs:
   validate:
     name: "Validate snowflake ${{ matrix.vendor_version }}/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
+    # Go and Rust validation use fixed table names in the same live schema.
+    concurrency:
+      group: snowflake-live-validation
+      cancel-in-progress: false
     strategy:
       fail-fast: true
       max-parallel: 4
       matrix:
         include:
           # I think we only need to test one platform, but we can change that later
-          - { platform: linux, arch: amd64, runner: ubuntu-latest, service_name: "test-service", vendor_version: "latest", environment: "Snowflake CI", aws: false, azure: false, gcloud: false }
+          - {
+              platform: linux,
+              arch: amd64,
+              runner: ubuntu-latest,
+              service_name: "test-service",
+              vendor_version: "latest",
+              environment: "Snowflake CI",
+              aws: false,
+              azure: false,
+              gcloud: false,
+            }
     environment: ${{ matrix.environment }}
     permissions:
       contents: read
@@ -173,24 +186,23 @@ jobs:
           # https://github.com/actions/runner-images/issues/2840
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: false
           cache-dependency-path: go/go.sum
           check-latest: true
           go-version-file: go/go.mod
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347  # v0.10.1
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           pixi-version: v0.72.0
           run-install: false
-
 
       - name: Log in to ghcr.io
         if: runner.os == 'Linux'
@@ -214,7 +226,7 @@ jobs:
             source .env.test
           fi
           set +a
-          pixi run adbc-make build DEBUG=true VERBOSE=true BUILD_TAGS=minicore_disabled
+          pixi run adbc-make build DEBUG=true VERBOSE=true DRIVER=snowflake IMPL_LANG=go BUILD_TAGS=minicore_disabled
       - name: Start Test Dependencies
         # Can't use Docker on macOS AArch64 runners, and Windows containers
         # work but often the container doesn't support Windows
@@ -274,8 +286,7 @@ jobs:
 
           cp validation-report.xml validation-report-${{ matrix.vendor_version }}.xml
 
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: validation-report-${{ matrix.vendor_version }}
           path: "go/validation-report-${{ matrix.vendor_version }}.xml"
@@ -286,7 +297,7 @@ jobs:
         run: |
           pixi run gendocs --output generated
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docs-${{ matrix.vendor_version }}
           path: "go/generated/snowflake.md"
@@ -309,20 +320,20 @@ jobs:
       packages: read
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: false
           cache-dependency-path: go/go.sum
           check-latest: true
           go-version-file: go/go.mod
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347  # v0.10.1
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           pixi-version: v0.72.0
           run-install: false
@@ -365,12 +376,12 @@ jobs:
             source .env.release
           fi
           set +a
-          pixi run adbc-make check CI=true VERBOSE=true BUILD_TAGS=minicore_disabled RELEASE=true
+          pixi run adbc-make check CI=true VERBOSE=true DRIVER=snowflake IMPL_LANG=go BUILD_TAGS=minicore_disabled RELEASE=true
           if [[ -f ci/scripts/post-build.sh ]]; then
             ./ci/scripts/post-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: drivers-${{ matrix.platform }}-${{ matrix.arch }}
           path: "go/build/libadbc_driver_snowflake.*"
@@ -386,24 +397,24 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: false
           check-latest: true
           go-version: "stable"
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347  # v0.10.1
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           pixi-version: v0.72.0
           run-install: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "drivers-*"
           path: "~/drivers"
@@ -432,13 +443,13 @@ jobs:
 
           ls ~/packages
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: all-packages
           path: ~/packages
           retention-days: 7
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "validation-report-*"
           path: "~/validation-report"
@@ -452,7 +463,7 @@ jobs:
           ls *.xml
           pixi run gendocs --output generated
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docs
           path: "go/generated/snowflake.md"
@@ -472,15 +483,15 @@ jobs:
           - { platform: windows, arch: amd64, runner: windows-latest }
     steps:
       # for now, install dbc from main
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache: false
-          go-version: 'stable'
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347  # v0.10.1
+          go-version: "stable"
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           pixi-version: v0.72.0
           run-install: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: "all-packages"
           path: "~/packages"
@@ -497,11 +508,11 @@ jobs:
           echo "Installing ${driver_pkg}"
           ./dbc install --no-verify "${driver_pkg}"
           echo "Installed ${driver_pkg}"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: load package
         working-directory: go
         run: |
@@ -531,23 +542,23 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          submodules: 'recursive'
+          submodules: "recursive"
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347  # v0.10.1
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           pixi-version: v0.72.0
           run-install: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: "all-packages"
           path: "~/packages"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: "docs"
           path: "~/packages"

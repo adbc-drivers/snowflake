@@ -13,60 +13,62 @@
 # limitations under the License.
 
 repos:
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: 0671d8ab202c4ac093b78433ae5baf74f3fc7246  # frozen: v0.15.15
-  hooks:
-    - id: ruff-check
-      name: "ruff check (isort)"
-      args: ["--select", "I", "--fix"]
-    - id: ruff-check
-      args: ["--fix"]
-    - id: ruff-format
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 0671d8ab202c4ac093b78433ae5baf74f3fc7246 # frozen: v0.15.15
+    hooks:
+      - id: ruff-check
+        name: "ruff check (isort)"
+        args: ["--select", "I", "--fix"]
+      - id: ruff-check
+        args: ["--fix"]
+      - id: ruff-format
 
-- repo: https://github.com/codespell-project/codespell
-  rev: 2ccb47ff45ad361a21071a7eedda4c37e6ae8c5a  # frozen: v2.4.2
-  hooks:
-  - id: codespell
-    exclude: >
-        (?x)^(
-            .*go\.sum
-        )$
+  - repo: https://github.com/codespell-project/codespell
+    rev: 2ccb47ff45ad361a21071a7eedda4c37e6ae8c5a # frozen: v2.4.2
+    hooks:
+      - id: codespell
+        exclude: >
+          (?x)^(
+              .*go\.sum
+          )$
 
-- repo: https://github.com/golangci/golangci-lint
-  # XXX: don't update this as it seems newer versions break nolint directives
-  rev: 5d1e709b7be35cb2025444e19de266b056b7b7ee  # frozen: v2.10.1
-  hooks:
-  - id: golangci-lint
-    name: lint
-    entry: bash -c 'cd go && golangci-lint run --fix --timeout 5m'
-    types_or: [go, go-mod]
+  - repo: https://github.com/golangci/golangci-lint
+    # XXX: don't update this as it seems newer versions break nolint directives
+    rev: 5d1e709b7be35cb2025444e19de266b056b7b7ee # frozen: v2.10.1
+    hooks:
+      - id: golangci-lint
+        name: lint
+        entry: bash -c 'cd go && golangci-lint run --fix --timeout 5m'
+        types_or: [go, go-mod]
 
-- repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
-  hooks:
-  - id: check-added-large-files
-    args: ["--enforce-all"]
-  - id: check-case-conflict
-  - id: check-executables-have-shebangs
-  - id: check-yaml
-  - id: detect-private-key
-  - id: end-of-file-fixer
-    exclude: '\.sln$'
-  - id: mixed-line-ending
-    args: [--fix=lf]
-    exclude: '\.(bat|sln)$'
-  - id: trailing-whitespace
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--enforce-all"]
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-yaml
+        # These are Jinja/Mako templates, not standalone YAML documents.
+        exclude: '^vendor/adbc-drivers-dev/adbc_drivers_dev/templates/.*\.yaml$'
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: '\.sln$'
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        exclude: '\.(bat|sln)$'
+      - id: trailing-whitespace
 
-- repo: https://github.com/adbc-drivers/dev
-  rev: efa57f642e794eb191cdd43a1de72413a849ba79
-  hooks:
-  - id: rat
+  - repo: https://github.com/adbc-drivers/dev
+    rev: efa57f642e794eb191cdd43a1de72413a849ba79
+    hooks:
+      - id: rat
 
-- repo: local
-  hooks:
-  - id: gofix
-    name: go fix
-    language: system
-    types: [go]
-    entry: bash -c 'cd go && go fix'
-    pass_filenames: false
+  - repo: local
+    hooks:
+      - id: gofix
+        name: go fix
+        language: system
+        types: [go]
+        entry: bash -c 'cd go && go fix'
+        pass_filenames: false

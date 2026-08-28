@@ -16,9 +16,15 @@
 .gitmodules
 */go.sum
 */pixi.lock
+*/Cargo.lock
 */*.csproj
 */*.sln
 go/license.tpl
 go/validation/queries/*/*.json
 go/validation/queries/*/*.sql
+rust/license.tpl
+rust/validation/queries/*/*.json
+rust/validation/queries/*/*.sql
+rust/validation/queries/*/*/*.json
+rust/validation/queries/*/*/*.sql
 csharp/test/Interop/Resources/snowflakeconfig.json

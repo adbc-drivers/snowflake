@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-slim
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -54,6 +54,6 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           git clone --depth 1 https://github.com/adbc-drivers/dev
-          python dev/adbc_drivers_dev/title_check.py $(pwd) "$PR_TITLE"
+          python dev/adbc_drivers_dev/title_check.py "$(pwd)" "$PR_TITLE"
 
       # TODO: assign milestone
