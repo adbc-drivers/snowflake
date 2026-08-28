@@ -222,9 +222,13 @@ func TestExtractSRIDFromMeta(t *testing.T) {
 func TestResolveGeoType(t *testing.T) {
 	opts := &ingestOptions{}
 
+	// EPSG:4326 without an "edges" field stays GEOGRAPHY: most GeoArrow
+	// producers (DuckDB, GeoPandas) emit a crs but no edges, and WGS84 data
+	// should not silently demote to GEOMETRY (matches the documented
+	// contract of resolveGeoType).
 	ty, err := opts.resolveGeoType(0, "geom", `{"crs":"EPSG:4326"}`)
 	assert.NoError(t, err)
-	assert.Equal(t, "geometry", ty)
+	assert.Equal(t, "geography", ty)
 
 	ty, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857"}`)
 	assert.NoError(t, err)
@@ -237,13 +241,15 @@ func TestResolveGeoType(t *testing.T) {
 	_, err = opts.resolveGeoType(0, "geom", `{"crs":"EPSG:3857", "edges":"spherical"}`)
 	assert.ErrorContains(t, err, `field #1 ("geom") is a GeoArrow array with spherical edges`)
 
+	// Missing or empty CRS metadata also stays GEOGRAPHY per the documented
+	// default.
 	ty, err = opts.resolveGeoType(0, "geom", "")
 	assert.NoError(t, err)
-	assert.Equal(t, "geometry", ty)
+	assert.Equal(t, "geography", ty)
 
 	ty, err = opts.resolveGeoType(0, "geom", "{}")
 	assert.NoError(t, err)
-	assert.Equal(t, "geometry", ty)
+	assert.Equal(t, "geography", ty)
 
 	// explicit geoType should override CRS-derived default
 	opts.geoType = "geometry"
