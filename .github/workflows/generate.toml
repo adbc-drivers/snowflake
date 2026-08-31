@@ -15,9 +15,6 @@
 driver = "snowflake"
 private = false
 
-[lang.go.build]
-additional-make-args = ["BUILD_TAGS=minicore_disabled"]
-
 [[lang.go.validation.configs]]
 environment = "Snowflake CI"
 

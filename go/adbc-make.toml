@@ -16,3 +16,4 @@ driver = "snowflake"
 
 [lang]
 lang = "go"
+build-tags = ["minicore_disabled"]
