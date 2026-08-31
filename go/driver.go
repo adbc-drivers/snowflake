@@ -149,6 +149,17 @@ const (
 	// Specify the identity provider to utilize for generating a workload identity
 	// federation attestation. Must be set when using OptionValueAuthWIF.
 	OptionIdentityProvider = "adbc.snowflake.sql.client_option.identity_provider"
+	// OptionValidateDefaultParameters controls whether Snowflake verifies, at
+	// login, that the database, schema and warehouse supplied on the connection
+	// exist and are authorized for the session. This maps to the
+	// CLIENT_VALIDATE_DEFAULT_PARAMETERS session parameter.
+	//
+	// Enabled by default, matching gosnowflake. When enabled, connecting with a
+	// warehouse the session cannot access fails fast at login with error 390201.
+	// Disable it to let the connection succeed and defer that failure to query
+	// time. An unauthorized role is rejected at authentication (390189)
+	// regardless of this option.
+	OptionValidateDefaultParameters = "adbc.snowflake.sql.client_option.validate_default_parameters"
 
 	// auth types are implemented by the Snowflake driver in gosnowflake
 	// general username password authentication

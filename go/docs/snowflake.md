@@ -274,6 +274,20 @@ Examples:
 
   (Deprecated) set the log level.
 
+`adbc.snowflake.sql.client_option.validate_default_parameters`
+: **Type:** boolean. **Default:** true
+
+  Whether Snowflake verifies at login that the database, schema and warehouse
+  supplied on the connection exist and are authorized for the session. Maps to
+  the `CLIENT_VALIDATE_DEFAULT_PARAMETERS` session parameter.
+
+  When enabled, connecting with a warehouse the session cannot access fails fast
+  at login with error 390201. Disable it to let the connection succeed and defer
+  that failure to query time. Note that disabling this also suppresses the
+  immediate error for a mistyped database or schema name, and that an
+  unauthorized role is rejected at authentication (390189) regardless of this
+  setting.
+
 `adbc.snowflake.sql.db`
 : **Type:** string
 

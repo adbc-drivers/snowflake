@@ -164,6 +164,12 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
+	case OptionValidateDefaultParameters:
+		// gosnowflake treats anything other than an explicit false as enabled.
+		if d.cfg.ValidateDefaultParameters != gosnowflake.ConfigBoolFalse {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
 	case OptionLogTracing:
 		return d.cfg.Tracing, nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientConfigFile:
@@ -517,6 +523,18 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			d.cfg.ClientStoreTemporaryCredential = gosnowflake.ConfigBoolTrue
 		case adbc.OptionValueDisabled:
 			d.cfg.ClientStoreTemporaryCredential = gosnowflake.ConfigBoolFalse
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+	case OptionValidateDefaultParameters:
+		switch v {
+		case adbc.OptionValueEnabled:
+			d.cfg.ValidateDefaultParameters = gosnowflake.ConfigBoolTrue
+		case adbc.OptionValueDisabled:
+			d.cfg.ValidateDefaultParameters = gosnowflake.ConfigBoolFalse
 		default:
 			return adbc.Error{
 				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", k, v),
