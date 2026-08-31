@@ -116,7 +116,7 @@ jobs:
           INPUTS: ${{ toJSON(inputs) }}
           MESSAGE: ${{ steps.get_run.outputs.message }}
           REPOSITORY: ${{ needs.setup.outputs.repository }}
-          WORKFLOW_RUN_URL: ${{ needs.setup.outputs.workflow_run_url }}
+          WORKFLOW_RUN_URL: ${{ steps.get_run.outputs.workflow_run_url }}
         with:
           github-token: ${{ github.token }}
           script: |
