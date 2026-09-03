@@ -194,14 +194,12 @@ func errToAdbcErr(code adbc.Status, err error) error {
 		return nil
 	}
 
-	var e adbc.Error
-	if errors.As(err, &e) {
+	if e, ok := errors.AsType[adbc.Error](err); ok {
 		e.Code = code
 		return e
 	}
 
-	var sferr *gosnowflake.SnowflakeError
-	if errors.As(err, &sferr) {
+	if sferr, ok := errors.AsType[*gosnowflake.SnowflakeError](err); ok {
 		var sqlstate [5]byte
 		copy(sqlstate[:], []byte(sferr.SQLState))
 

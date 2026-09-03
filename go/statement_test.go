@@ -37,9 +37,9 @@ type geoArrowType struct {
 
 func newGeoArrowType(name string, storage arrow.DataType, meta string) *geoArrowType {
 	return &geoArrowType{
-		ExtensionBase: arrow.ExtensionBase{Storage: storage},
-		name:          name,
-		meta:          meta,
+		Storage: storage,
+		name:    name,
+		meta:    meta,
 	}
 }
 
