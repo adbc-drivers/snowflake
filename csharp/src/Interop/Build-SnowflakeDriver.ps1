@@ -21,7 +21,6 @@
 
 Write-Host "Building the Snowflake ADBC Go driver"
 Write-Host "IsPackagingPipeline=$env:IsPackagingPipeline"
-Write-Host "IncludeGoSymbols=$env:IncludeGoSymbols"
 
 if (-not (Test-Path env:IsPackagingPipeline)) {
     Write-Host "IsPackagingPipeline environment variable does not exist."
@@ -30,14 +29,6 @@ if (-not (Test-Path env:IsPackagingPipeline)) {
 
 # Get the value of the IsPackagingPipeline environment variable
 $IsPackagingPipelineValue = $env:IsPackagingPipeline
-
-# Get the value of the IncludeGoSymbols environment variable, default to false if not set
-if (-not (Test-Path env:IncludeGoSymbols)) {
-    Write-Host "IncludeGoSymbols environment variable does not exist. Defaulting to 'false'."
-    $IncludeGoSymbolsValue = "false"
-} else {
-    $IncludeGoSymbolsValue = $env:IncludeGoSymbols
-}
 
 # Check if the value is "true"
 if ($IsPackagingPipelineValue -ne "true") {
@@ -49,37 +40,37 @@ $location = Get-Location
 
 $file = "libadbc_driver_snowflake.dll"
 
-if(Test-Path $file)
-{
+if (Test-Path $file) {
+    Write-Host "File $file already exists. Exiting the script."
     exit
 }
 
-cd ..\..\..\go\
+try {
+    Set-Location ..\..\..\go\
 
-if ($IncludeGoSymbolsValue -ne "true") {
-    Write-Host "Building without symbols"
-    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s -w -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg
-} else {
     Write-Host "Building with symbols"
-    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-s=0 -w=0 -X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg
-}
+    go build -buildmode=c-shared -tags="driverlib minicore_disabled" -o build\$file -ldflags "-X github.com/adbc-drivers/driverbase-go/driverbase.infoDriverVersion=unknown-dirty" ./pkg
 
-cd build
+    Set-Location build
 
-if(Test-Path $file)
-{
-    try {
-        Write-Host "Copying file with robocopy (5 retries, 2 second wait)..."
-        robocopy . $location $file /R:5 /W:2 /NP
+    if (Test-Path $file) {
+        try {
+            Write-Host "Copying file with robocopy (5 retries, 2 second wait)..."
+            robocopy . $location $file /R:5 /W:2 /NP
 
-        if ($LASTEXITCODE -le 7) {
-            Write-Host "File copied successfully. Exit code: $LASTEXITCODE"
-        } else {
-            Write-Host "Failed to copy file. Robocopy exit code: $LASTEXITCODE"
-            exit 1
+            if ($LASTEXITCODE -le 7) {
+                Write-Host "File copied successfully. Exit code: $LASTEXITCODE"
+            }
+            else {
+                Write-Host "Failed to copy file. Robocopy exit code: $LASTEXITCODE"
+                exit 1
+            }
+        }
+        catch {
+            Write-Host "Caught error: $_"
         }
     }
-    catch {
-        Write-Host "Caught error: $_"
-    }
- }
+}
+finally {
+    Set-Location $location
+}
