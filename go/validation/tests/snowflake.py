@@ -109,27 +109,6 @@ class SnowflakeQuirks(model.DriverQuirks):
             return default.replace("SELECT id + 1", 'SELECT "id" + 1')
         return super().query_override(context, default)
 
-    def drop_table(
-        self,
-        *,
-        table_name: str,
-        schema_name: str | None = None,
-        catalog_name: str | None = None,
-        if_exists: bool = True,
-        temporary: bool = False,
-    ) -> str:
-        # These shared fixtures are created with unquoted identifiers, which
-        # Snowflake stores in uppercase.
-        if table_name in {"test_timestamp", "test_timestamptz"}:
-            table_name = table_name.upper()
-        return super().drop_table(
-            table_name=table_name,
-            schema_name=schema_name,
-            catalog_name=catalog_name,
-            if_exists=if_exists,
-            temporary=temporary,
-        )
-
     def quote_one_identifier(self, identifier: str) -> str:
         """Quote an identifier to preserve case and ensure consistency."""
         identifier = identifier.replace('"', '""')

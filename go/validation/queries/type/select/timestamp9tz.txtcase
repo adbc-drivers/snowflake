@@ -12,16 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// part: metadata
+
+[setup]
+drop = "test_timestamptz9"
+
+// part: query
+
+SELECT "res" FROM "test_timestamptz9" ORDER BY "idx"
+
 // part: setup_query
 
-CREATE TABLE test_timestamptz (
-    idx INTEGER,
-    res TIMESTAMP_TZ(9)
+CREATE TABLE "test_timestamptz9" (
+    "idx" INTEGER,
+    "res" TIMESTAMP_TZ(9)
 );
 
-INSERT INTO test_timestamptz (idx, res) VALUES (1, '2023-05-15 13:45:30.123456789+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (2, '2000-01-01 00:00:00.234567890+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (3, '1969-07-20 20:17:40.345678901+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (4, '1677-09-21 00:12:43.145224192+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (5, '2262-04-11 23:47:16.854775807+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (6, NULL);
+INSERT INTO "test_timestamptz9" ("idx", "res") VALUES (1, '2023-05-15 13:45:30.123456789+00:00'::TIMESTAMP_TZ);
+INSERT INTO "test_timestamptz9" ("idx", "res") VALUES (2, '2000-01-01 00:00:00.234567890+00:00'::TIMESTAMP_TZ);
+INSERT INTO "test_timestamptz9" ("idx", "res") VALUES (3, '1969-07-20 20:17:40.345678901+00:00'::TIMESTAMP_TZ);
+INSERT INTO "test_timestamptz9" ("idx", "res") VALUES (4, '1677-09-21 00:12:43.145224192+00:00'::TIMESTAMP_TZ);
+INSERT INTO "test_timestamptz9" ("idx", "res") VALUES (5, '2262-04-11 23:47:16.854775807+00:00'::TIMESTAMP_TZ);
+INSERT INTO "test_timestamptz9" ("idx", "res") VALUES (6, NULL);
