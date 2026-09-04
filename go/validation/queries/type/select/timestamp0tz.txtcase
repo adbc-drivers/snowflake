@@ -1,4 +1,4 @@
-// Copyright (c) 2025 ADBC Drivers Contributors
+// Copyright (c) 2026 ADBC Drivers Contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,41 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// part: metadata
-
-[setup]
-drop = "TEST_TIMESTAMPTZ"
-
 // part: setup_query
 
 CREATE TABLE test_timestamptz (
     idx INTEGER,
-    res TIMESTAMP_TZ(6)
+    res TIMESTAMP_TZ(0)
 );
 
 INSERT INTO test_timestamptz (idx, res) VALUES (1, '2023-05-15 13:45:30+00:00'::TIMESTAMP_TZ);
 INSERT INTO test_timestamptz (idx, res) VALUES (2, '2000-01-01 00:00:00+00:00'::TIMESTAMP_TZ);
 INSERT INTO test_timestamptz (idx, res) VALUES (3, '1969-07-20 20:17:40+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (4, '9999-12-31 23:59:59+00:00'::TIMESTAMP_TZ);
-INSERT INTO test_timestamptz (idx, res) VALUES (5, NULL);
-
-// part: expected_schema
-
-{
-    "format": "+s",
-    "children": [
-        {
-            "name": "RES",
-            "format": "tsu:UTC",
-            "flags": ["nullable"]
-        }
-    ]
-}
-
-// part: expected
-
-{"RES": 1684158330000000}
-{"RES": 946684800000000}
-{"RES": -14182940000000}
-{"RES": 253402300799000000}
-{"RES": null}
+INSERT INTO test_timestamptz (idx, res) VALUES (4, '0001-01-01 00:00:00+00:00'::TIMESTAMP_TZ);
+INSERT INTO test_timestamptz (idx, res) VALUES (5, '9999-12-31 23:59:59+00:00'::TIMESTAMP_TZ);
+INSERT INTO test_timestamptz (idx, res) VALUES (6, NULL);
