@@ -181,6 +181,8 @@ const (
 const (
 	// Base table or view not found
 	SQLStateTableOrViewNotFound = "42S02"
+	// Object already exists
+	SQLStateObjectAlreadyExists = "42710"
 )
 
 func init() {
@@ -206,6 +208,8 @@ func errToAdbcErr(code adbc.Status, err error) error {
 		switch sferr.SQLState {
 		case SQLStateTableOrViewNotFound:
 			code = adbc.StatusNotFound
+		case SQLStateObjectAlreadyExists:
+			code = adbc.StatusAlreadyExists
 		case gosnowflake.SQLStateConnectionRejected:
 			code = adbc.StatusUnauthorized
 		}

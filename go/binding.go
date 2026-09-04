@@ -64,6 +64,8 @@ func convertArrowToNamedValue(batch arrow.RecordBatch, index int, params []drive
 		rawColumn := batch.Column(i)
 		params[i].Ordinal = i + 1
 		switch column := rawColumn.(type) {
+		case *array.Null:
+			params[i].Value = nil
 		case *array.Boolean:
 			params[i].Value = sql.NullBool{
 				Bool:  column.Value(index),
