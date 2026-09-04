@@ -36,6 +36,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/http"
 	"os"
@@ -2902,6 +2903,154 @@ func TestInvalidProxyOptions(t *testing.T) {
 			require.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
 		})
 	}
+}
+
+func TestValidateDefaultParametersDefaultsToEnabled(t *testing.T) {
+	ctx := context.Background()
+	adbcDriver := driver.NewDriver(memory.DefaultAllocator)
+	db, err := adbcDriver.NewDatabaseWithContext(ctx, nil)
+	require.NoError(t, err)
+	defer testutil.CheckedCloseWithContext(t, db, ctx)
+
+	getSetDB, ok := db.(adbc.GetSetOptionsWithContext)
+	require.True(t, ok)
+
+	// gosnowflake leaves the field unset and treats that as enabled, so the
+	// driver must report enabled rather than reading the zero value as false.
+	actual, err := getSetDB.GetOption(ctx, driver.OptionValidateDefaultParameters)
+	require.NoError(t, err)
+	require.Equal(t, adbc.OptionValueEnabled, actual)
+}
+
+func TestValidateDefaultParameters(t *testing.T) {
+	ctx := context.Background()
+	adbcDriver := driver.NewDriver(memory.DefaultAllocator)
+
+	for _, value := range []string{adbc.OptionValueDisabled, adbc.OptionValueEnabled} {
+		t.Run(value, func(t *testing.T) {
+			db, err := adbcDriver.NewDatabaseWithContext(ctx, map[string]string{
+				driver.OptionValidateDefaultParameters: value,
+			})
+			require.NoError(t, err)
+			defer testutil.CheckedCloseWithContext(t, db, ctx)
+
+			getSetDB, ok := db.(adbc.GetSetOptionsWithContext)
+			require.True(t, ok)
+
+			actual, err := getSetDB.GetOption(ctx, driver.OptionValidateDefaultParameters)
+			require.NoError(t, err)
+			require.Equal(t, value, actual)
+		})
+	}
+}
+
+func TestInvalidValidateDefaultParameters(t *testing.T) {
+	ctx := context.Background()
+	adbcDriver := driver.NewDriver(memory.DefaultAllocator)
+	_, err := adbcDriver.NewDatabaseWithContext(ctx, map[string]string{
+		driver.OptionValidateDefaultParameters: "maybe",
+	})
+	require.Error(t, err)
+	var adbcErr adbc.Error
+	require.ErrorAs(t, err, &adbcErr)
+	require.Equal(t, adbc.StatusInvalidArgument, adbcErr.Code)
+}
+
+// TestValidateDefaultParametersAgainstSnowflake exercises the option end to end:
+// it reports how the server resolves CLIENT_VALIDATE_DEFAULT_PARAMETERS and
+// confirms that disabling it lets a login succeed that would otherwise fail.
+func TestValidateDefaultParametersAgainstSnowflake(t *testing.T) {
+	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
+	if !ok {
+		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
+	}
+
+	ctx := context.Background()
+
+	db, err := sql.Open("snowflake", uri)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	// Informational only: Snowflake does not surface this parameter through SHOW
+	// PARAMETERS, so the behavioral subtests below are the real assertions.
+	rows, err := db.QueryContext(ctx, "SHOW PARAMETERS LIKE '%VALIDATE%'")
+	require.NoError(t, err)
+	cols, err := rows.Columns()
+	require.NoError(t, err)
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		require.NoError(t, rows.Scan(ptrs...))
+		row := make(map[string]any, len(cols))
+		for i, c := range cols {
+			row[strings.ToLower(c)] = vals[i]
+		}
+		t.Logf("SHOW PARAMETERS: key=%v value=%v default=%v level=%v",
+			row["key"], row["value"], row["default"], row["level"])
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+
+	// A warehouse that does not exist trips the same login-time validation as an
+	// unauthorized one, without needing grants or billable resources.
+	const missingWarehouse = "ADBC_VALIDATE_DEFAULT_PARAMETERS_NO_SUCH_WH"
+
+	connect := func(t *testing.T, extra map[string]string) error {
+		opts := map[string]string{
+			adbc.OptionKeyURI:      uri,
+			driver.OptionWarehouse: missingWarehouse,
+		}
+		maps.Copy(opts, extra)
+		adbcDB, err := driver.NewDriver(memory.DefaultAllocator).NewDatabaseWithContext(ctx, opts)
+		require.NoError(t, err)
+		defer testutil.CheckedCloseWithContext(t, adbcDB, ctx)
+
+		cnxn, err := adbcDB.Open(ctx)
+		if err != nil {
+			return err
+		}
+		return cnxn.Close(ctx)
+	}
+
+	t.Run("enabled by default rejects the login", func(t *testing.T) {
+		err := connect(t, nil)
+		require.Error(t, err)
+		t.Logf("login error with validation enabled: %v", err)
+	})
+
+	t.Run("disabled allows the login", func(t *testing.T) {
+		require.NoError(t, connect(t, map[string]string{
+			driver.OptionValidateDefaultParameters: adbc.OptionValueDisabled,
+		}))
+	})
+
+	// An unauthorized role is rejected at authentication regardless of this
+	// option, so the option must not be advertised as affecting roles.
+	t.Run("does not affect role validation", func(t *testing.T) {
+		withRole := func(extra map[string]string) error {
+			opts := map[string]string{
+				adbc.OptionKeyURI: uri,
+				driver.OptionRole: "ADBC_VALIDATE_DEFAULT_PARAMETERS_NO_SUCH_ROLE",
+			}
+			maps.Copy(opts, extra)
+			adbcDB, err := driver.NewDriver(memory.DefaultAllocator).NewDatabaseWithContext(ctx, opts)
+			require.NoError(t, err)
+			defer testutil.CheckedCloseWithContext(t, adbcDB, ctx)
+			cnxn, err := adbcDB.Open(ctx)
+			if err != nil {
+				return err
+			}
+			return cnxn.Close(ctx)
+		}
+
+		require.Error(t, withRole(nil))
+		require.Error(t, withRole(map[string]string{
+			driver.OptionValidateDefaultParameters: adbc.OptionValueDisabled,
+		}))
+	})
 }
 
 func (suite *SnowflakeTests) TestGetObjectsWithNilCatalog() {
