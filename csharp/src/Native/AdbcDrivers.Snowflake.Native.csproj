@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <PackageReadmeFile>readme.md</PackageReadmeFile>
+    <Description>Native C# Snowflake driver for Apache Arrow ADBC</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Abstractions only: the driver consumes ILogger/ILoggerFactory but never builds a provider.
+         JWT (key-pair auth) is hand-rolled over the in-box System.Security.Cryptography RSA. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\arrow-adbc\csharp\src\Apache.Arrow.Adbc\Apache.Arrow.Adbc.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AdbcDrivers.Snowflake.Native.Tests" />
+    <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="readme.md">
+      <Pack>true</Pack>
+      <PackagePath>\</PackagePath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+</Project>
