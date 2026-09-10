@@ -57,11 +57,7 @@ class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
                         b"value",
                     ]:
                         with pytest.raises(conn.NotSupportedError) as excinfo:
-                            handle.set_options(
-                                **{
-                                    "this_option_does_not_exist": v,
-                                }
-                            )
+                            handle.set_options(this_option_does_not_exist=v)
                         assert (
                             excinfo.value.status_code
                             == adbc_driver_manager.AdbcStatusCode.NOT_IMPLEMENTED

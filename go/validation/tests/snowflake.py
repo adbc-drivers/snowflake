@@ -99,6 +99,16 @@ class SnowflakeQuirks(model.DriverQuirks):
             or "does not exist or not authorized" in error_msg
         )
 
+    def query_override(self, context: str, default: str) -> str:
+        if context == "TestStatement.sample_table":
+            return default.replace(
+                "id INT, value VARCHAR",
+                '"id" INT, "value" VARCHAR',
+            )
+        if context == "TestStatement.test_execute_schema_noalias":
+            return default.replace("SELECT id + 1", 'SELECT "id" + 1')
+        return super().query_override(context, default)
+
     def quote_one_identifier(self, identifier: str) -> str:
         """Quote an identifier to preserve case and ensure consistency."""
         identifier = identifier.replace('"', '""')
