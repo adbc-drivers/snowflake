@@ -115,7 +115,7 @@ func escapeSingleQuoteForLike(arg string) string {
 			return b.String()
 		}
 
-		if before[len(before)-1] != '\\' {
+		if len(before) == 0 || before[len(before)-1] != '\\' {
 			b.WriteByte('\\')
 		}
 		b.WriteByte('\'')
