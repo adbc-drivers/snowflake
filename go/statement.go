@@ -32,9 +32,11 @@ import (
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
+	"github.com/adbc-drivers/driverbase-go/driverbase/arrowext"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/snowflakedb/gosnowflake/v2"
@@ -496,6 +498,51 @@ func toSnowflakeType(dt arrow.DataType) string {
 	return ""
 }
 
+func ingestColumnNamesEquivalent(expected, actual *arrow.Schema) bool {
+	if expected.NumFields() != actual.NumFields() {
+		return false
+	}
+
+	matched := make([]bool, actual.NumFields())
+	for _, expectedField := range expected.Fields() {
+		found := false
+		for i, actualField := range actual.Fields() {
+			if !matched[i] && strings.EqualFold(expectedField.Name, actualField.Name) {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (st *statement) validateIngestColumnNames(ctx context.Context, expected *arrow.Schema) error {
+	var catalog, dbSchema *string
+	if st.targetCatalog != "" {
+		catalog = &st.targetCatalog
+	}
+	if st.targetDbSchema != "" {
+		dbSchema = &st.targetDbSchema
+	}
+
+	actual, err := st.cnxn.GetTableSchema(ctx, catalog, dbSchema, st.targetTable)
+	if err != nil {
+		return err
+	}
+	if !ingestColumnNamesEquivalent(expected, actual) {
+		return adbc.Error{
+			Msg:  fmt.Sprintf("[Snowflake] target table %s already exists with an incompatible schema", st.qualifiedTableName()),
+			Code: adbc.StatusAlreadyExists,
+		}
+	}
+	return nil
+}
+
 // initIngest creates the target table for ingestion.
 //
 // typeOverrides maps field names to Snowflake types for extension columns
@@ -558,7 +605,7 @@ func (st *statement) initIngest(ctx context.Context, typeOverrides map[string]st
 
 	switch st.ingestMode {
 	case adbc.OptionValueIngestModeAppend:
-		// Do nothing
+		return st.validateIngestColumnNames(ctx, schema)
 	case adbc.OptionValueIngestModeReplace:
 		replaceQuery := "DROP TABLE IF EXISTS " + st.qualifiedTableName()
 		_, err := st.cnxn.cn.ExecContext(ctx, replaceQuery, nil)
@@ -578,6 +625,9 @@ func (st *statement) initIngest(ctx context.Context, typeOverrides map[string]st
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInternal, err)
 		}
+	}
+	if st.ingestMode == adbc.OptionValueIngestModeCreateAppend {
+		return st.validateIngestColumnNames(ctx, schema)
 	}
 
 	return nil
@@ -1087,7 +1137,7 @@ func (st *statement) SetSubstraitPlan(ctx context.Context, plan []byte) error {
 // The driver will call release on the passed in Record when it is done,
 // but it may not do this until the statement is closed or another
 // record is bound.
-func (st *statement) Bind(_ context.Context, values arrow.RecordBatch) error {
+func (st *statement) Bind(ctx context.Context, values arrow.RecordBatch) error {
 	if st.streamBind != nil {
 		st.streamBind.Release()
 		st.streamBind = nil
@@ -1096,10 +1146,22 @@ func (st *statement) Bind(_ context.Context, values arrow.RecordBatch) error {
 		st.bound = nil
 	}
 
-	st.bound = values
-	if st.bound != nil {
-		st.bound.Retain()
+	if values == nil {
+		return nil
 	}
+
+	schema, hasDictionary := arrowext.DictDecodeSchema(values.Schema())
+	if hasDictionary {
+		decoded, err := arrowext.DictDecodeRecordBatch(compute.WithAllocator(ctx, st.alloc), schema, values)
+		if err != nil {
+			return st.ErrorHelper.WrapInvalidArgument(err, "decode dictionary batch")
+		}
+		st.bound = decoded
+		return nil
+	}
+
+	st.bound = values
+	st.bound.Retain()
 	return nil
 }
 
@@ -1117,10 +1179,11 @@ func (st *statement) BindStream(_ context.Context, stream array.RecordReader) er
 		st.bound = nil
 	}
 
-	st.streamBind = stream
-	if st.streamBind != nil {
-		st.streamBind.Retain()
+	if stream == nil {
+		return nil
 	}
+
+	st.streamBind = arrowext.DictDecodeRecordReader(st.alloc, &st.ErrorHelper, stream)
 	return nil
 }
 
