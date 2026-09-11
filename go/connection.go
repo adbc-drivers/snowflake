@@ -115,7 +115,12 @@ func escapeSingleQuoteForLike(arg string) string {
 			return b.String()
 		}
 
-		if len(before) == 0 || before[len(before)-1] != '\\' {
+		backslashes := 0
+		for i := len(before) - 1; i >= 0 && before[i] == '\\'; i-- {
+			backslashes++
+		}
+		// Backslashes escape each other in pairs, so only an odd run escapes the quote.
+		if backslashes%2 == 0 {
 			b.WriteByte('\\')
 		}
 		b.WriteByte('\'')

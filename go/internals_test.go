@@ -35,6 +35,13 @@ func TestEscapeSingleQuoteForLike(t *testing.T) {
 		{"consecutive quotes", `ta''ble`, `ta\'\'ble`},
 		{"only consecutive quotes", `'''`, `\'\'\'`},
 		{"backslash before quote", `ta\'ble`, `ta\'ble`},
+		{"two backslashes before quote", `ta\\'ble`, `ta\\\'ble`},
+		{"three backslashes before quote", `ta\\\'ble`, `ta\\\'ble`},
+		{"four backslashes before quote", `ta\\\\'ble`, `ta\\\\\'ble`},
+		{"only two backslashes and quote", `\\'`, `\\\'`},
+		{"two backslashes before trailing quote", `ta\\'`, `ta\\\'`},
+		{"consecutive quotes after two backslashes", `ta\\''ble`, `ta\\\'\'ble`},
+		{"consecutive quotes after three backslashes", `ta\\\''ble`, `ta\\\'\'ble`},
 		{"quote after backslash-prefixed quote", `ta\''ble`, `ta\'\'ble`},
 	}
 	for _, tt := range tests {
