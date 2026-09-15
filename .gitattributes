@@ -12,20 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.vs
-.vscode
-.idea/
-bin
-obj
-x64
-*.dll
-*.lib
-*.obj
-*.exe
-*.csproj.user
-AdbcDrivers.Snowflake.sln.DotSettings.user
-*.pass
-
-artifacts/
-TestResults/
-packages/
+* text=auto eol=lf

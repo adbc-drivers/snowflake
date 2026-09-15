@@ -259,3 +259,7 @@ validation-report.xml
 
 # Git worktrees
 .worktrees/
+
+# Go shared library build artifacts
+go/libadbc_driver_snowflake.so
+go/libadbc_driver_snowflake.h
