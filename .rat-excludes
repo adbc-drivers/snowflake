@@ -21,4 +21,4 @@
 go/license.tpl
 go/validation/queries/*/*.json
 go/validation/queries/*/*.sql
-csharp/test/Interop/Resources/snowflakeconfig.json
+csharp/test/AdbcDrivers.Snowflake.Interop.Tests/Resources/snowflakeconfig.json

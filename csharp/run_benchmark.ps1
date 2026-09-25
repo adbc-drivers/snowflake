@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmark runner: native C# driver vs Go/Interop driver. Both projects expose an
+# Benchmark runner: C# driver vs Go/Interop driver. Both projects expose an
 # identically-shaped BenchmarkTests.BaselineQueryPerformance; this runs each suite 5
-# times and parses the per-limit timings (the [NATIVE]/[INTEROP] log lines).
+# times and parses the per-limit timings (the [CSHARP]/[INTEROP] log lines).
 
 $ErrorActionPreference = "Stop"
 
@@ -25,8 +25,8 @@ $ErrorActionPreference = "Stop"
 $repoRoot = $PSScriptRoot
 
 # Resolve project paths
-$nativeProject = Join-Path $repoRoot "test\Native\AdbcDrivers.Snowflake.Native.Tests.csproj"
-$interopProject = Join-Path $repoRoot "test\Interop\AdbcDrivers.Snowflake.Interop.Tests.csproj"
+$csharpProject = Join-Path $repoRoot "test\AdbcDrivers.Snowflake.Tests\AdbcDrivers.Snowflake.Tests.csproj"
+$interopProject = Join-Path $repoRoot "test\AdbcDrivers.Snowflake.Interop.Tests\AdbcDrivers.Snowflake.Interop.Tests.csproj"
 
 # Use an existing SNOWFLAKE_TEST_CONFIG_FILE environment variable if present.
 # Otherwise prompt the user for the config file.
@@ -46,13 +46,13 @@ Get-ChildItem $outDir -Filter *.txt -ErrorAction SilentlyContinue | Remove-Item 
 
 $runs = 5
 
-Write-Output "########## NATIVE (C#) driver — BenchmarkTests ##########"
+Write-Output "########## C# driver — BenchmarkTests ##########"
 for ($i = 1; $i -le $runs; $i++) {
-    Write-Output "---- native run $i/$runs ----"
-    dotnet test $nativeProject -c Release --no-build `
+    Write-Output "---- C# run $i/$runs ----"
+    dotnet test $csharpProject -c Release --no-build `
         --filter "FullyQualifiedName~BenchmarkTests.BaselineQueryPerformance" `
         --logger "console;verbosity=detailed" 2>&1 |
-        Tee-Object -FilePath "$outDir\native_$i.txt" | Out-Null
+        Tee-Object -FilePath "$outDir\csharp_$i.txt" | Out-Null
 }
 
 Write-Output "########## INTEROP (Go) driver — BenchmarkTests ##########"
@@ -113,14 +113,14 @@ function Show-Stats($name, $map) {
 Write-Output ""
 Write-Output "==================== RESULTS ===================="
 
-$nat = Get-Timings "native_*.txt"
+$nat = Get-Timings "csharp_*.txt"
 $intr = Get-Timings "interop_*.txt"
 
-Show-Stats "NATIVE (C#)" $nat
+Show-Stats "C#" $nat
 Show-Stats "INTEROP (Go)" $intr
 
 Write-Output ""
-Write-Output "===== mean comparison (native / interop) ====="
+Write-Output "===== mean comparison (C# / interop) ====="
 
 foreach ($limit in ($nat.Keys | Sort-Object)) {
     if ($intr.ContainsKey($limit)) {
@@ -128,7 +128,7 @@ foreach ($limit in ($nat.Keys | Sort-Object)) {
         $im = ($intr[$limit] | Measure-Object -Average).Average
         $ratio = [math]::Round($nm / $im, 2)
 
-        Write-Output ("limit {0,8}: native {1,7} ms  vs  interop {2,7} ms   ratio={3}x" -f $limit, [math]::Round($nm, 0), [math]::Round($im, 0), $ratio)
+        Write-Output ("limit {0,8}: C# {1,7} ms  vs  interop {2,7} ms   ratio={3}x" -f $limit, [math]::Round($nm, 0), [math]::Round($im, 0), $ratio)
     }
 }
 
