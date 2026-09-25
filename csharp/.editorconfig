@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# EditorConfig for the C# workspace: the native Snowflake driver and its tests.
+# EditorConfig for the C# workspace: the C# Snowflake driver and its tests.
 #
 # Layout rules (whitespace, line endings, brace placement) are enforced so `dotnet format`
 # is deterministic. Semantic style preferences (var, expression bodies) are documented at
