@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <VersionPrefix>0.0.0</VersionPrefix> <!-- x-release-please-version -->
+    <PackageId>AdbcDrivers.Snowflake</PackageId>
     <PackageReadmeFile>readme.md</PackageReadmeFile>
     <Description>C# Snowflake driver for Apache Arrow ADBC</Description>
   </PropertyGroup>
@@ -25,6 +27,11 @@
       <Pack>true</Pack>
       <PackagePath>\</PackagePath>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(RepoRoot)NOTICE.txt">
+      <Pack>true</Pack>
+      <PackagePath>\</PackagePath>
+      <Visible>false</Visible>
     </Content>
   </ItemGroup>
 </Project>

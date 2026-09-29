@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "pull-request-title-pattern": "chore(csharp): release${component} ${version}",
+  "packages": {
+    "csharp/src/AdbcDrivers.Snowflake": {
+      "release-type": "simple",
+      "component": "dotnet",
+      "tag-separator": "/",
+      "extra-files": [
+        "AdbcDrivers.Snowflake.csproj"
+      ]
+    }
+  }
+}

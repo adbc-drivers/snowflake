@@ -22,3 +22,6 @@ go/license.tpl
 go/validation/queries/*/*.json
 go/validation/queries/*/*.sql
 csharp/test/AdbcDrivers.Snowflake.Interop.Tests/Resources/snowflakeconfig.json
+csharp/src/AdbcDrivers.Snowflake/CHANGELOG.md
+.release-please-manifest.json
+release-please-config.json

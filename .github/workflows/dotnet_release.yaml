@@ -1,0 +1,81 @@
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds and publishes AdbcDrivers.Snowflake once dotnet_tag.yaml (release-please)
+# has cut a dotnet/v* tag. Packing has no secrets; publishing only runs after
+# approval on the nuget-release environment and authenticates to nuget.org via
+# short-lived OIDC-issued trusted publishing, never a stored API key.
+name: Dotnet Release
+
+on:
+  push:
+    tags:
+      - 'dotnet/v*'
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - run: dotnet pack csharp/src/AdbcDrivers.Snowflake/AdbcDrivers.Snowflake.csproj -c Release -o artifacts -p:VersionSuffix=
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nuget-package
+          path: artifacts/*.nupkg
+
+  publish:
+    needs: pack
+    runs-on: ubuntu-latest
+    environment: nuget-release
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nuget-package
+          path: artifacts
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'artifacts/*.nupkg'
+
+      - uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
+        id: nuget-login
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+
+      # release-please already created the GitHub release for this tag; attach the package to it.
+      - run: gh release upload "${GITHUB_REF_NAME}" artifacts/*.nupkg --repo "${GITHUB_REPOSITORY}"
+        env:
+          GH_TOKEN: ${{ github.token }}

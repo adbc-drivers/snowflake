@@ -66,6 +66,25 @@ $ pixi run gendocs --output generated/
 
 Then look at `./generated/snowflake.md`.
 
+### C#
+
+For basic development, the driver can be built and tested like any .NET project. From the
+`csharp/` subdirectory:
+
+```shell
+$ dotnet build
+$ dotnet test test/AdbcDrivers.Snowflake.Tests --filter "Category=Unit"
+```
+
+Integration tests require a live Snowflake account; see [the driver
+readme](./csharp/src/AdbcDrivers.Snowflake/readme.md#testing) for the config format.
+
+To build the NuGet package locally:
+
+```shell
+$ dotnet pack src/AdbcDrivers.Snowflake/AdbcDrivers.Snowflake.csproj -c Release
+```
+
 ## Opening a Pull Request
 
 Before opening a pull request:
