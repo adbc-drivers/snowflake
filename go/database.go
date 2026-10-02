@@ -125,6 +125,8 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return strconv.FormatFloat(d.cfg.LoginTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionRequestTimeout:
 		return strconv.FormatFloat(d.cfg.RequestTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
+	case OptionMaxRetryCount:
+		return strconv.Itoa(d.cfg.MaxRetryCount), nil
 	case OptionJwtExpireTimeout:
 		return strconv.FormatFloat(d.cfg.JWTExpireTimeout.Seconds(), 'f', -1, 64), nil //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
 	case OptionClientTimeout:
@@ -331,6 +333,15 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 			dur = -dur
 		}
 		d.cfg.RequestTimeout = dur //nolint:staticcheck,nolintlint // ignore snowflake deprecated warnings for now
+	case OptionMaxRetryCount:
+		count, err := strconv.Atoi(v)
+		if err != nil || count < 0 {
+			return adbc.Error{
+				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s' (expected a non-negative integer)", OptionMaxRetryCount, v),
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		d.cfg.MaxRetryCount = count
 	case OptionJwtExpireTimeout:
 		dur, err := time.ParseDuration(v)
 		if err != nil {

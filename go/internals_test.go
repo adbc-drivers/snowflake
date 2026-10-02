@@ -15,10 +15,35 @@
 package snowflake
 
 import (
+	"context"
 	"testing"
 
+	"github.com/snowflakedb/gosnowflake/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestSetOptionInternal_MaxRetryCount(t *testing.T) {
+	db := &databaseImpl{cfg: &gosnowflake.Config{}}
+	ctx := context.Background()
+
+	// unset: 0 means "use the gosnowflake default"
+	v, err := db.GetOption(ctx, OptionMaxRetryCount)
+	require.NoError(t, err)
+	require.Equal(t, "0", v)
+
+	require.NoError(t, db.SetOptionInternal(OptionMaxRetryCount, "50", nil))
+	require.Equal(t, 50, db.cfg.MaxRetryCount)
+	v, err = db.GetOption(ctx, OptionMaxRetryCount)
+	require.NoError(t, err)
+	require.Equal(t, "50", v)
+
+	for _, bad := range []string{"-1", "abc", "1.5", ""} {
+		err := db.SetOptionInternal(OptionMaxRetryCount, bad, nil)
+		require.Error(t, err, "value %q", bad)
+		require.Equal(t, 50, db.cfg.MaxRetryCount, "invalid value %q must not change the setting", bad)
+	}
+}
 
 func TestEscapeSingleQuoteForLike(t *testing.T) {
 	tests := []struct {

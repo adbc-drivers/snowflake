@@ -208,6 +208,17 @@ Examples:
   response. Uses Go's [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration)
   format; negative values are treated as their absolute value.
 
+`adbc.snowflake.sql.client_option.max_retry_count`
+: **Type:** non-negative integer. **Default:** 7
+
+  The maximum number of times each HTTP request is retried after a retryable
+  failure, such as an HTTP 503. The count is per request; 7 retries allow up to
+  8 attempts. An unset value or `0` keeps the gosnowflake default of 7.
+
+  Retries stop when either this count or the applicable `request_timeout` or
+  `login_timeout` expires. To retry for a time budget rather than a practical
+  count limit, set a high retry count together with the applicable timeout.
+
 `adbc.snowflake.sql.client_option.ocsp_fail_open_mode`
 : **Type:** boolean. **Default:** true (fail-open)
 
