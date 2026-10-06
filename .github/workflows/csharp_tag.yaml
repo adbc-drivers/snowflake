@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # Watches conventional-commit pushes to main and maintains a release PR for
-# AdbcDrivers.Snowflake. Merging that PR is what creates the dotnet/v* tag
-# and GitHub release that dotnet_release.yaml then builds and publishes.
-name: Dotnet Tag
+# AdbcDrivers.Snowflake. Merging that PR is what creates the csharp/v* tag
+# and GitHub release that csharp_release.yaml then builds and publishes.
+name: Csharp Tag
 
 on:
   push:
@@ -25,8 +25,8 @@ on:
       - 'csharp/src/AdbcDrivers.Snowflake/**'
       - 'csharp/Directory.Build.props'
       - 'release-please-config.json'
-      - '.github/workflows/dotnet_tag.yaml'
-      - '.github/workflows/dotnet_release.yaml'
+      - '.github/workflows/csharp_tag.yaml'
+      - '.github/workflows/csharp_release.yaml'
   workflow_dispatch: {}
 
 permissions:

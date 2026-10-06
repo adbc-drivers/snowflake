@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Builds and publishes AdbcDrivers.Snowflake once dotnet_tag.yaml (release-please)
-# has cut a dotnet/v* tag. Packing has no secrets; publishing only runs after
+# Builds and publishes AdbcDrivers.Snowflake once csharp_tag.yaml (release-please)
+# has cut a csharp/v* tag. Packing has no secrets; publishing only runs after
 # approval on the nuget-release environment and authenticates to nuget.org via
 # short-lived OIDC-issued trusted publishing, never a stored API key.
-name: Dotnet Release
+name: Csharp Release
 
 on:
   push:
     tags:
-      - 'dotnet/v*'
+      - 'csharp/v*'
 
 permissions:
   contents: read
