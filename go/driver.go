@@ -81,7 +81,8 @@ const (
 	// "300ms", "1.5s" or "1m30s". ParseDuration accepts negative values
 	// but the absolute value will be used.
 	OptionClientTimeout = "adbc.snowflake.sql.client_option.client_timeout"
-	// Don't interpret filters as wildcards in GetObjects.
+	// OptionDisableWildcards changes GetObjects to filter without
+	// interpreting % or _ as wildcards (but it remains case-insensitive).
 	OptionDisableWildcards = "adbc.connection.get_objects.disable_wildcards"
 	// OptionUseHighPrecision controls the data type used for NUMBER columns
 	// using a FIXED size data type. By default, this is enabled and NUMBER
