@@ -108,6 +108,11 @@ Examples:
 
 ### Connection Options
 
+`adbc.connection.get_objects.disable_wildcards`
+: **Type:** boolean. **Default:** false
+
+  Match GetObjects filters literally and case-sensitively; may improve performance, especially if your namespace names contain underscores.
+
 `adbc.snowflake.sql.account`
 : **Type:** string
 

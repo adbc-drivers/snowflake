@@ -184,7 +184,7 @@ func addStartsWith(query *strings.Builder, pattern *string, disableWildcards boo
 	if !disableWildcards || pattern == nil || len(*pattern) == 0 {
 		return
 	}
-	fmt.Fprintf(query, " STARTS WITH '%s'", escapeSingleQuoteForLike(*pattern))
+	fmt.Fprintf(query, " STARTS WITH '%s'", strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(*pattern))
 }
 
 func showTerseQuery(objType string, catalog, dbSchema, tableName *string, disableWildcards bool) (string, error) {
@@ -456,6 +456,10 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			Ordinal: i + 1,
 			Value:   arg.Value,
 		}
+	}
+
+	if c.disableWildcards {
+		query = strings.ReplaceAll(query, " ILIKE ", " LIKE ")
 	}
 
 	var rows driver.Rows

@@ -263,3 +263,25 @@ func TestMetadataPatternArg(t *testing.T) {
 		})
 	}
 }
+
+func TestAddStartsWith(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		pattern *string
+		want    string
+	}{
+		{"nil", nil, ""},
+		{"empty", new(""), ""},
+		{"wildcard characters", new("a_%!"), " STARTS WITH 'a_%!'"},
+		{"quote and backslash", new(`a\n'b`), ` STARTS WITH 'a\\n''b'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var query strings.Builder
+			addStartsWith(&query, tt.pattern, true)
+			assert.Equal(t, tt.want, query.String())
+			query.Reset()
+			addStartsWith(&query, tt.pattern, false)
+			assert.Empty(t, query.String())
+		})
+	}
+}

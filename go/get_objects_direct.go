@@ -63,7 +63,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 			return buildGetObjectsResult(c.Alloc)
 		}
 		if specificCatalog {
-			specificSchema := dbSchema != nil && (c.disableWildcards || !isWildcardStr(*dbSchema))
+			specificSchema := dbSchema != nil && (c.disableWildcards || !isWildcardStr(*dbSchema)) && (!c.disableWildcards || *dbSchema != "")
 			return c.getObjectsTablesDirect(ctx, *catalog, dbSchema, tableName, tableType, specificSchema)
 		}
 	}
@@ -254,7 +254,6 @@ func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pat
 	query.WriteString(objType)
 	addLike(&query, pattern, c.disableWildcards)
 	query.WriteString(suffix)
-	addStartsWith(&query, pattern, c.disableWildcards)
 
 	rows, err := c.cn.QueryContext(ctx, query.String(), nil)
 	if err != nil {
@@ -268,7 +267,20 @@ func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pat
 		err = errors.Join(err, rows.Close())
 	}()
 
-	return readTableEntries(rows)
+	entries, err = readTableEntries(rows)
+	if err != nil {
+		return nil, err
+	}
+	if c.disableWildcards && pattern != nil {
+		matched := entries[:0]
+		for _, entry := range entries {
+			if entry.tableName == *pattern {
+				matched = append(matched, entry)
+			}
+		}
+		entries = matched
+	}
+	return entries, nil
 }
 
 func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
@@ -323,7 +335,6 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 	query.WriteString(objSchemas)
 	addLike(&query, pattern, c.disableWildcards)
 	query.WriteString(suffix)
-	addStartsWith(&query, pattern, c.disableWildcards)
 
 	rows, err := c.cn.QueryContext(ctx, query.String(), nil)
 	if err != nil {
@@ -371,7 +382,9 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 		if dbIdx >= 0 {
 			entry.dbName = dest[dbIdx].(string)
 		}
-		entries = append(entries, entry)
+		if !c.disableWildcards || pattern == nil || entry.schemaName == *pattern {
+			entries = append(entries, entry)
+		}
 	}
 
 	return entries, nil
