@@ -28,6 +28,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// With GetObjects and disableWildcards, we can try to take a more optimized path
+
 const (
 	keyColumns        = `"database_name", "schema_name", "table_name", "constraint_name", "column_name", "key_sequence"`
 	fkColumns         = `"fk_database_name", "fk_schema_name", "fk_table_name", "fk_name", "fk_column_name", "pk_database_name", "pk_schema_name", "pk_table_name", "pk_column_name", "key_sequence"`
