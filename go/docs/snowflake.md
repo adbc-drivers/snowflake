@@ -358,8 +358,10 @@ Examples:
 `adbc.snowflake.rpc.prefetch_concurrency`
 : **Type:** int. **Default:** 5
 
-  The max number of result streams to fetch in parallel. Each stream buffers up
-  to `adbc.rpc.result_queue_size` batches.
+  The max number of result streams to prefetch, including downloaded streams
+  waiting to be consumed. A stream keeps its slot until the consumer drains
+  it, even after its download has completed. Each stream queues up to
+  `adbc.rpc.result_queue_size` batches.
 
   Can be set on the statement.
 
