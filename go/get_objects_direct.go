@@ -49,7 +49,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 	tableType []string,
 	hasViews, hasTables bool,
 ) (array.RecordReader, error) {
-	specificCatalog := catalog != nil && !isWildcardStr(*catalog)
+	specificCatalog := catalog != nil && (c.disableWildcards || !isWildcardStr(*catalog))
 
 	switch depth {
 	case adbc.ObjectDepthDBSchemas:
@@ -63,7 +63,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 			return buildGetObjectsResult(c.Alloc)
 		}
 		if specificCatalog {
-			specificSchema := dbSchema != nil && !isWildcardStr(*dbSchema)
+			specificSchema := dbSchema != nil && (c.disableWildcards || !isWildcardStr(*dbSchema))
 			return c.getObjectsTablesDirect(ctx, *catalog, dbSchema, tableName, tableType, specificSchema)
 		}
 	}
@@ -249,11 +249,14 @@ func showObjType(tableType []string) string {
 // execShowTables executes a SHOW TERSE command for tables/objects/views
 // and reads the results directly into a slice.
 func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pattern *string, suffix string) (entries []tableEntry, err error) {
-	query := "SHOW TERSE /* ADBC:getObjects */ " + objType
-	query = addLike(query, pattern)
-	query += suffix
+	var query strings.Builder
+	query.WriteString("SHOW TERSE /* ADBC:getObjects */ ")
+	query.WriteString(objType)
+	addLike(&query, pattern, c.disableWildcards)
+	query.WriteString(suffix)
+	addStartsWith(&query, pattern, c.disableWildcards)
 
-	rows, err := c.cn.QueryContext(ctx, query, nil)
+	rows, err := c.cn.QueryContext(ctx, query.String(), nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
 		if errors.As(err, &sfErr) && sfErr.Number == 2043 {
@@ -315,11 +318,14 @@ func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
 
 // execShowSchemas executes a SHOW TERSE SCHEMAS command and reads the results directly.
 func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) (_ []schemaEntry, err error) {
-	query := "SHOW TERSE /* ADBC:getObjects */ " + objSchemas
-	query = addLike(query, pattern)
-	query += suffix
+	var query strings.Builder
+	query.WriteString("SHOW TERSE /* ADBC:getObjects */ ")
+	query.WriteString(objSchemas)
+	addLike(&query, pattern, c.disableWildcards)
+	query.WriteString(suffix)
+	addStartsWith(&query, pattern, c.disableWildcards)
 
-	rows, err := c.cn.QueryContext(ctx, query, nil)
+	rows, err := c.cn.QueryContext(ctx, query.String(), nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
 		// error code 2043 is what you get when a `SHOW` command doesn't match

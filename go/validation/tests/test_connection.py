@@ -62,3 +62,51 @@ class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
                             excinfo.value.status_code
                             == adbc_driver_manager.AdbcStatusCode.NOT_IMPLEMENTED
                         )
+
+    def test_get_objects_disable_wildcards(
+        self, driver, conn, get_objects_table
+    ) -> None:
+        # if we use %, this should return all objects normally and no objects otherwise
+        objects = (
+            conn.adbc_get_objects(
+                depth="all",
+                catalog_filter="%",
+                db_schema_filter="%",
+                table_name_filter="%",
+            )
+            .read_all()
+            .to_pylist()
+        )
+        tables = [
+            (obj["catalog_name"], schema["db_schema_name"], table["table_name"])
+            for obj in objects
+            for schema in obj["catalog_db_schemas"]
+            for table in schema["db_schema_tables"]
+        ]
+        assert get_objects_table in tables
+
+        conn.adbc_connection.set_options(
+            **{"adbc.connection.get_objects.disable_wildcards": True}
+        )
+        try:
+            objects = (
+                conn.adbc_get_objects(
+                    depth="all",
+                    catalog_filter="%",
+                    db_schema_filter="%",
+                    table_name_filter="%",
+                )
+                .read_all()
+                .to_pylist()
+            )
+            tables = [
+                (obj["catalog_name"], schema["db_schema_name"], table["table_name"])
+                for obj in objects
+                for schema in obj["catalog_db_schemas"]
+                for table in schema["db_schema_tables"]
+            ]
+            assert tables == []
+        finally:
+            conn.adbc_connection.set_options(
+                **{"adbc.connection.get_objects.disable_wildcards": False}
+            )
