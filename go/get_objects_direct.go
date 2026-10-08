@@ -18,7 +18,6 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 
@@ -50,7 +49,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 	tableType []string,
 	hasViews, hasTables bool,
 ) (array.RecordReader, error) {
-	specificCatalog := catalog != nil && !isWildcardStr(*catalog)
+	specificCatalog := catalog != nil && (c.disableWildcards || !isWildcardStr(*catalog))
 
 	switch depth {
 	case adbc.ObjectDepthDBSchemas:
@@ -64,7 +63,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 			return buildGetObjectsResult(c.Alloc)
 		}
 		if specificCatalog {
-			specificSchema := dbSchema != nil && !isWildcardStr(*dbSchema)
+			specificSchema := dbSchema != nil && (c.disableWildcards || !isWildcardStr(*dbSchema))
 			return c.getObjectsTablesDirect(ctx, *catalog, dbSchema, tableName, tableType, specificSchema)
 		}
 	}
@@ -253,8 +252,9 @@ func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pat
 	var query strings.Builder
 	query.WriteString("SHOW TERSE /* ADBC:getObjects */ ")
 	query.WriteString(objType)
-	addLike(&query, pattern, false)
+	addLike(&query, pattern, c.disableWildcards)
 	query.WriteString(suffix)
+	addStartsWith(&query, pattern, c.disableWildcards)
 
 	rows, err := c.cn.QueryContext(ctx, query.String(), nil)
 	if err != nil {
@@ -298,21 +298,17 @@ func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
 		}
 
 		entry := tableEntry{}
-		for _, field := range []struct {
-			index int
-			value *string
-		}{
-			{nameIdx, &entry.tableName}, {kindIdx, &entry.tableType},
-			{dbIdx, &entry.dbName}, {schIdx, &entry.schemaName},
-		} {
-			if field.index < 0 || dest[field.index] == nil {
-				continue
-			}
-			value, ok := dest[field.index].(string)
-			if !ok {
-				return nil, errToAdbcErr(adbc.StatusInvalidData, fmt.Errorf("unexpected SHOW %s value of type %T", cols[field.index], dest[field.index]))
-			}
-			*field.value = value
+		if nameIdx >= 0 {
+			entry.tableName = dest[nameIdx].(string)
+		}
+		if kindIdx >= 0 {
+			entry.tableType = dest[kindIdx].(string)
+		}
+		if dbIdx >= 0 {
+			entry.dbName = dest[dbIdx].(string)
+		}
+		if schIdx >= 0 {
+			entry.schemaName = dest[schIdx].(string)
 		}
 		entries = append(entries, entry)
 	}
@@ -325,8 +321,9 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 	var query strings.Builder
 	query.WriteString("SHOW TERSE /* ADBC:getObjects */ ")
 	query.WriteString(objSchemas)
-	addLike(&query, pattern, false)
+	addLike(&query, pattern, c.disableWildcards)
 	query.WriteString(suffix)
+	addStartsWith(&query, pattern, c.disableWildcards)
 
 	rows, err := c.cn.QueryContext(ctx, query.String(), nil)
 	if err != nil {
