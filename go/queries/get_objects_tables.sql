@@ -31,7 +31,7 @@ SELECT
         'table_columns': null
     }) db_schema_tables
 FROM TABLE(RESULT_SCAN(:SHOW_TABLE_QUERY_ID))
-WHERE "database_name" ILIKE :CATALOG AND "schema_name" ILIKE :DB_SCHEMA AND "name" ILIKE :TABLE
+WHERE "database_name" ILIKE :CATALOG ESCAPE '!' AND "schema_name" ILIKE :DB_SCHEMA ESCAPE '!' AND "name" ILIKE :TABLE ESCAPE '!'
 GROUP BY "database_name", "schema_name"
 ),
 db_schemas AS (
@@ -42,7 +42,7 @@ db_schemas AS (
     FROM TABLE(RESULT_SCAN(:SHOW_SCHEMA_QUERY_ID))
     LEFT JOIN tables
     ON "database_name" = "catalog_name" AND "name" = tables."schema_name"
-    WHERE "database_name" ILIKE :CATALOG AND "name" ILIKE :DB_SCHEMA
+    WHERE "database_name" ILIKE :CATALOG ESCAPE '!' AND "name" ILIKE :DB_SCHEMA ESCAPE '!'
 )
 SELECT
     {
@@ -56,5 +56,5 @@ FROM
     TABLE(RESULT_SCAN(:SHOW_DB_QUERY_ID))
 LEFT JOIN db_schemas
 ON "name" = "catalog_name"
-WHERE "name" ILIKE :CATALOG
+WHERE "name" ILIKE :CATALOG ESCAPE '!'
 GROUP BY "name";

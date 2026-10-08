@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"io"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +81,7 @@ type connectionImpl struct {
 	ctor driver.Connector
 
 	activeTransaction     bool
+	disableWildcards      bool
 	useHighPrecision      bool
 	streamRetryEnabled    bool
 	geographyOutputFormat string
@@ -134,7 +134,7 @@ const (
 	errObjectNotFound = 2003 // the scoped object does not exist or is not authorized
 )
 
-func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string, alsoEmptyOn ...int) (string, error) {
+func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string) (string, error) {
 	rows, err := driverConn.QueryContext(ctx, query, nil)
 	if err != nil {
 		var sfErr *gosnowflake.SnowflakeError
@@ -143,11 +143,12 @@ func getQueryID(ctx context.Context, query string, driverConn driver.QueryerCont
 		// missing scoped object degrades to an empty result instead of failing
 		// the whole GetObjects call. Substitute emptyQuery so RESULT_SCAN has a
 		// valid (empty) source to read from.
+		// 2003: this is not found or not authorized => skip
 		if emptyQuery != "" && errors.As(err, &sfErr) &&
-			(sfErr.Number == errShowNoMatch || slices.Contains(alsoEmptyOn, sfErr.Number)) {
+			(sfErr.Number == errShowNoMatch || sfErr.Number == errObjectNotFound) {
 			return getQueryID(ctx, emptyQuery, driverConn, "")
 		}
-		return "", err
+		return "", errToAdbcErr(adbc.StatusUnknown, err)
 	}
 
 	return rows.(gosnowflake.SnowflakeRows).GetQueryID(), rows.Close()
@@ -161,47 +162,74 @@ const (
 	objObjects   = "OBJECTS"
 )
 
-func addLike(query string, pattern *string) string {
-	if pattern != nil && len(*pattern) > 0 && *pattern != "%" && *pattern != ".*" {
-		query += " LIKE '" + escapeSingleQuoteForLike(*pattern) + "'"
+// metadataPatternArg builds a pattern for ILIKE predicates using ESCAPE '!'.
+func metadataPatternArg(name string, pattern *string, disableWildcards bool) sql.NamedArg {
+	if pattern == nil {
+		return sql.Named(name, "%")
 	}
-	return query
+	if disableWildcards {
+		return sql.Named(name, strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(*pattern))
+	}
+	return sql.Named(name, strings.ReplaceAll(*pattern, "!", "!!"))
 }
 
-func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, catalog, dbSchema, tableName *string, outQueryID *string) {
-	grp.Go(func() error {
-		query := "SHOW TERSE /* ADBC:getObjects */ " + objType
-		emptyQuery := "SHOW TERSE /* ADBC:getObjects */ " + objType + " LIKE ''"
-		switch objType {
-		case objDatabases:
-			query = addLike(query, catalog)
-			query += " IN ACCOUNT"
-		case objSchemas:
-			query = addLike(query, dbSchema)
+func addLike(query *strings.Builder, pattern *string, disableWildcards bool) {
+	if disableWildcards || pattern == nil || len(*pattern) == 0 || *pattern == "%" || *pattern == ".*" {
+		return
+	}
+	fmt.Fprintf(query, " LIKE '%s'", escapeSingleQuoteForLike(*pattern))
+}
 
-			if catalog == nil || isWildcardStr(*catalog) {
-				query += " IN ACCOUNT"
-			} else {
-				query += " IN DATABASE " + quoteIdentifier(*catalog)
-			}
-		case objViews, objTables, objObjects:
-			query = addLike(query, tableName)
+func addStartsWith(query *strings.Builder, pattern *string, disableWildcards bool) {
+	if !disableWildcards || pattern == nil || len(*pattern) == 0 {
+		return
+	}
+	fmt.Fprintf(query, " STARTS WITH '%s'", escapeSingleQuoteForLike(*pattern))
+}
 
-			if catalog == nil || isWildcardStr(*catalog) {
-				query += " IN ACCOUNT"
-			} else {
-				escapedCatalog := quoteIdentifier(*catalog)
-				if dbSchema == nil || isWildcardStr(*dbSchema) {
-					query += " IN DATABASE " + escapedCatalog
-				} else {
-					query += " IN SCHEMA " + escapedCatalog + "." + quoteIdentifier(*dbSchema)
-				}
-			}
-		default:
-			return fmt.Errorf("unimplemented object type")
+func showTerseQuery(objType string, catalog, dbSchema, tableName *string, disableWildcards bool) (string, error) {
+	var query strings.Builder
+	query.WriteString("SHOW TERSE /* ADBC:getObjects */ ")
+	query.WriteString(objType)
+	switch objType {
+	case objDatabases:
+		addLike(&query, catalog, disableWildcards)
+		query.WriteString(" IN ACCOUNT")
+		addStartsWith(&query, catalog, disableWildcards)
+	case objSchemas:
+		addLike(&query, dbSchema, disableWildcards)
+		if catalog == nil || (!disableWildcards && isWildcardStr(*catalog)) {
+			query.WriteString(" IN ACCOUNT")
+		} else {
+			fmt.Fprintf(&query, " IN DATABASE %s", quoteIdentifier(*catalog))
 		}
+		addStartsWith(&query, dbSchema, disableWildcards)
+	case objViews, objTables, objObjects:
+		addLike(&query, tableName, disableWildcards)
+		if catalog == nil || (!disableWildcards && isWildcardStr(*catalog)) {
+			query.WriteString(" IN ACCOUNT")
+		} else {
+			escapedCatalog := quoteIdentifier(*catalog)
+			if dbSchema == nil || (!disableWildcards && isWildcardStr(*dbSchema)) {
+				fmt.Fprintf(&query, " IN DATABASE %s", escapedCatalog)
+			} else {
+				fmt.Fprintf(&query, " IN SCHEMA %s.%s", escapedCatalog, quoteIdentifier(*dbSchema))
+			}
+		}
+		addStartsWith(&query, tableName, disableWildcards)
+	default:
+		return "", fmt.Errorf("unimplemented object type")
+	}
+	return query.String(), nil
+}
 
-		var err error
+func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, catalog, dbSchema, tableName *string, disableWildcards bool, outQueryID *string) {
+	grp.Go(func() error {
+		emptyQuery := "SHOW TERSE /* ADBC:getObjects */ " + objType + " LIKE ''"
+		query, err := showTerseQuery(objType, catalog, dbSchema, tableName, disableWildcards)
+		if err != nil {
+			return err
+		}
 		*outQueryID, err = getQueryID(ctx, query, conn, emptyQuery)
 		return err
 	})
@@ -240,7 +268,20 @@ func scopeIdentifier(ident *string) (string, bool) {
 // reached only through '_'-as-wildcard matches, or through a case-insensitive
 // pattern that differs from the stored identifier, may report a NULL
 // xdbc_column_size, matching the behavior before this enrichment was added.
-func showColumnsScope(catalog, dbSchema, tableName *string) string {
+func showColumnsScope(catalog, dbSchema, tableName *string, disableWildcards bool) string {
+	if disableWildcards {
+		if catalog == nil || *catalog == "" {
+			return " IN ACCOUNT"
+		}
+		if dbSchema == nil || *dbSchema == "" {
+			return " IN DATABASE " + quoteIdentifier(*catalog)
+		}
+		if tableName == nil || *tableName == "" {
+			return " IN SCHEMA " + quoteIdentifier(*catalog) + "." + quoteIdentifier(*dbSchema)
+		}
+		return " IN TABLE " + quoteIdentifier(*catalog) + "." + quoteIdentifier(*dbSchema) + "." + quoteIdentifier(*tableName)
+	}
+
 	cat, ok := scopeIdentifier(catalog)
 	if !ok {
 		return " IN ACCOUNT"
@@ -297,19 +338,19 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 	case adbc.ObjectDepthCatalogs:
 		query = queryGetObjectsTerseCatalogs
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
-			catalog, dbSchema, tableName, &terseDbQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &terseDbQueryID)
 	case adbc.ObjectDepthDBSchemas:
 		query = queryGetObjectsDbSchemas
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
-			catalog, dbSchema, tableName, &showSchemaQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
-			catalog, dbSchema, tableName, &terseDbQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &terseDbQueryID)
 	case adbc.ObjectDepthTables:
 		query = queryGetObjectsTables
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
-			catalog, dbSchema, tableName, &showSchemaQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &showSchemaQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
-			catalog, dbSchema, tableName, &terseDbQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &terseDbQueryID)
 
 		objType := objObjects
 		if len(tableType) == 1 {
@@ -321,18 +362,18 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		}
 
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
-			catalog, dbSchema, tableName, &tableQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &tableQueryID)
 	default:
 		var suffix string
-		if catalog == nil || isWildcardStr(*catalog) {
+		if catalog == nil || (!c.disableWildcards && isWildcardStr(*catalog)) {
 			suffix = " IN ACCOUNT"
 		} else {
 			escapedCatalog := quoteIdentifier(*catalog)
-			if dbSchema == nil || isWildcardStr(*dbSchema) {
+			if dbSchema == nil || (!c.disableWildcards && isWildcardStr(*dbSchema)) {
 				suffix = " IN DATABASE " + escapedCatalog
 			} else {
 				escapedSchema := quoteIdentifier(*dbSchema)
-				if tableName == nil || isWildcardStr(*tableName) {
+				if tableName == nil || (!c.disableWildcards && isWildcardStr(*tableName)) {
 					suffix = " IN SCHEMA " + escapedCatalog + "." + escapedSchema
 				} else {
 					escapedTable := quoteIdentifier(*tableName)
@@ -341,33 +382,37 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			}
 		}
 
+		emptyPkUkQuery := `SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "constraint_name", NULL::VARCHAR AS "column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE`
+		emptyFkQuery := `SELECT NULL::VARCHAR AS "fk_database_name", NULL::VARCHAR AS "fk_schema_name", NULL::VARCHAR AS "fk_table_name", NULL::VARCHAR AS "fk_name", NULL::VARCHAR AS "fk_column_name", NULL::VARCHAR AS "pk_database_name", NULL::VARCHAR AS "pk_schema_name", NULL::VARCHAR AS "pk_table_name", NULL::VARCHAR AS "pk_column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE`
+		emptyColumnsQuery := `SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "column_name", NULL::VARCHAR AS "data_type" WHERE FALSE`
+
 		// Detailed constraint info not available in information_schema
 		// Need to dispatch SHOW queries and use conn.Raw to extract the queryID for reuse in GetObjects query
 		gQueryIDs.Go(func() (err error) {
-			pkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */"+suffix, conn, "")
+			pkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */"+suffix, conn, emptyPkUkQuery)
 			return err
 		})
 
 		gQueryIDs.Go(func() (err error) {
-			fkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */"+suffix, conn, "")
+			fkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */"+suffix, conn, emptyFkQuery)
 			return err
 		})
 
 		gQueryIDs.Go(func() (err error) {
-			uniqueQueryID, err = getQueryID(gQueryIDsCtx, "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */"+suffix, conn, "")
+			uniqueQueryID, err = getQueryID(gQueryIDsCtx, "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */"+suffix, conn, emptyPkUkQuery)
 			return err
 		})
 
-		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName)
+		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName, c.disableWildcards)
 		gQueryIDs.Go(func() (err error) {
-			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+columnsSuffix, conn, "SHOW COLUMNS /* ADBC:getObjects */ LIKE '' IN ACCOUNT", errObjectNotFound)
+			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+columnsSuffix, conn, emptyColumnsQuery)
 			return err
 		})
 
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
-			catalog, dbSchema, tableName, &terseDbQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &terseDbQueryID)
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
-			catalog, dbSchema, tableName, &showSchemaQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &showSchemaQueryID)
 
 		objType := objObjects
 		if len(tableType) == 1 {
@@ -378,7 +423,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			}
 		}
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
-			catalog, dbSchema, tableName, &tableQueryID)
+			catalog, dbSchema, tableName, c.disableWildcards, &tableQueryID)
 	}
 
 	// Need constraint subqueries to complete before we can query GetObjects
@@ -388,10 +433,10 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 
 	args := []sql.NamedArg{
 		// Optional filter patterns
-		driverbase.PatternToNamedArg("CATALOG", catalog),
-		driverbase.PatternToNamedArg("DB_SCHEMA", dbSchema),
-		driverbase.PatternToNamedArg("TABLE", tableName),
-		driverbase.PatternToNamedArg("COLUMN", columnName),
+		metadataPatternArg("CATALOG", catalog, c.disableWildcards),
+		metadataPatternArg("DB_SCHEMA", dbSchema, c.disableWildcards),
+		metadataPatternArg("TABLE", tableName, c.disableWildcards),
+		metadataPatternArg("COLUMN", columnName, c.disableWildcards),
 
 		// QueryIDs for constraint data if depth is tables or deeper
 		// or if the depth is catalog and catalog is null
@@ -939,6 +984,25 @@ func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition 
 
 func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
 	switch key {
+	case OptionDisableWildcards:
+		if c.disableWildcards {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionUseHighPrecision:
+		if c.useHighPrecision {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionStreamRetryEnabled:
+		if c.streamRetryEnabled {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
+	case OptionGeographyOutputFormat:
+		return c.geographyOutputFormat, nil
+	case OptionGeometryOutputFormat:
+		return c.geometryOutputFormat, nil
 	default:
 		return c.Base().GetOption(ctx, key)
 	}
@@ -946,6 +1010,19 @@ func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, err
 
 func (c *connectionImpl) SetOption(ctx context.Context, key, value string) error {
 	switch key {
+	case OptionDisableWildcards:
+		switch value {
+		case adbc.OptionValueEnabled:
+			c.disableWildcards = true
+		case adbc.OptionValueDisabled:
+			c.disableWildcards = false
+		default:
+			return adbc.Error{
+				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+		return nil
 	case OptionUseHighPrecision:
 		// statements will inherit the value of the OptionUseHighPrecision
 		// from the connection, but the option can be overridden at the
