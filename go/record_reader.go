@@ -49,6 +49,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 const MetadataKeySnowflakeType = "SNOWFLAKE_TYPE"
@@ -838,10 +839,14 @@ type reader struct {
 	schema     *arrow.Schema
 	chs        []chan arrow.RecordBatch
 	curChIndex int
-	rec        arrow.RecordBatch
-	err        error
-	errMu      sync.Mutex
-	errOnce    sync.Once
+
+	// A stream holds its slot until Next observes its closed, drained channel.
+	streamSlots *semaphore.Weighted
+
+	rec     arrow.RecordBatch
+	err     error
+	errMu   sync.Mutex
+	errOnce sync.Once
 
 	cancelFn context.CancelFunc
 	done     chan struct{} // signals all producer goroutines have finished
@@ -1380,6 +1385,16 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	ctx, cancelFn := context.WithCancel(ctx)
 	group.SetLimit(prefetchConcurrency)
 
+	streamSlots := semaphore.NewWeighted(int64(prefetchConcurrency))
+	// The first stream is already open for schema detection and also counts
+	// towards the limit, even if all of its records fit in its channel.
+	if err := streamSlots.Acquire(ctx, 1); err != nil {
+		cancelFn()
+		rr.Release()
+		_ = r.Close()
+		return nil, err
+	}
+
 	// Initialize all channels upfront to avoid race condition
 	chs := make([]chan arrow.RecordBatch, len(batches))
 	for i := range chs {
@@ -1387,11 +1402,11 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	}
 
 	rdr := &reader{
-		refCount: 1,
-		chs:      chs,
-		err:      nil,
-		cancelFn: cancelFn,
-		done:     make(chan struct{}),
+		refCount:    1,
+		chs:         chs,
+		streamSlots: streamSlots,
+		cancelFn:    cancelFn,
+		done:        make(chan struct{}),
 	}
 
 	var recTransform recordTransformer
@@ -1417,12 +1432,12 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	group.Go(func() (err error) {
 		defer rr.Release()
 		defer func() {
-			rdr.setErr(err)
 			err = errors.Join(err, r.Close())
+			rdr.setErr(err)
+			if len(batches) > 1 {
+				close(chs[0])
+			}
 		}()
-		if len(batches) > 1 {
-			defer close(chs[0])
-		}
 		return streamRecordReaderToChannel(
 			ctx,
 			rr,
@@ -1435,16 +1450,25 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	go func() {
 		for i := range batches[1:] {
 			batch, batchIdx := &batches[i+1], i+1
-			// Channels already initialized above, no need to create them here
+			if err := streamSlots.Acquire(ctx, 1); err != nil {
+				rdr.setErr(err)
+				// No producer owns these channels. Close them for Next and
+				// Release; the final channel is closed after group.Wait below.
+				for _, ch := range chs[batchIdx:lastChannelIndex] {
+					close(ch)
+				}
+				break
+			}
 			group.Go(func(batch batchStreamer, batchIdx int) func() error {
 				return func() (err error) {
 					defer func() {
+						// Publish errors before closing the channel so Next
+						// cannot advance past a failed stream.
 						rdr.setErr(err)
+						if batchIdx != lastChannelIndex {
+							close(chs[batchIdx])
+						}
 					}()
-					// close channels (except the last) so that Next can move on to the next channel properly
-					if batchIdx != lastChannelIndex {
-						defer close(chs[batchIdx])
-					}
 
 					if streamRetryEnabled {
 						recs, err := readBatchRecords(ctx, batch, alloc, recTransform, defaultStreamMaxRetries)
@@ -1541,6 +1565,9 @@ func (r *reader) Next() bool {
 		}
 		if r.getErr() != nil {
 			return false
+		}
+		if r.streamSlots != nil {
+			r.streamSlots.Release(1)
 		}
 		r.curChIndex++
 	}
