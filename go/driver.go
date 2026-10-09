@@ -241,7 +241,7 @@ func errToAdbcErr(code adbc.Status, err error) error {
 			// syntax error
 			code = adbc.StatusInvalidArgument
 		case errObjectNotFound:
-			code = adbc.StatusUnauthorized
+			code = adbc.StatusNotFound
 		case 100383:
 			// geometry self-intersection
 			code = adbc.StatusInvalidArgument
