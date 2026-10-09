@@ -95,39 +95,6 @@ func (c *connectionImpl) useGeoArrow() bool {
 	return c.geographyOutputFormat == "EWKB" || c.geometryOutputFormat == "EWKB"
 }
 
-func escapeSingleQuoteForLike(arg string) string {
-	if len(arg) == 0 {
-		return arg
-	}
-
-	idx := strings.IndexByte(arg, '\'')
-	if idx == -1 {
-		return arg
-	}
-
-	var b strings.Builder
-	b.Grow(len(arg))
-
-	for {
-		before, after, found := strings.Cut(arg, `'`)
-		b.WriteString(before)
-		if !found {
-			return b.String()
-		}
-
-		backslashes := 0
-		for i := len(before) - 1; i >= 0 && before[i] == '\\'; i-- {
-			backslashes++
-		}
-		// Backslashes escape each other in pairs, so only an odd run escapes the quote.
-		if backslashes%2 == 0 {
-			b.WriteByte('\\')
-		}
-		b.WriteByte('\'')
-		arg = after
-	}
-}
-
 const (
 	// Snowflake error numbers signalling a SHOW produced no usable result set.
 	errShowNoMatch    = 2043 // the SHOW command matched nothing
@@ -188,13 +155,17 @@ func addLike(query *strings.Builder, pattern *string, disableWildcards bool) {
 	if disableWildcards || pattern == nil || len(*pattern) == 0 || *pattern == "%" || *pattern == ".*" {
 		return
 	}
-	fmt.Fprintf(query, " LIKE '%s'", escapeSingleQuoteForLike(*pattern))
+	// SHOW LIKE interprets backslashes in both the pattern and the SQL string
+	// literal, so a literal backslash needs four backslashes in the query.
+	// Preserve '%' and '_' as wildcards, matching the bound metadata filters.
+	fmt.Fprintf(query, " LIKE '%s'", strings.NewReplacer(`\`, `\\\\`, `'`, `''`).Replace(*pattern))
 }
 
 func addStartsWith(query *strings.Builder, pattern *string, disableWildcards bool) {
 	if !disableWildcards || pattern == nil || len(*pattern) == 0 {
 		return
 	}
+	// STARTS WITH only needs SQL string escaping, not LIKE pattern escaping.
 	fmt.Fprintf(query, " STARTS WITH '%s'", strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(*pattern))
 }
 
