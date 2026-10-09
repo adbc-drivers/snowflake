@@ -27,3 +27,4 @@ SELECT
     'catalog_db_schemas': null
     } get_objects
 FROM TABLE(RESULT_SCAN(:SHOW_DB_QUERY_ID))
+WHERE "name" ILIKE :CATALOG ESCAPE '!'

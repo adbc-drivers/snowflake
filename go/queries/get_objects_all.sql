@@ -28,7 +28,7 @@ WITH show_columns AS (
         "column_name" column_name,
         TRY_PARSE_JSON("data_type"):"byteLength"::int AS byte_length
     FROM TABLE(RESULT_SCAN(:SHOW_COLUMNS_QUERY_ID))
-    WHERE "database_name" ILIKE :CATALOG AND "schema_name" ILIKE :DB_SCHEMA AND "table_name" ILIKE :TABLE AND "column_name" ILIKE :COLUMN
+    WHERE "database_name" ILIKE :CATALOG ESCAPE '!' AND "schema_name" ILIKE :DB_SCHEMA ESCAPE '!' AND "table_name" ILIKE :TABLE ESCAPE '!' AND "column_name" ILIKE :COLUMN ESCAPE '!'
 ),
 columns AS (
     SELECT
@@ -54,7 +54,7 @@ columns AS (
      AND c.table_schema = sc.table_schema
      AND c.table_name = sc.table_name
      AND c.column_name = sc.column_name
-    WHERE c.table_catalog ILIKE :CATALOG AND c.table_schema ILIKE :DB_SCHEMA AND c.table_name ILIKE :TABLE AND c.column_name ILIKE :COLUMN
+    WHERE c.table_catalog ILIKE :CATALOG ESCAPE '!' AND c.table_schema ILIKE :DB_SCHEMA ESCAPE '!' AND c.table_name ILIKE :TABLE ESCAPE '!' AND c.column_name ILIKE :COLUMN ESCAPE '!'
     GROUP BY c.table_catalog, c.table_schema, c.table_name
 ),
 pk_constraints AS (
@@ -67,7 +67,7 @@ pk_constraints AS (
         ARRAY_AGG("column_name") WITHIN GROUP (ORDER BY "key_sequence") constraint_column_names,
         [] constraint_column_usage,
     FROM TABLE(RESULT_SCAN(:PK_QUERY_ID))
-    WHERE table_catalog ILIKE :CATALOG AND table_schema ILIKE :DB_SCHEMA AND table_name ILIKE :TABLE
+    WHERE table_catalog ILIKE :CATALOG ESCAPE '!' AND table_schema ILIKE :DB_SCHEMA ESCAPE '!' AND table_name ILIKE :TABLE ESCAPE '!'
     GROUP BY table_catalog, table_schema, table_name, "constraint_name"
 ),
 unique_constraints AS (
@@ -80,7 +80,7 @@ unique_constraints AS (
         ARRAY_AGG("column_name") WITHIN GROUP (ORDER BY "key_sequence") constraint_column_names,
         [] constraint_column_usage,
     FROM TABLE(RESULT_SCAN(:UNIQUE_QUERY_ID))
-    WHERE table_catalog ILIKE :CATALOG AND table_schema ILIKE :DB_SCHEMA AND table_name ILIKE :TABLE
+    WHERE table_catalog ILIKE :CATALOG ESCAPE '!' AND table_schema ILIKE :DB_SCHEMA ESCAPE '!' AND table_name ILIKE :TABLE ESCAPE '!'
     GROUP BY table_catalog, table_schema, table_name, "constraint_name"
 ),
 fk_constraints AS (
@@ -98,7 +98,7 @@ fk_constraints AS (
             'fk_column_name': "pk_column_name"
         }) WITHIN GROUP (ORDER BY "key_sequence") constraint_column_usage,
     FROM TABLE(RESULT_SCAN(:FK_QUERY_ID))
-    WHERE table_catalog ILIKE :CATALOG AND table_schema ILIKE :DB_SCHEMA AND table_name ILIKE :TABLE
+    WHERE table_catalog ILIKE :CATALOG ESCAPE '!' AND table_schema ILIKE :DB_SCHEMA ESCAPE '!' AND table_name ILIKE :TABLE ESCAPE '!'
     GROUP BY table_catalog, table_schema, table_name, constraint_name
 ),
 constraints AS (
@@ -136,7 +136,7 @@ LEFT JOIN columns
 USING (table_catalog, table_schema, table_name)
 LEFT JOIN constraints
 USING (table_catalog, table_schema, table_name)
-WHERE table_catalog ILIKE :CATALOG AND table_schema ILIKE :DB_SCHEMA AND table_name ILIKE :TABLE
+WHERE table_catalog ILIKE :CATALOG ESCAPE '!' AND table_schema ILIKE :DB_SCHEMA ESCAPE '!' AND table_name ILIKE :TABLE ESCAPE '!'
 GROUP BY table_catalog, table_schema
 ),
 db_schemas AS (
@@ -147,7 +147,7 @@ db_schemas AS (
     FROM information_schema.schemata
     LEFT JOIN tables
     USING (catalog_name, schema_name)
-    WHERE catalog_name ILIKE :CATALOG AND schema_name ILIKE :DB_SCHEMA
+    WHERE catalog_name ILIKE :CATALOG ESCAPE '!' AND schema_name ILIKE :DB_SCHEMA ESCAPE '!'
 )
 SELECT
     {
@@ -161,5 +161,5 @@ FROM
     information_schema.databases
 LEFT JOIN db_schemas
 ON database_name = catalog_name
-WHERE database_name ILIKE :CATALOG
+WHERE database_name ILIKE :CATALOG ESCAPE '!'
 GROUP BY database_name;

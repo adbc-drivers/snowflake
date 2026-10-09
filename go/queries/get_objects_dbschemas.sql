@@ -25,11 +25,11 @@ WITH db_schemas AS (
         "database_name" as "catalog_name",
         "name" as "schema_name"
     FROM table(RESULT_SCAN(:SHOW_SCHEMA_QUERY_ID))
-    WHERE "database_name" ILIKE :CATALOG
+    WHERE "database_name" ILIKE :CATALOG ESCAPE '!' AND "name" ILIKE :DB_SCHEMA ESCAPE '!'
 ), db_info AS (
     SELECT "name" AS "database_name"
     FROM table(RESULT_SCAN(:SHOW_DB_QUERY_ID))
-    WHERE "name" ILIKE :CATALOG
+    WHERE "name" ILIKE :CATALOG ESCAPE '!'
 )
 SELECT
     {
@@ -43,5 +43,5 @@ FROM
     db_info
 LEFT JOIN db_schemas
 ON "database_name" = "catalog_name"
-WHERE "database_name" ILIKE :CATALOG
+WHERE "database_name" ILIKE :CATALOG ESCAPE '!'
 GROUP BY "database_name";

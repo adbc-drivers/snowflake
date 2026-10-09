@@ -81,6 +81,8 @@ const (
 	// "300ms", "1.5s" or "1m30s". ParseDuration accepts negative values
 	// but the absolute value will be used.
 	OptionClientTimeout = "adbc.snowflake.sql.client_option.client_timeout"
+	// Match GetObjects filters literally and case-sensitively.
+	OptionDisableWildcards = "adbc.connection.get_objects.disable_wildcards"
 	// OptionUseHighPrecision controls the data type used for NUMBER columns
 	// using a FIXED size data type. By default, this is enabled and NUMBER
 	// columns will be returned as Decimal128 types using the indicated
@@ -235,14 +237,26 @@ func errToAdbcErr(code adbc.Status, err error) error {
 			code = adbc.StatusUnauthorized
 		}
 		switch sferr.Number {
+		case 1003:
+			// syntax error
+			code = adbc.StatusInvalidArgument
+		case errObjectNotFound:
+			code = adbc.StatusNotFound
 		case 100383:
 			// geometry self-intersection
 			code = adbc.StatusInvalidArgument
 		}
 
+		var msg string
+		if sferr.QueryID != "" {
+			msg = fmt.Sprintf("[snowflake] %s (query ID: %s)", sferr.Error(), sferr.QueryID)
+		} else {
+			msg = fmt.Sprintf("[snowflake] %s", sferr.Error())
+		}
+
 		return adbc.Error{
 			Code:       code,
-			Msg:        sferr.Error(),
+			Msg:        msg,
 			VendorCode: int32(sferr.Number),
 			SqlState:   sqlstate,
 		}

@@ -25,7 +25,6 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/snowflakedb/gosnowflake/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -49,7 +48,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 	tableType []string,
 	hasViews, hasTables bool,
 ) (array.RecordReader, error) {
-	specificCatalog := catalog != nil && !isWildcardStr(*catalog)
+	specificCatalog := catalog != nil && (c.disableWildcards || !isWildcardStr(*catalog))
 
 	switch depth {
 	case adbc.ObjectDepthDBSchemas:
@@ -63,7 +62,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 			return buildGetObjectsResult(c.Alloc)
 		}
 		if specificCatalog {
-			specificSchema := dbSchema != nil && !isWildcardStr(*dbSchema)
+			specificSchema := dbSchema != nil && (c.disableWildcards || !isWildcardStr(*dbSchema)) && (!c.disableWildcards || *dbSchema != "")
 			return c.getObjectsTablesDirect(ctx, *catalog, dbSchema, tableName, tableType, specificSchema)
 		}
 	}
@@ -78,7 +77,11 @@ func (c *connectionImpl) getObjectsDBSchemasDirect(
 	catalog string,
 	dbSchema *string,
 ) (array.RecordReader, error) {
-	schemas, err := c.execShowSchemas(ctx, dbSchema, " IN DATABASE "+quoteTblName(catalog))
+	var schemas []schemaEntry
+	var err error
+	if !hasEmptyLiteralFilter(c.disableWildcards, &catalog, dbSchema) {
+		schemas, err = c.execShowSchemas(ctx, dbSchema, " IN DATABASE "+quoteTblName(catalog))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +129,11 @@ func (c *connectionImpl) getObjectsTablesInSchema(
 	objType, escapedCatalog string,
 ) (array.RecordReader, error) {
 	suffix := " IN SCHEMA " + escapedCatalog + "." + quoteTblName(dbSchema)
-	entries, err := c.execShowTables(ctx, objType, tableName, suffix)
+	var entries []tableEntry
+	var err error
+	if !hasEmptyLiteralFilter(c.disableWildcards, &catalog, &dbSchema, tableName) {
+		entries, err = c.execShowTables(ctx, objType, tableName, suffix)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -163,21 +170,23 @@ func (c *connectionImpl) getObjectsTablesInDatabase(
 		tableEntries []tableEntry
 	)
 
-	dbSuffix := " IN DATABASE " + escapedCatalog
-	g, gCtx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		var err error
-		schemas, err = c.execShowSchemas(gCtx, dbSchema, dbSuffix)
-		return err
-	})
-	g.Go(func() error {
-		var err error
-		tableEntries, err = c.execShowTables(gCtx, objType, tableName, dbSuffix)
-		return err
-	})
+	if !hasEmptyLiteralFilter(c.disableWildcards, &catalog, dbSchema) {
+		dbSuffix := " IN DATABASE " + escapedCatalog
+		g, gCtx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			var err error
+			schemas, err = c.execShowSchemas(gCtx, dbSchema, dbSuffix)
+			return err
+		})
+		g.Go(func() error {
+			var err error
+			tableEntries, err = c.execShowTables(gCtx, objType, tableName, dbSuffix)
+			return err
+		})
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Build set of matching schema names for filtering
@@ -249,14 +258,13 @@ func showObjType(tableType []string) string {
 // execShowTables executes a SHOW TERSE command for tables/objects/views
 // and reads the results directly into a slice.
 func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pattern *string, suffix string) (entries []tableEntry, err error) {
-	query := "SHOW TERSE /* ADBC:getObjects */ " + objType
-	query = addLike(query, pattern)
-	query += suffix
-
+	if hasEmptyLiteralFilter(c.disableWildcards, pattern) {
+		return nil, nil
+	}
+	query := buildShowTerseQuery(objType, pattern, suffix, c.disableWildcards)
 	rows, err := c.cn.QueryContext(ctx, query, nil)
 	if err != nil {
-		var sfErr *gosnowflake.SnowflakeError
-		if errors.As(err, &sfErr) && sfErr.Number == 2043 {
+		if isMetadataNotFound(err) {
 			return nil, nil
 		}
 		return nil, errToAdbcErr(adbc.StatusIO, err)
@@ -265,7 +273,20 @@ func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pat
 		err = errors.Join(err, rows.Close())
 	}()
 
-	return readTableEntries(rows)
+	entries, err = readTableEntries(rows)
+	if err != nil {
+		return nil, err
+	}
+	if c.disableWildcards && pattern != nil {
+		matched := entries[:0]
+		for _, entry := range entries {
+			if entry.tableName == *pattern {
+				matched = append(matched, entry)
+			}
+		}
+		entries = matched
+	}
+	return entries, nil
 }
 
 func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
@@ -315,17 +336,14 @@ func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
 
 // execShowSchemas executes a SHOW TERSE SCHEMAS command and reads the results directly.
 func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) (_ []schemaEntry, err error) {
-	query := "SHOW TERSE /* ADBC:getObjects */ " + objSchemas
-	query = addLike(query, pattern)
-	query += suffix
-
+	if hasEmptyLiteralFilter(c.disableWildcards, pattern) {
+		return nil, nil
+	}
+	query := buildShowTerseQuery(objSchemas, pattern, suffix, c.disableWildcards)
 	rows, err := c.cn.QueryContext(ctx, query, nil)
 	if err != nil {
-		var sfErr *gosnowflake.SnowflakeError
-		// error code 2043 is what you get when a `SHOW` command doesn't match
-		// anything (e.g. SHOW TERSE DATABASE "nonexistent"). In this case, we
-		// want to return an empty set rather than a failure.
-		if errors.As(err, &sfErr) && sfErr.Number == 2043 {
+		// Missing or inaccessible scopes contribute no schemas.
+		if isMetadataNotFound(err) {
 			return nil, nil
 		}
 		return nil, errToAdbcErr(adbc.StatusIO, err)
@@ -365,7 +383,9 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 		if dbIdx >= 0 {
 			entry.dbName = dest[dbIdx].(string)
 		}
-		entries = append(entries, entry)
+		if !c.disableWildcards || pattern == nil || entry.schemaName == *pattern {
+			entries = append(entries, entry)
+		}
 	}
 
 	return entries, nil
