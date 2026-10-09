@@ -134,18 +134,29 @@ const (
 	errObjectNotFound = 2003 // the scoped object does not exist or is not authorized
 )
 
+func isMetadataNotFound(err error) bool {
+	var sfErr *gosnowflake.SnowflakeError
+	return errors.As(err, &sfErr) && (sfErr.Number == errShowNoMatch || sfErr.Number == errObjectNotFound)
+}
+
+// hasEmptyLiteralFilter identifies filters that cannot match an object name.
+func hasEmptyLiteralFilter(disableWildcards bool, filters ...*string) bool {
+	if disableWildcards {
+		for _, filter := range filters {
+			if filter != nil && *filter == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext, emptyQuery string) (string, error) {
 	rows, err := driverConn.QueryContext(ctx, query, nil)
 	if err != nil {
-		var sfErr *gosnowflake.SnowflakeError
-		// errShowNoMatch always maps to an empty result. Callers running an
-		// optional, narrowly-scoped SHOW may also pass errObjectNotFound so a
-		// missing scoped object degrades to an empty result instead of failing
-		// the whole GetObjects call. Substitute emptyQuery so RESULT_SCAN has a
-		// valid (empty) source to read from.
-		// 2003: this is not found or not authorized => skip
-		if emptyQuery != "" && errors.As(err, &sfErr) &&
-			(sfErr.Number == errShowNoMatch || sfErr.Number == errObjectNotFound) {
+		// A missing or inaccessible scoped object has no metadata to contribute.
+		// Substitute a typed empty source so RESULT_SCAN remains valid.
+		if emptyQuery != "" && query != emptyQuery && isMetadataNotFound(err) {
 			return getQueryID(ctx, emptyQuery, driverConn, "")
 		}
 		return "", errToAdbcErr(adbc.StatusUnknown, err)
@@ -187,45 +198,74 @@ func addStartsWith(query *strings.Builder, pattern *string, disableWildcards boo
 	fmt.Fprintf(query, " STARTS WITH '%s'", strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(*pattern))
 }
 
-func showTerseQuery(objType string, catalog, dbSchema, tableName *string, disableWildcards bool) (string, error) {
+// buildShowTerseQuery keeps filters in the order required by SHOW syntax.
+func buildShowTerseQuery(objType string, pattern *string, suffix string, disableWildcards bool) string {
 	var query strings.Builder
 	query.WriteString("SHOW TERSE /* ADBC:getObjects */ ")
 	query.WriteString(objType)
+	addLike(&query, pattern, disableWildcards)
+	query.WriteString(suffix)
+	addStartsWith(&query, pattern, disableWildcards)
+	return query.String()
+}
+
+// emptyShowTerseQuery exposes only the columns consumed by RESULT_SCAN templates.
+func emptyShowTerseQuery(objType string) (string, error) {
 	switch objType {
 	case objDatabases:
-		addLike(&query, catalog, disableWildcards)
-		query.WriteString(" IN ACCOUNT")
-		addStartsWith(&query, catalog, disableWildcards)
+		return `SELECT NULL::VARCHAR AS "name" WHERE FALSE`, nil
 	case objSchemas:
-		addLike(&query, dbSchema, disableWildcards)
-		if catalog == nil || (!disableWildcards && isWildcardStr(*catalog)) {
-			query.WriteString(" IN ACCOUNT")
-		} else {
-			fmt.Fprintf(&query, " IN DATABASE %s", quoteIdentifier(*catalog))
-		}
-		addStartsWith(&query, dbSchema, disableWildcards)
+		return `SELECT NULL::VARCHAR AS "name", NULL::VARCHAR AS "database_name" WHERE FALSE`, nil
 	case objViews, objTables, objObjects:
-		addLike(&query, tableName, disableWildcards)
-		if catalog == nil || (!disableWildcards && isWildcardStr(*catalog)) {
-			query.WriteString(" IN ACCOUNT")
-		} else {
-			escapedCatalog := quoteIdentifier(*catalog)
-			if dbSchema == nil || (!disableWildcards && isWildcardStr(*dbSchema)) {
-				fmt.Fprintf(&query, " IN DATABASE %s", escapedCatalog)
-			} else {
-				fmt.Fprintf(&query, " IN SCHEMA %s.%s", escapedCatalog, quoteIdentifier(*dbSchema))
-			}
-		}
-		addStartsWith(&query, tableName, disableWildcards)
+		return `SELECT NULL::VARCHAR AS "name", NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "kind" WHERE FALSE`, nil
 	default:
 		return "", fmt.Errorf("unimplemented object type")
 	}
-	return query.String(), nil
+}
+
+func showTerseQuery(objType string, catalog, dbSchema, tableName *string, disableWildcards bool) (string, error) {
+	var pattern *string
+	var suffix string
+	switch objType {
+	case objDatabases:
+		pattern, suffix = catalog, " IN ACCOUNT"
+		if hasEmptyLiteralFilter(disableWildcards, catalog) {
+			return emptyShowTerseQuery(objType)
+		}
+	case objSchemas:
+		pattern = dbSchema
+		if hasEmptyLiteralFilter(disableWildcards, catalog, dbSchema) {
+			return emptyShowTerseQuery(objType)
+		}
+		if catalog == nil || (!disableWildcards && isWildcardStr(*catalog)) {
+			suffix = " IN ACCOUNT"
+		} else {
+			suffix = " IN DATABASE " + quoteIdentifier(*catalog)
+		}
+	case objViews, objTables, objObjects:
+		pattern = tableName
+		if hasEmptyLiteralFilter(disableWildcards, catalog, dbSchema, tableName) {
+			return emptyShowTerseQuery(objType)
+		}
+		if catalog == nil || (!disableWildcards && isWildcardStr(*catalog)) {
+			suffix = " IN ACCOUNT"
+		} else if dbSchema == nil || (!disableWildcards && isWildcardStr(*dbSchema)) {
+			suffix = " IN DATABASE " + quoteIdentifier(*catalog)
+		} else {
+			suffix = " IN SCHEMA " + quoteIdentifier(*catalog) + "." + quoteIdentifier(*dbSchema)
+		}
+	default:
+		return "", fmt.Errorf("unimplemented object type")
+	}
+	return buildShowTerseQuery(objType, pattern, suffix, disableWildcards), nil
 }
 
 func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, catalog, dbSchema, tableName *string, disableWildcards bool, outQueryID *string) {
 	grp.Go(func() error {
-		emptyQuery := "SHOW TERSE /* ADBC:getObjects */ " + objType + " LIKE ''"
+		emptyQuery, err := emptyShowTerseQuery(objType)
+		if err != nil {
+			return err
+		}
 		query, err := showTerseQuery(objType, catalog, dbSchema, tableName, disableWildcards)
 		if err != nil {
 			return err
@@ -389,23 +429,39 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		// Detailed constraint info not available in information_schema
 		// Need to dispatch SHOW queries and use conn.Raw to extract the queryID for reuse in GetObjects query
 		gQueryIDs.Go(func() (err error) {
-			pkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */"+suffix, conn, emptyPkUkQuery)
+			query := "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */" + suffix
+			if hasEmptyLiteralFilter(c.disableWildcards, catalog, dbSchema, tableName) {
+				query = emptyPkUkQuery
+			}
+			pkQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyPkUkQuery)
 			return err
 		})
 
 		gQueryIDs.Go(func() (err error) {
-			fkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */"+suffix, conn, emptyFkQuery)
+			query := "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */" + suffix
+			if hasEmptyLiteralFilter(c.disableWildcards, catalog, dbSchema, tableName) {
+				query = emptyFkQuery
+			}
+			fkQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyFkQuery)
 			return err
 		})
 
 		gQueryIDs.Go(func() (err error) {
-			uniqueQueryID, err = getQueryID(gQueryIDsCtx, "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */"+suffix, conn, emptyPkUkQuery)
+			query := "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */" + suffix
+			if hasEmptyLiteralFilter(c.disableWildcards, catalog, dbSchema, tableName) {
+				query = emptyPkUkQuery
+			}
+			uniqueQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyPkUkQuery)
 			return err
 		})
 
 		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName, c.disableWildcards)
 		gQueryIDs.Go(func() (err error) {
-			columnsQueryID, err = getQueryID(gQueryIDsCtx, "SHOW COLUMNS /* ADBC:getObjects */"+columnsSuffix, conn, emptyColumnsQuery)
+			query := "SHOW COLUMNS /* ADBC:getObjects */" + columnsSuffix
+			if hasEmptyLiteralFilter(c.disableWildcards, catalog, dbSchema, tableName, columnName) {
+				query = emptyColumnsQuery
+			}
+			columnsQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyColumnsQuery)
 			return err
 		})
 
