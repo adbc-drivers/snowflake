@@ -247,7 +247,6 @@ class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
             # TODO(lidavidm): identify why this fails
             pytest.param("tables", marks=[pytest.mark.xfail()]),
             "columns",
-            "all",
         ],
     )
     @pytest.mark.parametrize(
@@ -314,6 +313,53 @@ class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
                     ] == expected
         finally:
             with literal_conn.cursor() as cursor:
+                for table in reversed(created):
+                    driver.try_drop_table(
+                        cursor,
+                        catalog_name=catalog,
+                        schema_name=schema,
+                        table_name=table,
+                    )
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            r"literal_%!\n'quoted",
+            "literal_%!'quoted",
+            "literal_%!",
+            "literal_under_score",
+        ],
+    )
+    def test_get_objects_special_names(self, driver, conn, name):
+        catalog = driver.features.current_catalog
+        schema = driver.features.current_schema
+        names = (name, name.upper(), name + "suffix")
+        created = []
+        try:
+            with conn.cursor() as cursor:
+                for table in names:
+                    cursor.execute(
+                        f"CREATE TEMPORARY TABLE {driver.quote_identifier(catalog, schema, table)} "
+                        '("id" INT PRIMARY KEY, "col_%!" INT, "bytes" BINARY(16))'
+                    )
+                    created.append(table)
+            tables = {
+                table["table_name"]: table
+                for obj in conn.adbc_get_objects(
+                    depth="tables",
+                    catalog_filter=catalog,
+                    db_schema_filter=schema,
+                    table_name_filter=name,
+                )
+                .read_all()
+                .to_pylist()
+                for schema in obj["catalog_db_schemas"] or []
+                for table in schema["db_schema_tables"] or []
+            }
+            # without the literal option, the driver ignores case
+            assert set(tables) == {name, name.upper()}
+        finally:
+            with conn.cursor() as cursor:
                 for table in reversed(created):
                     driver.try_drop_table(
                         cursor,

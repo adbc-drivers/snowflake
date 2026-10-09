@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	"github.com/snowflakedb/gosnowflake/v2"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,36 +41,5 @@ func TestSetOptionInternal_MaxRetryCount(t *testing.T) {
 		err := db.SetOptionInternal(OptionMaxRetryCount, bad, nil)
 		require.Error(t, err, "value %q", bad)
 		require.Equal(t, 50, db.cfg.MaxRetryCount, "invalid value %q must not change the setting", bad)
-	}
-}
-
-func TestEscapeSingleQuoteForLike(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"empty", "", ""},
-		{"no quotes", "table_%", "table_%"},
-		{"single quote", `'`, `\'`},
-		{"leading quote", `'table`, `\'table`},
-		{"trailing quote", `table'`, `table\'`},
-		{"embedded quote", `ta'ble`, `ta\'ble`},
-		{"consecutive quotes", `ta''ble`, `ta\'\'ble`},
-		{"only consecutive quotes", `'''`, `\'\'\'`},
-		{"backslash before quote", `ta\'ble`, `ta\'ble`},
-		{"two backslashes before quote", `ta\\'ble`, `ta\\\'ble`},
-		{"three backslashes before quote", `ta\\\'ble`, `ta\\\'ble`},
-		{"four backslashes before quote", `ta\\\\'ble`, `ta\\\\\'ble`},
-		{"only two backslashes and quote", `\\'`, `\\\'`},
-		{"two backslashes before trailing quote", `ta\\'`, `ta\\\'`},
-		{"consecutive quotes after two backslashes", `ta\\''ble`, `ta\\\'\'ble`},
-		{"consecutive quotes after three backslashes", `ta\\\''ble`, `ta\\\'\'ble`},
-		{"quote after backslash-prefixed quote", `ta\''ble`, `ta\'\'ble`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, escapeSingleQuoteForLike(tt.input))
-		})
 	}
 }

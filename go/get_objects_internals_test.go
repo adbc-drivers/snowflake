@@ -212,6 +212,32 @@ func TestShowTerseQuery(t *testing.T) {
 			catalog:  new("foobar%catalog"),
 			dbSchema: new("foobar_schema"),
 		},
+		{
+			query:   `SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB\\\\name''_%' IN ACCOUNT`,
+			objType: objDatabases,
+			catalog: new(`DB\name'_%`),
+		},
+		{
+			query:    `SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'schema\\\\backslash' IN DATABASE "DB\name""X"`,
+			objType:  objSchemas,
+			catalog:  new(`DB\name"X`),
+			dbSchema: new(`schema\backslash`),
+		},
+		{
+			query:     `SHOW TERSE /* ADBC:getObjects */ TABLES LIKE 'T\\\\''_%' IN SCHEMA "DB\name"."S\name"`,
+			objType:   objTables,
+			catalog:   new(`DB\name`),
+			dbSchema:  new(`S\name`),
+			tableName: new(`T\'_%`),
+		},
+		{
+			query:            `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB\name"."S\name" STARTS WITH 'T\\''_%'`,
+			objType:          objTables,
+			catalog:          new(`DB\name`),
+			dbSchema:         new(`S\name`),
+			tableName:        new(`T\'_%`),
+			disableWildcards: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -251,6 +277,8 @@ func TestMetadataPatternArg(t *testing.T) {
 		{"escape character", new("!"), "!!", "!!"},
 		{"mixed", new("a!_%!!b"), "a!!_%!!!!b", "a!!!_!%!!!!b"},
 		{"quote and backslash", new(`a'\b`), `a'\b`, `a'\b`},
+		{"trailing backslash", new(`a\`), `a\`, `a\`},
+		{"backslashes before wildcards", new(`a\%\_`), `a\%\_`, `a\!%\!_`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -260,6 +288,48 @@ func TestMetadataPatternArg(t *testing.T) {
 			arg = metadataPatternArg("TABLE", tt.pattern, true)
 			assert.Equal(t, "TABLE", arg.Name)
 			assert.Equal(t, tt.literal, arg.Value)
+		})
+	}
+}
+
+func TestAddLike(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		pattern *string
+		want    string
+	}{
+		{"nil", nil, ""},
+		{"empty", new(""), ""},
+		{"percent sentinel", new("%"), ""},
+		{"dot-star sentinel", new(".*"), ""},
+		{"plain", new("table"), ` LIKE 'table'`},
+		{"wildcard characters", new("a_%!"), ` LIKE 'a_%!'`},
+		{"single quote", new(`'`), ` LIKE ''''`},
+		{"leading quote", new(`'table`), ` LIKE '''table'`},
+		{"trailing quote", new(`table'`), ` LIKE 'table'''`},
+		{"embedded quote", new(`ta'ble`), ` LIKE 'ta''ble'`},
+		{"consecutive quotes", new(`ta''ble`), ` LIKE 'ta''''ble'`},
+		{"only consecutive quotes", new(`'''`), ` LIKE ''''''''`},
+		{"embedded backslash", new(`schema\backslash`), ` LIKE 'schema\\\\backslash'`},
+		{"trailing backslash", new(`table\`), ` LIKE 'table\\\\'`},
+		{"only backslash", new(`\`), ` LIKE '\\\\'`},
+		{"escape sequence text", new(`a\n\b`), ` LIKE 'a\\\\n\\\\b'`},
+		{"backslash before quote", new(`ta\'ble`), ` LIKE 'ta\\\\''ble'`},
+		{"two backslashes before quote", new(`ta\\'ble`), ` LIKE 'ta\\\\\\\\''ble'`},
+		{"three backslashes before quote", new(`ta\\\'ble`), ` LIKE 'ta\\\\\\\\\\\\''ble'`},
+		{"four backslashes before quote", new(`ta\\\\'ble`), ` LIKE 'ta\\\\\\\\\\\\\\\\''ble'`},
+		{"consecutive quotes after backslash", new(`ta\''ble`), ` LIKE 'ta\\\\''''ble'`},
+		{"quote before backslash", new(`ta'\ble`), ` LIKE 'ta''\\\\ble'`},
+		{"backslashes before wildcards", new(`a\%\_`), ` LIKE 'a\\\\%\\\\_'`},
+		{"wildcards before backslashes", new(`a%\_\`), ` LIKE 'a%\\\\_\\\\'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var query strings.Builder
+			addLike(&query, tt.pattern, false)
+			assert.Equal(t, tt.want, query.String())
+			query.Reset()
+			addLike(&query, tt.pattern, true)
+			assert.Empty(t, query.String())
 		})
 	}
 }
@@ -274,6 +344,9 @@ func TestAddStartsWith(t *testing.T) {
 		{"empty", new(""), ""},
 		{"wildcard characters", new("a_%!"), " STARTS WITH 'a_%!'"},
 		{"quote and backslash", new(`a\n'b`), ` STARTS WITH 'a\\n''b'`},
+		{"trailing backslash", new(`a\`), ` STARTS WITH 'a\\'`},
+		{"backslash before quote", new(`a\'`), ` STARTS WITH 'a\\'''`},
+		{"backslashes before wildcards", new(`a\%\_`), ` STARTS WITH 'a\\%\\_'`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var query strings.Builder
@@ -295,6 +368,8 @@ func TestBuildShowTerseQuery(t *testing.T) {
 	}{
 		{"unfiltered", nil, true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S"`},
 		{"wildcards", new("T_%"), false, `SHOW TERSE /* ADBC:getObjects */ TABLES LIKE 'T_%' IN SCHEMA "DB"."S"`},
+		{"LIKE quotes and backslashes", new(`T\n'X`), false, `SHOW TERSE /* ADBC:getObjects */ TABLES LIKE 'T\\\\n''X' IN SCHEMA "DB"."S"`},
+		{"LIKE trailing backslash", new(`T\`), false, `SHOW TERSE /* ADBC:getObjects */ TABLES LIKE 'T\\\\' IN SCHEMA "DB"."S"`},
 		{"literal", new("T_%"), true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S" STARTS WITH 'T_%'`},
 		{"quotes and backslashes", new(`T\n'X`), true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S" STARTS WITH 'T\\n''X'`},
 	} {
