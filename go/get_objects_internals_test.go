@@ -15,10 +15,14 @@
 package snowflake
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
+	"github.com/snowflakedb/gosnowflake/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -284,4 +288,55 @@ func TestAddStartsWith(t *testing.T) {
 			assert.Empty(t, query.String())
 		})
 	}
+}
+
+func TestBuildShowTerseQuery(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		pattern          *string
+		disableWildcards bool
+		want             string
+	}{
+		{"unfiltered", nil, true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S"`},
+		{"wildcards", new("T_%"), false, `SHOW TERSE /* ADBC:getObjects */ TABLES LIKE 'T_%' IN SCHEMA "DB"."S"`},
+		{"literal", new("T_%"), true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S" STARTS WITH 'T_%'`},
+		{"quotes and backslashes", new(`T\n'X`), true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S" STARTS WITH 'T\\n''X'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, buildShowTerseQuery(objTables, tt.pattern, ` IN SCHEMA "DB"."S"`, tt.disableWildcards))
+		})
+	}
+}
+
+func TestShowTerseEmptyLiteralFilters(t *testing.T) {
+	for _, objType := range []string{objDatabases, objSchemas, objTables, objViews, objObjects} {
+		t.Run(objType, func(t *testing.T) {
+			filters := []*string{new("DB"), new("S"), new("T")}
+			count := 3
+			switch objType {
+			case objDatabases:
+				count = 1
+			case objSchemas:
+				count = 2
+			}
+			for i := range filters {
+				original := filters[i]
+				filters[i] = new("")
+				query, err := showTerseQuery(objType, filters[0], filters[1], filters[2], true)
+				require.NoError(t, err)
+				if i < count {
+					assert.True(t, strings.HasPrefix(query, "SELECT NULL::VARCHAR"))
+					assert.True(t, strings.HasSuffix(query, "WHERE FALSE"))
+				} else {
+					assert.True(t, strings.HasPrefix(query, "SHOW TERSE"))
+				}
+				filters[i] = original
+			}
+		})
+	}
+	_, err := showTerseQuery("unsupported", nil, nil, nil, true)
+	require.Error(t, err)
+	assert.False(t, hasEmptyLiteralFilter(false, new("")))
+	assert.False(t, hasEmptyLiteralFilter(true, nil, new("%")))
+	assert.True(t, hasEmptyLiteralFilter(true, nil, new("")))
 }
