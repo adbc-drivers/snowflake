@@ -15,14 +15,10 @@
 package snowflake
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
 
-	"github.com/snowflakedb/gosnowflake/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
