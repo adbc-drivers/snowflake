@@ -33,9 +33,18 @@
   <!-- AssemblyInfo properties -->
   <PropertyGroup>
     <Product>ADBC Driver for Snowflake</Product>
-    <Copyright>Copyright 2025 ADBC Drivers Contributors</Copyright>
+    <Copyright>Copyright 2026 ADBC Drivers Contributors</Copyright>
     <VersionPrefix>0.24.0</VersionPrefix>
     <VersionSuffix>SNAPSHOT</VersionSuffix>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata -->
+  <PropertyGroup>
+    <Authors>ADBC Drivers Contributors</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/adbc-drivers/snowflake</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/adbc-drivers/snowflake</RepositoryUrl>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
   </PropertyGroup>
 
   <PropertyGroup>
