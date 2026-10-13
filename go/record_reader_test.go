@@ -1079,3 +1079,96 @@ func BenchmarkStripEWKBSRIDColumn(b *testing.B) {
 		out.Release()
 	}
 }
+
+// jsonRow builds an expected decoded row; "<null>" stands for a JSON null.
+func jsonRow(vals ...string) []*string {
+	row := make([]*string, len(vals))
+	for i, v := range vals {
+		if v != "<null>" {
+			row[i] = &v
+		}
+	}
+	return row
+}
+
+func TestDecodeJSONChunkRows(t *testing.T) {
+	chunks := map[string]struct {
+		data string
+		want [][]*string
+	}{
+		"single row":               {`["a","b"]`, [][]*string{jsonRow("a", "b")}},
+		"nulls":                    {`[null,"1"],["2",null]`, [][]*string{jsonRow("<null>", "1"), jsonRow("2", "<null>")}},
+		"escapes and unicode":      {`["a\"b\\c","é\n\u00e9"],["[,]","{\"k\":1}"]`, [][]*string{jsonRow(`a"b\c`, "é\né"), jsonRow("[,]", `{"k":1}`)}},
+		"invalid UTF-8":            {"[\"a\xffb\",\"\\ud800\"]", [][]*string{jsonRow("a\uFFFDb", "\uFFFD")}},
+		"whitespace between rows":  {"[\"1\"],\n[\"2\"],\t [\"3\"]", [][]*string{jsonRow("1"), jsonRow("2"), jsonRow("3")}},
+		"empty row":                {`[],["x"]`, [][]*string{jsonRow(), jsonRow("x")}},
+		"rows of different widths": {`["1"],["2","3","4"],["5","6"]`, [][]*string{jsonRow("1"), jsonRow("2", "3", "4"), jsonRow("5", "6")}},
+		"fewer rows than in chunk": {`["1"],["2"],["3"]`, [][]*string{jsonRow("1"), jsonRow("2")}},
+	}
+	for name, tc := range chunks {
+		t.Run(name, func(t *testing.T) {
+			got := make([][]*string, len(tc.want))
+			require.NoError(t, decodeJSONChunkRows([]byte(tc.data), got))
+			require.Len(t, got, len(tc.want))
+			for i := range tc.want {
+				assert.Equal(t, len(tc.want[i]), len(got[i]), "row %d", i)
+				for j := range min(len(tc.want[i]), len(got[i])) {
+					assert.Equal(t, tc.want[i][j], got[i][j], "row %d col %d", i, j)
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeJSONChunkRowsReusesRows(t *testing.T) {
+	rows := make([][]*string, 2)
+	require.NoError(t, decodeJSONChunkRows([]byte(`["a","b","c"],["d"]`), rows))
+	require.NoError(t, decodeJSONChunkRows([]byte(`["x"],[null,"y"]`), rows))
+	assert.Equal(t, [][]*string{jsonRow("x"), jsonRow("<null>", "y")}, rows)
+}
+
+func TestDecodeJSONChunkRowsErrors(t *testing.T) {
+	for name, data := range map[string]string{
+		"too few rows":         `["1"]`,
+		"not a list":           `{"a":"1"}`,
+		"number value":         `["1"],[2]`,
+		"truncated":            `["1"],["2"`,
+		"truncated mid-string": `["1"],["2`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := decodeJSONChunkRows([]byte(data), make([][]*string, 2))
+			assert.ErrorContains(t, err, "JSON decode failed")
+		})
+	}
+}
+
+func BenchmarkDecodeJSONChunkRows(b *testing.B) {
+	const rows, cols = 50_000, 8
+	var sb strings.Builder
+	for r := range rows {
+		if r > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('[')
+		for c := range cols {
+			if c > 0 {
+				sb.WriteByte(',')
+			}
+			if (r+c)%7 == 0 {
+				sb.WriteString("null")
+			} else {
+				fmt.Fprintf(&sb, "%q", fmt.Sprintf("row %d col %d", r, c))
+			}
+		}
+		sb.WriteByte(']')
+	}
+	data := []byte(sb.String())
+	dst := make([][]*string, rows)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := decodeJSONChunkRows(data, dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
