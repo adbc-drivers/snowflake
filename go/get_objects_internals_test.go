@@ -231,12 +231,12 @@ func TestShowTerseQuery(t *testing.T) {
 			tableName: new(`T\'_%`),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB\name"."S\name" STARTS WITH 'T\\''_%'`,
-			objType:          objTables,
-			catalog:          new(`DB\name`),
-			dbSchema:         new(`S\name`),
-			tableName:        new(`T\'_%`),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB\name"."S\name" STARTS WITH 'T\\''_%'`,
+			objType:      objTables,
+			catalog:      new(`DB\name`),
+			dbSchema:     new(`S\name`),
+			tableName:    new(`T\'_%`),
+			matchExactly: true,
 		},
 	}
 
