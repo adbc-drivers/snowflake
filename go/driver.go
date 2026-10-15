@@ -82,7 +82,7 @@ const (
 	// but the absolute value will be used.
 	OptionClientTimeout = "adbc.snowflake.sql.client_option.client_timeout"
 	// Match GetObjects filters literally and case-sensitively.
-	OptionDisableWildcards = "adbc.connection.get_objects.disable_wildcards"
+	OptionMatchExactly = "adbc.connection.get_objects.match_exactly"
 	// OptionUseHighPrecision controls the data type used for NUMBER columns
 	// using a FIXED size data type. By default, this is enabled and NUMBER
 	// columns will be returned as Decimal128 types using the indicated

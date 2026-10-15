@@ -48,7 +48,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 	tableType []string,
 	hasViews, hasTables bool,
 ) (array.RecordReader, error) {
-	specificCatalog := catalog != nil && (c.disableWildcards || !isWildcardStr(*catalog))
+	specificCatalog := catalog != nil && (c.matchExactly || !isWildcardStr(*catalog))
 
 	switch depth {
 	case adbc.ObjectDepthDBSchemas:
@@ -62,7 +62,7 @@ func (c *connectionImpl) getObjectsDirectPath(
 			return buildGetObjectsResult(c.Alloc)
 		}
 		if specificCatalog {
-			specificSchema := dbSchema != nil && (c.disableWildcards || !isWildcardStr(*dbSchema)) && (!c.disableWildcards || *dbSchema != "")
+			specificSchema := dbSchema != nil && (c.matchExactly || !isWildcardStr(*dbSchema)) && (!c.matchExactly || *dbSchema != "")
 			return c.getObjectsTablesDirect(ctx, *catalog, dbSchema, tableName, tableType, specificSchema)
 		}
 	}
@@ -79,7 +79,7 @@ func (c *connectionImpl) getObjectsDBSchemasDirect(
 ) (array.RecordReader, error) {
 	var schemas []schemaEntry
 	var err error
-	if !hasEmptyLiteralFilter(c.disableWildcards, &catalog, dbSchema) {
+	if !hasEmptyLiteralFilter(c.matchExactly, &catalog, dbSchema) {
 		schemas, err = c.execShowSchemas(ctx, dbSchema, " IN DATABASE "+quoteTblName(catalog))
 	}
 	if err != nil {
@@ -131,7 +131,7 @@ func (c *connectionImpl) getObjectsTablesInSchema(
 	suffix := " IN SCHEMA " + escapedCatalog + "." + quoteTblName(dbSchema)
 	var entries []tableEntry
 	var err error
-	if !hasEmptyLiteralFilter(c.disableWildcards, &catalog, &dbSchema, tableName) {
+	if !hasEmptyLiteralFilter(c.matchExactly, &catalog, &dbSchema, tableName) {
 		entries, err = c.execShowTables(ctx, objType, tableName, suffix)
 	}
 	if err != nil {
@@ -170,7 +170,7 @@ func (c *connectionImpl) getObjectsTablesInDatabase(
 		tableEntries []tableEntry
 	)
 
-	if !hasEmptyLiteralFilter(c.disableWildcards, &catalog, dbSchema) {
+	if !hasEmptyLiteralFilter(c.matchExactly, &catalog, dbSchema) {
 		dbSuffix := " IN DATABASE " + escapedCatalog
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
@@ -258,10 +258,10 @@ func showObjType(tableType []string) string {
 // execShowTables executes a SHOW TERSE command for tables/objects/views
 // and reads the results directly into a slice.
 func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pattern *string, suffix string) (entries []tableEntry, err error) {
-	if hasEmptyLiteralFilter(c.disableWildcards, pattern) {
+	if hasEmptyLiteralFilter(c.matchExactly, pattern) {
 		return nil, nil
 	}
-	query := buildShowTerseQuery(objType, pattern, suffix, c.disableWildcards)
+	query := buildShowTerseQuery(objType, pattern, suffix, c.matchExactly)
 	rows, err := c.cn.QueryContext(ctx, query, nil)
 	if err != nil {
 		if isMetadataNotFound(err) {
@@ -277,7 +277,7 @@ func (c *connectionImpl) execShowTables(ctx context.Context, objType string, pat
 	if err != nil {
 		return nil, err
 	}
-	if c.disableWildcards && pattern != nil {
+	if c.matchExactly && pattern != nil {
 		matched := entries[:0]
 		for _, entry := range entries {
 			if entry.tableName == *pattern {
@@ -336,10 +336,10 @@ func readTableEntries(rows driver.Rows) ([]tableEntry, error) {
 
 // execShowSchemas executes a SHOW TERSE SCHEMAS command and reads the results directly.
 func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, suffix string) (_ []schemaEntry, err error) {
-	if hasEmptyLiteralFilter(c.disableWildcards, pattern) {
+	if hasEmptyLiteralFilter(c.matchExactly, pattern) {
 		return nil, nil
 	}
-	query := buildShowTerseQuery(objSchemas, pattern, suffix, c.disableWildcards)
+	query := buildShowTerseQuery(objSchemas, pattern, suffix, c.matchExactly)
 	rows, err := c.cn.QueryContext(ctx, query, nil)
 	if err != nil {
 		// Missing or inaccessible scopes contribute no schemas.
@@ -383,7 +383,7 @@ func (c *connectionImpl) execShowSchemas(ctx context.Context, pattern *string, s
 		if dbIdx >= 0 {
 			entry.dbName = dest[dbIdx].(string)
 		}
-		if !c.disableWildcards || pattern == nil || entry.schemaName == *pattern {
+		if !c.matchExactly || pattern == nil || entry.schemaName == *pattern {
 			entries = append(entries, entry)
 		}
 	}

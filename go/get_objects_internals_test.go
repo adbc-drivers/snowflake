@@ -29,7 +29,7 @@ func TestShowColumnsScope(t *testing.T) {
 	tests := []struct {
 		name                   string
 		catalog, schema, table *string
-		disableWildcards       bool
+		matchExactly           bool
 		want                   string
 	}{
 		{"concrete names with underscores scope to the table", sp("DB_NAME"), sp("TEST_SCHEMA"), sp("LINEITEM"), false, ` IN TABLE "DB_NAME"."TEST_SCHEMA"."LINEITEM"`},
@@ -57,7 +57,7 @@ func TestShowColumnsScope(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, showColumnsScope(tt.catalog, tt.schema, tt.table, tt.disableWildcards))
+			assert.Equal(t, tt.want, showColumnsScope(tt.catalog, tt.schema, tt.table, tt.matchExactly))
 		})
 	}
 }
@@ -67,7 +67,7 @@ func TestShowTerseQuery(t *testing.T) {
 		query                        string
 		objType                      string
 		catalog, dbSchema, tableName *string
-		disableWildcards             bool
+		matchExactly                 bool
 	}{
 		{
 			query:   `SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT`,
@@ -79,10 +79,10 @@ func TestShowTerseQuery(t *testing.T) {
 			catalog: new("foobar_catalog"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'foobar_catalog'`,
-			objType:          "DATABASES",
-			catalog:          new("foobar_catalog"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'foobar_catalog'`,
+			objType:      "DATABASES",
+			catalog:      new("foobar_catalog"),
+			matchExactly: true,
 		},
 		{
 			query:   `SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'foobar%catalog' IN ACCOUNT`,
@@ -90,10 +90,10 @@ func TestShowTerseQuery(t *testing.T) {
 			catalog: new("foobar%catalog"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'foobar%catalog'`,
-			objType:          "DATABASES",
-			catalog:          new("foobar%catalog"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'foobar%catalog'`,
+			objType:      "DATABASES",
+			catalog:      new("foobar%catalog"),
+			matchExactly: true,
 		},
 		{
 			query:   `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN ACCOUNT`,
@@ -116,17 +116,17 @@ func TestShowTerseQuery(t *testing.T) {
 			dbSchema: new("foobar_schema"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar_catalog"`,
-			objType:          "SCHEMAS",
-			catalog:          new("foobar_catalog"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar_catalog"`,
+			objType:      "SCHEMAS",
+			catalog:      new("foobar_catalog"),
+			matchExactly: true,
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar_catalog" STARTS WITH 'foobar_schema'`,
-			objType:          "SCHEMAS",
-			catalog:          new("foobar_catalog"),
-			dbSchema:         new("foobar_schema"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar_catalog" STARTS WITH 'foobar_schema'`,
+			objType:      "SCHEMAS",
+			catalog:      new("foobar_catalog"),
+			dbSchema:     new("foobar_schema"),
+			matchExactly: true,
 		},
 		{
 			query:   `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN ACCOUNT`,
@@ -140,17 +140,17 @@ func TestShowTerseQuery(t *testing.T) {
 			dbSchema: new("foobar_schema"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar%catalog"`,
-			objType:          "SCHEMAS",
-			catalog:          new("foobar%catalog"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar%catalog"`,
+			objType:      "SCHEMAS",
+			catalog:      new("foobar%catalog"),
+			matchExactly: true,
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar%catalog" STARTS WITH 'foobar_schema'`,
-			objType:          "SCHEMAS",
-			catalog:          new("foobar%catalog"),
-			dbSchema:         new("foobar_schema"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "foobar%catalog" STARTS WITH 'foobar_schema'`,
+			objType:      "SCHEMAS",
+			catalog:      new("foobar%catalog"),
+			dbSchema:     new("foobar_schema"),
+			matchExactly: true,
 		},
 		{
 			query:   `SHOW TERSE /* ADBC:getObjects */ TABLES IN ACCOUNT`,
@@ -162,10 +162,10 @@ func TestShowTerseQuery(t *testing.T) {
 			catalog: new("foobar_catalog"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ TABLES IN DATABASE "foobar_catalog"`,
-			objType:          "TABLES",
-			catalog:          new("foobar_catalog"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ TABLES IN DATABASE "foobar_catalog"`,
+			objType:      "TABLES",
+			catalog:      new("foobar_catalog"),
+			matchExactly: true,
 		},
 		{
 			query:    `SHOW TERSE /* ADBC:getObjects */ TABLES IN ACCOUNT`,
@@ -174,11 +174,11 @@ func TestShowTerseQuery(t *testing.T) {
 			dbSchema: new("foobar_schema"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "foobar_catalog"."foobar_schema"`,
-			objType:          "TABLES",
-			catalog:          new("foobar_catalog"),
-			dbSchema:         new("foobar_schema"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "foobar_catalog"."foobar_schema"`,
+			objType:      "TABLES",
+			catalog:      new("foobar_catalog"),
+			dbSchema:     new("foobar_schema"),
+			matchExactly: true,
 		},
 		{
 			query:    `SHOW TERSE /* ADBC:getObjects */ TABLES IN ACCOUNT`,
@@ -194,12 +194,12 @@ func TestShowTerseQuery(t *testing.T) {
 			tableName: new("foobar%table"),
 		},
 		{
-			query:            `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "foobar_catalog"."foobar%schema" STARTS WITH 'foobar%table'`,
-			objType:          "TABLES",
-			catalog:          new("foobar_catalog"),
-			dbSchema:         new("foobar%schema"),
-			tableName:        new("foobar%table"),
-			disableWildcards: true,
+			query:        `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "foobar_catalog"."foobar%schema" STARTS WITH 'foobar%table'`,
+			objType:      "TABLES",
+			catalog:      new("foobar_catalog"),
+			dbSchema:     new("foobar%schema"),
+			tableName:    new("foobar%table"),
+			matchExactly: true,
 		},
 		{
 			query:   `SHOW TERSE /* ADBC:getObjects */ TABLES IN ACCOUNT`,
@@ -226,11 +226,11 @@ func TestShowTerseQuery(t *testing.T) {
 		if tt.tableName != nil {
 			fmt.Fprintf(&testName, ";table=%s", *tt.tableName)
 		}
-		if tt.disableWildcards {
-			testName.WriteString(";disableWildcards")
+		if tt.matchExactly {
+			testName.WriteString(";matchExactly")
 		}
 		t.Run(testName.String(), func(t *testing.T) {
-			query, err := showTerseQuery(tt.objType, tt.catalog, tt.dbSchema, tt.tableName, tt.disableWildcards)
+			query, err := showTerseQuery(tt.objType, tt.catalog, tt.dbSchema, tt.tableName, tt.matchExactly)
 			assert.NoError(t, err)
 			require.Equal(t, tt.query, query)
 		})
@@ -288,10 +288,10 @@ func TestAddStartsWith(t *testing.T) {
 
 func TestBuildShowTerseQuery(t *testing.T) {
 	for _, tt := range []struct {
-		name             string
-		pattern          *string
-		disableWildcards bool
-		want             string
+		name         string
+		pattern      *string
+		matchExactly bool
+		want         string
 	}{
 		{"unfiltered", nil, true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S"`},
 		{"wildcards", new("T_%"), false, `SHOW TERSE /* ADBC:getObjects */ TABLES LIKE 'T_%' IN SCHEMA "DB"."S"`},
@@ -299,7 +299,7 @@ func TestBuildShowTerseQuery(t *testing.T) {
 		{"quotes and backslashes", new(`T\n'X`), true, `SHOW TERSE /* ADBC:getObjects */ TABLES IN SCHEMA "DB"."S" STARTS WITH 'T\\n''X'`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, buildShowTerseQuery(objTables, tt.pattern, ` IN SCHEMA "DB"."S"`, tt.disableWildcards))
+			assert.Equal(t, tt.want, buildShowTerseQuery(objTables, tt.pattern, ` IN SCHEMA "DB"."S"`, tt.matchExactly))
 		})
 	}
 }

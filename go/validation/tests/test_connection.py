@@ -66,7 +66,7 @@ class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
 
     @pytest.fixture
     def literal_conn(self, conn):
-        option = "adbc.connection.get_objects.disable_wildcards"
+        option = "adbc.connection.get_objects.match_exactly"
         previous = conn.adbc_connection.get_option(option)
         conn.adbc_connection.set_options(**{option: True})
         try:

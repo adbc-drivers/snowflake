@@ -108,7 +108,7 @@ Examples:
 
 ### Connection Options
 
-`adbc.connection.get_objects.disable_wildcards`
+`adbc.connection.get_objects.match_exactly`
 : **Type:** boolean. **Default:** false
 
   Match GetObjects filters literally and case-sensitively; may improve performance, especially if your namespace names contain underscores.
