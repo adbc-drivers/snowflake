@@ -79,6 +79,7 @@ type statement struct {
 	ingestMode     string
 	ingestOptions  ingestOptions
 	queryTag       string
+	mcs            MetadataCollectionState
 
 	bound      arrow.RecordBatch
 	streamBind array.RecordReader
@@ -196,6 +197,10 @@ func parseCompressionCodec(val string) (compress.Compression, error) {
 
 // SetOption sets a string option on this statement
 func (st *statement) SetOption(ctx context.Context, key string, val string) error {
+	if handled, err := st.mcs.SetOption(key, val); handled {
+		return err
+	}
+
 	switch key {
 	case adbc.OptionKeyIngestTargetTable:
 		st.query = ""
@@ -917,6 +922,11 @@ func extractSRIDFromMeta(metadata string) (int, string) {
 //
 // This invalidates any prior result sets on this statement.
 func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReader, nRows int64, err error) {
+	if q := st.mcs.Take(); q != nil {
+		reader, err := q.(snowflakeMetadataCollection).Execute(ctx, st.cnxn.Alloc, st.cnxn.cn)
+		return reader, -1, err
+	}
+
 	nRows = -1
 
 	var span trace.Span

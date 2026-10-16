@@ -983,6 +983,7 @@ func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithCo
 		maxTimestampPrecision: c.maxTimestampPrecision,
 		ingestOptions:         DefaultIngestOptions(),
 	}
+	stmt.mcs.AddCollection(&catalogCollection{})
 	return driverbase.NewStatement(stmt), nil
 }
 
