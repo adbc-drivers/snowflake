@@ -69,6 +69,8 @@ jobs:
       - uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
         id: nuget-login
         with:
+          # Individual NuGet username that created the Trusted Publishing policy.
+          # Package ownership is selected separately in that policy.
           user: ${{ vars.NUGET_USER }}
 
       - run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
