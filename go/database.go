@@ -30,6 +30,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"strconv"
@@ -645,25 +646,29 @@ func validateGeoOutputFormat(optionName, value string) error {
 	}
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.ConnectionWithContext, err error) {
-	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
-	defer driverbase.EndSpan(span, err)
+func (d *databaseImpl) connectorConfig() gosnowflake.Config {
+	cfg := *d.cfg
+	cfg.Params = make(map[string]*string, len(d.cfg.Params)+2)
+	maps.Copy(cfg.Params, d.cfg.Params)
 
 	// Set the Snowflake session output format for GEOGRAPHY/GEOMETRY based on
 	// the configured option. EWKB enables the GeoArrow path (binary + SRID
 	// peek); GeoJSON returns text strings. Only set the session parameter if
 	// the user hasn't already configured it directly via the Params map.
-	if d.cfg.Params == nil {
-		d.cfg.Params = make(map[string]*string)
+	if _, ok := cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
+		cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = new(d.geographyOutputFormat)
 	}
-	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
-		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = new(d.geographyOutputFormat)
+	if _, ok := cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
+		cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = new(d.geometryOutputFormat)
 	}
-	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
-		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = new(d.geometryOutputFormat)
-	}
+	return cfg
+}
 
-	connector := gosnowflake.NewConnector(drv, *d.cfg)
+func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.ConnectionWithContext, err error) {
+	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
+	defer driverbase.EndSpan(span, err)
+
+	connector := gosnowflake.NewConnector(drv, d.connectorConfig())
 
 	ctx = gosnowflake.WithArrowAllocator(
 		arrowbatches.WithArrowBatches(ctx), d.Alloc)

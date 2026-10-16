@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/snowflakedb/gosnowflake/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,4 +43,37 @@ func TestSetOptionInternal_MaxRetryCount(t *testing.T) {
 		require.Error(t, err, "value %q", bad)
 		require.Equal(t, 50, db.cfg.MaxRetryCount, "invalid value %q must not change the setting", bad)
 	}
+}
+
+func TestConnectorConfigDoesNotMutateDatabase(t *testing.T) {
+	db := &databaseImpl{
+		cfg:                   &gosnowflake.Config{Params: map[string]*string{}},
+		geographyOutputFormat: "GEOJSON",
+		geometryOutputFormat:  "GEOJSON",
+	}
+
+	cfg := db.connectorConfig()
+	require.NotNil(t, cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"])
+	assert.Equal(t, "GEOJSON", *cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"])
+	assert.Equal(t, "GEOJSON", *cfg.Params["GEOMETRY_OUTPUT_FORMAT"])
+	assert.Empty(t, db.cfg.Params, "per-connection defaults leaked into the database config")
+
+	// Changing the option after a connection was opened applies to the next one.
+	require.NoError(t, db.SetOptionInternal(OptionGeographyOutputFormat, "EWKB", nil))
+	cfg = db.connectorConfig()
+	assert.Equal(t, "EWKB", *cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"])
+}
+
+func TestConnectorConfigKeepsExplicitParams(t *testing.T) {
+	db := &databaseImpl{
+		cfg:                   &gosnowflake.Config{Params: map[string]*string{}},
+		geographyOutputFormat: "GEOJSON",
+		geometryOutputFormat:  "GEOJSON",
+	}
+	require.NoError(t, db.SetOptionInternal("GEOMETRY_OUTPUT_FORMAT", "WKT", nil))
+
+	cfg := db.connectorConfig()
+	assert.Equal(t, "WKT", *cfg.Params["GEOMETRY_OUTPUT_FORMAT"])
+	assert.Equal(t, "GEOJSON", *cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"])
+	assert.Len(t, db.cfg.Params, 1)
 }
