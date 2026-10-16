@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # Watches conventional-commit pushes to main and maintains a release PR for
-# AdbcDrivers.Snowflake. Merging that PR is what creates the csharp/v* tag
-# and GitHub release that csharp_release.yaml then builds and publishes.
-name: Csharp Tag
+# AdbcDrivers.Snowflake. Merging it creates a draft GitHub release.
+# Dispatch the package workflow explicitly: a draft has no Git tag yet.
+name: Csharp Prepare Release
 
 on:
   push:
@@ -25,7 +25,7 @@ on:
       - 'csharp/src/AdbcDrivers.Snowflake/**'
       - 'csharp/Directory.Build.props'
       - 'release-please-config.json'
-      - '.github/workflows/csharp_tag.yaml'
+      - '.github/workflows/csharp_prepare_release.yaml'
       - '.github/workflows/csharp_release.yaml'
   workflow_dispatch: {}
 
@@ -36,11 +36,22 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      actions: write
     steps:
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        id: release
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Start draft release publishing
+        if: ${{ steps.release.outputs['csharp/src/AdbcDrivers.Snowflake--release_created'] == 'true' }}
+        run: |
+          gh workflow run csharp_release.yaml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f release_tag="$RELEASE_TAG" -f release_sha="$RELEASE_SHA"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs['csharp/src/AdbcDrivers.Snowflake--tag_name'] }}
+          RELEASE_SHA: ${{ steps.release.outputs['csharp/src/AdbcDrivers.Snowflake--sha'] }}
