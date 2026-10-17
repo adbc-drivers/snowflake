@@ -15,6 +15,7 @@
 
 import adbc_driver_manager
 import adbc_drivers_validation.tests.connection
+import pyarrow
 import pytest
 
 from . import snowflake
@@ -26,6 +27,27 @@ def pytest_generate_tests(metafunc) -> None:
 
 
 class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
+    def test_meta_collection_catalogs(self, driver, conn) -> None:
+        with conn.cursor() as cursor:
+            cursor.adbc_statement.set_options(
+                **{
+                    "adbc.metadata.collection": "catalogs",
+                }
+            )
+            handle, _ = cursor.adbc_statement.execute_query()
+            with pyarrow.RecordBatchReader._import_from_c(handle.address) as reader:
+                result = reader.read_all()
+                assert result.schema == pyarrow.schema(
+                    [
+                        ("catalog_name", pyarrow.string(), True),
+                        ("catalog_remarks", pyarrow.string(), True),
+                    ]
+                )
+                catalogs = result[0].to_pylist()
+                assert sorted(catalogs) == catalogs
+                assert driver.features.current_catalog in catalogs
+                assert driver.features.secondary_catalog in catalogs
+
     def test_unknown_option(self, subtests, driver, conn) -> None:
         # database impl here accepts all options as extra connection options, so override this test
         with conn.cursor() as cursor:
