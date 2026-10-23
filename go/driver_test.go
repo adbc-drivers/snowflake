@@ -2645,6 +2645,52 @@ func (suite *SnowflakeTests) TestIngestEmptyChunk() {
 	suite.EqualValues(int64(3), n)
 }
 
+// Many small files with concurrent uploads and COPYs often leave files for
+// the final COPY to load after the background COPYs finish.
+func (suite *SnowflakeTests) TestIngestManySmallFiles() {
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, "bulk_ingest_many_files"))
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "col_int64", Type: arrow.PrimitiveTypes.Int64,
+			Nullable: true,
+		},
+		{
+			Name: "col_string", Type: arrow.BinaryTypes.String,
+			Nullable: true,
+		},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	const numBatches, batchSize = 300, 200
+	recs := make([]arrow.RecordBatch, numBatches)
+	for b := range numBatches {
+		for i := range batchSize {
+			bldr.Field(0).(*array.Int64Builder).Append(int64(b*batchSize + i))
+			bldr.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("row-%d-%d", b, i))
+		}
+		recs[b] = bldr.NewRecordBatch()
+		defer recs[b].Release()
+	}
+
+	rdr, err := array.NewRecordReader(sc, recs)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.Require().NoError(suite.stmt.BindStream(suite.ctx, rdr))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, "bulk_ingest_many_files"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestTargetFileSize, "1024"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestWriterConcurrency, "8"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestUploadConcurrency, "16"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestCopyConcurrency, "8"))
+
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.EqualValues(numBatches*batchSize, n)
+}
+
 func TestIngestCancelContext(t *testing.T) {
 	withQuirks(t, func(q *SnowflakeQuirks) {
 		ctx := context.Background()
