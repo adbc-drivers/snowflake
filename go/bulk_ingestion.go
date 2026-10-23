@@ -191,7 +191,7 @@ func (st *statement) ingestRecord(ctx context.Context, copyQ string) (nrows int6
 			err = errors.Join(err, bw.Flush(), w.Close())
 		}()
 
-		err = writeParquet(schema, bw, recordCh, 0, parquetProps, arrowProps)
+		err = writeParquet(schema, bw, nil, recordCh, 0, parquetProps, arrowProps)
 		if err != io.EOF {
 			return err
 		}
@@ -393,9 +393,12 @@ func writeRecordToParquet(wr *pqarrow.FileWriter, rec arrow.RecordBatch) (int64,
 	return wr.RowGroupTotalBytesWritten(), nil
 }
 
+// writeParquet writes first, if not nil, and then records from in to w as a
+// Parquet file, until the file reaches targetSize or in is closed.
 func writeParquet(
 	schema *arrow.Schema,
 	w io.Writer,
+	first arrow.RecordBatch,
 	in <-chan arrow.RecordBatch,
 	targetSize int,
 	parquetProps *parquet.WriterProperties,
@@ -403,6 +406,9 @@ func writeParquet(
 ) (err error) {
 	pqWriter, err := pqarrow.NewFileWriter(schema, w, parquetProps, arrowProps)
 	if err != nil {
+		if first != nil {
+			first.Release()
+		}
 		return err
 	}
 	defer func() {
@@ -416,8 +422,17 @@ func writeParquet(
 		}
 	}()
 
+	next := func() (arrow.RecordBatch, bool) {
+		if rec := first; rec != nil {
+			first = nil
+			return rec, true
+		}
+		rec, ok := <-in
+		return rec, ok
+	}
+
 	var bytesWritten int64
-	for rec := range in {
+	for rec, ok := next(); ok; rec, ok = next() {
 		nbytes, err := writeRecordToParquet(pqWriter, rec)
 		if err != nil {
 			return err
@@ -479,6 +494,9 @@ func runParallelParquetWriters(
 		}
 
 		g.Go(func() error {
+			// Wait for a record before taking a buffer, so that writers
+			// with nothing to write don't each allocate a full file.
+			var first arrow.RecordBatch
 			select {
 			case <-done:
 				// Channel may have already closed while goroutine was waiting to get scheduled
@@ -486,12 +504,16 @@ func runParallelParquetWriters(
 			case <-ctx.Done():
 				finished()
 				return ctx.Err()
-			default:
-				// Proceed to write a new file
+			case rec, ok := <-in:
+				if !ok {
+					finished()
+					return nil
+				}
+				first = rec
 			}
 
 			buf := buffers.GetBuffer()
-			err := writeParquet(schema, buf, in, targetSize, parquetProps, arrowProps)
+			err := writeParquet(schema, buf, first, in, targetSize, parquetProps, arrowProps)
 			if err == io.EOF {
 				tryWriteBuffer(buf)
 				finished()
