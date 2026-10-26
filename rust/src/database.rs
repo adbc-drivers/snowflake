@@ -193,8 +193,6 @@ pub struct Database {
     pub(crate) sf_settings: HashMap<String, Setting>,
     /// Database-level warning messages already surfaced to the application logger.
     pub(crate) surfaced_warnings: HashSet<String>,
-    /// Map NUMBER(p,s) with s>0 to Decimal128 instead of Float64.
-    pub(crate) use_high_precision: bool,
     /// Arrow time unit used for TIMESTAMP columns.
     pub(crate) timestamp_precision: TimestampPrecision,
 }
@@ -236,12 +234,6 @@ impl Optionable for Database {
                 Status::InvalidArguments,
             ));
         }
-        if key_str == "adbc.snowflake.sql.client_option.use_high_precision" {
-            if let OptionValue::String(s) = &value {
-                self.use_high_precision = s == "enabled" || s == "true";
-            }
-            return Ok(());
-        }
         if key_str == "adbc.snowflake.sql.client_option.max_timestamp_precision" {
             if let OptionValue::String(s) = &value {
                 self.timestamp_precision = match s.as_str() {
@@ -264,13 +256,6 @@ impl Optionable for Database {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let key_str = key.as_ref();
-        if key_str == "adbc.snowflake.sql.client_option.use_high_precision" {
-            return Ok(if self.use_high_precision {
-                "enabled".to_string()
-            } else {
-                "disabled".to_string()
-            });
-        }
         if key_str == "adbc.snowflake.sql.client_option.max_timestamp_precision" {
             return Ok(match self.timestamp_precision {
                 TimestampPrecision::Microseconds => "microseconds",
@@ -723,7 +708,6 @@ impl adbc_core::Database for Database {
             inner: self.inner.clone(),
             conn_handle,
             autocommit: true,
-            use_high_precision: self.use_high_precision,
             timestamp_precision: self.timestamp_precision,
         };
         // From this point Connection::drop owns cleanup on every error path.

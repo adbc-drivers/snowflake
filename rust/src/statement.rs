@@ -73,7 +73,6 @@ pub struct Statement {
     pub(crate) ingest_mode: Option<String>,
     pub(crate) query_tag: Option<String>,
     pub(crate) query_timeout_seconds: Option<u32>,
-    pub(crate) use_high_precision: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
     /// Parameter batches stored by bind() / bind_stream(). Each row is one execution.
     pub(crate) bound_batches: Vec<RecordBatch>,
@@ -128,16 +127,6 @@ impl Optionable for Statement {
                         Status::InvalidArguments,
                     ))
                 }
-            }
-            OptionStatement::Other(ref k)
-                if k == "adbc.snowflake.sql.client_option.use_high_precision" =>
-            {
-                if let OptionValue::String(s) = value {
-                    self.use_high_precision = s == "enabled" || s == "true";
-                }
-                self.prepared_parameter_schema = None;
-                self.prepared_result_schema = None;
-                Ok(())
             }
             OptionStatement::Other(ref k)
                 if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
@@ -319,12 +308,10 @@ impl Statement {
                 self.prepared_parameter_schema = parameter_schema_from_prepare(
                     prepared.number_of_binds,
                     &prepared.binds,
-                    self.use_high_precision,
                     self.timestamp_precision.time_unit(),
                 );
                 let schema = adjust_schema(
                     &prepared.reader.schema(),
-                    self.use_high_precision,
                     self.timestamp_precision.time_unit(),
                 );
                 self.prepared_result_schema = Some(schema.as_ref().clone());
@@ -338,7 +325,6 @@ impl Statement {
         let inner = self.inner.clone();
         let stmt_handle = self.stmt_handle;
         let timeout_seconds = self.execution_timeout_seconds();
-        let use_high_precision = self.use_high_precision;
         let timestamp_precision = self.timestamp_precision;
         let mut last_query_id = self.last_query_id.clone();
         let result = execute_bound_rows(&self.bound_batches, Arc::new(Schema::empty()), |row| {
@@ -354,7 +340,6 @@ impl Statement {
             last_query_id = Some(result.descriptor.query_id.clone());
             Ok(Box::new(ConvertingReader::new(
                 result.reader,
-                use_high_precision,
                 timestamp_precision.time_unit(),
                 timestamp_precision,
             )))
@@ -411,7 +396,6 @@ impl adbc_core::Statement for Statement {
         let reader = result.reader;
         Ok(Box::new(ConvertingReader::new(
             reader,
-            self.use_high_precision,
             self.timestamp_precision.time_unit(),
             self.timestamp_precision,
         )))
@@ -475,12 +459,10 @@ impl adbc_core::Statement for Statement {
         self.prepared_parameter_schema = parameter_schema_from_prepare(
             prepared.number_of_binds,
             &prepared.binds,
-            self.use_high_precision,
             self.timestamp_precision.time_unit(),
         );
         let schema = adjust_schema(
             &prepared.reader.schema(),
-            self.use_high_precision,
             self.timestamp_precision.time_unit(),
         )
         .as_ref()
@@ -519,13 +501,11 @@ impl adbc_core::Statement for Statement {
         self.prepared_parameter_schema = parameter_schema_from_prepare(
             prepared.number_of_binds,
             &prepared.binds,
-            self.use_high_precision,
             self.timestamp_precision.time_unit(),
         );
         self.prepared_result_schema = Some(
             adjust_schema(
                 &prepared.reader.schema(),
-                self.use_high_precision,
                 self.timestamp_precision.time_unit(),
             )
             .as_ref()
@@ -650,7 +630,6 @@ impl RecordBatchReader for ConcatReader {
 fn parameter_schema_from_prepare(
     number_of_binds: i32,
     binds: &[ColumnMetadata],
-    use_high_precision: bool,
     ts_unit: TimeUnit,
 ) -> Option<Schema> {
     let bind_count = usize::try_from(number_of_binds).ok()?;
@@ -664,7 +643,15 @@ fn parameter_schema_from_prepare(
             let logical_type = bind.r#type.to_ascii_uppercase();
             let scale = bind.scale.unwrap_or(0);
             let physical_type = match logical_type.as_str() {
-                "FIXED" => DataType::Int64,
+                // Binds carry no server Arrow type, so choose the narrowest exact
+                // representation the declared precision and scale allow.
+                "FIXED" => match (bind.precision, scale) {
+                    (Some(precision), 0) if precision <= 18 => DataType::Int64,
+                    (precision, scale) => DataType::Decimal128(
+                        precision.unwrap_or(38).clamp(1, 38) as u8,
+                        scale.clamp(0, 38) as i8,
+                    ),
+                },
                 "REAL" => DataType::Float64,
                 "BOOLEAN" => DataType::Boolean,
                 "DATE" => DataType::Date32,
@@ -691,7 +678,7 @@ fn parameter_schema_from_prepare(
         })
         .collect::<Vec<_>>();
     Some(
-        adjust_schema(&Schema::new(fields), use_high_precision, ts_unit)
+        adjust_schema(&Schema::new(fields), ts_unit)
             .as_ref()
             .clone(),
     )
@@ -726,16 +713,14 @@ fn time_unit_rank(unit: TimeUnit) -> u32 {
     }
 }
 
-pub(crate) fn adjust_schema(
-    schema: &Schema,
-    use_high_precision: bool,
-    ts_unit: TimeUnit,
-) -> Arc<Schema> {
+/// Map Snowflake's physical encodings for temporal and REAL columns to their
+/// Arrow types. Numeric (FIXED) and other columns keep the server's type.
+pub(crate) fn adjust_schema(schema: &Schema, ts_unit: TimeUnit) -> Arc<Schema> {
     let adjusted_fields: Vec<Field> = schema
         .fields()
         .iter()
         .map(|f| {
-            let target = compute_target_type(f, use_high_precision, ts_unit);
+            let target = compute_target_type(f, ts_unit);
             Field::new(f.name(), target, f.is_nullable())
         })
         .collect();
@@ -745,7 +730,7 @@ pub(crate) fn adjust_schema(
     ))
 }
 
-fn compute_target_type(field: &Field, use_high_precision: bool, ts_unit: TimeUnit) -> DataType {
+fn compute_target_type(field: &Field, ts_unit: TimeUnit) -> DataType {
     let logical_type = field
         .metadata()
         .get("logicalType")
@@ -756,23 +741,8 @@ fn compute_target_type(field: &Field, use_high_precision: bool, ts_unit: TimeUni
         .get("scale")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let precision: u8 = field
-        .metadata()
-        .get("precision")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(38)
-        .min(38);
 
     match logical_type {
-        "FIXED" => {
-            if use_high_precision && scale > 0 {
-                DataType::Decimal128(precision, scale as i8)
-            } else if scale == 0 {
-                DataType::Int64
-            } else {
-                DataType::Float64
-            }
-        }
         "TIME" => {
             let unit = scale_to_time_unit(scale as u32);
             if scale < 6 {
@@ -794,35 +764,13 @@ fn compute_target_type(field: &Field, use_high_precision: bool, ts_unit: TimeUni
             let unit = timestamp_target_unit(scale, ts_unit);
             DataType::Timestamp(unit, Some(Arc::from("UTC")))
         }
-        _ => match field.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => DataType::Int64,
-            other => other.clone(),
-        },
+        _ => field.data_type().clone(),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn adjust_schema_integers(schema: &Schema) -> Arc<Schema> {
-    let adjusted_fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|f| match f.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-                Field::new(f.name(), DataType::Int64, f.is_nullable())
-            }
-            _ => f.as_ref().clone(),
-        })
-        .collect();
-    Arc::new(Schema::new_with_metadata(
-        adjusted_fields,
-        schema.metadata().clone(),
-    ))
 }
 
 pub(crate) struct ConvertingReader<R: RecordBatchReader> {
     inner: R,
     schema: Arc<Schema>,
-    use_high_precision: bool,
     ts_unit: TimeUnit,
     check_overflow: bool,
     logical_types: Vec<String>,
@@ -830,12 +778,7 @@ pub(crate) struct ConvertingReader<R: RecordBatchReader> {
 }
 
 impl<R: RecordBatchReader> ConvertingReader<R> {
-    pub(crate) fn new(
-        inner: R,
-        use_high_precision: bool,
-        ts_unit: TimeUnit,
-        ts_precision: TimestampPrecision,
-    ) -> Self {
+    pub(crate) fn new(inner: R, ts_unit: TimeUnit, ts_precision: TimestampPrecision) -> Self {
         let orig_schema = inner.schema();
         let logical_types: Vec<String> = orig_schema
             .fields()
@@ -852,12 +795,11 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                     .unwrap_or(0)
             })
             .collect();
-        let schema = adjust_schema(&orig_schema, use_high_precision, ts_unit);
+        let schema = adjust_schema(&orig_schema, ts_unit);
 
         Self {
             inner,
             schema,
-            use_high_precision,
             ts_unit,
             check_overflow: ts_precision == TimestampPrecision::NanosecondsErrorOnOverflow,
             logical_types,
@@ -870,63 +812,10 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
         logical_type: &str,
         scale: i64,
         target_type: &DataType,
-        use_high_precision: bool,
         ts_unit: TimeUnit,
         check_overflow: bool,
     ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
         match logical_type {
-            "FIXED" => {
-                if scale == 0 {
-                    match col.data_type() {
-                        DataType::Int64 => Ok(col.clone()),
-                        _ => arrow_cast::cast(col.as_ref(), &DataType::Int64),
-                    }
-                } else if use_high_precision {
-                    match col.data_type() {
-                        // Source is already Decimal128 — cast to ensure target_type metadata is applied exactly
-                        DataType::Decimal128(_, _) => arrow_cast::cast(col.as_ref(), target_type),
-                        // Source is Int64 (scaled integer) — convert to Decimal128(precision, scale)
-                        // following Go's integerToDecimal128: cast Int64 → Decimal128(20,0),
-                        // then reinterpret as Decimal128(precision, scale).
-                        _ => {
-                            let intermediate =
-                                arrow_cast::cast(col.as_ref(), &DataType::Decimal128(20, 0))?;
-                            let data = intermediate.to_data();
-                            // Safety: Decimal128 and Decimal128(20,0) share identical 128-bit
-                            // buffer layouts, so this reinterpret is memory-safe.
-                            // Values that exceed target_type's precision are not validated here
-                            // and will silently overflow the declared precision.
-                            let retyped = unsafe {
-                                data.into_builder()
-                                    .data_type(target_type.clone())
-                                    .build_unchecked()
-                            };
-                            Ok(arrow_array::make_array(retyped))
-                        }
-                    }
-                } else {
-                    match col.data_type() {
-                        DataType::Decimal128(_, _) => {
-                            arrow_cast::cast(col.as_ref(), &DataType::Float64)
-                        }
-                        _ => {
-                            let casted = arrow_cast::cast(col.as_ref(), &DataType::Float64)?;
-                            let divisor = 10f64.powi(scale as i32);
-                            let float_arr = casted
-                                .as_any()
-                                .downcast_ref::<arrow_array::Float64Array>()
-                                .ok_or_else(|| {
-                                    arrow_schema::ArrowError::CastError(
-                                        "expected Float64Array after cast".into(),
-                                    )
-                                })?;
-                            let divided: arrow_array::Float64Array =
-                                float_arr.iter().map(|v| v.map(|x| x / divisor)).collect();
-                            Ok(Arc::new(divided) as ArrayRef)
-                        }
-                    }
-                }
-            }
             "TIME" => arrow_cast::cast(col.as_ref(), target_type),
             "REAL" => arrow_cast::cast(col.as_ref(), &DataType::Float64),
             "TIMESTAMP_NTZ" => convert_timestamp_ntz(col, scale, ts_unit, check_overflow, None),
@@ -934,12 +823,7 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                 convert_timestamp_ntz(col, scale, ts_unit, check_overflow, Some(Arc::from("UTC")))
             }
             "TIMESTAMP_TZ" => convert_timestamp_tz(col, scale, ts_unit, check_overflow),
-            _ => match col.data_type() {
-                DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-                    arrow_cast::cast(col.as_ref(), &DataType::Int64)
-                }
-                _ => Ok(col.clone()),
-            },
+            _ => Ok(col.clone()),
         }
     }
 }
@@ -1231,7 +1115,6 @@ impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
                     logical_type,
                     scale,
                     target_type,
-                    self.use_high_precision,
                     self.ts_unit,
                     check_overflow,
                 )
@@ -1732,7 +1615,6 @@ mod tests {
             ingest_mode: None,
             query_tag: None,
             query_timeout_seconds: None,
-            use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
             binding_supplied: false,
@@ -1906,7 +1788,6 @@ mod tests {
             ingest_mode: None,
             query_tag: None,
             query_timeout_seconds: None,
-            use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
             binding_supplied: false,
@@ -1935,7 +1816,6 @@ mod tests {
             ingest_mode: None,
             query_tag: None,
             query_timeout_seconds: None,
-            use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             bound_batches: vec![],
             binding_supplied: false,
@@ -1958,13 +1838,14 @@ mod tests {
     #[test]
     fn valid_prepare_bind_metadata_uses_stable_names_and_existing_conversions() {
         let schema = parameter_schema_from_prepare(
-            3,
+            5,
             &[
                 bind_metadata("", "FIXED", Some(10), Some(2)),
                 bind_metadata("named", "TIMESTAMP_NTZ", None, Some(6)),
                 bind_metadata("unknown", "FUTURE_TYPE", None, None),
+                bind_metadata("int", "FIXED", Some(18), Some(0)),
+                bind_metadata("wide", "FIXED", Some(38), Some(0)),
             ],
-            true,
             TimeUnit::Nanosecond,
         )
         .unwrap();
@@ -1978,26 +1859,22 @@ mod tests {
         );
         assert_eq!(schema.field(2).name(), "unknown");
         assert_eq!(schema.field(2).data_type(), &DataType::Null);
+        // Integers fit Int64 only up to 18 digits; wider ones need Decimal128.
+        assert_eq!(schema.field(3).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Decimal128(38, 0));
     }
 
     #[test]
     fn invalid_prepare_bind_metadata_is_not_exposed() {
         let bind = bind_metadata("", "FIXED", Some(10), Some(0));
         assert!(
-            parameter_schema_from_prepare(
-                2,
-                std::slice::from_ref(&bind),
-                true,
-                TimeUnit::Nanosecond
-            )
-            .is_none()
+            parameter_schema_from_prepare(2, std::slice::from_ref(&bind), TimeUnit::Nanosecond)
+                .is_none()
         );
         let mut missing_type = bind;
         missing_type.r#type.clear();
-        assert!(
-            parameter_schema_from_prepare(1, &[missing_type], true, TimeUnit::Nanosecond).is_none()
-        );
-        assert!(parameter_schema_from_prepare(-1, &[], true, TimeUnit::Nanosecond).is_none());
+        assert!(parameter_schema_from_prepare(1, &[missing_type], TimeUnit::Nanosecond).is_none());
+        assert!(parameter_schema_from_prepare(-1, &[], TimeUnit::Nanosecond).is_none());
     }
 
     #[test]
@@ -2016,12 +1893,6 @@ mod tests {
     #[test]
     fn parameter_schema_cache_is_invalidated_by_conversion_and_ingest_options() {
         let cases = [
-            (
-                OptionStatement::Other(
-                    "adbc.snowflake.sql.client_option.use_high_precision".into(),
-                ),
-                OptionValue::String("disabled".into()),
-            ),
             (
                 OptionStatement::Other(
                     "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
@@ -2163,184 +2034,46 @@ mod tests {
     }
 
     #[test]
-    fn test_adjust_schema_int8_to_int64() {
-        let schema = Schema::new(vec![Field::new("a", DataType::Int8, false)]);
-        let result = adjust_schema_integers(&schema);
-        assert_eq!(result.field(0).data_type(), &DataType::Int64);
-    }
-
-    #[test]
-    fn test_adjust_schema_int16_to_int64() {
-        let schema = Schema::new(vec![Field::new("b", DataType::Int16, true)]);
-        let result = adjust_schema_integers(&schema);
-        assert_eq!(result.field(0).data_type(), &DataType::Int64);
-    }
-
-    #[test]
-    fn test_adjust_schema_int32_to_int64() {
-        let schema = Schema::new(vec![Field::new("c", DataType::Int32, false)]);
-        let result = adjust_schema_integers(&schema);
-        assert_eq!(result.field(0).data_type(), &DataType::Int64);
-    }
-
-    #[test]
-    fn test_adjust_schema_int64_passthrough() {
-        let schema = Schema::new(vec![Field::new("d", DataType::Int64, false)]);
-        let result = adjust_schema_integers(&schema);
-        assert_eq!(result.field(0).data_type(), &DataType::Int64);
-    }
-
-    #[test]
-    fn test_adjust_schema_mixed() {
-        use arrow_schema::DataType;
-        let schema = Schema::new(vec![
-            Field::new("i8", DataType::Int8, false),
-            Field::new("s", DataType::Utf8, false),
-            Field::new("i32", DataType::Int32, true),
-            Field::new("f64", DataType::Float64, false),
-        ]);
-        let result = adjust_schema_integers(&schema);
-        assert_eq!(result.field(0).data_type(), &DataType::Int64);
-        assert_eq!(result.field(1).data_type(), &DataType::Utf8);
-        assert_eq!(result.field(2).data_type(), &DataType::Int64);
-        assert_eq!(result.field(3).data_type(), &DataType::Float64);
-    }
-
-    #[test]
-    fn test_converting_reader_int8_values() {
-        use arrow_array::Int8Array;
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int8, false)]));
+    fn test_converting_reader_passes_server_numeric_types_through() {
+        use arrow_array::{Decimal128Array, Int8Array};
+        let schema = Arc::new(Schema::new(vec![
+            make_field_with_precision("small", DataType::Int8, "FIXED", "0", "2"),
+            make_field_with_precision("dec", DataType::Decimal128(10, 2), "FIXED", "2", "10"),
+            Field::new("plain", DataType::Int16, true),
+        ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int8Array::from(vec![1i8, 2, 3]))],
+            vec![
+                Arc::new(Int8Array::from(vec![Some(7i8), None])),
+                Arc::new(
+                    Decimal128Array::from(vec![12345i128, -255])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+                Arc::new(arrow_array::Int16Array::from(vec![Some(1i16), Some(-2)])),
+            ],
         )
         .unwrap();
         let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
+            batches: vec![batch.clone()].into_iter(),
             schema,
         };
         let mut cr = ConvertingReader::new(
             reader,
-            true,
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
         );
         let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .unwrap();
-        assert_eq!(col.values(), &[1i64, 2, 3]);
-    }
 
-    #[test]
-    fn test_converting_reader_null_values() {
-        use arrow_array::Int16Array;
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int16, true)]));
-        let arr = Int16Array::from(vec![Some(10i16), None, Some(30)]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            true,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int8);
+        assert_eq!(
+            out.schema().field(1).data_type(),
+            &DataType::Decimal128(10, 2)
         );
-        let out = cr.next().unwrap().unwrap();
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .unwrap();
-        assert_eq!(col.value(0), 10i64);
-        assert!(col.is_null(1));
-        assert_eq!(col.value(2), 30i64);
+        assert_eq!(out.schema().field(2).data_type(), &DataType::Int16);
+        assert_eq!(out.columns(), batch.columns());
     }
 
-    #[test]
-    fn test_converting_reader_empty_batch() {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let batch = RecordBatch::new_empty(schema.clone());
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            true,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-        let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
-        assert_eq!(out.num_rows(), 0);
-    }
-
-    #[test]
-    fn test_converting_reader_multiple_batches_different_widths() {
-        use arrow_array::{Int8Array, Int32Array};
-        struct TwoBatchReader {
-            batches: std::vec::IntoIter<RecordBatch>,
-            schema: Arc<Schema>,
-        }
-        impl Iterator for TwoBatchReader {
-            type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                self.batches.next().map(Ok)
-            }
-        }
-        impl RecordBatchReader for TwoBatchReader {
-            fn schema(&self) -> Arc<Schema> {
-                self.schema.clone()
-            }
-        }
-
-        let declared_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-
-        let schema_i8 = Arc::new(Schema::new(vec![Field::new("v", DataType::Int8, false)]));
-        let schema_i32 = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let batch1 =
-            RecordBatch::try_new(schema_i8, vec![Arc::new(Int8Array::from(vec![1i8, 2]))]).unwrap();
-        let batch2 = RecordBatch::try_new(
-            schema_i32,
-            vec![Arc::new(Int32Array::from(vec![100i32, 200]))],
-        )
-        .unwrap();
-
-        let reader = TwoBatchReader {
-            batches: vec![batch1, batch2].into_iter(),
-            schema: declared_schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            true,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-
-        let out1 = cr.next().unwrap().unwrap();
-        assert_eq!(out1.column(0).data_type(), &DataType::Int64);
-        let col1 = out1
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .unwrap();
-        assert_eq!(col1.values(), &[1i64, 2]);
-
-        let out2 = cr.next().unwrap().unwrap();
-        assert_eq!(out2.column(0).data_type(), &DataType::Int64);
-        let col2 = out2
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .unwrap();
-        assert_eq!(col2.values(), &[100i64, 200]);
-    }
     fn make_field_with_meta(name: &str, dt: DataType, logical_type: &str, scale: &str) -> Field {
         make_field_with_precision(name, dt, logical_type, scale, "38")
     }
@@ -2363,7 +2096,7 @@ mod tests {
     fn test_adjust_schema_time_scale3_is_time32_millisecond() {
         let f = make_field_with_meta("t", DataType::Int32, "TIME", "3");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Time32(TimeUnit::Millisecond)
@@ -2374,7 +2107,7 @@ mod tests {
     fn test_adjust_schema_time_scale9_is_time64_nanosecond() {
         let f = make_field_with_meta("t", DataType::Int64, "TIME", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Time64(TimeUnit::Nanosecond)
@@ -2382,26 +2115,10 @@ mod tests {
     }
 
     #[test]
-    fn test_adjust_schema_fixed_scale2_is_float64() {
-        let f = make_field_with_meta("x", DataType::Int64, "FIXED", "2");
-        let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Float64);
-    }
-
-    #[test]
-    fn test_adjust_schema_fixed_scale2_high_precision_is_decimal128() {
-        let f = make_field_with_precision("x", DataType::Int64, "FIXED", "2", "10");
-        let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, true, TimeUnit::Nanosecond);
-        assert_eq!(result.field(0).data_type(), &DataType::Decimal128(10, 2));
-    }
-
-    #[test]
     fn test_adjust_schema_timestamp_ntz_int64_to_timestamp_ns() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, false, TimeUnit::Nanosecond);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
@@ -2412,171 +2129,11 @@ mod tests {
     fn test_adjust_schema_timestamp_ltz_is_utc() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_LTZ", "6");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, false, TimeUnit::Microsecond);
+        let result = adjust_schema(&schema, TimeUnit::Microsecond);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
         );
-    }
-
-    #[test]
-    fn test_converting_reader_fixed_scale2_produces_float64() {
-        let f = make_field_with_meta("x", DataType::Int64, "FIXED", "2");
-        let schema = Arc::new(Schema::new(vec![f]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![12345i64, 255]))],
-        )
-        .unwrap();
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            false,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-        let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Float64Array>()
-            .unwrap();
-        assert!((col.value(0) - 123.45).abs() < 1e-9);
-        assert!((col.value(1) - 2.55).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_converting_reader_fixed_scale2_high_precision_produces_decimal128() {
-        let f = make_field_with_precision("x", DataType::Int64, "FIXED", "2", "10");
-        let schema = Arc::new(Schema::new(vec![f]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![
-                12345i64, -255,
-            ]))],
-        )
-        .unwrap();
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            true,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-        let out = cr.next().unwrap().unwrap();
-        assert_eq!(
-            out.schema().field(0).data_type(),
-            &DataType::Decimal128(10, 2)
-        );
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
-            .unwrap();
-        // 12345 with scale 2 = 123.45
-        assert_eq!(col.value(0), 12345i128);
-        // -255 with scale 2 = -2.55
-        assert_eq!(col.value(1), -255i128);
-    }
-
-    #[test]
-    fn test_converting_reader_fixed_scale0_high_precision_stays_int64() {
-        let f = make_field_with_precision("x", DataType::Int64, "FIXED", "0", "10");
-        let schema = Arc::new(Schema::new(vec![f]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![42i64]))],
-        )
-        .unwrap();
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            true,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-        let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
-    }
-
-    #[test]
-    fn test_converting_reader_decimal128_source_high_precision_identity() {
-        let f = make_field_with_precision("x", DataType::Decimal128(10, 2), "FIXED", "2", "10");
-        let schema = Arc::new(Schema::new(vec![f]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(
-                arrow_array::Decimal128Array::from(vec![12345i128, -255])
-                    .with_precision_and_scale(10, 2)
-                    .unwrap(),
-            )],
-        )
-        .unwrap();
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            true,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-        let out = cr.next().unwrap().unwrap();
-        assert_eq!(
-            out.schema().field(0).data_type(),
-            &DataType::Decimal128(10, 2)
-        );
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
-            .unwrap();
-        assert_eq!(col.value(0), 12345i128);
-        assert_eq!(col.value(1), -255i128);
-    }
-
-    #[test]
-    fn test_converting_reader_decimal128_source_no_high_precision_casts_to_float64() {
-        let f = make_field_with_precision("x", DataType::Decimal128(10, 2), "FIXED", "2", "10");
-        let schema = Arc::new(Schema::new(vec![f]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(
-                arrow_array::Decimal128Array::from(vec![12345i128])
-                    .with_precision_and_scale(10, 2)
-                    .unwrap(),
-            )],
-        )
-        .unwrap();
-        let reader = ConcatReader {
-            batches: vec![batch].into_iter(),
-            schema,
-        };
-        let mut cr = ConvertingReader::new(
-            reader,
-            false,
-            TimeUnit::Nanosecond,
-            TimestampPrecision::Nanoseconds,
-        );
-        let out = cr.next().unwrap().unwrap();
-        assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Float64Array>()
-            .unwrap();
-        assert!((col.value(0) - 123.45).abs() < 1e-9);
     }
 
     #[test]
@@ -2595,7 +2152,6 @@ mod tests {
         };
         let mut cr = ConvertingReader::new(
             reader,
-            false,
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
         );
@@ -2616,7 +2172,7 @@ mod tests {
     fn test_adjust_schema_timestamp_ntz_capped_by_ts_unit() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, false, TimeUnit::Microsecond);
+        let result = adjust_schema(&schema, TimeUnit::Microsecond);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)

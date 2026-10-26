@@ -42,7 +42,6 @@ pub struct Connection {
     pub(crate) inner: Arc<Inner>,
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
-    pub(crate) use_high_precision: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
 }
 
@@ -317,7 +316,6 @@ impl adbc_core::Connection for Connection {
             ingest_mode: None,
             query_tag: None,
             query_timeout_seconds: None,
-            use_high_precision: self.use_high_precision,
             timestamp_precision: self.timestamp_precision,
             bound_batches: vec![],
             binding_supplied: false,
@@ -544,13 +542,9 @@ impl adbc_core::Connection for Connection {
                     Status::Internal,
                 ));
             }
-            Ok(adjust_schema(
-                &schema,
-                self.use_high_precision,
-                self.timestamp_precision.time_unit(),
-            )
-            .as_ref()
-            .clone())
+            Ok(adjust_schema(&schema, self.timestamp_precision.time_unit())
+                .as_ref()
+                .clone())
         })();
         let release = self.inner.sf.statement_release(stmt_handle);
         match result {
@@ -685,7 +679,6 @@ mod tests {
             inner: driver.inner.clone(),
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             autocommit: true,
-            use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
         };
         let result = conn.get_option_string(OptionConnection::Other("unknown".into()));
@@ -721,7 +714,6 @@ mod tests {
             inner: driver.inner.clone(),
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             autocommit: true,
-            use_high_precision: true,
             timestamp_precision: TimestampPrecision::Nanoseconds,
         };
         let mut reader = conn.get_table_types().unwrap();

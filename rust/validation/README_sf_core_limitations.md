@@ -49,16 +49,7 @@ This document serves as a reference for future improvements that should ideally 
 
 - **sf_core:** When requested, natively map `TIMESTAMP_*` columns directly to Arrow `Timestamp` primitive arrays in the returned FFI stream, hiding the epoch/fraction struct complexity from the consumer.
 
-## 4. Scaled Integers (`FIXED` type)
-
-**Issue:** `sf_core` returns `FIXED` (e.g., `NUMBER(10,3)`) columns as raw `Int64` buffers representing the scaled integer (e.g., `12345` for `12.345`). The Arrow FFI stream schema only reports `Int64` with custom metadata (`logicalType: "FIXED"`, `scale: "3"`).
-**Impact:** The ADBC driver has to implement a complex `ConvertingReader` to interpret this metadata and manually cast `Int64` to `Float64` (dividing by `10^scale`) or `Decimal128`.
-**Workaround in Driver:** We intercept the Arrow FFI stream, read the metadata, and perform a secondary pass using `arrow_cast::cast` + manual division (for `Float64`) or unchecked precision reinterpretation via `build_unchecked` (values that exceed `target_type`'s precision are not rejected) for `Decimal128`.
-**Ideal Fix:**
-
-- **sf_core:** Automatically apply the scale. If `sf_core` detects a `FIXED` type with `scale > 0`, it should export the FFI stream as `Decimal128` natively. Arrow already supports `Decimal128Type`, which perfectly represents Snowflake's scaled integers without needing consumer-side interpretation.
-
-## 5. FFI Error Path Memory Leak
+## 4. FFI Error Path Memory Leak
 
 **Issue:** If `ArrowArrayStreamReader::from_raw` fails on an FFI stream exported by `sf_core`, the Arrow C Data Interface specification states that the release callback is *not* called.
 **Impact:** If the driver doesn't handle the error, the `Box::into_raw` pointer leaks.
@@ -67,7 +58,7 @@ This document serves as a reference for future improvements that should ideally 
 
 - **Arrow Crate:** Provide a safer abstraction for FFI stream consumption that guarantees cleanup on failure.
 
-## 6. Timezone Handling in Arrow IPC
+## 5. Timezone Handling in Arrow IPC
 
 **Issue:** Snowflake's Arrow IPC responses include named timezones like `"UTC"` in the metadata. The Rust `arrow` crate requires the `"chrono-tz"` feature to parse these named timezones; otherwise, decoding fails.
 **Impact:** Consumers of the ADBC driver (like `pyarrow`) receive invalid timezone errors.
@@ -78,4 +69,4 @@ This document serves as a reference for future improvements that should ideally 
 
 ## Summary
 
-The current Rust ADBC driver performs significant "last-mile" data conversion (scaled integers, timestamp reconstruction, schema adjustment). If `sf_core` were to export canonical Arrow types (`Decimal128`, `Timestamp(unit, tz)`) directly, the `ConvertingReader` in the ADBC driver could be completely eliminated, resulting in a zero-copy, highly performant passthrough.
+The current Rust ADBC driver performs "last-mile" data conversion for temporal types (timestamp reconstruction, TIME/TIMESTAMP schema adjustment). Numeric (`FIXED`) columns already pass through with the server's Arrow types. If `sf_core` were to export canonical `Timestamp(unit, tz)` types directly, the `ConvertingReader` in the ADBC driver could be completely eliminated, resulting in a zero-copy, highly performant passthrough.
