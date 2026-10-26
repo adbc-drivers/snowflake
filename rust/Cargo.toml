@@ -29,9 +29,6 @@ arrow-array = { version = "58.1.0", default-features = false, features = [
   "ffi",
   "chrono-tz",
 ] }
-arrow-sf-core = { package = "arrow", version = "=56.2.0", default-features = false, features = [
-  "ffi",
-] }
 arrow-buffer = { version = "58.1.0", default-features = false }
 arrow-schema = { version = "58.1.0", default-features = false }
 arrow-cast = { version = "58.1.0", default-features = false }
@@ -42,12 +39,6 @@ percent-encoding = "2.3.2"
 # This crate doesn't call openssl APIs directly; it exists to ensure
 # all transitive deps link statically. Bump manually on OpenSSL CVEs.
 openssl = { version = "0.10.76", features = ["vendored"] }
-
-[dev-dependencies]
-env_logger = "0.10"
-snafu = "0.8.9"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
 
 # sf_core pins rustls-webpki =0.103.16 but caps aws-lc-rs <1.18, while
 # crates.io rustls-webpki 0.103.14+ requires aws-lc-rs ^1.18. Upstream resolves

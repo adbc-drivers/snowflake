@@ -69,22 +69,6 @@ pub(crate) struct PreparedResult {
     pub binds: Vec<ColumnMetadata>,
 }
 
-/// Bridge sf_core's Arrow 56 reader to the Arrow 58 types exposed by this
-/// driver through the stable Arrow C Stream interface.
-pub(crate) fn bridge_arrow_reader(
-    reader: Box<dyn arrow_sf_core::array::RecordBatchReader + Send>,
-) -> Result<Box<dyn RecordBatchReader + Send>> {
-    let stream = Box::new(arrow_sf_core::ffi_stream::FFI_ArrowArrayStream::new(reader));
-    let raw = Box::into_raw(stream) as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream;
-    let reader = unsafe { arrow_array::ffi_stream::ArrowArrayStreamReader::from_raw(raw) }
-        .map_err(|error| {
-            // from_raw does not invoke release on failure, so reclaim the stream.
-            drop(unsafe { Box::from_raw(raw) });
-            Error::with_message_and_status(error.to_string(), Status::IO)
-        })?;
-    Ok(Box::new(reader))
-}
-
 impl Inner {
     fn new() -> Result<Self> {
         let runtime = Runtime::new().map_err(|e| {
@@ -202,17 +186,15 @@ impl Inner {
             .runtime
             .block_on(self.sf.statement_prepare(operation_ctx, statement, None))
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let reader = bridge_arrow_reader(result.stream)?;
         Ok(PreparedResult {
-            reader,
+            reader: result.stream,
             query_id: result.query_id,
             number_of_binds: result.number_of_binds,
             binds: result.binds,
         })
     }
 
-    /// Acquire a core result stream, release its handle on every path, and bridge
-    /// sf_core's Arrow version to the ADBC-facing Arrow version.
+    /// Acquire a core result stream and release its handle on every path.
     pub fn acquire_result(&self, result: ResultSetInfo) -> Result<QueryResult> {
         let stream = self
             .runtime
@@ -230,8 +212,6 @@ impl Inner {
                 return Err(crate::error::api_error_to_adbc_error(error));
             }
         };
-
-        let reader = bridge_arrow_reader(reader)?;
 
         Ok(QueryResult {
             reader,
@@ -273,6 +253,11 @@ impl adbc_core::Driver for Driver {
             sf_settings,
             surfaced_warnings: Default::default(),
             timestamp_precision: TimestampPrecision::default(),
+            auth_type: None,
+            okta_url: None,
+            max_retry_count: None,
+            duration_options: Default::default(),
+            credential_options: Default::default(),
         };
         for (key, value) in opts {
             db.set_option(key, value)?;
@@ -295,28 +280,5 @@ mod tests {
     fn new_database_succeeds_with_no_options() {
         let mut driver = Driver::default();
         let _db = driver.new_database().expect("new_database failed");
-    }
-
-    #[test]
-    fn arrow_reader_bridge_preserves_schema_and_owns_stream() {
-        let schema = Arc::new(arrow_sf_core::datatypes::Schema::new(vec![
-            arrow_sf_core::datatypes::Field::new(
-                "value",
-                arrow_sf_core::datatypes::DataType::Int64,
-                true,
-            ),
-        ]));
-        let batch = arrow_sf_core::record_batch::RecordBatch::new_empty(schema.clone());
-        let reader = Box::new(arrow_sf_core::record_batch::RecordBatchIterator::new(
-            std::iter::once(Ok(batch)),
-            schema,
-        )) as Box<dyn arrow_sf_core::array::RecordBatchReader + Send>;
-        let reader = bridge_arrow_reader(reader).unwrap();
-
-        assert_eq!(reader.schema().field(0).name(), "value");
-        assert_eq!(
-            reader.schema().field(0).data_type(),
-            &arrow_schema::DataType::Int64
-        );
     }
 }

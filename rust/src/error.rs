@@ -38,19 +38,41 @@ fn classify_query_failure(
 ) -> (Status, i32, [c_char; 5]) {
     let sqlstate = sql_state.and_then(sqlstate_to_adbc).unwrap_or([0; 5]);
     let server_cancel = code == Some(QUERY_CANCELED) || sql_state == Some("57014");
-    let status = if server_cancel && is_snowflake_statement_timeout(message) {
-        Status::Timeout
-    } else if server_cancel {
-        Status::Cancelled
-    } else {
-        Status::IO
+    // Go's SQLSTATE mapping is applied first; vendor codes override it.
+    let mut status = match sql_state {
+        Some("42S02") => Status::NotFound,
+        Some("42710") => Status::AlreadyExists,
+        Some("08004") => Status::Unauthorized,
+        _ => Status::IO,
     };
+    status = match code {
+        Some(1003 | 100383) => Status::InvalidArguments,
+        Some(2003) => Status::NotFound,
+        _ => status,
+    };
+    // Server cancellation and statement timeout are distinguished by the
+    // server message, even when another diagnostic code is also present.
+    if server_cancel {
+        status = if is_snowflake_statement_timeout(message) {
+            Status::Timeout
+        } else {
+            Status::Cancelled
+        };
+    }
     (status, code.unwrap_or_default(), sqlstate)
+}
+
+fn format_query_failure_message(message: &str, query_id: Option<&str>) -> String {
+    match query_id.filter(|id| !id.is_empty()) {
+        Some(id) => format!("[snowflake] {message} (query ID: {id})"),
+        None => format!("[snowflake] {message}"),
+    }
 }
 
 pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
     let mut vendor_code = 0;
     let mut sqlstate = [0; 5];
+    let mut query_message = None;
     let status = match &err {
         ApiError::InvalidArgument { .. } => Status::InvalidArguments,
         ApiError::Configuration { .. } => Status::InvalidArguments,
@@ -69,6 +91,7 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
                 message,
                 code,
                 sql_state,
+                ids,
                 ..
             } = source.as_ref()
             {
@@ -76,6 +99,10 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
                     classify_query_failure(message, *code, sql_state.as_deref());
                 vendor_code = code;
                 sqlstate = state;
+                query_message = Some(format_query_failure_message(
+                    message,
+                    ids.query_id.as_deref(),
+                ));
                 status
             } else {
                 Status::IO
@@ -93,7 +120,8 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::Cancelled { .. } => Status::Cancelled,
         _ => Status::IO,
     };
-    let mut error = Error::with_message_and_status(err.to_string(), status);
+    let mut error =
+        Error::with_message_and_status(query_message.unwrap_or_else(|| err.to_string()), status);
     error.vendor_code = vendor_code;
     error.sqlstate = sqlstate;
     error
@@ -156,13 +184,59 @@ mod tests {
     }
 
     #[test]
-    fn other_server_query_failure_keeps_io_status_and_diagnostics() {
-        let (status, vendor_code, sqlstate) =
-            classify_query_failure("object does not exist", Some(2003), Some("42S02"));
+    fn go_sqlstate_and_vendor_code_mappings() {
+        let cases = [
+            ("table not found", None, Some("42S02"), Status::NotFound),
+            ("object exists", None, Some("42710"), Status::AlreadyExists),
+            (
+                "connection rejected",
+                None,
+                Some("08004"),
+                Status::Unauthorized,
+            ),
+            ("syntax error", Some(1003), None, Status::InvalidArguments),
+            ("object not found", Some(2003), None, Status::NotFound),
+            (
+                "invalid geometry",
+                Some(100383),
+                None,
+                Status::InvalidArguments,
+            ),
+            // A vendor code wins over a conflicting SQLSTATE, as in Go.
+            (
+                "syntax error",
+                Some(1003),
+                Some("42710"),
+                Status::InvalidArguments,
+            ),
+            ("other error", Some(1), Some("22000"), Status::IO),
+        ];
+        for (message, code, sql_state, expected) in cases {
+            let (status, vendor_code, sqlstate) = classify_query_failure(message, code, sql_state);
+            assert_eq!(status, expected, "{message}");
+            assert_eq!(vendor_code, code.unwrap_or_default(), "{message}");
+            assert_eq!(
+                sqlstate,
+                sql_state.and_then(sqlstate_to_adbc).unwrap_or([0; 5]),
+                "{message}"
+            );
+        }
+    }
 
-        assert_eq!(status, Status::IO);
-        assert_eq!(vendor_code, 2003);
-        assert_eq!(sqlstate, sqlstate_to_adbc("42S02").unwrap());
+    #[test]
+    fn query_failure_message_includes_query_id_when_present() {
+        assert_eq!(
+            format_query_failure_message("syntax error", Some("01abcdef")),
+            "[snowflake] syntax error (query ID: 01abcdef)"
+        );
+        assert_eq!(
+            format_query_failure_message("syntax error", None),
+            "[snowflake] syntax error"
+        );
+        assert_eq!(
+            format_query_failure_message("syntax error", Some("")),
+            "[snowflake] syntax error"
+        );
     }
 
     #[test]

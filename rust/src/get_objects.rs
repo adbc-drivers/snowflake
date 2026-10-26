@@ -31,7 +31,7 @@ use sf_core::apis::database_driver_v1::{
     DEPTH_CATALOGS, DEPTH_COLUMNS, DEPTH_DB_SCHEMAS, DEPTH_TABLES, GetObjectsRequest,
 };
 
-use crate::connection::{Connection, SingleBatchReader};
+use crate::connection::{Connection, single_batch_reader};
 
 #[derive(Default)]
 struct ObjectTree {
@@ -77,11 +77,7 @@ pub(crate) fn execute_get_objects(
     table_type: Option<Vec<&str>>,
     column_name: Option<&str>,
 ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
-    let table_types = table_type
-        .unwrap_or_default()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let table_types = table_type.unwrap_or_default();
     let mut objects = ObjectTree::default();
 
     let catalogs = fetch_core_objects(connection, DEPTH_CATALOGS, catalog, None, None, &[], None)?;
@@ -133,7 +129,7 @@ pub(crate) fn execute_get_objects(
     }
 
     let batch = build_batch(&objects, depth).map_err(arrow_to_adbc_error)?;
-    Ok(Box::new(SingleBatchReader::new(batch)))
+    Ok(single_batch_reader(batch))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -143,7 +139,7 @@ fn fetch_core_objects(
     catalog: Option<&str>,
     db_schema: Option<&str>,
     table_name: Option<&str>,
-    table_type: &[String],
+    table_type: &[&str],
     column_name: Option<&str>,
 ) -> AdbcResult<ObjectTree> {
     let request = GetObjectsRequest {
@@ -152,7 +148,10 @@ fn fetch_core_objects(
         catalog: catalog.map(str::to_owned),
         db_schema: db_schema.map(str::to_owned),
         table_name: table_name.map(str::to_owned),
-        table_type: table_type.to_vec(),
+        table_type: table_type
+            .iter()
+            .map(|table_type| (*table_type).to_owned())
+            .collect(),
         column_name: column_name.map(str::to_owned),
     };
     let result = connection

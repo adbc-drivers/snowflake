@@ -24,7 +24,7 @@ use adbc_core::{
 use sf_core::apis::database_driver_v1::{
     Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
 };
-use sf_core::config::param_registry::{param_names, registry};
+use sf_core::config::param_registry::{Wrapper, param_names, registry};
 use sf_core::config::settings::Setting;
 
 use crate::connection::{Connection, cleanup_connection_handle};
@@ -32,150 +32,178 @@ use crate::driver::{Inner, TimestampPrecision};
 
 use percent_encoding::percent_decode_str;
 
-/// Convert an ADBC OptionDatabase key + OptionValue into an sf_core (param_name, Setting) pair.
-/// Returns None for the "uri" key (handled by apply_uri separately).
-/// Returns Err for keys with invalid values (e.g. non-numeric port).
-fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(String, Setting)>> {
-    let setting = match value {
-        OptionValue::String(s) => Setting::String(s.clone()),
-        OptionValue::Int(i) => Setting::Int(*i),
-        OptionValue::Double(d) => Setting::Double(*d),
-        OptionValue::Bytes(b) => Setting::Bytes(b.clone()),
-        _ => {
-            return Err(Error::with_message_and_status(
-                "unsupported option value type",
-                Status::InvalidArguments,
-            ));
-        }
-    };
+const AUTH_TYPE: &str = "adbc.snowflake.sql.auth_type";
+const OKTA_URL: &str = "adbc.snowflake.sql.client_option.okta_url";
+const MAX_RETRY_COUNT: &str = "adbc.snowflake.sql.client_option.max_retry_count";
+const CACHE_MFA_TOKEN: &str = "adbc.snowflake.sql.client_option.cache_mfa_token";
+const STORE_TEMP_CREDS: &str = "adbc.snowflake.sql.client_option.store_temp_creds";
+const MAX_TIMESTAMP_PRECISION: &str = "adbc.snowflake.sql.client_option.max_timestamp_precision";
 
-    let param: String = match key {
-        "username" => param_names::USER.into(),
-        "password" => param_names::PASSWORD.into(),
-        "adbc.snowflake.sql.account" => param_names::ACCOUNT.into(),
-        "adbc.snowflake.sql.db" => param_names::DATABASE.into(),
-        "adbc.snowflake.sql.schema" => param_names::SCHEMA.into(),
-        "adbc.snowflake.sql.warehouse" => param_names::WAREHOUSE.into(),
-        "adbc.snowflake.sql.role" => param_names::ROLE.into(),
-        "adbc.snowflake.sql.uri.host" => param_names::HOST.into(),
-        "adbc.snowflake.sql.uri.protocol" => param_names::PROTOCOL.into(),
-        "adbc.snowflake.sql.auth_type" => param_names::AUTHENTICATOR.into(),
-        "adbc.snowflake.sql.client_option.application" => "application".to_string(),
-        "adbc.snowflake.sql.client_option.auth_token" => param_names::TOKEN.into(),
-        "adbc.snowflake.sql.client_option.jwt_private_key" => param_names::PRIVATE_KEY_FILE.into(),
-        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => {
-            param_names::PRIVATE_KEY.into()
-        }
-        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password" => {
-            param_names::PRIVATE_KEY_PASSWORD.into()
-        }
-        // Auth extras
-        // The Okta authenticator URL is the authenticator value in sf_core.
-        "adbc.snowflake.sql.client_option.okta_url" => param_names::AUTHENTICATOR.into(),
-        "adbc.snowflake.sql.client_option.identity_provider" => {
-            param_names::WORKLOAD_IDENTITY_PROVIDER.into()
-        }
-        // Connection timeouts (normalized to sf_core integer seconds below)
-        "adbc.snowflake.sql.client_option.login_timeout" => "login_timeout".to_string(),
-        "adbc.snowflake.sql.client_option.request_timeout" => "request_timeout".to_string(),
-        "adbc.snowflake.sql.client_option.jwt_expire_timeout" => "jwt_expire_timeout".to_string(),
-        "adbc.snowflake.sql.client_option.client_timeout" => "client_timeout".to_string(),
-        // TLS
-        "adbc.snowflake.sql.client_option.tls_skip_verify" => param_names::TLS_SKIP_VERIFY.into(),
-        "adbc.snowflake.sql.client_option.tls_root_cert" => {
-            param_names::CUSTOM_ROOT_STORE_PATH.into()
-        }
-        // Session behaviour
-        "adbc.snowflake.sql.client_option.keep_session_alive" => {
-            param_names::CLIENT_SESSION_KEEP_ALIVE.into()
-        }
-        "adbc.snowflake.sql.client_option.disable_telemetry" => {
-            param_names::CLIENT_TELEMETRY_ENABLED.into()
-        }
-        // sf_core's temporary-credential setting explicitly controls MFA-token
-        // caching. The Go/ADBC store_temp_creds option instead controls ID-token
-        // storage, so retain that raw name and let sf_core report it as unknown.
-        "adbc.snowflake.sql.client_option.cache_mfa_token" => {
-            param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.into()
-        }
-        "adbc.snowflake.sql.client_option.store_temp_creds" => "store_temp_creds".to_string(),
-        // Config / logging
-        "adbc.snowflake.sql.client_option.config_file" => "config_file".to_string(),
-        "adbc.snowflake.sql.client_option.tracing" => "log_level".to_string(),
-        "adbc.snowflake.sql.uri.port" => {
-            let port = match value {
-                OptionValue::String(s) => s.parse::<i64>().map_err(|_| {
-                    Error::with_message_and_status(
-                        format!("invalid port value: {s}"),
-                        Status::InvalidArguments,
-                    )
-                })?,
-                OptionValue::Int(i) => *i,
-                _ => {
-                    return Err(Error::with_message_and_status(
-                        "port must be a string or int",
-                        Status::InvalidArguments,
-                    ));
-                }
-            };
-            return Ok(Some((param_names::PORT.into(), Setting::Int(port))));
-        }
-        "uri" => return Ok(None),
-        other => other.to_string(),
-    };
+// None means that sf_core needs the separately configured Okta URL as authenticator.
+const AUTH_TYPES: [(&str, Option<&str>); 8] = [
+    ("auth_snowflake", Some("SNOWFLAKE")),
+    ("auth_oauth", Some("OAUTH")),
+    ("auth_ext_browser", Some("EXTERNALBROWSER")),
+    ("auth_okta", None),
+    ("auth_jwt", Some("SNOWFLAKE_JWT")),
+    ("auth_mfa", Some("USERNAME_PASSWORD_MFA")),
+    ("auth_pat", Some("PROGRAMMATIC_ACCESS_TOKEN")),
+    ("auth_wif", Some("WORKLOAD_IDENTITY")),
+];
 
-    let setting = match key {
-        "adbc.snowflake.sql.client_option.login_timeout"
-        | "adbc.snowflake.sql.client_option.request_timeout" => {
-            let seconds = match value {
-                OptionValue::Int(value) => *value,
-                OptionValue::String(value) => {
-                    let value = value.strip_suffix('s').unwrap_or(value);
-                    if value.is_empty() {
-                        0
-                    } else {
-                        value.parse::<i64>().map_err(|_| {
-                            Error::with_message_and_status(
-                                format!("invalid timeout value: {value}"),
-                                Status::InvalidArguments,
-                            )
-                        })?
-                    }
-                }
-                _ => {
-                    return Err(Error::with_message_and_status(
-                        "timeout must be a string or int",
-                        Status::InvalidArguments,
-                    ));
-                }
-            };
-            Setting::Int(seconds)
-        }
-        "adbc.snowflake.sql.client_option.tls_skip_verify"
-        | "adbc.snowflake.sql.client_option.keep_session_alive"
-        | "adbc.snowflake.sql.client_option.cache_mfa_token"
-        | "adbc.snowflake.sql.client_option.store_temp_creds" => {
-            Setting::Bool(adbc_option_enabled(value)?)
-        }
-        "adbc.snowflake.sql.client_option.disable_telemetry" => {
-            Setting::Bool(!adbc_option_enabled(value)?)
-        }
-        _ => setting,
-    };
+fn invalid_option_value(key: &str, value: &str) -> Error {
+    Error::with_message_and_status(
+        format!("Invalid value for database option '{key}': '{value}'"),
+        Status::InvalidArguments,
+    )
+}
 
-    Ok(Some((param, setting)))
+fn invalid_typed_option_value(key: &str, value: &OptionValue) -> Error {
+    match value {
+        OptionValue::String(value) => invalid_option_value(key, value),
+        OptionValue::Int(value) => invalid_option_value(key, &value.to_string()),
+        OptionValue::Double(value) => invalid_option_value(key, &value.to_string()),
+        OptionValue::Bytes(value) => invalid_option_value(key, &format!("{value:?}")),
+        _ => invalid_option_value(key, &format!("{value:?}")),
+    }
+}
+
+fn unrecognized_option(key: &str) -> Error {
+    Error::with_message_and_status(
+        format!("unrecognized database option '{key}'"),
+        Status::NotImplemented,
+    )
+}
+
+fn option_to_setting(value: &OptionValue) -> Result<Setting> {
+    match value {
+        OptionValue::String(value) => Ok(Setting::String(value.clone())),
+        OptionValue::Int(value) => Ok(Setting::Int(*value)),
+        OptionValue::Double(value) => Ok(Setting::Double(*value)),
+        OptionValue::Bytes(value) => Ok(Setting::Bytes(value.clone())),
+        _ => Err(Error::with_message_and_status(
+            "unsupported option value type",
+            Status::InvalidArguments,
+        )),
+    }
+}
+
+// Go's ParseDuration accepts signed composite/fractional durations; sf_core
+// accepts integral seconds. Round positive subsecond amounts up rather than
+// silently converting a timeout to zero (which sf_core treats as unlimited).
+fn go_duration_seconds(value: &str) -> Option<i64> {
+    let (negative, mut rest) = match value.as_bytes().first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value),
+    };
+    if rest == "0" {
+        return Some(0);
+    }
+    let mut nanos = 0_u128;
+    let mut components = 0;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let whole = if digits == 0 {
+            Some(0)
+        } else {
+            rest[..digits].parse::<u128>().ok()
+        };
+        rest = &rest[digits..];
+        let mut fraction = 0_u128;
+        let mut divisor = 1_u128;
+        let mut fraction_digits = 0;
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            let count = after_dot.bytes().take_while(u8::is_ascii_digit).count();
+            for &digit in after_dot.as_bytes().iter().take(count) {
+                // More than 19 decimal places cannot change an integral
+                // nanosecond for the supported units.
+                if fraction_digits < 19 {
+                    fraction = fraction * 10 + u128::from(digit - b'0');
+                    divisor *= 10;
+                    fraction_digits += 1;
+                }
+            }
+            rest = &after_dot[count..];
+            if digits == 0 && count == 0 {
+                return None;
+            }
+        } else if digits == 0 {
+            return None;
+        }
+        let (unit, after_unit) = [
+            ("ns", 1_u128),
+            ("us", 1_000),
+            ("µs", 1_000),
+            ("μs", 1_000),
+            ("ms", 1_000_000),
+            ("s", 1_000_000_000),
+            ("m", 60_000_000_000),
+            ("h", 3_600_000_000_000),
+        ]
+        .iter()
+        .find_map(|&(unit, nanos)| rest.strip_prefix(unit).map(|remaining| (nanos, remaining)))?;
+        let whole_nanos = whole?.checked_mul(unit)?;
+        let fractional_nanos = fraction.checked_mul(unit)? / divisor;
+        nanos = nanos
+            .checked_add(whole_nanos)?
+            .checked_add(fractional_nanos)?;
+        rest = after_unit;
+        components += 1;
+    }
+    if components == 0 || nanos > (i64::MAX as u128) + u128::from(negative) {
+        return None;
+    }
+    i64::try_from(nanos.div_ceil(1_000_000_000)).ok()
+}
+
+fn duration_setting(key: &str, value: &OptionValue) -> Result<Setting> {
+    let seconds = match value {
+        OptionValue::String(duration) => {
+            go_duration_seconds(duration).ok_or_else(|| invalid_option_value(key, duration))?
+        }
+        OptionValue::Int(seconds) => seconds
+            .checked_abs()
+            .ok_or_else(|| invalid_option_value(key, &seconds.to_string()))?,
+        _ => return Err(invalid_typed_option_value(key, value)),
+    };
+    Ok(Setting::Int(seconds))
+}
+
+fn non_negative_int(key: &str, value: &OptionValue) -> Result<i64> {
+    let number = match value {
+        OptionValue::String(number) => number
+            .parse::<i64>()
+            .map_err(|_| invalid_option_value(key, number))?,
+        OptionValue::Int(number) => *number,
+        _ => return Err(invalid_typed_option_value(key, value)),
+    };
+    if number < 0 {
+        return Err(invalid_option_value(key, &number.to_string()));
+    }
+    Ok(number)
 }
 
 fn adbc_option_enabled(value: &OptionValue) -> Result<bool> {
     match value {
-        OptionValue::String(value) => match value.to_ascii_lowercase().as_str() {
-            "enabled" | "true" | "1" => Ok(true),
-            "disabled" | "false" | "0" => Ok(false),
-            _ => Err(Error::with_message_and_status(
-                "boolean option must be enabled, true, 1, disabled, false, or 0",
-                Status::InvalidArguments,
-            )),
-        },
+        OptionValue::String(value)
+            if value.eq_ignore_ascii_case("enabled")
+                || value.eq_ignore_ascii_case("true")
+                || value == "1" =>
+        {
+            Ok(true)
+        }
+        OptionValue::String(value)
+            if value.eq_ignore_ascii_case("disabled")
+                || value.eq_ignore_ascii_case("false")
+                || value == "0" =>
+        {
+            Ok(false)
+        }
+        OptionValue::String(_) => Err(Error::with_message_and_status(
+            "boolean option must be enabled, true, 1, disabled, false, or 0",
+            Status::InvalidArguments,
+        )),
         OptionValue::Int(value) => Ok(*value != 0),
         _ => Err(Error::with_message_and_status(
             "boolean option must be a string or int",
@@ -184,13 +212,114 @@ fn adbc_option_enabled(value: &OptionValue) -> Result<bool> {
     }
 }
 
+/// Resolve a Go/ADBC option or a registry-recognized raw sf_core name.
+fn adbc_db_param(key: &str) -> Result<&'static str> {
+    let param = match key {
+        "username" => param_names::USER,
+        "password" => param_names::PASSWORD,
+        "adbc.snowflake.sql.account" => param_names::ACCOUNT,
+        "adbc.snowflake.sql.db" => param_names::DATABASE,
+        "adbc.snowflake.sql.schema" => param_names::SCHEMA,
+        "adbc.snowflake.sql.warehouse" => param_names::WAREHOUSE,
+        "adbc.snowflake.sql.role" => param_names::ROLE,
+        "adbc.snowflake.sql.uri.host" => param_names::HOST,
+        "adbc.snowflake.sql.uri.protocol" => param_names::PROTOCOL,
+        "adbc.snowflake.sql.uri.port" => param_names::PORT,
+        "adbc.snowflake.sql.client_option.app_name"
+        | "adbc.snowflake.sql.client_option.application" => param_names::APPLICATION,
+        "adbc.snowflake.sql.client_option.auth_token" => param_names::TOKEN,
+        "adbc.snowflake.sql.client_option.jwt_private_key" => param_names::PRIVATE_KEY_FILE,
+        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => param_names::PRIVATE_KEY,
+        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password" => {
+            param_names::PRIVATE_KEY_PASSWORD
+        }
+        "adbc.snowflake.sql.client_option.identity_provider" => {
+            param_names::WORKLOAD_IDENTITY_PROVIDER
+        }
+        "adbc.snowflake.sql.client_option.login_timeout" => param_names::LOGIN_TIMEOUT,
+        "adbc.snowflake.sql.client_option.request_timeout" => param_names::REQUEST_TIMEOUT,
+        "adbc.snowflake.sql.client_option.client_timeout" => param_names::RETRY_TIMEOUT,
+        MAX_RETRY_COUNT => param_names::RETRY_MAX_ATTEMPTS,
+        "adbc.snowflake.sql.client_option.tls_skip_verify" => param_names::TLS_SKIP_VERIFY,
+        "adbc.snowflake.sql.client_option.tls_root_cert" => param_names::CUSTOM_ROOT_STORE_PATH,
+        "adbc.snowflake.sql.client_option.keep_session_alive" => {
+            param_names::SERVER_SESSION_KEEP_ALIVE
+        }
+        "adbc.snowflake.sql.client_option.disable_telemetry" => {
+            param_names::CLIENT_TELEMETRY_ENABLED
+        }
+        CACHE_MFA_TOKEN | STORE_TEMP_CREDS => param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL,
+        "adbc.snowflake.sql.client_option.validate_default_parameters" => {
+            param_names::VALIDATE_DEFAULT_PARAMETERS
+        }
+        "adbc.snowflake.sql.client_option.proxy_host" => param_names::PROXY_HOST,
+        "adbc.snowflake.sql.client_option.proxy_port" => param_names::PROXY_PORT,
+        "adbc.snowflake.sql.client_option.proxy_user" => param_names::PROXY_USER,
+        "adbc.snowflake.sql.client_option.proxy_password" => param_names::PROXY_PASSWORD,
+        "adbc.snowflake.sql.client_option.proxy_protocol" => param_names::PROXY_SCHEME,
+        other => {
+            return registry()
+                .resolve_for(Wrapper::Python, other)
+                .map(|definition| definition.canonical_name)
+                .ok_or_else(|| unrecognized_option(other));
+        }
+    };
+    Ok(param.as_str())
+}
+
+/// Convert a validated ADBC database option to an sf_core setting.
+fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static str, Setting)>> {
+    if key == "uri" {
+        return Ok(None);
+    }
+    let param = adbc_db_param(key)?;
+    let setting = match key {
+        "adbc.snowflake.sql.uri.port" | "adbc.snowflake.sql.client_option.proxy_port" => {
+            let port = non_negative_int(key, value)?;
+            if key.ends_with("proxy_port") && !(1..=65535).contains(&port) {
+                return Err(invalid_option_value(key, &port.to_string()));
+            }
+            Setting::Int(port)
+        }
+        "adbc.snowflake.sql.client_option.login_timeout"
+        | "adbc.snowflake.sql.client_option.request_timeout"
+        | "adbc.snowflake.sql.client_option.client_timeout" => duration_setting(key, value)?,
+        "adbc.snowflake.sql.client_option.tls_skip_verify"
+        | "adbc.snowflake.sql.client_option.keep_session_alive"
+        | CACHE_MFA_TOKEN
+        | STORE_TEMP_CREDS
+        | "adbc.snowflake.sql.client_option.validate_default_parameters" => {
+            Setting::Bool(adbc_option_enabled(value)?)
+        }
+        "adbc.snowflake.sql.client_option.disable_telemetry" => {
+            Setting::Bool(!adbc_option_enabled(value)?)
+        }
+        "adbc.snowflake.sql.client_option.proxy_protocol" => match value {
+            OptionValue::String(protocol)
+                if protocol.eq_ignore_ascii_case("http")
+                    || protocol.eq_ignore_ascii_case("https") =>
+            {
+                Setting::String(protocol.to_ascii_lowercase())
+            }
+            OptionValue::String(protocol) => return Err(invalid_option_value(key, protocol)),
+            _ => return Err(invalid_typed_option_value(key, value)),
+        },
+        _ => option_to_setting(value)?,
+    };
+    Ok(Some((param, setting)))
+}
+
 pub struct Database {
     pub(crate) inner: Arc<Inner>,
     pub(crate) db_handle: Handle,
-    /// Local copy of sf_core settings, using canonical parameter names when an
-    /// equivalent exists and preserving original raw names otherwise.
-    /// Propagated to each new connection before connection_init.
+    /// Canonical sf_core settings already stored on the database handle. Used
+    /// only for local getters and the bare-connection signal, never re-seeded.
     pub(crate) sf_settings: HashMap<String, Setting>,
+    pub(crate) auth_type: Option<&'static str>,
+    pub(crate) okta_url: Option<String>,
+    pub(crate) max_retry_count: Option<i64>,
+    pub(crate) duration_options: HashMap<&'static str, String>,
+    pub(crate) credential_options: HashMap<&'static str, bool>,
     /// Database-level warning messages already surfaced to the application logger.
     pub(crate) surfaced_warnings: HashSet<String>,
     /// Arrow time unit used for TIMESTAMP columns.
@@ -218,6 +347,12 @@ impl Database {
         }
         Ok(())
     }
+
+    fn set_sf_option(&mut self, param: &'static str, setting: Setting) -> Result<()> {
+        self.set_sf_options(HashMap::from([(param.into(), setting.clone())]))?;
+        self.sf_settings.insert(param.into(), setting);
+        Ok(())
+    }
 }
 
 impl Optionable for Database {
@@ -234,29 +369,124 @@ impl Optionable for Database {
                 Status::InvalidArguments,
             ));
         }
-        if key_str == "adbc.snowflake.sql.client_option.max_timestamp_precision" {
-            if let OptionValue::String(s) = &value {
-                self.timestamp_precision = match s.as_str() {
-                    "microseconds" => TimestampPrecision::Microseconds,
-                    "nanoseconds_error_on_overflow" => {
-                        TimestampPrecision::NanosecondsErrorOnOverflow
-                    }
-                    _ => TimestampPrecision::Nanoseconds,
-                };
+        if key_str == MAX_TIMESTAMP_PRECISION {
+            let OptionValue::String(precision) = &value else {
+                return Err(invalid_typed_option_value(key_str, &value));
+            };
+            self.timestamp_precision = match precision.as_str() {
+                "microseconds" => TimestampPrecision::Microseconds,
+                "nanoseconds_error_on_overflow" => TimestampPrecision::NanosecondsErrorOnOverflow,
+                "nanoseconds" => TimestampPrecision::Nanoseconds,
+                _ => return Err(invalid_option_value(key_str, precision)),
+            };
+            return Ok(());
+        }
+        if key_str == AUTH_TYPE {
+            let OptionValue::String(auth) = &value else {
+                return Err(invalid_typed_option_value(key_str, &value));
+            };
+            let &(go_value, core_value) = AUTH_TYPES
+                .iter()
+                .find(|&&(go_value, _)| go_value == auth.as_str())
+                .ok_or_else(|| invalid_option_value(key_str, auth))?;
+            if let Some(authenticator) = core_value.or(self.okta_url.as_deref()) {
+                self.set_sf_option(
+                    param_names::AUTHENTICATOR.as_str(),
+                    Setting::String(authenticator.to_string()),
+                )?;
             }
+            self.auth_type = Some(go_value);
+            return Ok(());
+        }
+        if key_str == OKTA_URL {
+            let OptionValue::String(url) = &value else {
+                return Err(invalid_typed_option_value(key_str, &value));
+            };
+            if self.auth_type == Some("auth_okta") {
+                self.set_sf_option(
+                    param_names::AUTHENTICATOR.as_str(),
+                    Setting::String(url.clone()),
+                )?;
+            }
+            self.okta_url = Some(url.clone());
+            return Ok(());
+        }
+        if key_str == MAX_RETRY_COUNT {
+            let retries = non_negative_int(key_str, &value)?;
+            let attempts = if retries == 0 {
+                8
+            } else {
+                retries
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_option_value(key_str, &retries.to_string()))?
+            };
+            if attempts > u32::MAX as i64 {
+                return Err(invalid_option_value(key_str, &retries.to_string()));
+            }
+            self.set_sf_option(
+                param_names::RETRY_MAX_ATTEMPTS.as_str(),
+                Setting::Int(attempts),
+            )?;
+            self.max_retry_count = Some(retries);
             return Ok(());
         }
         if let Some((param, setting)) = adbc_db_opt_to_sf(key_str, &value)? {
-            self.set_sf_options(HashMap::from([(param.clone(), setting.clone())]))?;
-            self.sf_settings.insert(param, setting);
+            let credential_enabled = match &setting {
+                Setting::Bool(enabled) => Some(*enabled),
+                _ => None,
+            };
+            self.set_sf_option(param, setting)?;
+            if key_str.eq_ignore_ascii_case(param_names::AUTHENTICATOR.as_str()) {
+                self.auth_type = None;
+            }
+            if param == param_names::RETRY_MAX_ATTEMPTS.as_str() {
+                self.max_retry_count = None;
+            }
+            if param == param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str() {
+                if key_str == CACHE_MFA_TOKEN || key_str == STORE_TEMP_CREDS {
+                    if let Some(enabled) = credential_enabled {
+                        self.credential_options.insert(
+                            if key_str == CACHE_MFA_TOKEN {
+                                CACHE_MFA_TOKEN
+                            } else {
+                                STORE_TEMP_CREDS
+                            },
+                            enabled,
+                        );
+                    }
+                } else {
+                    self.credential_options.clear();
+                }
+            }
+            self.duration_options.remove(param);
+            if let OptionValue::String(duration) = &value
+                && matches!(
+                    key_str,
+                    "adbc.snowflake.sql.client_option.login_timeout"
+                        | "adbc.snowflake.sql.client_option.request_timeout"
+                        | "adbc.snowflake.sql.client_option.client_timeout"
+                )
+            {
+                self.duration_options.insert(
+                    match key_str {
+                        "adbc.snowflake.sql.client_option.login_timeout" => {
+                            param_names::LOGIN_TIMEOUT.as_str()
+                        }
+                        "adbc.snowflake.sql.client_option.request_timeout" => {
+                            param_names::REQUEST_TIMEOUT.as_str()
+                        }
+                        _ => param_names::RETRY_TIMEOUT.as_str(),
+                    },
+                    duration.clone(),
+                );
+            }
         }
-
         Ok(())
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let key_str = key.as_ref();
-        if key_str == "adbc.snowflake.sql.client_option.max_timestamp_precision" {
+        if key_str == MAX_TIMESTAMP_PRECISION {
             return Ok(match self.timestamp_precision {
                 TimestampPrecision::Microseconds => "microseconds",
                 TimestampPrecision::NanosecondsErrorOnOverflow => "nanoseconds_error_on_overflow",
@@ -264,32 +494,53 @@ impl Optionable for Database {
             }
             .to_string());
         }
-        let lookup_value = if matches!(
-            key_str,
-            "adbc.snowflake.sql.client_option.tls_skip_verify"
-                | "adbc.snowflake.sql.client_option.keep_session_alive"
-                | "adbc.snowflake.sql.client_option.cache_mfa_token"
-                | "adbc.snowflake.sql.client_option.store_temp_creds"
-                | "adbc.snowflake.sql.client_option.disable_telemetry"
-        ) {
-            OptionValue::String("disabled".into())
-        } else {
-            OptionValue::String(String::new())
-        };
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &lookup_value)
-            && let Some(setting) = self.sf_settings.get(&param)
+        if key_str == AUTH_TYPE {
+            if let Some(auth) = self.auth_type {
+                return Ok(auth.to_string());
+            }
+            if let Some(Setting::String(auth)) =
+                self.sf_settings.get(param_names::AUTHENTICATOR.as_str())
+            {
+                return Ok(AUTH_TYPES
+                    .iter()
+                    .find(|&&(_, core)| core.is_some_and(|core| core.eq_ignore_ascii_case(auth)))
+                    .map(|&(go, _)| go)
+                    .or_else(|| {
+                        auth.eq_ignore_ascii_case("SNOWFLAKE_PASSWORD")
+                            .then_some("auth_snowflake")
+                    })
+                    .or_else(|| {
+                        auth.get(..8)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+                            .then_some("auth_okta")
+                    })
+                    .unwrap_or(auth)
+                    .to_string());
+            }
+        }
+        if key_str == OKTA_URL {
+            return self.okta_url.clone().ok_or_else(|| {
+                Error::with_message_and_status(
+                    format!("option not found: {key_str}"),
+                    Status::NotFound,
+                )
+            });
+        }
+        if key_str == MAX_RETRY_COUNT
+            && let Some(count) = self.max_retry_count
         {
+            return Ok(count.to_string());
+        }
+        if let Some(&enabled) = self.credential_options.get(key_str) {
+            return Ok(if enabled { "enabled" } else { "disabled" }.to_string());
+        }
+        let param = adbc_db_param(key_str).ok();
+        if let Some(value) = param.and_then(|param| self.duration_options.get(param)) {
+            return Ok(value.clone());
+        }
+        if let Some(setting) = param.and_then(|param| self.sf_settings.get(param)) {
             return match setting {
                 Setting::String(value) => Ok(value.clone()),
-                Setting::Int(value)
-                    if matches!(
-                        key_str,
-                        "adbc.snowflake.sql.client_option.login_timeout"
-                            | "adbc.snowflake.sql.client_option.request_timeout"
-                    ) =>
-                {
-                    Ok(format!("{value}s"))
-                }
                 Setting::Int(value) => Ok(value.to_string()),
                 Setting::Double(value) => Ok(value.to_string()),
                 Setting::Bool(value)
@@ -312,8 +563,8 @@ impl Optionable for Database {
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
         let key_str = key.as_ref();
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Bytes(vec![]))
-            && let Some(Setting::Bytes(b)) = self.sf_settings.get(&param)
+        if let Ok(param) = adbc_db_param(key_str)
+            && let Some(Setting::Bytes(b)) = self.sf_settings.get(param)
         {
             return Ok(b.clone());
         }
@@ -325,8 +576,13 @@ impl Optionable for Database {
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
         let key_str = key.as_ref();
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Int(0))
-            && let Some(Setting::Int(i)) = self.sf_settings.get(&param)
+        if key_str == MAX_RETRY_COUNT
+            && let Some(count) = self.max_retry_count
+        {
+            return Ok(count);
+        }
+        if let Ok(param) = adbc_db_param(key_str)
+            && let Some(Setting::Int(i)) = self.sf_settings.get(param)
         {
             return Ok(*i);
         }
@@ -338,8 +594,8 @@ impl Optionable for Database {
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
         let key_str = key.as_ref();
-        if let Ok(Some((param, _))) = adbc_db_opt_to_sf(key_str, &OptionValue::Double(0.0))
-            && let Some(Setting::Double(d)) = self.sf_settings.get(&param)
+        if let Ok(param) = adbc_db_param(key_str)
+            && let Some(Setting::Double(d)) = self.sf_settings.get(param)
         {
             return Ok(*d);
         }
@@ -479,7 +735,7 @@ impl Database {
                         "host" => "adbc.snowflake.sql.uri.host",
                         "port" => "adbc.snowflake.sql.uri.port",
                         "protocol" => "adbc.snowflake.sql.uri.protocol",
-                        "authenticator" => "adbc.snowflake.sql.auth_type",
+                        "authenticator" => "authenticator",
                         "private_key_file" => "adbc.snowflake.sql.client_option.jwt_private_key",
                         "private_key" => {
                             "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value"
@@ -510,19 +766,6 @@ fn decode_uri_component(value: &str, what: &str) -> Result<String> {
         })
 }
 
-fn connection_option_to_setting(value: &OptionValue) -> Result<Setting> {
-    match value {
-        OptionValue::String(value) => Ok(Setting::String(value.clone())),
-        OptionValue::Int(value) => Ok(Setting::Int(*value)),
-        OptionValue::Double(value) => Ok(Setting::Double(*value)),
-        OptionValue::Bytes(value) => Ok(Setting::Bytes(value.clone())),
-        _ => Err(Error::with_message_and_status(
-            "unsupported option value type",
-            Status::InvalidArguments,
-        )),
-    }
-}
-
 struct AccumulatedConnectionOptions {
     sf_options: HashMap<String, Setting>,
     post_connect_options: Vec<(OptionConnection, OptionValue)>,
@@ -533,7 +776,7 @@ fn accumulate_connection_options(
     database_options: &HashMap<String, Setting>,
     opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
 ) -> Result<AccumulatedConnectionOptions> {
-    let mut sf_options = database_options.clone();
+    let mut sf_options = HashMap::new();
     // This mirrors sf_core peers' raw-kwargs contract: only a call with no
     // database settings and no raw connection options is a bare connection.
     let mut no_connection_details = database_options.is_empty();
@@ -542,14 +785,7 @@ fn accumulate_connection_options(
     for (key, value) in opts {
         no_connection_details = false;
         if let OptionConnection::Other(name) = &key {
-            // Canonicalize only known registry parameters so a connection-level
-            // alias/case variant replaces the database-level canonical value.
-            // Unknown wrapper/vendor options retain their original spelling.
-            let name = registry()
-                .resolve(name)
-                .map(|param| param.canonical_name.to_owned())
-                .unwrap_or_else(|| name.clone());
-            sf_options.insert(name, connection_option_to_setting(&value)?);
+            sf_options.insert(name.clone(), option_to_setting(&value)?);
         } else {
             post_connect_options.push((key, value));
         }
@@ -641,9 +877,25 @@ impl adbc_core::Database for Database {
             "client_app_id".to_string(),
             Setting::String("PythonConnector".to_string()),
         );
-        sf_options
-            .entry("application".to_string())
-            .or_insert_with(|| Setting::String("ADBC Snowflake Driver (Rust)".to_string()));
+        if !self
+            .sf_settings
+            .contains_key(param_names::APPLICATION.as_str())
+            && !sf_options
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(param_names::APPLICATION.as_str()))
+        {
+            sf_options.insert(
+                param_names::APPLICATION.into(),
+                Setting::String("ADBC Snowflake Driver (Rust)".to_string()),
+            );
+        }
+        if self.auth_type == Some("auth_okta") && self.okta_url.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(Error::with_message_and_status(
+                format!("database option '{OKTA_URL}' is required for '{AUTH_TYPE}=auth_okta'"),
+                Status::InvalidArguments,
+            ));
+        }
         let conn_handle = self.inner.sf.connection_new();
 
         let setup = (|| -> Result<()> {
@@ -747,120 +999,6 @@ mod tests {
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
         driver.new_database().unwrap()
-    }
-
-    #[test]
-    fn connection_options_accumulate_once_with_connection_values_winning() {
-        let database_options = HashMap::from([
-            ("account".to_string(), Setting::String("db-account".into())),
-            (
-                "warehouse".to_string(),
-                Setting::String("db-warehouse".into()),
-            ),
-        ]);
-        let accumulated = accumulate_connection_options(
-            &database_options,
-            [
-                (
-                    OptionConnection::Other("account".into()),
-                    OptionValue::String("connection-account".into()),
-                ),
-                (
-                    OptionConnection::CurrentSchema,
-                    OptionValue::String("schema".into()),
-                ),
-                (
-                    OptionConnection::AutoCommit,
-                    OptionValue::String("false".into()),
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            accumulated.sf_options.get("account"),
-            Some(&Setting::String("connection-account".into()))
-        );
-        assert_eq!(
-            accumulated.sf_options.get("warehouse"),
-            Some(&Setting::String("db-warehouse".into()))
-        );
-        assert!(!accumulated.no_connection_details);
-        assert!(matches!(
-            accumulated.post_connect_options.as_slice(),
-            [
-                (OptionConnection::CurrentSchema, _),
-                (OptionConnection::AutoCommit, _)
-            ]
-        ));
-    }
-
-    #[test]
-    fn only_no_database_settings_and_no_raw_options_is_bare() {
-        let bare = accumulate_connection_options(&HashMap::new(), []).unwrap();
-        assert!(bare.no_connection_details);
-
-        let database_options = HashMap::from([(
-            param_names::ACCOUNT.to_string(),
-            Setting::String("account".into()),
-        )]);
-        let with_database_setting = accumulate_connection_options(&database_options, []).unwrap();
-        assert!(!with_database_setting.no_connection_details);
-    }
-
-    #[test]
-    fn any_raw_option_makes_the_connection_non_bare() {
-        let accumulated = accumulate_connection_options(
-            &HashMap::new(),
-            [(
-                OptionConnection::AutoCommit,
-                OptionValue::String("false".into()),
-            )],
-        )
-        .unwrap();
-        assert!(!accumulated.no_connection_details);
-        assert!(accumulated.sf_options.is_empty());
-    }
-
-    #[test]
-    fn known_connection_alias_overrides_database_canonical_option() {
-        let database_options = HashMap::from([(
-            param_names::USER.to_string(),
-            Setting::String("database-user".into()),
-        )]);
-        let accumulated = accumulate_connection_options(
-            &database_options,
-            [(
-                OptionConnection::Other("USER".into()),
-                OptionValue::String("connection-user".into()),
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(
-            accumulated.sf_options,
-            HashMap::from([(
-                param_names::USER.to_string(),
-                Setting::String("connection-user".into()),
-            )])
-        );
-    }
-
-    #[test]
-    fn unknown_connection_option_preserves_original_key() {
-        let accumulated = accumulate_connection_options(
-            &HashMap::new(),
-            [(
-                OptionConnection::Other("Vendor.CustomOption".into()),
-                OptionValue::String("value".into()),
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(
-            accumulated.sf_options.get("Vendor.CustomOption"),
-            Some(&Setting::String("value".into()))
-        );
     }
 
     #[test]
@@ -995,7 +1133,7 @@ mod tests {
             ),
             (
                 "adbc.snowflake.sql.client_option.keep_session_alive",
-                param_names::CLIENT_SESSION_KEEP_ALIVE.as_str(),
+                param_names::SERVER_SESSION_KEEP_ALIVE.as_str(),
                 true,
             ),
             (
@@ -1005,7 +1143,12 @@ mod tests {
             ),
             (
                 "adbc.snowflake.sql.client_option.store_temp_creds",
-                "store_temp_creds",
+                param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str(),
+                true,
+            ),
+            (
+                "adbc.snowflake.sql.client_option.validate_default_parameters",
+                param_names::VALIDATE_DEFAULT_PARAMETERS.as_str(),
                 true,
             ),
             (
@@ -1036,24 +1179,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_options_use_equivalent_core_parameters_or_original_raw_names() {
+    fn go_options_use_consumed_core_settings() {
         let cases = [
             (
                 "adbc.snowflake.sql.client_option.keep_session_alive",
-                param_names::CLIENT_SESSION_KEEP_ALIVE.as_str(),
+                param_names::SERVER_SESSION_KEEP_ALIVE.as_str(),
                 Setting::Bool(true),
             ),
             (
-                "adbc.snowflake.sql.client_option.cache_mfa_token",
+                CACHE_MFA_TOKEN,
                 param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str(),
                 Setting::Bool(true),
             ),
-            // sf_core has no ID-token-storage equivalent. Preserving the Go
-            // option name keeps it distinct and produces an explicit unknown-
-            // parameter validation warning rather than changing its meaning.
             (
-                "adbc.snowflake.sql.client_option.store_temp_creds",
-                "store_temp_creds",
+                STORE_TEMP_CREDS,
+                param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str(),
                 Setting::Bool(true),
             ),
             (
@@ -1066,86 +1206,115 @@ mod tests {
                 param_names::CLIENT_TELEMETRY_ENABLED.as_str(),
                 Setting::Bool(false),
             ),
+            (
+                "adbc.snowflake.sql.client_option.validate_default_parameters",
+                param_names::VALIDATE_DEFAULT_PARAMETERS.as_str(),
+                Setting::Bool(true),
+            ),
+            (
+                "adbc.snowflake.sql.client_option.proxy_protocol",
+                param_names::PROXY_SCHEME.as_str(),
+                Setting::String("https".into()),
+            ),
         ];
         for (key, expected_name, expected_setting) in cases {
             let value = if key.ends_with("identity_provider") {
-                OptionValue::String("AWS".into())
+                "AWS"
+            } else if key.ends_with("proxy_protocol") {
+                "HTTPS"
             } else {
-                OptionValue::String("enabled".into())
+                "enabled"
             };
-            let (name, setting) = adbc_db_opt_to_sf(key, &value).unwrap().unwrap();
+            let (name, setting) = adbc_db_opt_to_sf(key, &OptionValue::String(value.into()))
+                .unwrap()
+                .unwrap();
             assert_eq!(name, expected_name);
             assert_eq!(setting, expected_setting);
         }
     }
 
     #[test]
-    fn cache_mfa_token_and_store_temp_creds_are_independent() {
-        let cache_mfa_token =
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.cache_mfa_token".into());
-        let store_temp_creds =
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.store_temp_creds".into());
+    fn credential_cache_options_round_trip_even_though_core_combines_them() {
         let mut db = make_db();
-
-        db.set_option(
-            cache_mfa_token.clone(),
-            OptionValue::String("enabled".into()),
-        )
-        .unwrap();
-        db.set_option(
-            store_temp_creds.clone(),
-            OptionValue::String("disabled".into()),
-        )
-        .unwrap();
-
-        assert_eq!(
-            db.sf_settings,
-            HashMap::from([
-                (
-                    param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.to_string(),
-                    Setting::Bool(true),
-                ),
-                ("store_temp_creds".to_string(), Setting::Bool(false)),
-            ])
-        );
-        assert_eq!(
-            db.get_option_string(cache_mfa_token.clone()).unwrap(),
-            "enabled"
-        );
-        assert_eq!(
-            db.get_option_string(store_temp_creds.clone()).unwrap(),
-            "disabled"
-        );
-
-        db.set_option(cache_mfa_token.clone(), OptionValue::Int(0))
+        for (key, value) in [(CACHE_MFA_TOKEN, "enabled"), (STORE_TEMP_CREDS, "disabled")] {
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
             .unwrap();
-        db.set_option(store_temp_creds.clone(), OptionValue::Int(1))
-            .unwrap();
-
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Other(key.into()))
+                    .unwrap(),
+                value
+            );
+        }
         assert_eq!(
             db.sf_settings
                 .get(param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str()),
             Some(&Setting::Bool(false))
         );
         assert_eq!(
-            db.sf_settings.get("store_temp_creds"),
-            Some(&Setting::Bool(true))
+            db.get_option_string(OptionDatabase::Other(CACHE_MFA_TOKEN.into()))
+                .unwrap(),
+            "enabled"
         );
-        assert_eq!(db.get_option_string(cache_mfa_token).unwrap(), "disabled");
-        assert_eq!(db.get_option_string(store_temp_creds).unwrap(), "enabled");
     }
 
     #[test]
-    fn region_and_ocsp_are_not_translated_to_non_equivalent_core_options() {
+    fn unsupported_go_and_unknown_options_are_not_stored() {
+        let mut db = make_db();
         for key in [
             "adbc.snowflake.sql.region",
             "adbc.snowflake.sql.client_option.ocsp_fail_open_mode",
+            "adbc.snowflake.sql.client_option.jwt_expire_timeout",
+            "adbc.snowflake.sql.client_option.tracing",
+            "adbc.snowflake.sql.client_option.config_file",
+            "adbc.snowflake.sql.client_option.geography_output_format",
+            "adbc.snowflake.sql.client_option.geometry_output_format",
+            "adbc.snowflake.sql.client_option.use_high_precision",
+            "adbc.snowflake.sql.client_option.stream_retry_enabled",
+            "adbc.connection.get_objects.match_exactly",
+            "some.unknown.database.option",
         ] {
-            let (name, _) = adbc_db_opt_to_sf(key, &OptionValue::String("enabled".into()))
-                .unwrap()
-                .unwrap();
-            assert_eq!(name, key);
+            let error = db
+                .set_option(
+                    OptionDatabase::Other(key.into()),
+                    OptionValue::String("value".into()),
+                )
+                .unwrap_err();
+            assert_eq!(error.status, Status::NotImplemented, "{key}");
+            assert_eq!(
+                error.message,
+                format!("unrecognized database option '{key}'")
+            );
+            assert!(!db.sf_settings.contains_key(key));
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Other(key.into()))
+                    .unwrap_err()
+                    .status,
+                Status::NotFound
+            );
         }
+        assert!(db.sf_settings.is_empty());
+    }
+
+    #[test]
+    fn recognized_raw_core_alias_is_accepted_and_gettable() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Other("USER".into()),
+            OptionValue::String("raw-user".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::USER.as_str()),
+            Some(&Setting::String("raw-user".into()))
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other("USER".into()))
+                .unwrap(),
+            "raw-user"
+        );
     }
 
     #[test]
@@ -1191,7 +1360,7 @@ mod tests {
     fn simple_option_round_trips() {
         let mut db = make_db();
         let cases = [
-            ("adbc.snowflake.sql.region", "us-east-1"),
+            ("adbc.snowflake.sql.client_option.app_name", "my-app"),
             ("adbc.snowflake.sql.client_option.login_timeout", "30s"),
             ("adbc.snowflake.sql.client_option.request_timeout", "60s"),
             (
@@ -1202,11 +1371,21 @@ mod tests {
                 "adbc.snowflake.sql.client_option.disable_telemetry",
                 "enabled",
             ),
-            ("adbc.snowflake.sql.client_option.tracing", "debug"),
+            ("adbc.snowflake.sql.client_option.client_timeout", "120s"),
             (
-                "adbc.snowflake.sql.client_option.config_file",
-                "/home/user/.snowflake/config.toml",
+                "adbc.snowflake.sql.client_option.identity_provider",
+                "AZURE",
             ),
+            (
+                "adbc.snowflake.sql.client_option.proxy_host",
+                "proxy.example",
+            ),
+            ("adbc.snowflake.sql.client_option.proxy_user", "proxy-user"),
+            (
+                "adbc.snowflake.sql.client_option.proxy_password",
+                "proxy-pass",
+            ),
+            ("adbc.snowflake.sql.client_option.proxy_protocol", "https"),
         ];
         for (key, val) in cases {
             db.set_option(
@@ -1218,6 +1397,256 @@ mod tests {
                 .get_option_string(OptionDatabase::Other(key.into()))
                 .unwrap_or_else(|e| panic!("get_option_string({key}) failed: {e}"));
             assert_eq!(got, val, "round-trip failed for {key}");
+        }
+    }
+
+    #[test]
+    fn auth_type_maps_all_go_values_and_round_trips() {
+        for &(go, core) in &AUTH_TYPES {
+            if let Some(core) = core {
+                let mut db = make_db();
+                let option = OptionDatabase::Other(AUTH_TYPE.into());
+                db.set_option(option.clone(), OptionValue::String(go.into()))
+                    .unwrap();
+                assert_eq!(
+                    db.sf_settings.get(param_names::AUTHENTICATOR.as_str()),
+                    Some(&Setting::String(core.into()))
+                );
+                assert_eq!(db.get_option_string(option).unwrap(), go);
+            }
+        }
+    }
+
+    #[test]
+    fn native_authenticator_values_map_back_to_go_auth_type() {
+        for &(go, core) in &AUTH_TYPES {
+            if let Some(core) = core {
+                let mut db = make_db();
+                db.set_option(
+                    OptionDatabase::Other("authenticator".into()),
+                    OptionValue::String(core.to_ascii_lowercase()),
+                )
+                .unwrap();
+                assert_eq!(
+                    db.get_option_string(OptionDatabase::Other(AUTH_TYPE.into()))
+                        .unwrap(),
+                    go
+                );
+            }
+        }
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Other("authenticator".into()),
+            OptionValue::String("SNOWFLAKE_PASSWORD".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(AUTH_TYPE.into()))
+                .unwrap(),
+            "auth_snowflake"
+        );
+    }
+
+    #[test]
+    fn okta_url_only_selects_authenticator_when_auth_okta_is_selected() {
+        for url_first in [true, false] {
+            let mut db = make_db();
+            let auth = OptionDatabase::Other(AUTH_TYPE.into());
+            let okta = OptionDatabase::Other(OKTA_URL.into());
+            if url_first {
+                db.set_option(
+                    okta.clone(),
+                    OptionValue::String("https://okta.test".into()),
+                )
+                .unwrap();
+                assert!(
+                    !db.sf_settings
+                        .contains_key(param_names::AUTHENTICATOR.as_str())
+                );
+                db.set_option(auth.clone(), OptionValue::String("auth_okta".into()))
+                    .unwrap();
+            } else {
+                db.set_option(auth.clone(), OptionValue::String("auth_okta".into()))
+                    .unwrap();
+                db.set_option(
+                    okta.clone(),
+                    OptionValue::String("https://okta.test".into()),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                db.sf_settings.get(param_names::AUTHENTICATOR.as_str()),
+                Some(&Setting::String("https://okta.test".into()))
+            );
+            assert_eq!(db.get_option_string(auth.clone()).unwrap(), "auth_okta");
+            assert_eq!(
+                db.get_option_string(okta.clone()).unwrap(),
+                "https://okta.test"
+            );
+            db.set_option(auth, OptionValue::String("auth_oauth".into()))
+                .unwrap();
+            assert_eq!(
+                db.sf_settings.get(param_names::AUTHENTICATOR.as_str()),
+                Some(&Setting::String("OAUTH".into()))
+            );
+            assert_eq!(db.get_option_string(okta).unwrap(), "https://okta.test");
+        }
+    }
+
+    #[test]
+    fn invalid_auth_type_does_not_change_setting() {
+        let mut db = make_db();
+        let auth = OptionDatabase::Other(AUTH_TYPE.into());
+        db.set_option(auth.clone(), OptionValue::String("auth_snowflake".into()))
+            .unwrap();
+        for invalid in ["SNOWFLAKE", "oauth", "auth_OKTA", "auth_unknown"] {
+            let error = db
+                .set_option(auth.clone(), OptionValue::String(invalid.into()))
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert_eq!(
+                db.sf_settings.get(param_names::AUTHENTICATOR.as_str()),
+                Some(&Setting::String("SNOWFLAKE".into()))
+            );
+            assert_eq!(
+                db.get_option_string(auth.clone()).unwrap(),
+                "auth_snowflake"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_authenticator_uses_native_sf_core_values() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("snowflake://myaccount?authenticator=externalbrowser".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::AUTHENTICATOR.as_str()),
+            Some(&Setting::String("externalbrowser".into()))
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(AUTH_TYPE.into()))
+                .unwrap(),
+            "auth_ext_browser"
+        );
+    }
+
+    #[test]
+    fn timestamp_precision_rejects_invalid_values_without_changing_state() {
+        let mut db = make_db();
+        let option = OptionDatabase::Other(MAX_TIMESTAMP_PRECISION.into());
+        for valid in [
+            "nanoseconds",
+            "nanoseconds_error_on_overflow",
+            "microseconds",
+        ] {
+            db.set_option(option.clone(), OptionValue::String(valid.into()))
+                .unwrap();
+            assert_eq!(db.get_option_string(option.clone()).unwrap(), valid);
+        }
+        for invalid in [
+            OptionValue::String("millis".into()),
+            OptionValue::String("".into()),
+            OptionValue::Int(0),
+        ] {
+            let displayed = match &invalid {
+                OptionValue::String(value) => value.clone(),
+                OptionValue::Int(value) => value.to_string(),
+                _ => unreachable!(),
+            };
+            let error = db.set_option(option.clone(), invalid).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert_eq!(
+                error.message,
+                format!(
+                    "Invalid value for database option '{MAX_TIMESTAMP_PRECISION}': '{displayed}'"
+                )
+            );
+            assert_eq!(
+                db.get_option_string(option.clone()).unwrap(),
+                "microseconds"
+            );
+        }
+    }
+
+    #[test]
+    fn go_duration_converts_fractional_composite_and_extreme_values() {
+        for (duration, seconds) in [
+            ("0", 0),
+            ("300ms", 1),
+            ("1.5s", 2),
+            (".5s", 1),
+            ("1m30s", 90),
+            ("1h.5m", 3630),
+            ("-1m30s", 90),
+            ("1ns", 1),
+            ("-9223372036.854775808s", 9223372037),
+            ("9223372036.854775807s", 9223372037),
+        ] {
+            assert_eq!(go_duration_seconds(duration), Some(seconds), "{duration}");
+        }
+        for invalid in ["", "30", "1w", "1.5", "1ss", "9223372036.854775808s"] {
+            assert_eq!(go_duration_seconds(invalid), None, "{invalid}");
+        }
+        let mut db = make_db();
+        let option =
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.client_timeout".into());
+        db.set_option(option.clone(), OptionValue::String("300ms".into()))
+            .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::RETRY_TIMEOUT.as_str()),
+            Some(&Setting::Int(1))
+        );
+        assert_eq!(db.get_option_string(option.clone()).unwrap(), "300ms");
+        let error = db
+            .set_option(option.clone(), OptionValue::String("30".into()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(db.get_option_string(option).unwrap(), "300ms");
+    }
+
+    #[test]
+    fn retry_count_converts_retries_to_attempts_and_preserves_zero() {
+        let mut db = make_db();
+        let option = OptionDatabase::Other(MAX_RETRY_COUNT.into());
+        for (input, attempts) in [("0", 8), ("1", 2), ("7", 8)] {
+            db.set_option(option.clone(), OptionValue::String(input.into()))
+                .unwrap();
+            assert_eq!(
+                db.sf_settings.get(param_names::RETRY_MAX_ATTEMPTS.as_str()),
+                Some(&Setting::Int(attempts))
+            );
+            assert_eq!(db.get_option_string(option.clone()).unwrap(), input);
+        }
+        for invalid in ["-1", "4294967295", "bogus"] {
+            let error = db
+                .set_option(option.clone(), OptionValue::String(invalid.into()))
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert_eq!(db.get_option_int(option.clone()).unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn proxy_port_validates_go_bounds() {
+        let mut db = make_db();
+        let option = OptionDatabase::Other("adbc.snowflake.sql.client_option.proxy_port".into());
+        for port in ["1", "65535"] {
+            db.set_option(option.clone(), OptionValue::String(port.into()))
+                .unwrap();
+            assert_eq!(db.get_option_string(option.clone()).unwrap(), port);
+        }
+        for invalid in ["0", "65536", "-1", "abc"] {
+            assert_eq!(
+                db.set_option(option.clone(), OptionValue::String(invalid.into()))
+                    .unwrap_err()
+                    .status,
+                Status::InvalidArguments
+            );
+            assert_eq!(db.get_option_int(option.clone()).unwrap(), 65535);
         }
     }
 
