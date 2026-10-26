@@ -334,6 +334,10 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
         NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
     );
     let copy_plan = build_copy_plan(&qname, &schema, &stmt.ingest_options, &stage)?;
+    // Reject input Parquet cannot encode (e.g. unions) and invalid writer
+    // settings before any DDL, so a failed create-mode ingest leaves no table.
+    let normalized = normalize_schema(&schema)?;
+    let props = stmt.ingest_options.writer_properties()?;
     initialize_target(stmt, &operation, &qname, &schema, &copy_plan.overrides)?;
 
     let stage_sql = create_stage_sql(&stage, stmt.ingest_options.vectorized_scanner);
@@ -352,6 +356,8 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
             copy_sql: copy_plan.sql,
             timeout: stmt.query_timeout_seconds,
             options: stmt.ingest_options.clone(),
+            normalized,
+            props,
         },
         batches,
         schema,
@@ -874,6 +880,9 @@ struct IngestJob {
     copy_sql: String,
     timeout: Option<u32>,
     options: IngestOptions,
+    /// Parquet schema and writer settings, validated before any DDL runs.
+    normalized: SchemaRef,
+    props: WriterProperties,
 }
 
 fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Result<i64> {
@@ -885,9 +894,9 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         copy_sql,
         timeout,
         options,
+        normalized,
+        props,
     } = job;
-    let props = options.writer_properties()?;
-    let normalized = normalize_schema(&schema)?;
     let uploads: Arc<Mutex<Vec<JoinHandle<Result<()>>>>> = Arc::new(Mutex::new(Vec::new()));
     let copies: Arc<Mutex<Vec<JoinHandle<Result<i64>>>>> = Arc::new(Mutex::new(Vec::new()));
     let outstanding = Arc::new(Mutex::new(HashSet::<String>::new()));
