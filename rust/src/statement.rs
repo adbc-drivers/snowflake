@@ -335,19 +335,17 @@ impl Statement {
     }
 
     /// Parameter binding requires random access; ingest consumes the stream directly.
-    fn materialize_bound_stream(&mut self) -> Result<()> {
-        if matches!(self.bound, Bound::Stream(_)) {
-            let Bound::Stream(reader) = std::mem::replace(&mut self.bound, Bound::Empty) else {
-                unreachable!()
-            };
-            let batches = reader
+    /// Take ownership before executing so failures cannot leave stale parameters bound.
+    fn take_bound_batches(&mut self) -> Result<Vec<RecordBatch>> {
+        match std::mem::replace(&mut self.bound, Bound::Empty) {
+            Bound::Batches(batches) => Ok(batches),
+            Bound::Stream(reader) => reader
                 .map(|batch| {
                     batch.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))
                 })
-                .collect::<Result<Vec<_>>>()?;
-            self.bound = Bound::Batches(batches);
+                .collect(),
+            Bound::Empty => unreachable!("take_bound_batches requires supplied bindings"),
         }
-        Ok(())
     }
 
     fn execution_timeout_seconds(&self) -> Option<u32> {
@@ -384,11 +382,8 @@ impl Statement {
         &mut self,
         query: String,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        self.materialize_bound_stream()?;
-        let row_count: usize = match &self.bound {
-            Bound::Batches(batches) => batches.iter().map(RecordBatch::num_rows).sum(),
-            _ => unreachable!("execute_bound requires supplied bindings"),
-        };
+        let batches = self.take_bound_batches()?;
+        let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let operation = self.begin_operation();
         if row_count == 0 {
             // ADBC defines this as zero executions. Describe-only prepare provides
@@ -402,10 +397,7 @@ impl Statement {
                         .prepare_statement(Some(&operation), self.stmt_handle, query)?;
                 Arc::new(self.store_prepared_schemas(&prepared)?)
             };
-            let Bound::Batches(batches) = &self.bound else {
-                unreachable!("stream was materialized")
-            };
-            return execute_bound_rows(batches, schema, |_| {
+            return execute_bound_rows(&batches, schema, |_| {
                 unreachable!("zero-row bindings must not execute")
             });
         }
@@ -416,10 +408,7 @@ impl Statement {
         let timeout_seconds = self.execution_timeout_seconds();
         let timestamp_precision = self.timestamp_precision;
         let mut last_query_id = self.last_query_id.clone();
-        let Bound::Batches(batches) = &self.bound else {
-            unreachable!("stream was materialized")
-        };
-        let result = execute_bound_rows(batches, Arc::new(Schema::empty()), |row| {
+        let result = execute_bound_rows(&batches, Arc::new(Schema::empty()), |row| {
             let json_bytes = arrow_batches_to_json_bindings(&[row])?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let result = inner.execute_query_with_timeout(
@@ -500,17 +489,14 @@ impl adbc_core::Statement for Statement {
         // A supplied binding with no rows represents zero executions, so do not
         // run the statement unbound or send an empty binding.
         if !matches!(self.bound, Bound::Empty) {
-            self.materialize_bound_stream()?;
-            let Bound::Batches(batches) = &self.bound else {
-                unreachable!("stream was materialized")
-            };
+            let batches = self.take_bound_batches()?;
             if batches.iter().all(|batch| batch.num_rows() == 0) {
                 self.last_query_id = None;
                 return Ok(Some(0));
             }
 
             // Parameterised DML: execute once with JSON bindings.
-            let json_bytes = arrow_batches_to_json_bindings(batches)?;
+            let json_bytes = arrow_batches_to_json_bindings(&batches)?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let binding = BindingType::Json(data_ptr);
 
@@ -576,7 +562,6 @@ impl adbc_core::Statement for Statement {
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.query = Some(query.as_ref().to_string());
         self.target_table = None;
-        self.bound = Bound::Empty;
         self.clear_prepared_schemas();
         Ok(())
     }
@@ -1195,18 +1180,23 @@ fn convert_timestamp_ntz(
     tz_str: Option<Arc<str>>,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
     let unit = timestamp_target_unit(scale, ts_unit);
-    let target = DataType::Timestamp(unit, tz_str.clone());
+    let target = DataType::Timestamp(unit, tz_str);
 
     match col.data_type() {
         DataType::Int64 => {
-            let natural_unit = scale_to_time_unit(scale.max(0) as u32);
-            if natural_unit == unit {
-                arrow_cast::cast(col.as_ref(), &target)
-            } else {
-                let natural_target = DataType::Timestamp(natural_unit, tz_str);
-                let intermediate = arrow_cast::cast(col.as_ref(), &natural_target)?;
-                arrow_cast::cast(intermediate.as_ref(), &target)
+            let (multiplier, divisor) = compact_timestamp_factors(scale, unit);
+            if multiplier == 1 && divisor == 1 {
+                return arrow_cast::cast(col.as_ref(), &target);
             }
+            let raw = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .expect("Int64 column");
+            let check_ns = check_overflow && unit == TimeUnit::Nanosecond;
+            let values: arrow_array::Int64Array = raw.try_unary(|value| {
+                compact_timestamp_to_unit(value, multiplier, divisor, check_ns)
+            })?;
+            arrow_cast::cast(&values, &target)
         }
         DataType::Struct(_) => {
             use arrow_array::{Int32Array, Int64Array, StructArray};
@@ -1310,13 +1300,44 @@ fn check_ns_overflow(ns: i128) -> std::result::Result<(), arrow_schema::ArrowErr
 
 fn ns_to_unit(ns: i128, unit: TimeUnit) -> i64 {
     let val = match unit {
-        TimeUnit::Second => ns / 1_000_000_000,
-        TimeUnit::Millisecond => ns / 1_000_000,
-        TimeUnit::Microsecond => ns / 1_000,
-        // Intentional truncation: ns outside i64::MIN..=i64::MAX wraps. Use check_overflow=true in the caller to reject out-of-range values *before* this cast is reached.
+        TimeUnit::Second => ns.div_euclid(1_000_000_000),
+        TimeUnit::Millisecond => ns.div_euclid(1_000_000),
+        TimeUnit::Microsecond => ns.div_euclid(1_000),
+        // Without the overflow option, nanosecond values outside i64 wrap.
         TimeUnit::Nanosecond => ns,
     };
     val as i64
+}
+
+/// Compact timestamps hold epoch seconds multiplied by 10^scale, plus the
+/// fractional digits at that exact scale (not the rounded-up Arrow unit).
+fn compact_timestamp_factors(scale: i64, unit: TimeUnit) -> (i64, i64) {
+    let scale = scale.clamp(0, 9);
+    let unit_scale = (time_unit_rank(unit) * 3) as i64;
+    if scale < unit_scale {
+        (10i64.pow((unit_scale - scale) as u32), 1)
+    } else {
+        (1, 10i64.pow((scale - unit_scale) as u32))
+    }
+}
+
+fn compact_timestamp_to_unit(
+    value: i64,
+    multiplier: i64,
+    divisor: i64,
+    check_overflow: bool,
+) -> std::result::Result<i64, arrow_schema::ArrowError> {
+    if divisor > 1 {
+        return Ok(value.div_euclid(divisor));
+    }
+    if multiplier == 1 {
+        return Ok(value);
+    }
+    let scaled = value as i128 * multiplier as i128;
+    if check_overflow {
+        check_ns_overflow(scaled)?;
+    }
+    Ok(scaled as i64)
 }
 
 fn build_timestamp_from_epoch_fraction(
@@ -1343,7 +1364,7 @@ fn build_timestamp_from_epoch_fraction(
         } else {
             let ns: i128 =
                 epoch.value(i) as i128 * 1_000_000_000 + fraction.value(i) as i128 * frac_to_ns;
-            if check_overflow {
+            if check_overflow && unit == TimeUnit::Nanosecond {
                 check_ns_overflow(ns)?;
             }
             values.push(Some(ns_to_unit(ns, unit)));
@@ -1374,27 +1395,22 @@ fn build_timestamp_tz_2field(
     };
 
     let len = epoch.len();
+    let (multiplier, divisor) = compact_timestamp_factors(scale, unit);
+    let check_ns = check_overflow && unit == TimeUnit::Nanosecond;
     let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
 
     for i in 0..len {
         if struct_arr.is_null(i) {
             values.push(None);
         } else {
-            // Snowflake stores two-field TIMESTAMP_TZ epochs in physical unit groups:
-            // seconds for scale 0, milliseconds for 1-3, microseconds for 4-6,
-            // and nanoseconds for 7-9. The timezone offset is display metadata; the
-            // epoch already identifies the UTC instant.
-            let epoch_to_ns = match scale.clamp(0, 9) {
-                0 => 1_000_000_000,
-                1..=3 => 1_000_000,
-                4..=6 => 1_000,
-                _ => 1,
-            };
-            let utc_ns = epoch.value(i) as i128 * epoch_to_ns;
-            if check_overflow {
-                check_ns_overflow(utc_ns)?;
-            }
-            values.push(Some(ns_to_unit(utc_ns, unit)));
+            // The timezone offset is display metadata; the compact epoch
+            // already identifies the UTC instant at the exact declared scale.
+            values.push(Some(compact_timestamp_to_unit(
+                epoch.value(i),
+                multiplier,
+                divisor,
+                check_ns,
+            )?));
         }
     }
     let int_arr = arrow_array::Int64Array::from(values);
@@ -1737,109 +1753,6 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
 fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Option<String>> {
     use arrow_array::*;
     match dt {
-        DataType::Int8 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<Int8Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::Int16 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<Int16Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::Int32 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::Int64 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::UInt8 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<UInt8Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::UInt16 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<UInt16Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::UInt32 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::UInt64 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::Float16 => {
-            let v = arr
-                .as_any()
-                .downcast_ref::<Float16Array>()
-                .unwrap()
-                .value(row)
-                .to_f32();
-            Ok(v.is_finite().then(|| format!("{v:?}")))
-        }
-        DataType::Float32 => {
-            let v = arr
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row);
-            if v.is_finite() {
-                Ok(Some(format!("{v:?}")))
-            } else {
-                Ok(None)
-            }
-        }
-        DataType::Float64 => {
-            let v = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row);
-            if v.is_finite() {
-                Ok(Some(format!("{v:?}")))
-            } else {
-                Ok(None)
-            }
-        }
-        DataType::Utf8 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
-        DataType::LargeUtf8 => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<LargeStringArray>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
         DataType::Boolean => Ok(Some(
             arr.as_any()
                 .downcast_ref::<BooleanArray>()
@@ -1871,45 +1784,6 @@ fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Opti
                 .value(row);
             Ok(Some(decimal128_to_string(val, *scale)))
         }
-        DataType::Binary => {
-            let bytes = arr
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap()
-                .value(row);
-            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
-        }
-        DataType::LargeBinary => {
-            let bytes = arr
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .unwrap()
-                .value(row);
-            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let bytes = arr
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .unwrap()
-                .value(row);
-            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
-        }
-        DataType::BinaryView => {
-            let bytes = arr
-                .as_any()
-                .downcast_ref::<BinaryViewArray>()
-                .unwrap()
-                .value(row);
-            Ok(Some(bytes.iter().map(|b| format!("{b:02x}")).collect()))
-        }
-        DataType::Utf8View => Ok(Some(
-            arr.as_any()
-                .downcast_ref::<StringViewArray>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        )),
         DataType::Time32(TimeUnit::Second) => {
             let v = arr
                 .as_any()
@@ -2069,6 +1943,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn set_sql_query_preserves_bound_parameters() {
+        let mut stmt = make_stmt();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "parameter",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7]))],
+        )
+        .unwrap();
+        stmt.bind(batch).unwrap();
+        stmt.prepared_parameter_schema = Some(Schema::empty());
+        stmt.set_sql_query("SELECT ?").unwrap();
+        stmt.set_sql_query("SELECT ? + 1").unwrap();
+        assert_eq!(stmt.query.as_deref(), Some("SELECT ? + 1"));
+        assert!(stmt.prepared_parameter_schema.is_none());
+        assert!(matches!(&stmt.bound, Bound::Batches(batches) if batches.len() == 1));
+
+        stmt.bind_stream(Box::new(ConcatReader {
+            batches: Vec::new().into_iter(),
+            schema,
+        }))
+        .unwrap();
+        stmt.set_sql_query("SELECT ? + 2").unwrap();
+        assert!(matches!(stmt.bound, Bound::Stream(_)));
+    }
+
+    #[test]
     fn query_timeout_parses_round_trips_and_clears() {
         let mut stmt = make_stmt();
         let key = OptionStatement::Other(QUERY_TIMEOUT_OPTION.into());
@@ -2177,6 +2081,27 @@ pub(crate) mod tests {
         assert_eq!(reader.schema(), schema);
         assert!(reader.next().is_none());
         assert_eq!(stmt.last_query_id, None);
+        assert!(matches!(stmt.bound, Bound::Empty));
+    }
+
+    #[test]
+    fn bound_query_failure_consumes_parameters() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("SELECT ?").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "parameter",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7]))],
+        )
+        .unwrap();
+        stmt.bind(batch).unwrap();
+
+        assert!(stmt.execute().is_err()); // Invalid sf_core handle, not a live query.
+        assert!(matches!(stmt.bound, Bound::Empty));
     }
 
     #[test]
@@ -2197,21 +2122,7 @@ pub(crate) mod tests {
 
         assert_eq!(stmt.execute_update().unwrap(), Some(0));
         assert_eq!(stmt.last_query_id, None);
-        assert!(matches!(stmt.bound, Bound::Batches(ref batches) if batches.is_empty()));
-        stmt.set_sql_query("SELECT 1").unwrap();
         assert!(matches!(stmt.bound, Bound::Empty));
-    }
-
-    #[test]
-    fn execute_update_with_zero_row_batch_returns_zero_rows() {
-        let mut stmt = make_stmt();
-        stmt.set_sql_query("DELETE FROM example WHERE id = ?")
-            .unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        stmt.bind(RecordBatch::new_empty(schema)).unwrap();
-
-        assert_eq!(stmt.execute_update().unwrap(), Some(0));
-        assert_eq!(stmt.last_query_id, None);
     }
 
     #[test]
@@ -2227,6 +2138,24 @@ pub(crate) mod tests {
 
         assert_eq!(stmt.execute_update().unwrap(), Some(0));
         assert_eq!(stmt.last_query_id, None);
+        assert!(matches!(stmt.bound, Bound::Empty));
+    }
+
+    #[test]
+    fn bound_update_failure_consumes_parameters() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("DELETE FROM example WHERE id = ?")
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7]))],
+        )
+        .unwrap();
+        stmt.bind(batch).unwrap();
+
+        assert!(stmt.execute_update().is_err()); // Invalid sf_core handle.
+        assert!(matches!(stmt.bound, Bound::Empty));
     }
 
     #[test]
@@ -2801,28 +2730,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_adjust_schema_time_scale3_is_time32_millisecond() {
-        let f = make_field_with_meta("t", DataType::Int32, "TIME", "3");
-        let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
-        assert_eq!(
-            result.field(0).data_type(),
-            &DataType::Time32(TimeUnit::Millisecond)
-        );
-    }
-
-    #[test]
-    fn test_adjust_schema_time_scale9_is_time64_nanosecond() {
-        let f = make_field_with_meta("t", DataType::Int64, "TIME", "9");
-        let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
-        assert_eq!(
-            result.field(0).data_type(),
-            &DataType::Time64(TimeUnit::Nanosecond)
-        );
-    }
-
-    #[test]
     fn time_values_are_rescaled_to_a_valid_arrow_unit() {
         for (scale, raw, expected_type, expected) in [
             // 1234.5 seconds at scale 1 -> milliseconds.
@@ -2953,6 +2860,133 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compact_ntz_and_ltz_timestamps_use_their_exact_decimal_scale() {
+        for (logical_type, timezone) in [
+            ("TIMESTAMP_NTZ", None),
+            ("TIMESTAMP_LTZ", Some(Arc::from("America/Los_Angeles"))),
+        ] {
+            for (scale, raw, unit, expected) in [
+                ("1", 1_234i64, TimeUnit::Millisecond, 123_400i64),
+                ("4", 1_234_567, TimeUnit::Microsecond, 123_456_700),
+                ("7", 1_234_567_890, TimeUnit::Nanosecond, 123_456_789_000),
+            ] {
+                let field = make_field_with_meta("ts", DataType::Int64, logical_type, scale);
+                let schema = Arc::new(Schema::new(vec![field]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(arrow_array::Int64Array::from(vec![
+                        Some(raw),
+                        None,
+                    ]))],
+                )
+                .unwrap();
+                let mut reader = ConvertingReader::new(
+                    ConcatReader {
+                        batches: vec![batch].into_iter(),
+                        schema,
+                    },
+                    TimeUnit::Nanosecond,
+                    TimestampPrecision::Nanoseconds,
+                    Arc::from("America/Los_Angeles"),
+                );
+                let out = reader.next().unwrap().unwrap();
+                assert_eq!(
+                    out.schema().field(0).data_type(),
+                    &DataType::Timestamp(unit, timezone.clone()),
+                    "{logical_type}({scale})"
+                );
+                let values = arrow_cast::cast(out.column(0), &DataType::Int64).unwrap();
+                let values = values
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), expected, "{logical_type}({scale})");
+                assert!(values.is_null(1));
+            }
+        }
+    }
+
+    #[test]
+    fn negative_submicrosecond_timestamps_floor_when_downscaled() {
+        let compact = Arc::new(arrow_array::Int64Array::from(vec![-1])) as ArrayRef;
+        let converted =
+            convert_timestamp_ntz(&compact, 7, TimeUnit::Microsecond, false, None).unwrap();
+        let values = converted
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(values.value(0), -1); // -100 ns floors to -1 µs.
+
+        let epoch = arrow_array::Int64Array::from(vec![-1]);
+        let fraction = arrow_array::Int32Array::from(vec![999_999_999]);
+        let source = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("epoch", DataType::Int64, false)),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("fraction", DataType::Int32, false)),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
+        ]);
+        let converted = build_timestamp_from_epoch_fraction(
+            &epoch,
+            &fraction,
+            &source,
+            9,
+            false,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap();
+        let values = converted
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(values.value(0), -1); // -1 ns floors to -1 µs.
+    }
+
+    #[test]
+    fn nanosecond_overflow_check_does_not_reject_representable_microseconds() {
+        let epoch = arrow_array::Int64Array::from(vec![253_402_300_799i64]);
+        let fraction = arrow_array::Int32Array::from(vec![0]);
+        let source = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("epoch", DataType::Int64, false)),
+                Arc::new(epoch.clone()) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("fraction", DataType::Int32, false)),
+                Arc::new(fraction.clone()) as ArrayRef,
+            ),
+        ]);
+        let microseconds = build_timestamp_from_epoch_fraction(
+            &epoch,
+            &fraction,
+            &source,
+            9,
+            true,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap();
+        let values = microseconds
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(values.value(0), 253_402_300_799_000_000);
+        assert!(
+            build_timestamp_from_epoch_fraction(
+                &epoch,
+                &fraction,
+                &source,
+                9,
+                true,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_adjust_schema_timestamp_ntz_capped_by_ts_unit() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
@@ -2968,8 +3002,8 @@ pub(crate) mod tests {
         use arrow_array::{Int32Array, Int64Array, StructArray};
         use arrow_schema::Field as SchemaField;
 
-        let epoch_us: i64 = 253402300799000000; // 9999-12-31T23:59:59Z in microseconds
-        let epoch_arr = Int64Array::from(vec![epoch_us]);
+        let epoch_ms: i64 = 253_402_300_799_000; // 9999-12-31T23:59:59Z in milliseconds
+        let epoch_arr = Int64Array::from(vec![epoch_ms]);
         let tz_arr = Int32Array::from(vec![1440i32]); // UTC
 
         let fields = vec![
@@ -3001,31 +3035,29 @@ pub(crate) mod tests {
             epoch_col,
             tz_col,
             &struct_arr,
-            6,
-            false,
-            DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+            3,
+            true,
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
         )
         .unwrap();
 
         let ts = result
             .as_any()
-            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
             .unwrap();
-        assert_eq!(
-            ts.value(0),
-            epoch_us,
-            "year 9999 should round-trip as microseconds"
-        );
+        assert_eq!(ts.value(0), epoch_ms);
     }
 
     #[test]
-    fn test_build_timestamp_tz_2field_uses_storage_unit_groups_and_ignores_offset() {
+    fn test_build_timestamp_tz_2field_uses_exact_scale_and_ignores_offset() {
         use arrow_array::{Int32Array, Int64Array, StructArray};
 
         for (scale, epoch, expected_ns) in [
-            (1, 1_234i64, 1_234_000_000i64),
-            (4, 1_234_567i64, 1_234_567_000i64),
-            (7, 1_234_567_890i64, 1_234_567_890i64),
+            (0, 123i64, 123_000_000_000i64),
+            (1, 1_234, 123_400_000_000),
+            (1, -1, -100_000_000),
+            (2, 12_345, 123_450_000_000),
+            (3, 123_456, 123_456_000_000),
         ] {
             let epoch = Int64Array::from(vec![epoch]);
             let offset = Int32Array::from(vec![960]); // -08:00 display offset

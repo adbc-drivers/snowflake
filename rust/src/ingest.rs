@@ -19,7 +19,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc,
+        mpsc::{self, RecvTimeoutError, TrySendError},
     },
     time::Duration,
 };
@@ -37,7 +37,10 @@ use parquet::{
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use sf_core::apis::{database_driver_v1::Handle, operation_ctx::OperationCtx};
-use tokio::{sync::Semaphore, task::JoinHandle};
+use tokio::{
+    sync::Semaphore,
+    task::{JoinHandle, JoinSet},
+};
 
 use crate::{
     connection::{qualified_table_identifier, quote_identifier},
@@ -294,6 +297,97 @@ fn cancelled() -> Error {
 
 fn join_error(err: tokio::task::JoinError) -> Error {
     Error::with_message_and_status(format!("ingest worker failed: {err}"), Status::Internal)
+}
+
+/// Record the first failure before cancelling: other workers may subsequently
+/// return "cancelled", but that must not obscure the originating error.
+struct IngestFailure {
+    op: Arc<OperationCtx>,
+    first: Mutex<Option<Error>>,
+}
+
+impl IngestFailure {
+    fn new(op: Arc<OperationCtx>) -> Self {
+        Self {
+            op,
+            first: Mutex::new(None),
+        }
+    }
+
+    fn report(&self, error: Error) {
+        let mut first = self.first.lock().unwrap_or_else(|e| e.into_inner());
+        if first.is_none() {
+            *first = Some(error);
+        }
+        drop(first);
+        self.op.cancel();
+    }
+
+    fn take(&self) -> Option<Error> {
+        self.first.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+fn send_batch(
+    sender: &mpsc::SyncSender<RecordBatch>,
+    mut batch: RecordBatch,
+    op: &OperationCtx,
+) -> bool {
+    loop {
+        if op.token().is_cancelled() {
+            return false;
+        }
+        match sender.try_send(batch) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(unsent)) => {
+                batch = unsent;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn receive_batch(
+    receiver: &Mutex<mpsc::Receiver<RecordBatch>>,
+    op: &OperationCtx,
+) -> Result<Option<RecordBatch>> {
+    loop {
+        if op.token().is_cancelled() {
+            return Err(cancelled());
+        }
+        match receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(Duration::from_millis(20))
+        {
+            Ok(batch) => return Ok(Some(batch)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+fn reap_uploads(
+    uploads: &Mutex<Vec<JoinHandle<()>>>,
+    runtime: &tokio::runtime::Handle,
+    failure: &IngestFailure,
+) {
+    loop {
+        let finished = {
+            let mut handles = uploads.lock().unwrap_or_else(|e| e.into_inner());
+            handles
+                .iter()
+                .position(JoinHandle::is_finished)
+                .map(|index| handles.swap_remove(index))
+        };
+        let Some(finished) = finished else {
+            break;
+        };
+        if let Err(error) = runtime.block_on(finished) {
+            failure.report(join_error(error));
+        }
+    }
 }
 
 /// A single cancellable operation spans DDL, uploads, and all COPY tasks.
@@ -878,26 +972,38 @@ fn normalize_batch(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch
     RecordBatch::try_new(Arc::clone(target), columns).map_err(parquet_error)
 }
 
+/// How bound batches are laid out as Parquet files.
+struct ParquetLayout {
+    input_schema: SchemaRef,
+    schema: SchemaRef,
+    properties: WriterProperties,
+    target_size: usize,
+}
+
 // Workers consume batches via a bounded channel, and each writes whole batches
 // until the estimated compressed file size passes the target. A target of 0
 // produces one file per nonempty batch, matching Go's implementation.
 fn write_files(
     receiver: Arc<Mutex<mpsc::Receiver<RecordBatch>>>,
-    input_schema: SchemaRef,
-    schema: SchemaRef,
-    properties: WriterProperties,
-    target_size: usize,
+    op: &OperationCtx,
+    layout: ParquetLayout,
     next_file: Arc<AtomicUsize>,
     on_file: impl Fn(String, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
+    let ParquetLayout {
+        input_schema,
+        schema,
+        properties,
+        target_size,
+    } = layout;
     loop {
         // Do not create an empty Parquet writer for idle workers (or after the
         // last file). Creating one serializes schema metadata into the buffer.
         let first = loop {
-            match receiver.lock().unwrap_or_else(|e| e.into_inner()).recv() {
-                Ok(batch) if batch.num_rows() == 0 => continue,
-                Ok(batch) => break batch,
-                Err(_) => return Ok(()),
+            match receive_batch(&receiver, op)? {
+                Some(batch) if batch.num_rows() == 0 => continue,
+                Some(batch) => break batch,
+                None => return Ok(()),
             }
         };
         let mut bytes = Vec::new();
@@ -908,15 +1014,14 @@ fn write_files(
         loop {
             let batch = match next.take() {
                 Some(batch) => Some(batch),
-                None => receiver
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .recv()
-                    .ok(),
+                None => receive_batch(&receiver, op)?,
             };
             match batch {
                 Some(batch) if batch.num_rows() == 0 => continue,
                 Some(batch) => {
+                    if op.token().is_cancelled() {
+                        return Err(cancelled());
+                    }
                     if !Arc::ptr_eq(batch.schema_ref(), &input_schema)
                         && batch.schema_ref() != &input_schema
                     {
@@ -954,6 +1059,24 @@ struct IngestJob {
     props: WriterProperties,
 }
 
+fn record_copy_completion(
+    result: std::result::Result<Option<i64>, tokio::task::JoinError>,
+    loaded: &mut i64,
+    failure: &IngestFailure,
+) {
+    match result {
+        Ok(Some(rows)) => match loaded.checked_add(rows) {
+            Some(total) => *loaded = total,
+            None => failure.report(Error::with_message_and_status(
+                "ingest row count overflow",
+                Status::Internal,
+            )),
+        },
+        Ok(None) => {}
+        Err(error) => failure.report(join_error(error)),
+    }
+}
+
 fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Result<i64> {
     let IngestJob {
         inner,
@@ -966,8 +1089,8 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         normalized,
         props,
     } = job;
-    let uploads: Arc<Mutex<Vec<JoinHandle<Result<()>>>>> = Arc::new(Mutex::new(Vec::new()));
-    let copies: Arc<Mutex<Vec<JoinHandle<Result<i64>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let failure = Arc::new(IngestFailure::new(Arc::clone(&op)));
+    let uploads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let outstanding = Arc::new(Mutex::new(HashSet::<String>::new()));
     let next_file = Arc::new(AtomicUsize::new(0));
     let upload_limit = Arc::new(Semaphore::new(options.upload_concurrency));
@@ -983,33 +1106,74 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
     // rather than queuing one background job per file.
     let (copy_ready, mut copy_notifications) = tokio::sync::mpsc::channel::<()>(1);
     let copy_dispatch = {
-        let copies = Arc::clone(&copies);
         let outstanding = Arc::clone(&outstanding);
         let inner = Arc::clone(&inner);
         let op = Arc::clone(&op);
+        let failure = Arc::clone(&failure);
         let copy_sql = Arc::clone(&copy_sql);
         runtime.spawn(async move {
-            while copy_notifications.recv().await.is_some() {
-                let permit = match &copy_limit {
-                    Some(limit) => Some(
-                        Arc::clone(limit)
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| cancelled())?,
-                    ),
-                    None => None,
-                };
-                let inner = Arc::clone(&inner);
-                let op = Arc::clone(&op);
-                let outstanding = Arc::clone(&outstanding);
-                let copy_sql = Arc::clone(&copy_sql);
-                let task = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    execute_copy(&inner, conn, &op, copy_sql.as_str(), timeout, &outstanding)
-                });
-                copies.lock().unwrap_or_else(|e| e.into_inner()).push(task);
+            let mut copies = JoinSet::new();
+            let mut loaded = 0i64;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = op.token().cancelled() => break,
+                    result = copies.join_next(), if !copies.is_empty() => {
+                        if let Some(result) = result {
+                            record_copy_completion(result, &mut loaded, &failure);
+                        }
+                    }
+                    notification = copy_notifications.recv() => {
+                        if notification.is_none() || op.token().is_cancelled() {
+                            break;
+                        }
+                        let permit = match &copy_limit {
+                            Some(limit) => {
+                                tokio::select! {
+                                    biased;
+                                    _ = op.token().cancelled() => break,
+                                    permit = Arc::clone(limit).acquire_owned() => {
+                                        match permit {
+                                            Ok(permit) => Some(permit),
+                                            Err(_) => {
+                                                failure.report(cancelled());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        if op.token().is_cancelled() {
+                            break;
+                        }
+                        let inner = Arc::clone(&inner);
+                        let op = Arc::clone(&op);
+                        let failure = Arc::clone(&failure);
+                        let outstanding = Arc::clone(&outstanding);
+                        let copy_sql = Arc::clone(&copy_sql);
+                        copies.spawn_blocking(move || {
+                            let _permit = permit;
+                            if op.token().is_cancelled() {
+                                return None;
+                            }
+                            match execute_copy(&inner, conn, &op, copy_sql.as_str(), timeout, &outstanding) {
+                                Ok(rows) => Some(rows),
+                                Err(error) => {
+                                    failure.report(error);
+                                    None
+                                }
+                            }
+                        });
+                    }
+                }
             }
-            Ok::<_, Error>(())
+            drop(copy_notifications);
+            while let Some(result) = copies.join_next().await {
+                record_copy_completion(result, &mut loaded, &failure);
+            }
+            loaded
         })
     };
     let (sender, receiver) = mpsc::sync_channel(options.writer_concurrency);
@@ -1029,37 +1193,62 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         let op = Arc::clone(&op);
         let stage = Arc::clone(&stage);
         let worker_runtime = runtime.clone();
+        let failure = Arc::clone(&failure);
         writers.push(runtime.spawn_blocking(move || {
-            write_files(
+            let result = write_files(
                 receiver,
-                input_schema,
-                normalized,
-                props,
-                options.target_file_size,
+                &op,
+                ParquetLayout {
+                    input_schema,
+                    schema: normalized,
+                    properties: props,
+                    target_size: options.target_file_size,
+                },
                 next_file,
                 |filename, bytes| {
                     if op.token().is_cancelled() {
                         return Err(cancelled());
                     }
+                    reap_uploads(&uploads, &worker_runtime, &failure);
                     // Reserving an upload slot before dispatch also bounds the
                     // number of completed in-memory Parquet files awaiting PUT.
-                    let permit = worker_runtime
-                        .block_on(Arc::clone(&upload_limit).acquire_owned())
-                        .map_err(|_| cancelled())?;
+                    let permit = worker_runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            _ = op.token().cancelled() => Err(cancelled()),
+                            permit = Arc::clone(&upload_limit).acquire_owned() => {
+                                permit.map_err(|_| cancelled())
+                            }
+                        }
+                    })?;
+                    if op.token().is_cancelled() {
+                        return Err(cancelled());
+                    }
                     let inner = Arc::clone(&inner);
                     let op = Arc::clone(&op);
+                    let failure = Arc::clone(&failure);
                     let outstanding = Arc::clone(&outstanding);
                     let copy_ready = copy_ready.clone();
                     let upload_sql = put_sql(&stage, &filename);
                     let spawned = worker_runtime.spawn(async move {
                         let _permit = permit;
-                        upload_parquet(&inner, conn, &op, upload_sql, bytes).await?;
+                        if op.token().is_cancelled() {
+                            return;
+                        }
+                        if let Err(error) =
+                            upload_parquet(&inner, conn, &op, upload_sql, bytes).await
+                        {
+                            failure.report(error);
+                            return;
+                        }
+                        if op.token().is_cancelled() {
+                            return;
+                        }
                         outstanding
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(filename);
                         let _ = copy_ready.try_send(());
-                        Ok(())
                     });
                     uploads
                         .lock()
@@ -1067,15 +1256,17 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                         .push(spawned);
                     Ok(())
                 },
-            )
+            );
+            if let Err(error) = result {
+                failure.report(error);
+            }
         }));
     }
+    drop(receiver);
 
-    let mut read_error = None;
     let mut batches = batches;
     loop {
         if op.token().is_cancelled() {
-            read_error = Some(cancelled());
             break;
         }
         let batch = match catch_unwind(AssertUnwindSafe(|| batches.next())) {
@@ -1087,7 +1278,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                     .map(String::as_str)
                     .or_else(|| payload.downcast_ref::<&str>().copied())
                     .unwrap_or("unknown panic");
-                read_error = Some(Error::with_message_and_status(
+                failure.report(Error::with_message_and_status(
                     format!("failed to read record batch from bound stream: {message}"),
                     Status::InvalidArguments,
                 ));
@@ -1096,14 +1287,14 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         };
         match batch {
             Ok(batch) => {
-                if sender.send(batch).is_err() {
-                    // All readers exited; their join result has the actual
-                    // writer error (or panic), which takes precedence here.
+                if !send_batch(&sender, batch, &op) {
+                    // All readers exited or an earlier failure cancelled the
+                    // operation. Their failures are captured during joining.
                     break;
                 }
             }
             Err(error) => {
-                read_error = Some(Error::with_message_and_status(
+                failure.report(Error::with_message_and_status(
                     format!("failed to read record batch from bound stream: {error}"),
                     Status::InvalidArguments,
                 ));
@@ -1111,67 +1302,31 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
             }
         }
     }
-    if read_error.is_some() {
-        op.cancel();
-    }
     drop(sender);
-    let mut first_error = read_error;
-    for worker in writers {
-        match inner
-            .runtime
-            .block_on(worker)
-            .map_err(join_error)
-            .and_then(|r| r)
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
+    for writer in writers {
+        if let Err(error) = inner.runtime.block_on(writer) {
+            failure.report(join_error(error));
         }
     }
     let upload_handles = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     for upload in upload_handles {
-        match inner
-            .runtime
-            .block_on(upload)
-            .map_err(join_error)
-            .and_then(|r| r)
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
+        if let Err(error) = inner.runtime.block_on(upload) {
+            failure.report(join_error(error));
         }
     }
     drop(copy_ready);
-    match inner
-        .runtime
-        .block_on(copy_dispatch)
-        .map_err(join_error)
-        .and_then(|r| r)
-    {
-        Ok(()) => {}
-        Err(err) if first_error.is_none() => first_error = Some(err),
-        Err(_) => {}
-    }
-    let copy_handles = std::mem::take(&mut *copies.lock().unwrap_or_else(|e| e.into_inner()));
-    let mut loaded = 0i64;
-    for copy in copy_handles {
-        match inner
-            .runtime
-            .block_on(copy)
-            .map_err(join_error)
-            .and_then(|r| r)
-        {
-            Ok(n) => {
-                loaded = loaded.checked_add(n).ok_or_else(|| {
-                    Error::with_message_and_status("ingest row count overflow", Status::Internal)
-                })?
-            }
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
+    let mut loaded = match inner.runtime.block_on(copy_dispatch) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            failure.report(join_error(error));
+            0
         }
-    }
-    if let Some(error) = first_error {
+    };
+    if let Some(error) = failure.take() {
         return Err(error);
+    }
+    if op.token().is_cancelled() {
+        return Err(cancelled());
     }
     if next_file.load(Ordering::Relaxed) == 0 {
         return Err(Error::with_message_and_status(
@@ -1325,6 +1480,113 @@ mod tests {
 
     fn option(name: &str) -> String {
         format!("{INGEST_OPTION_PREFIX}{name}")
+    }
+
+    #[test]
+    fn ingest_failure_cancels_and_preserves_original_error() {
+        let op = Arc::new(OperationCtx::with_own_token());
+        let failure = IngestFailure::new(Arc::clone(&op));
+        failure.report(Error::with_message_and_status(
+            "first COPY failed",
+            Status::IO,
+        ));
+        assert!(op.token().is_cancelled());
+        failure.report(cancelled());
+        failure.report(Error::with_message_and_status(
+            "later upload failed",
+            Status::IO,
+        ));
+        let error = failure.take().unwrap();
+        assert_eq!(error.message, "first COPY failed");
+        assert_eq!(error.status, Status::IO);
+    }
+
+    #[test]
+    fn writer_failure_stops_a_bounded_producer_without_deadlocking() {
+        let op = Arc::new(OperationCtx::with_own_token());
+        let failure = Arc::new(IngestFailure::new(Arc::clone(&op)));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let writer_failure = Arc::clone(&failure);
+        let writer_op = Arc::clone(&op);
+        let writer_schema = Arc::clone(&schema);
+        let writer = std::thread::spawn(move || {
+            let result = write_files(
+                receiver,
+                &writer_op,
+                ParquetLayout {
+                    input_schema: Arc::clone(&writer_schema),
+                    schema: writer_schema,
+                    properties: WriterProperties::builder().build(),
+                    target_size: 0,
+                },
+                Arc::new(AtomicUsize::new(0)),
+                |_, _| {
+                    Err(Error::with_message_and_status(
+                        "first upload failed",
+                        Status::IO,
+                    ))
+                },
+            );
+            if let Err(error) = result {
+                writer_failure.report(error);
+            }
+        });
+        assert!(send_batch(&sender, batch.clone(), &op));
+        let mut sent = 1;
+        while sent < 100 {
+            if !send_batch(&sender, batch.clone(), &op) {
+                break;
+            }
+            sent += 1;
+        }
+        drop(sender);
+        writer.join().unwrap();
+        assert!(sent < 100, "producer continued after the upload failed");
+        assert!(op.token().is_cancelled());
+        let error = failure.take().unwrap();
+        assert_eq!(error.message, "first upload failed");
+        assert_eq!(error.status, Status::IO);
+    }
+
+    #[test]
+    fn copy_failure_stops_a_producer_waiting_for_channel_capacity() {
+        let op = Arc::new(OperationCtx::with_own_token());
+        let failure = IngestFailure::new(Arc::clone(&op));
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(send_batch(&sender, batch.clone(), &op));
+        failure.report(Error::with_message_and_status("COPY failed", Status::IO));
+        assert!(!send_batch(&sender, batch, &op));
+        assert_eq!(failure.take().unwrap().message, "COPY failed");
+    }
+
+    #[test]
+    fn completed_upload_handles_are_reaped_while_dispatching() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let finished = runtime.spawn(async {});
+        runtime.block_on(async {
+            while !finished.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        });
+        let in_flight = runtime.spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let uploads = Mutex::new(vec![finished, in_flight]);
+        let op = Arc::new(OperationCtx::with_own_token());
+        let failure = IngestFailure::new(op);
+        reap_uploads(&uploads, runtime.handle(), &failure);
+        let mut handles = uploads.lock().unwrap();
+        assert_eq!(handles.len(), 1);
+        handles.pop().unwrap().abort();
+        assert!(failure.take().is_none());
     }
 
     #[test]
@@ -1802,10 +2064,13 @@ mod tests {
         let files = Mutex::new(Vec::new());
         write_files(
             Arc::new(Mutex::new(receiver)),
-            schema.clone(),
-            normalize_schema(&schema).unwrap(),
-            IngestOptions::default().writer_properties().unwrap(),
-            target_size,
+            &OperationCtx::with_own_token(),
+            ParquetLayout {
+                input_schema: schema.clone(),
+                schema: normalize_schema(&schema).unwrap(),
+                properties: IngestOptions::default().writer_properties().unwrap(),
+                target_size,
+            },
             Arc::new(AtomicUsize::new(0)),
             |name, bytes| {
                 files.lock().unwrap().push((name, bytes));

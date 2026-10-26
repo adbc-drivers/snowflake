@@ -108,27 +108,10 @@ pub(crate) fn execute_get_objects(
             .into_iter()
             .flatten()
             .any(|filter| filter.contains('\\'));
-    let core_catalog = catalog.and_then(|value| {
-        if connection.match_exactly {
-            Some(exact_core_filter(value))
-        } else if value.contains('\\') {
-            None
-        } else {
-            Some(Cow::Borrowed(value))
-        }
-    });
-    let core_schema = db_schema.and_then(|value| {
-        if connection.match_exactly {
-            Some(exact_core_filter(value))
-        } else if value.contains('\\') {
-            None
-        } else {
-            Some(Cow::Borrowed(value))
-        }
-    });
-    let core_table = table_name.filter(|value| !connection.match_exactly && !value.contains('\\'));
-    let core_column =
-        column_name.filter(|value| !connection.match_exactly && !value.contains('\\'));
+    let core_catalog = catalog.and_then(|value| core_filter(value, connection.match_exactly));
+    let core_schema = db_schema.and_then(|value| core_filter(value, connection.match_exactly));
+    let core_table = table_name.and_then(|value| core_filter(value, connection.match_exactly));
+    let core_column = column_name.and_then(|value| core_filter(value, connection.match_exactly));
 
     let catalogs = fetch_core_objects(
         connection,
@@ -169,7 +152,7 @@ pub(crate) fn execute_get_objects(
             DEPTH_TABLES,
             core_catalog.as_deref(),
             core_schema.as_deref(),
-            core_table,
+            core_table.as_deref(),
             &table_types,
             None,
         )?;
@@ -183,9 +166,9 @@ pub(crate) fn execute_get_objects(
             DEPTH_COLUMNS,
             core_catalog.as_deref(),
             core_schema.as_deref(),
-            core_table,
+            core_table.as_deref(),
             &[],
-            core_column,
+            core_column.as_deref(),
         )?;
         merge_columns(&mut objects, columns);
     }
@@ -223,6 +206,16 @@ pub(crate) fn execute_get_objects(
 
     let batch = build_batch(&objects, depth).map_err(arrow_to_adbc_error)?;
     Ok(single_batch_reader(batch))
+}
+
+fn core_filter(value: &str, match_exactly: bool) -> Option<Cow<'_, str>> {
+    if match_exactly {
+        Some(exact_core_filter(value))
+    } else if value.contains('\\') {
+        None
+    } else {
+        Some(Cow::Borrowed(value))
+    }
 }
 
 fn exact_core_filter(value: &str) -> Cow<'_, str> {
@@ -1486,6 +1479,11 @@ mod tests {
     #[test]
     fn exact_filters_treat_wildcards_as_literal_and_preserve_case() {
         assert_eq!(exact_core_filter(r"A_%\B"), r"A\_\%\\B");
+        // The table and column requests both receive escaped exact filters;
+        // the local match below still enforces case-sensitive literal names.
+        assert_eq!(core_filter("T_%", true).as_deref(), Some(r"T\_\%"));
+        assert_eq!(core_filter("col_%!", true).as_deref(), Some(r"col\_\%!"));
+        assert_eq!(core_filter(r"A\B", false), None);
         let mut objects = parent_tree();
         let tables = &mut objects
             .catalogs
