@@ -561,6 +561,9 @@ fn initialize_target(
             stmt.query_timeout_seconds,
         ),
         "adbc.ingest.mode.replace" => {
+            // Validate the replacement DDL before dropping anything, so an
+            // unsupported input type cannot delete the existing table.
+            let create_sql = build_create_sql(qname, schema, overrides, false)?;
             stmt.inner.execute_temporary_statement(
                 Some(op),
                 stmt.conn_handle,
@@ -570,7 +573,7 @@ fn initialize_target(
             stmt.inner.execute_temporary_statement(
                 Some(op),
                 stmt.conn_handle,
-                build_create_sql(qname, schema, overrides, false)?,
+                create_sql,
                 stmt.query_timeout_seconds,
             )
         }
@@ -1526,6 +1529,22 @@ mod tests {
             .unwrap(),
             "CREATE TABLE IF NOT EXISTS \"table\" (\"odd\"\"name\" boolean NOT NULL)"
         );
+    }
+
+    #[test]
+    fn replace_mode_rejects_unsupported_ddl_before_dropping_the_table() {
+        // The statement's handles are invalid, so executing DROP first would
+        // fail inside sf_core instead of reporting the unsupported type.
+        let mut stmt = crate::statement::tests::make_stmt();
+        stmt.ingest_mode = Some("adbc.ingest.mode.replace".into());
+        let schema = Schema::new(vec![Field::new(
+            "elapsed",
+            DataType::Duration(TimeUnit::Second),
+            true,
+        )]);
+        let op = OperationCtx::with_own_token();
+        let error = initialize_target(&stmt, &op, "\"target\"", &schema, &[None]).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented, "{error:?}");
     }
 
     #[test]

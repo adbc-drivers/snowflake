@@ -1970,7 +1970,7 @@ fn decimal128_to_string(value: i128, scale: i8) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use adbc_core::Statement as _;
 
@@ -2000,7 +2000,8 @@ mod tests {
         }
     }
 
-    fn make_stmt() -> Statement {
+    /// A statement whose handles are invalid: any sf_core call on it fails.
+    pub(crate) fn make_stmt() -> Statement {
         let driver = crate::driver::Driver::default();
         Statement {
             inner: driver.inner.clone(),
