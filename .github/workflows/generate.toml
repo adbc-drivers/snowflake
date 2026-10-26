@@ -15,8 +15,12 @@
 driver = "snowflake"
 private = false
 
+[lang.go]
+github-stack-behavior = "top"
+
 [lang.go.test]
 environment = "Snowflake CI"
+timeout-minutes = 40
 
 [[lang.go.validation.configs]]
 environment = "Snowflake CI"

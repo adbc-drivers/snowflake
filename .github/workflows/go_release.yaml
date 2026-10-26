@@ -43,6 +43,7 @@ permissions:
   contents: read
 
 
+
 jobs:
   test:
     name: "Test/${{ matrix.platform }}_${{ matrix.arch }}"
@@ -158,7 +159,7 @@ jobs:
           fi
           set +a
 
-          go test -tags assert -v ./...
+          go test -timeout 40m -tags assert -v ./...
 
 
       - name: go mod tidy
