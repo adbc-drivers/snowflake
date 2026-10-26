@@ -15,10 +15,7 @@
 
 set -ex
 
-if [[ "$2" == "windows" ]]; then
-    choco install openssl -y
-    echo "OPENSSL_DIR='C:\Program Files\OpenSSL'" > .env.build
-elif [[ "$2" == "linux" ]]; then
+if [[ "$2" == "linux" ]]; then
     echo "Checking if we need to patch adbc-drivers-dev manylinux-rust Dockerfile"
 
     # Ensure pixi environment is set up so we can find adbc_drivers_dev
