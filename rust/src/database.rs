@@ -735,26 +735,25 @@ impl Database {
         let parts: Vec<&str> = path.splitn(3, '/').collect();
         if let Some(authority) = parts.first().filter(|s| !s.is_empty()) {
             let authority = decode_uri_component(authority, "account/host")?;
-            if explicit_account {
-                let (host, port) = authority
-                    .rsplit_once(':')
-                    .map_or((authority.as_str(), None), |(host, port)| {
-                        (host, Some(port))
-                    });
-                self.set_option(
-                    OptionDatabase::Other("adbc.snowflake.sql.uri.host".into()),
-                    OptionValue::String(host.to_string()),
-                )?;
-                if let Some(port) = port {
-                    self.set_option(
-                        OptionDatabase::Other("adbc.snowflake.sql.uri.port".into()),
-                        OptionValue::String(port.to_string()),
-                    )?;
-                }
+            // The documented form is host[:port], with or without account=.
+            let (host, port) = authority
+                .rsplit_once(':')
+                .map_or((authority.as_str(), None), |(host, port)| {
+                    (host, Some(port))
+                });
+            let host_key = if explicit_account {
+                "adbc.snowflake.sql.uri.host"
             } else {
+                "adbc.snowflake.sql.account"
+            };
+            self.set_option(
+                OptionDatabase::Other(host_key.into()),
+                OptionValue::String(host.to_string()),
+            )?;
+            if let Some(port) = port {
                 self.set_option(
-                    OptionDatabase::Other("adbc.snowflake.sql.account".into()),
-                    OptionValue::String(authority),
+                    OptionDatabase::Other("adbc.snowflake.sql.uri.port".into()),
+                    OptionValue::String(port.to_string()),
                 )?;
             }
         }
@@ -1796,6 +1795,25 @@ mod tests {
             db.sf_settings.get(param_names::ACCOUNT.as_str()).unwrap(),
             &Setting::String("vpc-id-1234".into())
         );
+    }
+
+    #[test]
+    fn uri_account_with_port_splits_port_without_explicit_account() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("snowflake://user:pass@myorg-account1:443/db".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::ACCOUNT.as_str()).unwrap(),
+            &Setting::String("myorg-account1".into())
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::PORT.as_str()).unwrap(),
+            &Setting::Int(443)
+        );
+        assert!(!db.sf_settings.contains_key(param_names::HOST.as_str()));
     }
 
     #[test]
