@@ -557,31 +557,23 @@ fn initialize_target(
         "adbc.ingest.mode.create" => stmt.inner.execute_temporary_statement(
             Some(op),
             stmt.conn_handle,
-            build_create_sql(qname, schema, overrides, false)?,
+            build_create_sql(qname, schema, overrides, CreateMode::Create)?,
             stmt.query_timeout_seconds,
         ),
-        "adbc.ingest.mode.replace" => {
-            // Validate the replacement DDL before dropping anything, so an
-            // unsupported input type cannot delete the existing table.
-            let create_sql = build_create_sql(qname, schema, overrides, false)?;
-            stmt.inner.execute_temporary_statement(
-                Some(op),
-                stmt.conn_handle,
-                format!("DROP TABLE IF EXISTS {qname}"),
-                stmt.query_timeout_seconds,
-            )?;
-            stmt.inner.execute_temporary_statement(
-                Some(op),
-                stmt.conn_handle,
-                create_sql,
-                stmt.query_timeout_seconds,
-            )
-        }
+        // CREATE OR REPLACE is atomic in Snowflake: if the new table cannot
+        // be created (for any reason, including server-side DDL rejection),
+        // the existing table is left untouched.
+        "adbc.ingest.mode.replace" => stmt.inner.execute_temporary_statement(
+            Some(op),
+            stmt.conn_handle,
+            build_create_sql(qname, schema, overrides, CreateMode::Replace)?,
+            stmt.query_timeout_seconds,
+        ),
         "adbc.ingest.mode.create_append" => {
             stmt.inner.execute_temporary_statement(
                 Some(op),
                 stmt.conn_handle,
-                build_create_sql(qname, schema, overrides, true)?,
+                build_create_sql(qname, schema, overrides, CreateMode::IfNotExists)?,
                 stmt.query_timeout_seconds,
             )?;
             validate_target_schema(&stmt.inner, stmt.conn_handle, op, qname, schema)
@@ -596,11 +588,18 @@ fn initialize_target(
     }
 }
 
+#[derive(Clone, Copy)]
+enum CreateMode {
+    Create,
+    Replace,
+    IfNotExists,
+}
+
 fn build_create_sql(
     qname: &str,
     schema: &Schema,
     overrides: &[Option<String>],
-    if_not_exists: bool,
+    mode: CreateMode,
 ) -> Result<String> {
     let mut columns = Vec::with_capacity(schema.fields().len());
     for (field, override_type) in schema.fields().iter().zip(overrides) {
@@ -611,11 +610,12 @@ fn build_create_sql(
         let not_null = if field.is_nullable() { "" } else { " NOT NULL" };
         columns.push(format!("{} {ty}{not_null}", quote_identifier(field.name())));
     }
-    let exists = if if_not_exists { " IF NOT EXISTS" } else { "" };
-    Ok(format!(
-        "CREATE TABLE{exists} {qname} ({})",
-        columns.join(", ")
-    ))
+    let create = match mode {
+        CreateMode::Create => "CREATE TABLE",
+        CreateMode::Replace => "CREATE OR REPLACE TABLE",
+        CreateMode::IfNotExists => "CREATE TABLE IF NOT EXISTS",
+    };
+    Ok(format!("{create} {qname} ({})", columns.join(", ")))
 }
 
 fn to_sf_ddl(ty: &DataType) -> Result<String> {
@@ -631,7 +631,19 @@ fn to_sf_ddl(ty: &DataType) -> Result<String> {
         | DataType::UInt32
         | DataType::UInt64 => "integer".into(),
         DataType::Float16 | DataType::Float32 | DataType::Float64 => "double".into(),
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("NUMERIC({p},{s})"),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+            // Snowflake NUMBER: precision 1..=38, scale 0..=37 and <= precision.
+            if *p > 38 || *s < 0 || *s > 37 || i16::from(*s) > i16::from(*p) {
+                return Err(Error::with_message_and_status(
+                    format!(
+                        "decimal({p},{s}) cannot be ingested: Snowflake NUMBER supports \
+                         precision up to 38 and scale from 0 to 37 (not exceeding precision)"
+                    ),
+                    Status::NotImplemented,
+                ));
+            }
+            format!("NUMERIC({p},{s})")
+        }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "text".into(),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "binary".into(),
         DataType::FixedSizeBinary(size) => format!("binary({size})"),
@@ -1416,7 +1428,6 @@ mod tests {
             (DataType::UInt64, "integer"),
             (DataType::Float16, "double"),
             (DataType::Decimal128(10, 2), "NUMERIC(10,2)"),
-            (DataType::Decimal256(40, -4), "NUMERIC(40,-4)"),
             (DataType::Utf8View, "text"),
             (DataType::BinaryView, "binary"),
             (DataType::FixedSizeBinary(16), "binary(16)"),
@@ -1524,16 +1535,42 @@ mod tests {
                 "\"table\"",
                 &Schema::new(vec![Field::new("odd\"name", DataType::Boolean, false)]),
                 &[None],
-                true
+                CreateMode::IfNotExists
             )
             .unwrap(),
             "CREATE TABLE IF NOT EXISTS \"table\" (\"odd\"\"name\" boolean NOT NULL)"
         );
+        assert_eq!(
+            build_create_sql(
+                "\"table\"",
+                &Schema::new(vec![Field::new("flag", DataType::Boolean, true)]),
+                &[None],
+                CreateMode::Replace
+            )
+            .unwrap(),
+            "CREATE OR REPLACE TABLE \"table\" (\"flag\" boolean)"
+        );
+        assert_eq!(
+            to_sf_ddl(&DataType::Decimal256(38, 37)).unwrap(),
+            "NUMERIC(38,37)"
+        );
+        for unsupported in [
+            DataType::Decimal256(39, 0),
+            DataType::Decimal128(10, -2),
+            DataType::Decimal128(38, 38),
+            DataType::Decimal128(5, 6),
+        ] {
+            assert_eq!(
+                to_sf_ddl(&unsupported).unwrap_err().status,
+                Status::NotImplemented,
+                "{unsupported}"
+            );
+        }
     }
 
     #[test]
-    fn replace_mode_rejects_unsupported_ddl_before_dropping_the_table() {
-        // The statement's handles are invalid, so executing DROP first would
+    fn replace_mode_rejects_unsupported_ddl_before_touching_the_table() {
+        // The statement's handles are invalid, so issuing any DDL first would
         // fail inside sf_core instead of reporting the unsupported type.
         let mut stmt = crate::statement::tests::make_stmt();
         stmt.ingest_mode = Some("adbc.ingest.mode.replace".into());
