@@ -196,7 +196,7 @@ impl Connection {
         if let Some(sql) = exact_identifier_sql(kind, name) {
             return self
                 .inner
-                .execute_temporary_statement(self.conn_handle, sql, None);
+                .execute_temporary_statement(None, self.conn_handle, sql, None);
         }
         let result = match kind {
             SessionIdentifierKind::Database => self.inner.runtime.block_on(
@@ -324,6 +324,9 @@ impl adbc_core::Connection for Connection {
             last_query_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
+            operation: std::sync::Mutex::new(std::sync::Arc::new(
+                sf_core::apis::operation_ctx::OperationCtx::with_own_token(),
+            )),
         })
     }
 
@@ -529,9 +532,11 @@ impl adbc_core::Connection for Connection {
             .map_err(crate::error::api_error_to_adbc_error)?;
 
         let result = (|| {
-            let prepared = self
-                .inner
-                .prepare_statement(stmt_handle, format!("SELECT * FROM {qualified}"))?;
+            let prepared = self.inner.prepare_statement(
+                None,
+                stmt_handle,
+                format!("SELECT * FROM {qualified}"),
+            )?;
             let schema = prepared.reader.schema();
             if schema.fields().is_empty() {
                 return Err(Error::with_message_and_status(

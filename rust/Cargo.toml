@@ -24,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 adbc_core = ">=0.22.0"
 adbc_ffi = ">=0.22.0"
-sf_core = { git = "https://github.com/snowflakedb/universal-driver", rev = "f9175f07e7784c45907dffca9d0738fccbaf37d1" }
+sf_core = { git = "https://github.com/snowflakedb/universal-driver", rev = "fcebbccd845e6b6f8589eb20f84f95a60ba82ea4" }
 arrow-array = { version = "58.1.0", default-features = false, features = [
   "ffi",
   "chrono-tz",
@@ -48,3 +48,10 @@ env_logger = "0.10"
 snafu = "0.8.9"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+
+# sf_core pins rustls-webpki =0.103.16 but caps aws-lc-rs <1.18, while
+# crates.io rustls-webpki 0.103.14+ requires aws-lc-rs ^1.18. Upstream resolves
+# this with a workspace patch to its vendored copy; [patch] does not propagate
+# to git dependents, so mirror it here. Keep the rev in sync with sf_core.
+[patch.crates-io]
+rustls-webpki = { git = "https://github.com/snowflakedb/universal-driver", rev = "fcebbccd845e6b6f8589eb20f84f95a60ba82ea4" }

@@ -26,6 +26,7 @@ use sf_core::apis::database_driver_v1::{
     ApiError, BindingType, ColumnMetadata, DatabaseDriverV1, ExecuteQueryResult, Handle,
     ResultSetDescriptor, ResultSetInfo,
 };
+use sf_core::apis::operation_ctx::OperationCtx;
 use tokio::runtime::Runtime;
 
 use crate::database::Database;
@@ -103,6 +104,7 @@ impl Inner {
     /// cleanup errors; a release error is returned only after successful execution.
     pub(crate) fn execute_temporary_statement(
         &self,
+        operation_ctx: Option<&OperationCtx>,
         connection: Handle,
         query: impl Into<String>,
         timeout_seconds: Option<u32>,
@@ -111,8 +113,13 @@ impl Inner {
             .sf
             .statement_new(connection)
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result =
-            self.execute_query_with_timeout(statement, query.into(), None, timeout_seconds);
+        let result = self.execute_query_with_timeout(
+            operation_ctx,
+            statement,
+            query.into(),
+            None,
+            timeout_seconds,
+        );
         let release = self.sf.statement_release(statement);
         match result {
             Ok(_) => release
@@ -130,13 +137,20 @@ impl Inner {
     /// retain the core/session default.
     pub fn execute_query_with_timeout<'a>(
         &self,
+        operation_ctx: Option<&OperationCtx>,
         statement: Handle,
         query: String,
         bindings: Option<BindingType<'a>>,
         timeout_seconds: Option<u32>,
     ) -> Result<QueryResult> {
         let result = self
-            .execute_query_raw_with_timeout(statement, query, bindings, timeout_seconds)
+            .execute_query_raw_with_timeout(
+                operation_ctx,
+                statement,
+                query,
+                bindings,
+                timeout_seconds,
+            )
             .map_err(crate::error::api_error_to_adbc_error)?;
         self.acquire_execute_result(result)
     }
@@ -146,6 +160,7 @@ impl Inner {
     /// handles are released on every stream-acquisition path.
     pub(crate) fn execute_query_raw_with_timeout<'a>(
         &self,
+        operation_ctx: Option<&OperationCtx>,
         statement: Handle,
         query: String,
         bindings: Option<BindingType<'a>>,
@@ -153,25 +168,30 @@ impl Inner {
     ) -> std::result::Result<ExecuteQueryResult, ApiError> {
         self.runtime
             .block_on(self.sf.statement_set_sql_query(statement, query))?;
-        self.runtime.block_on(
-            self.sf
-                .statement_execute_query(statement, bindings, timeout_seconds),
-        )
+        self.runtime.block_on(self.sf.statement_execute_query(
+            operation_ctx,
+            statement,
+            bindings,
+            timeout_seconds,
+            None,
+            None,
+        ))
     }
 
     pub(crate) fn acquire_execute_result(&self, result: ExecuteQueryResult) -> Result<QueryResult> {
-        let ExecuteQueryResult::Single(result) = result else {
+        let ExecuteQueryResult::Single { info, .. } = result else {
             return Err(Error::with_message_and_status(
                 "multi-statement query results are not supported",
                 Status::NotImplemented,
             ));
         };
-        self.acquire_result(result)
+        self.acquire_result(info)
     }
 
     /// Synchronize SQL to sf_core and issue its describe-only prepare request.
     pub(crate) fn prepare_statement(
         &self,
+        operation_ctx: Option<&OperationCtx>,
         statement: Handle,
         query: String,
     ) -> Result<PreparedResult> {
@@ -180,7 +200,7 @@ impl Inner {
             .map_err(crate::error::api_error_to_adbc_error)?;
         let result = self
             .runtime
-            .block_on(self.sf.statement_prepare(statement))
+            .block_on(self.sf.statement_prepare(operation_ctx, statement, None))
             .map_err(crate::error::api_error_to_adbc_error)?;
         let reader = bridge_arrow_reader(result.stream)?;
         Ok(PreparedResult {

@@ -13,7 +13,10 @@
 // limitations under the License.
 
 // src/statement.rs
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use adbc_core::{
     Optionable, PartitionedResult,
@@ -23,8 +26,8 @@ use adbc_core::{
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use sf_core::apis::database_driver_v1::{BindingType, ColumnMetadata, DataPtr, Handle};
+use sf_core::apis::operation_ctx::OperationCtx;
 use sf_core::config::{param_registry::param_names, settings::Setting};
-use sf_core::rest::snowflake::AbortOutcome;
 
 use crate::driver::{Inner, QueryResult, TimestampPrecision};
 
@@ -81,6 +84,11 @@ pub struct Statement {
     pub(crate) prepared_parameter_schema: Option<Schema>,
     /// Truthful result schema returned by Snowflake's describe-only prepare.
     pub(crate) prepared_result_schema: Option<Schema>,
+    /// The most recently started sf_core operation. `cancel()` may be invoked
+    /// from another thread while an execute is blocked, so it is shared
+    /// through a lock rather than `&mut self`. Cancelling a finished operation
+    /// is a no-op.
+    pub(crate) operation: Mutex<Arc<OperationCtx>>,
 }
 
 impl Drop for Statement {
@@ -266,14 +274,24 @@ impl Statement {
         self.query_timeout_seconds
     }
 
+    /// Start a cancellable sf_core operation and publish it for `cancel()`.
+    /// Each operation needs a fresh context because cancellation is one-shot.
+    pub(crate) fn begin_operation(&self) -> Arc<OperationCtx> {
+        let operation = Arc::new(OperationCtx::with_own_token());
+        *self.operation.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&operation);
+        operation
+    }
+
     /// Route every user-statement execution through the statement timeout.
     /// The binding owner must remain alive until this synchronous call returns.
     pub(crate) fn execute_query<'a>(
         &self,
+        operation: &OperationCtx,
         query: String,
         bindings: Option<BindingType<'a>>,
     ) -> Result<QueryResult> {
         self.inner.execute_query_with_timeout(
+            Some(operation),
             self.stmt_handle,
             query,
             bindings,
@@ -287,6 +305,7 @@ impl Statement {
         query: String,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
+        let operation = self.begin_operation();
         if row_count == 0 {
             // ADBC defines this as zero executions. Describe-only prepare provides
             // the result schema without accidentally running the SQL unbound.
@@ -294,7 +313,9 @@ impl Statement {
             let schema = if let Some(schema) = &self.prepared_result_schema {
                 Arc::new(schema.clone())
             } else {
-                let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
+                let prepared =
+                    self.inner
+                        .prepare_statement(Some(&operation), self.stmt_handle, query)?;
                 self.prepared_parameter_schema = parameter_schema_from_prepare(
                     prepared.number_of_binds,
                     &prepared.binds,
@@ -324,6 +345,7 @@ impl Statement {
             let json_bytes = arrow_batches_to_json_bindings(&[row])?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let result = inner.execute_query_with_timeout(
+                Some(&operation),
                 stmt_handle,
                 query.clone(),
                 Some(BindingType::Json(data_ptr)),
@@ -382,7 +404,8 @@ impl adbc_core::Statement for Statement {
             return self.execute_bound(query);
         }
 
-        let result = self.execute_query(query, None)?;
+        let operation = self.begin_operation();
+        let result = self.execute_query(&operation, query, None)?;
 
         self.last_query_id = Some(result.descriptor.query_id.clone());
         let reader = result.reader;
@@ -421,14 +444,16 @@ impl adbc_core::Statement for Statement {
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let binding = BindingType::Json(data_ptr);
 
-            let result = self.execute_query(query, Some(binding))?;
+            let operation = self.begin_operation();
+            let result = self.execute_query(&operation, query, Some(binding))?;
 
             self.last_query_id = Some(result.descriptor.query_id.clone());
 
             return Ok(result.descriptor.rows_affected);
         }
 
-        let result = self.execute_query(query, None)?;
+        let operation = self.begin_operation();
+        let result = self.execute_query(&operation, query, None)?;
 
         self.last_query_id = Some(result.descriptor.query_id.clone());
 
@@ -442,7 +467,10 @@ impl adbc_core::Statement for Statement {
 
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
-        let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
+        let operation = self.begin_operation();
+        let prepared = self
+            .inner
+            .prepare_statement(Some(&operation), self.stmt_handle, query)?;
         self.last_query_id = Some(prepared.query_id.clone());
         self.prepared_parameter_schema = parameter_schema_from_prepare(
             prepared.number_of_binds,
@@ -483,7 +511,10 @@ impl adbc_core::Statement for Statement {
         })?;
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
-        let prepared = self.inner.prepare_statement(self.stmt_handle, query)?;
+        let operation = self.begin_operation();
+        let prepared = self
+            .inner
+            .prepare_statement(Some(&operation), self.stmt_handle, query)?;
         self.last_query_id = Some(prepared.query_id);
         self.prepared_parameter_schema = parameter_schema_from_prepare(
             prepared.number_of_binds,
@@ -520,14 +551,11 @@ impl adbc_core::Statement for Statement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        match self
-            .inner
-            .runtime
-            .block_on(self.inner.sf.statement_cancel(self.stmt_handle))
-            .map_err(crate::error::api_error_to_adbc_error)?
-        {
-            AbortOutcome::Aborted | AbortOutcome::NotRunning => Ok(()),
-        }
+        self.operation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
+        Ok(())
     }
 }
 
@@ -1687,6 +1715,7 @@ mod tests {
             is_auto_increment: false,
             ext_col_type_name: String::new(),
             udt_output_type: String::new(),
+            fields: Vec::new(),
         }
     }
 
@@ -1710,6 +1739,7 @@ mod tests {
             last_query_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
+            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
         }
     }
 
@@ -1883,6 +1913,7 @@ mod tests {
             last_query_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
+            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
         };
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
@@ -1911,6 +1942,7 @@ mod tests {
             last_query_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
+            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
         };
         stmt.set_sql_query("SELECT 1").unwrap();
         assert!(stmt.target_table.is_none());
