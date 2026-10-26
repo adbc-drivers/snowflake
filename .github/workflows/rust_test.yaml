@@ -89,7 +89,7 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.ref == ''
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -97,7 +97,7 @@ jobs:
 
       - name: "checkout remote"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.ref != ''
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -216,7 +216,7 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.ref == ''
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -224,7 +224,7 @@ jobs:
 
       - name: "checkout remote"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.ref != ''
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -356,7 +356,7 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.ref == ''
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -364,7 +364,7 @@ jobs:
 
       - name: "checkout remote"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.ref != ''
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -429,7 +429,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.ref == ''
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -437,7 +437,7 @@ jobs:
 
       - name: "checkout remote"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.ref != ''
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -528,14 +528,14 @@ jobs:
           ./dbc install --no-verify "${driver_pkg}"
           echo "Installed ${driver_pkg}"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.ref == ''
         with:
           fetch-depth: 1
           persist-credentials: false
           submodules: 'recursive'
       - name: "checkout remote"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.ref != ''
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -572,7 +572,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.ref == ''
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -580,7 +580,7 @@ jobs:
 
       - name: "checkout remote"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.ref != ''
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
