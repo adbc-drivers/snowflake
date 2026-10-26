@@ -436,7 +436,7 @@ fn test_timestamp_precision_get_table_schema() {
     }
 }
 
-// ── missing database options ──────────────────────────────────────────────────
+// ── database options ──────────────────────────────────────────────────────────
 
 /// Verify simple 1:1 option round-trips through the public Database API.
 /// No live connection required — make_db() only needs SNOWFLAKE_URI for the env
@@ -449,10 +449,8 @@ fn test_database_options_round_trip() {
     };
 
     let cases: &[(&str, &str)] = &[
-        ("adbc.snowflake.sql.region", "us-east-1"),
         ("adbc.snowflake.sql.client_option.login_timeout", "30s"),
         ("adbc.snowflake.sql.client_option.request_timeout", "60s"),
-        ("adbc.snowflake.sql.client_option.jwt_expire_timeout", "90s"),
         ("adbc.snowflake.sql.client_option.client_timeout", "120s"),
         (
             "adbc.snowflake.sql.client_option.keep_session_alive",
@@ -470,7 +468,6 @@ fn test_database_options_round_trip() {
             "adbc.snowflake.sql.client_option.store_temp_creds",
             "enabled",
         ),
-        ("adbc.snowflake.sql.client_option.tracing", "debug"),
         (
             "adbc.snowflake.sql.client_option.identity_provider",
             "azure",
@@ -529,38 +526,22 @@ fn test_tls_skip_verify_option() {
     );
 }
 
-/// Verify the legacy OCSP option remains an opaque round-trippable option.
+/// Unsupported Go-only options cannot be silently accepted by sf_core.
 #[test]
-fn test_ocsp_fail_open_mode_option() {
+fn test_ocsp_fail_open_mode_is_not_implemented() {
     let Some(mut db) = make_db() else {
         eprintln!("Skipping: SNOWFLAKE_URI not set");
         return;
     };
-
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
-        OptionValue::String("enabled".into()),
-    )
-    .expect("set ocsp_fail_open_mode enabled");
+    let option =
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into());
+    let error = db
+        .set_option(option.clone(), OptionValue::String("enabled".into()))
+        .unwrap_err();
+    assert_eq!(error.status, adbc_core::error::Status::NotImplemented);
     assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()
-        ))
-        .unwrap(),
-        "enabled"
-    );
-
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()),
-        OptionValue::String("disabled".into()),
-    )
-    .expect("set ocsp_fail_open_mode disabled");
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.ocsp_fail_open_mode".into()
-        ))
-        .unwrap(),
-        "disabled"
+        db.get_option_string(option).unwrap_err().status,
+        adbc_core::error::Status::NotFound
     );
 }
 

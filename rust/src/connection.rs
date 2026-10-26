@@ -28,8 +28,8 @@ use adbc_core::{
     schemas,
 };
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
-    UnionArray,
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray, UInt32Array, UnionArray,
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema};
@@ -93,9 +93,11 @@ impl Drop for Connection {
     }
 }
 
-pub(crate) struct SingleBatchReader {
-    batch: Option<RecordBatch>,
-    schema: std::sync::Arc<Schema>,
+pub(crate) fn single_batch_reader(
+    batch: RecordBatch,
+) -> Box<dyn RecordBatchReader + Send + 'static> {
+    let schema = batch.schema();
+    Box::new(RecordBatchIterator::new(std::iter::once(Ok(batch)), schema))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +120,7 @@ fn exact_identifier_sql(kind: SessionIdentifierKind, name: &str) -> Option<Strin
     Some(format!("USE {keyword} \"{}\"", name.replace('"', "\"\"")))
 }
 
-fn quote_identifier(identifier: &str) -> String {
+pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
@@ -138,29 +140,6 @@ fn qualified_table_identifier(
         (None, Some(db_schema)) => format!("{}.{}", quote_identifier(db_schema), table_name),
         (Some(catalog), None) => format!("{}..{}", quote_identifier(catalog), table_name),
         (None, None) => table_name,
-    }
-}
-
-impl SingleBatchReader {
-    pub(crate) fn new(batch: RecordBatch) -> Self {
-        let schema = batch.schema();
-        Self {
-            batch: Some(batch),
-            schema,
-        }
-    }
-}
-
-impl Iterator for SingleBatchReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-    fn next(&mut self) -> Option<Self::Item> {
-        Ok(self.batch.take()).transpose()
-    }
-}
-
-impl RecordBatchReader for SingleBatchReader {
-    fn schema(&self) -> std::sync::Arc<Schema> {
-        self.schema.clone()
     }
 }
 
@@ -389,7 +368,7 @@ impl adbc_core::Connection for Connection {
 
         if selected.is_empty() {
             let batch = RecordBatch::new_empty(schemas::GET_INFO_SCHEMA.clone());
-            return Ok(Box::new(SingleBatchReader::new(batch)));
+            return Ok(single_batch_reader(batch));
         }
 
         let name_vals: Vec<u32> = selected.iter().map(|(c, _, _)| u32::from(c)).collect();
@@ -505,7 +484,7 @@ impl adbc_core::Connection for Connection {
         )
         .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
 
-        Ok(Box::new(SingleBatchReader::new(batch)))
+        Ok(single_batch_reader(batch))
     }
 
     #[allow(refining_impl_trait)]
@@ -577,23 +556,23 @@ impl adbc_core::Connection for Connection {
         let array = Arc::new(StringArray::from(vec!["TABLE", "VIEW"]));
         let batch = RecordBatch::try_new(schemas::GET_TABLE_TYPES_SCHEMA.clone(), vec![array])
             .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
-        Ok(Box::new(SingleBatchReader::new(batch)))
+        Ok(single_batch_reader(batch))
     }
 
     #[allow(refining_impl_trait)]
     fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(crate::error::not_implemented("get_statistic_names"))
+        crate::statistics::get_statistic_names()
     }
 
     #[allow(refining_impl_trait)]
     fn get_statistics(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _approximate: bool,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(crate::error::not_implemented("get_statistics"))
+        crate::statistics::get_statistics(self, catalog, db_schema, table_name, approximate)
     }
 
     fn commit(&mut self) -> Result<()> {

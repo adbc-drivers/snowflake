@@ -379,7 +379,7 @@ impl adbc_core::Statement for Statement {
             result?;
             let batch =
                 arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
-            return Ok(Box::new(crate::connection::SingleBatchReader::new(batch)));
+            return Ok(crate::connection::single_batch_reader(batch));
         }
         let query = self.query.clone().ok_or_else(|| {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
