@@ -579,22 +579,23 @@ impl adbc_core::Connection for Connection {
             (InfoCode::DriverArrowVersion, 0, 4),
         ];
 
-        let selected: Vec<_> = match &codes {
-            None => all_entries.iter().collect(),
-            Some(set) => all_entries
-                .iter()
-                .filter(|(c, _, _)| set.contains(c))
-                .collect(),
-        };
-
-        if selected.is_empty() {
+        let capacity = codes
+            .as_ref()
+            .map_or(all_entries.len(), |set| set.len().min(all_entries.len()));
+        let mut name_vals = Vec::with_capacity(capacity);
+        let mut type_ids = Vec::with_capacity(capacity);
+        let mut offsets = Vec::with_capacity(capacity);
+        for &(code, type_id, offset) in all_entries {
+            if codes.as_ref().is_none_or(|set| set.contains(&code)) {
+                name_vals.push(u32::from(&code));
+                type_ids.push(type_id);
+                offsets.push(offset);
+            }
+        }
+        if name_vals.is_empty() {
             let batch = RecordBatch::new_empty(schemas::GET_INFO_SCHEMA.clone());
             return Ok(single_batch_reader(batch));
         }
-
-        let name_vals: Vec<u32> = selected.iter().map(|(c, _, _)| u32::from(c)).collect();
-        let type_ids: Vec<i8> = selected.iter().map(|(_, t, _)| *t).collect();
-        let offsets: Vec<i32> = selected.iter().map(|(_, _, o)| *o).collect();
 
         use arrow_schema::UnionFields;
 

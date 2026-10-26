@@ -148,19 +148,11 @@ pub(crate) fn get_statistics(
                 Err(_) => None,
             }
         };
-        let mut schemas: Vec<(&str, Vec<&TableInfo>)> = Vec::new();
-        let mut schema_indices = HashMap::<&str, usize>::new();
-        for table in &catalog.tables {
-            match schema_indices.get(table.schema.as_str()) {
-                Some(&index) => schemas[index].1.push(table),
-                None => {
-                    schema_indices.insert(&table.schema, schemas.len());
-                    schemas.push((&table.schema, vec![table]));
-                }
-            }
-        }
-
-        for (schema, tables) in schemas {
+        for tables in catalog
+            .tables
+            .chunk_by(|left, right| left.schema == right.schema)
+        {
+            let schema = &tables[0].schema;
             for table in tables {
                 let metric = storage.as_ref().and_then(|metrics| {
                     metrics
@@ -292,56 +284,6 @@ fn clustering_sql(catalog: &str, schema: &str, table: &str) -> String {
     sql
 }
 
-fn with_query_reader<T>(
-    connection: &Connection,
-    operation: &sf_core::apis::operation_ctx::OperationCtx,
-    query: String,
-    consume: impl FnOnce(&mut dyn RecordBatchReader) -> Result<T>,
-) -> Result<T> {
-    let stmt_handle = connection
-        .inner
-        .sf
-        .statement_new(connection.conn_handle)
-        .map_err(crate::error::api_error_to_adbc_error)?;
-    let result = (|| {
-        let mut result = connection.inner.execute_query_with_timeout(
-            Some(operation),
-            stmt_handle,
-            query,
-            None,
-            None,
-        )?;
-        let value = match consume(result.reader.as_mut()) {
-            Ok(value) => value,
-            Err(_) if operation.token().is_cancelled() => {
-                return Err(Error::with_message_and_status(
-                    "operation cancelled",
-                    Status::Cancelled,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        if operation.token().is_cancelled() {
-            return Err(Error::with_message_and_status(
-                "operation cancelled",
-                Status::Cancelled,
-            ));
-        }
-        Ok(value)
-    })();
-    let release = connection.inner.sf.statement_release(stmt_handle);
-    match result {
-        Ok(value) => {
-            release.map_err(crate::error::api_error_to_adbc_error)?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = release;
-            Err(error)
-        }
-    }
-}
-
 fn matching_databases(
     connection: &Connection,
     operation: &sf_core::apis::operation_ctx::OperationCtx,
@@ -350,7 +292,7 @@ fn matching_databases(
     if let Some(name) = catalog.filter(|name| !name.contains(['%', '_'])) {
         return Ok(vec![name.to_owned()]);
     }
-    with_query_reader(connection, operation, databases_sql(catalog), |reader| {
+    connection.with_metadata_reader(operation, databases_sql(catalog), |reader| {
         let mut databases = Vec::new();
         for batch in reader {
             let batch = batch.map_err(io_error)?;
@@ -381,8 +323,7 @@ fn query_tables(
     schema_filter: &str,
     table_filter: &str,
 ) -> Result<(Option<String>, Vec<TableInfo>)> {
-    with_query_reader(
-        connection,
+    connection.with_metadata_reader(
         operation,
         tables_sql(catalog, schema_filter, table_filter),
         |reader| {
@@ -430,42 +371,37 @@ fn query_storage_metrics(
     catalog: &str,
     tables: &[TableInfo],
 ) -> Result<StorageMetrics> {
-    with_query_reader(
-        connection,
-        operation,
-        storage_sql(catalog, tables),
-        |reader| {
-            let mut metrics = StorageMetrics::new();
-            for batch in reader {
-                let batch = batch.map_err(io_error)?;
-                if batch.num_columns() != 5 {
-                    return Err(unexpected_columns("TABLE_STORAGE_METRICS", 5, &batch));
-                }
-                let schemas = string_column(&batch, 0, "table_schema")?;
-                let names = string_column(&batch, 1, "table_name")?;
-                let active = int64_column(batch.column(2))?;
-                let travel = int64_column(batch.column(3))?;
-                let failsafe = int64_column(batch.column(4))?;
-                let active = active.as_any().downcast_ref::<Int64Array>().unwrap();
-                let travel = travel.as_any().downcast_ref::<Int64Array>().unwrap();
-                let failsafe = failsafe.as_any().downcast_ref::<Int64Array>().unwrap();
-                for row in 0..batch.num_rows() {
-                    metrics
-                        .entry(required_string(schemas, row, "table_schema")?.to_owned())
-                        .or_default()
-                        .insert(
-                            required_string(names, row, "table_name")?.to_owned(),
-                            StorageMetric {
-                                active_bytes: numeric_value(active, row, 0),
-                                time_travel_bytes: numeric_value(travel, row, 0),
-                                failsafe_bytes: numeric_value(failsafe, row, 0),
-                            },
-                        );
-                }
+    connection.with_metadata_reader(operation, storage_sql(catalog, tables), |reader| {
+        let mut metrics = StorageMetrics::new();
+        for batch in reader {
+            let batch = batch.map_err(io_error)?;
+            if batch.num_columns() != 5 {
+                return Err(unexpected_columns("TABLE_STORAGE_METRICS", 5, &batch));
             }
-            Ok(metrics)
-        },
-    )
+            let schemas = string_column(&batch, 0, "table_schema")?;
+            let names = string_column(&batch, 1, "table_name")?;
+            let active = int64_column(batch.column(2))?;
+            let travel = int64_column(batch.column(3))?;
+            let failsafe = int64_column(batch.column(4))?;
+            let active = active.as_any().downcast_ref::<Int64Array>().unwrap();
+            let travel = travel.as_any().downcast_ref::<Int64Array>().unwrap();
+            let failsafe = failsafe.as_any().downcast_ref::<Int64Array>().unwrap();
+            for row in 0..batch.num_rows() {
+                metrics
+                    .entry(required_string(schemas, row, "table_schema")?.to_owned())
+                    .or_default()
+                    .insert(
+                        required_string(names, row, "table_name")?.to_owned(),
+                        StorageMetric {
+                            active_bytes: numeric_value(active, row, 0),
+                            time_travel_bytes: numeric_value(travel, row, 0),
+                            failsafe_bytes: numeric_value(failsafe, row, 0),
+                        },
+                    );
+            }
+        }
+        Ok(metrics)
+    })
 }
 
 fn query_clustering_depth(
@@ -474,8 +410,7 @@ fn query_clustering_depth(
     catalog: &str,
     table: &TableInfo,
 ) -> Result<f64> {
-    with_query_reader(
-        connection,
+    connection.with_metadata_reader(
         operation,
         clustering_sql(catalog, &table.schema, &table.name),
         |reader| {

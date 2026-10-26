@@ -30,8 +30,6 @@ use sf_core::config::settings::Setting;
 use crate::connection::{Connection, cleanup_connection_handle};
 use crate::driver::{Inner, TimestampPrecision};
 
-use percent_encoding::percent_decode_str;
-
 const AUTH_TYPE: &str = "adbc.snowflake.sql.auth_type";
 const OKTA_URL: &str = "adbc.snowflake.sql.client_option.okta_url";
 const MAX_RETRY_COUNT: &str = "adbc.snowflake.sql.client_option.max_retry_count";
@@ -416,8 +414,8 @@ impl Optionable for Database {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         let key_str = key.as_ref();
         if key_str == "uri" {
-            if let OptionValue::String(uri) = &value {
-                return self.apply_uri(uri.clone());
+            if let OptionValue::String(uri) = value {
+                return self.apply_uri(&uri);
             }
             return Err(Error::with_message_and_status(
                 "uri option must be a string",
@@ -672,35 +670,16 @@ impl Database {
     ///
     /// Limitations: passwords containing `@` are not supported; use `set_option` for
     /// Username/Password directly when credentials contain special characters.
-    fn apply_uri(&mut self, uri: String) -> Result<()> {
-        let stripped = uri.strip_prefix("snowflake://").unwrap_or(&uri).to_string();
-        let (user_info, rest) = if let Some(at) = stripped.find('@') {
-            (
-                Some(stripped[..at].to_string()),
-                stripped[at + 1..].to_string(),
-            )
-        } else {
-            (None, stripped)
-        };
+    fn apply_uri(&mut self, uri: &str) -> Result<()> {
+        let stripped = uri.strip_prefix("snowflake://").unwrap_or(uri);
+        let (user_info, rest) = stripped
+            .split_once('@')
+            .map_or((None, stripped), |(info, rest)| (Some(info), rest));
 
         if let Some(info) = user_info {
-            if let Some(colon) = info.find(':') {
-                let user = percent_decode_str(&info[..colon])
-                    .decode_utf8()
-                    .map_err(|e| {
-                        Error::with_message_and_status(
-                            format!("invalid UTF-8 in URI username: {e}"),
-                            Status::InvalidArguments,
-                        )
-                    })?;
-                let pass = percent_decode_str(&info[colon + 1..])
-                    .decode_utf8()
-                    .map_err(|e| {
-                        Error::with_message_and_status(
-                            format!("invalid UTF-8 in URI password: {e}"),
-                            Status::InvalidArguments,
-                        )
-                    })?;
+            if let Some((encoded_user, encoded_pass)) = info.split_once(':') {
+                let user = decode_uri_component(encoded_user, "username")?;
+                let pass = decode_uri_component(encoded_pass, "password")?;
                 if !user.is_empty() {
                     self.set_option(
                         OptionDatabase::Username,
@@ -712,12 +691,7 @@ impl Database {
                     OptionValue::String(pass.into_owned()),
                 )?;
             } else if !info.is_empty() {
-                let user = percent_decode_str(&info).decode_utf8().map_err(|e| {
-                    Error::with_message_and_status(
-                        format!("invalid UTF-8 in URI username: {e}"),
-                        Status::InvalidArguments,
-                    )
-                })?;
+                let user = decode_uri_component(info, "username")?;
                 self.set_option(
                     OptionDatabase::Username,
                     OptionValue::String(user.into_owned()),
@@ -728,24 +702,25 @@ impl Database {
         let (path, query) = if let Some(q) = rest.find('?') {
             (&rest[..q], Some(&rest[q + 1..]))
         } else {
-            (rest.as_str(), None)
+            (rest, None)
         };
         let explicit_account = query.is_some_and(|query| {
             query.split('&').any(|pair| {
-                pair.split_once('=')
-                    .is_some_and(|(key, _)| key == "account")
+                pair.split_once('=').is_some_and(|(key, _)| {
+                    decode_uri_component(key, "query parameter name")
+                        .is_ok_and(|key| key == "account")
+                })
             })
         });
 
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if let Some(authority) = parts.first().filter(|s| !s.is_empty()) {
+        let mut parts = path.splitn(3, '/');
+        if let Some(authority) = parts.next().filter(|s| !s.is_empty()) {
             let authority = decode_uri_component(authority, "account/host")?;
             // The documented form is host[:port], with or without account=.
-            let (host, port) = authority
-                .rsplit_once(':')
-                .map_or((authority.as_str(), None), |(host, port)| {
-                    (host, Some(port))
-                });
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((host, port)) => (host.to_owned(), Some(port.to_owned())),
+                None => (authority.into_owned(), None),
+            };
             let host_key = if explicit_account {
                 "adbc.snowflake.sql.uri.host"
             } else {
@@ -753,40 +728,33 @@ impl Database {
             };
             self.set_option(
                 OptionDatabase::Other(host_key.into()),
-                OptionValue::String(host.to_string()),
+                OptionValue::String(host),
             )?;
             if let Some(port) = port {
                 self.set_option(
                     OptionDatabase::Other("adbc.snowflake.sql.uri.port".into()),
-                    OptionValue::String(port.to_string()),
+                    OptionValue::String(port),
                 )?;
             }
         }
-        if let Some(database) = parts.get(1).filter(|s| !s.is_empty()) {
+        if let Some(database) = parts.next().filter(|s| !s.is_empty()) {
             self.set_option(
                 OptionDatabase::Other("adbc.snowflake.sql.db".into()),
-                OptionValue::String(decode_uri_component(database, "database")?),
+                OptionValue::String(decode_uri_component(database, "database")?.into_owned()),
             )?;
         }
-        if let Some(schema) = parts.get(2).filter(|s| !s.is_empty()) {
+        if let Some(schema) = parts.next().filter(|s| !s.is_empty()) {
             self.set_option(
                 OptionDatabase::Other("adbc.snowflake.sql.schema".into()),
-                OptionValue::String(decode_uri_component(schema, "schema")?),
+                OptionValue::String(decode_uri_component(schema, "schema")?.into_owned()),
             )?;
         }
 
         if let Some(q) = query {
             for pair in q.split('&') {
                 if let Some((key, encoded_value)) = pair.split_once('=') {
-                    let value = percent_decode_str(encoded_value)
-                        .decode_utf8()
-                        .map_err(|e| {
-                            Error::with_message_and_status(
-                                format!("invalid UTF-8 in URI query parameter: {e}"),
-                                Status::InvalidArguments,
-                            )
-                        })?;
-                    let adbc_key = match key {
+                    let key = decode_uri_component(key, "query parameter name")?;
+                    let adbc_key = match key.as_ref() {
                         "account" => "adbc.snowflake.sql.account",
                         "warehouse" => "adbc.snowflake.sql.warehouse",
                         "role" => "adbc.snowflake.sql.role",
@@ -800,6 +768,7 @@ impl Database {
                         }
                         _ => continue,
                     };
+                    let value = decode_uri_component(encoded_value, "query parameter")?;
                     self.set_option(
                         OptionDatabase::Other(adbc_key.into()),
                         OptionValue::String(value.into_owned()),
@@ -811,11 +780,44 @@ impl Database {
     }
 }
 
-/// Percent-decode one URI component, rejecting invalid UTF-8.
-fn decode_uri_component(value: &str, what: &str) -> Result<String> {
-    percent_decode_str(value)
-        .decode_utf8()
-        .map(|decoded| decoded.into_owned())
+/// Decode a DSN component with Go's url.QueryUnescape semantics, rejecting
+/// malformed percent escapes and invalid UTF-8.
+fn decode_uri_component<'a>(value: &'a str, what: &str) -> Result<std::borrow::Cow<'a, str>> {
+    let bytes = value.as_bytes();
+    if !bytes.iter().any(|&byte| matches!(byte, b'+' | b'%')) {
+        return Ok(std::borrow::Cow::Borrowed(value));
+    }
+    let invalid_escape = || {
+        Error::with_message_and_status(
+            format!("invalid percent escape in URI {what}"),
+            Status::InvalidArguments,
+        )
+    };
+    let hex = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let high = bytes.get(index + 1).and_then(|&byte| hex(byte));
+                let low = bytes.get(index + 2).and_then(|&byte| hex(byte));
+                decoded.push(
+                    (high.ok_or_else(invalid_escape)? << 4) | low.ok_or_else(invalid_escape)?,
+                );
+                index += 2;
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(decoded)
+        .map(std::borrow::Cow::Owned)
         .map_err(|e| {
             Error::with_message_and_status(
                 format!("invalid UTF-8 in URI {what}: {e}"),
@@ -1863,6 +1865,38 @@ mod tests {
             db.sf_settings.get(param_names::DATABASE.as_str()).unwrap(),
             &sf_core::config::settings::Setting::String("mydb".into())
         );
+    }
+
+    #[test]
+    fn uri_query_unescapes_user_password_path_and_query_values() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String(
+                "snowflake://a+lice:p+ss%2Bword@myaccount/MY+DB/S%2B+X?%77arehouse=WH+1%2B2".into(),
+            ),
+        )
+        .unwrap();
+        for (key, expected) in [
+            (param_names::USER.as_str(), "a lice"),
+            (param_names::PASSWORD.as_str(), "p ss+word"),
+            (param_names::DATABASE.as_str(), "MY DB"),
+            (param_names::SCHEMA.as_str(), "S+ X"),
+            (param_names::WAREHOUSE.as_str(), "WH 1+2"),
+        ] {
+            assert_eq!(
+                db.sf_settings.get(key),
+                Some(&Setting::String(expected.to_owned())),
+                "{key}"
+            );
+        }
+        let error = make_db()
+            .set_option(
+                OptionDatabase::Uri,
+                OptionValue::String("snowflake://alice:bad%2@myaccount".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]

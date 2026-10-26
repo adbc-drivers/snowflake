@@ -36,8 +36,7 @@ parquet = { version = "58.1.0", default-features = false, features = ["arrow", "
 serde_json = "1"
 uuid = "1"
 log = "0.4.22"
-tokio = { version = "1", features = ["rt-multi-thread"] }
-percent-encoding = "2.3.2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 
 # Force vendored (static) OpenSSL on Linux for manylinux compatibility.
 # This crate doesn't call openssl APIs directly; it exists to ensure

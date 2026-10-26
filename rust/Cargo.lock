@@ -16,7 +16,6 @@ dependencies = [
  "log",
  "openssl",
  "parquet",
- "percent-encoding",
  "serde_json",
  "sf_core",
  "tokio",
