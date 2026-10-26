@@ -38,6 +38,44 @@ const MAX_RETRY_COUNT: &str = "adbc.snowflake.sql.client_option.max_retry_count"
 const CACHE_MFA_TOKEN: &str = "adbc.snowflake.sql.client_option.cache_mfa_token";
 const STORE_TEMP_CREDS: &str = "adbc.snowflake.sql.client_option.store_temp_creds";
 const MAX_TIMESTAMP_PRECISION: &str = "adbc.snowflake.sql.client_option.max_timestamp_precision";
+pub(crate) const GEOGRAPHY_OUTPUT_FORMAT: &str =
+    "adbc.snowflake.sql.client_option.geography_output_format";
+pub(crate) const GEOMETRY_OUTPUT_FORMAT: &str =
+    "adbc.snowflake.sql.client_option.geometry_output_format";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GeoOutputFormat {
+    Ewkb,
+    #[default]
+    GeoJson,
+}
+
+impl GeoOutputFormat {
+    pub(crate) fn parse(key: &str, value: &OptionValue) -> Result<Self> {
+        let OptionValue::String(value) = value else {
+            return Err(invalid_typed_option_value(key, value));
+        };
+        if value.eq_ignore_ascii_case("EWKB") {
+            Ok(Self::Ewkb)
+        } else if value.eq_ignore_ascii_case("GEOJSON") {
+            Ok(Self::GeoJson)
+        } else {
+            Err(Error::with_message_and_status(
+                format!(
+                    "[snowflake] invalid value for database option '{key}': '{value}' (must be 'EWKB' or 'GeoJSON')"
+                ),
+                Status::InvalidArguments,
+            ))
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ewkb => "EWKB",
+            Self::GeoJson => "GEOJSON",
+        }
+    }
+}
 
 // None means that sf_core needs the separately configured Okta URL as authenticator.
 const AUTH_TYPES: [(&str, Option<&str>); 8] = [
@@ -324,6 +362,8 @@ pub struct Database {
     pub(crate) surfaced_warnings: HashSet<String>,
     /// Arrow time unit used for TIMESTAMP columns.
     pub(crate) timestamp_precision: TimestampPrecision,
+    pub(crate) geography_output_format: GeoOutputFormat,
+    pub(crate) geometry_output_format: GeoOutputFormat,
 }
 
 impl Drop for Database {
@@ -379,6 +419,14 @@ impl Optionable for Database {
                 "nanoseconds" => TimestampPrecision::Nanoseconds,
                 _ => return Err(invalid_option_value(key_str, precision)),
             };
+            return Ok(());
+        }
+        if key_str == GEOGRAPHY_OUTPUT_FORMAT {
+            self.geography_output_format = GeoOutputFormat::parse(key_str, &value)?;
+            return Ok(());
+        }
+        if key_str == GEOMETRY_OUTPUT_FORMAT {
+            self.geometry_output_format = GeoOutputFormat::parse(key_str, &value)?;
             return Ok(());
         }
         if key_str == AUTH_TYPE {
@@ -493,6 +541,12 @@ impl Optionable for Database {
                 TimestampPrecision::Nanoseconds => "nanoseconds",
             }
             .to_string());
+        }
+        if key_str == GEOGRAPHY_OUTPUT_FORMAT {
+            return Ok(self.geography_output_format.as_str().to_string());
+        }
+        if key_str == GEOMETRY_OUTPUT_FORMAT {
+            return Ok(self.geometry_output_format.as_str().to_string());
         }
         if key_str == AUTH_TYPE {
             if let Some(auth) = self.auth_type {
@@ -785,7 +839,28 @@ fn accumulate_connection_options(
     for (key, value) in opts {
         no_connection_details = false;
         if let OptionConnection::Other(name) = &key {
-            sf_options.insert(name.clone(), option_to_setting(&value)?);
+            if name == GEOGRAPHY_OUTPUT_FORMAT || name == GEOMETRY_OUTPUT_FORMAT {
+                post_connect_options.push((key, value));
+                continue;
+            }
+            match adbc_db_opt_to_sf(name, &value) {
+                Ok(Some((param, setting))) => {
+                    sf_options.insert(param.to_string(), setting);
+                }
+                Ok(None) => {
+                    return Err(Error::with_message_and_status(
+                        format!("unrecognized connection option '{name}'"),
+                        Status::NotImplemented,
+                    ));
+                }
+                Err(error) if error.status == Status::NotImplemented => {
+                    return Err(Error::with_message_and_status(
+                        format!("unrecognized connection option '{name}'"),
+                        Status::NotImplemented,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             post_connect_options.push((key, value));
         }
@@ -928,10 +1003,20 @@ impl adbc_core::Database for Database {
                 .runtime
                 .block_on(self.inner.sf.connection_set_session_parameters(
                     conn_handle,
-                    HashMap::from([(
-                        "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".to_string(),
-                        "ARROW".to_string(),
-                    )]),
+                    HashMap::from([
+                        (
+                            "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".to_string(),
+                            "ARROW".to_string(),
+                        ),
+                        (
+                            "GEOGRAPHY_OUTPUT_FORMAT".to_string(),
+                            self.geography_output_format.as_str().to_string(),
+                        ),
+                        (
+                            "GEOMETRY_OUTPUT_FORMAT".to_string(),
+                            self.geometry_output_format.as_str().to_string(),
+                        ),
+                    ]),
                 ))
                 .map_err(crate::error::api_error_to_adbc_error)?;
 
@@ -977,6 +1062,11 @@ impl adbc_core::Database for Database {
             conn_handle,
             autocommit: true,
             timestamp_precision: self.timestamp_precision,
+            geography_output_format: self.geography_output_format,
+            geometry_output_format: self.geometry_output_format,
+            operation: std::sync::Mutex::new(std::sync::Arc::new(
+                sf_core::apis::operation_ctx::OperationCtx::with_own_token(),
+            )),
         };
         // From this point Connection::drop owns cleanup on every error path.
         for (key, value) in post_connect_options {
@@ -1039,6 +1129,41 @@ mod tests {
             &ordered[3].1,
             OptionValue::String(value) if value == "false"
         ));
+    }
+
+    #[test]
+    fn geo_formats_validate_and_round_trip_without_changing_on_error() {
+        let mut db = make_db();
+        for key in [GEOGRAPHY_OUTPUT_FORMAT, GEOMETRY_OUTPUT_FORMAT] {
+            let option = OptionDatabase::Other(key.into());
+            assert_eq!(db.get_option_string(option.clone()).unwrap(), "GEOJSON");
+            db.set_option(option.clone(), OptionValue::String("ewKb".into()))
+                .unwrap();
+            assert_eq!(db.get_option_string(option.clone()).unwrap(), "EWKB");
+            for value in [OptionValue::String("WKT".into()), OptionValue::Int(1)] {
+                let err = db.set_option(option.clone(), value).unwrap_err();
+                assert_eq!(err.status, Status::InvalidArguments);
+                assert_eq!(db.get_option_string(option.clone()).unwrap(), "EWKB");
+            }
+            db.set_option(option.clone(), OptionValue::String("geojson".into()))
+                .unwrap();
+            assert_eq!(db.get_option_string(option).unwrap(), "GEOJSON");
+        }
+    }
+
+    #[test]
+    fn connection_options_reject_unknown_before_opening() {
+        let error = accumulate_connection_options(
+            &HashMap::new(),
+            [(
+                OptionConnection::Other("adbc.fake".into()),
+                OptionValue::Int(1),
+            )],
+        )
+        .err()
+        .expect("unknown option must fail");
+        assert_eq!(error.status, Status::NotImplemented);
+        assert_eq!(error.message, "unrecognized connection option 'adbc.fake'");
     }
 
     #[test]
@@ -1269,8 +1394,6 @@ mod tests {
             "adbc.snowflake.sql.client_option.jwt_expire_timeout",
             "adbc.snowflake.sql.client_option.tracing",
             "adbc.snowflake.sql.client_option.config_file",
-            "adbc.snowflake.sql.client_option.geography_output_format",
-            "adbc.snowflake.sql.client_option.geometry_output_format",
             "adbc.snowflake.sql.client_option.use_high_precision",
             "adbc.snowflake.sql.client_option.stream_retry_enabled",
             "adbc.connection.get_objects.match_exactly",

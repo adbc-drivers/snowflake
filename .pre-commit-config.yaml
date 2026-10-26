@@ -29,7 +29,8 @@ repos:
       - id: codespell
         exclude: >
           (?x)^(
-              .*go\.sum
+              .*go\.sum|
+              .*Cargo\.lock
           )$
 
   - repo: https://github.com/golangci/golangci-lint
