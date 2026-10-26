@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -22,8 +23,9 @@ use adbc_core::{
     schemas,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, LargeListArray, ListArray,
-    RecordBatch, RecordBatchReader, StringArray, StructArray, new_empty_array, new_null_array,
+    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, LargeListArray,
+    LargeStringArray, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+    new_empty_array, new_null_array,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, Fields};
@@ -31,7 +33,7 @@ use sf_core::apis::database_driver_v1::{
     DEPTH_CATALOGS, DEPTH_COLUMNS, DEPTH_DB_SCHEMAS, DEPTH_TABLES, GetObjectsRequest,
 };
 
-use crate::connection::{Connection, single_batch_reader};
+use crate::connection::{Connection, quote_identifier, single_batch_reader};
 
 #[derive(Default)]
 struct ObjectTree {
@@ -52,6 +54,7 @@ struct SchemaEntry {
 struct TableEntry {
     table_type: String,
     columns: Vec<ColumnEntry>,
+    constraints: Vec<ConstraintEntry>,
 }
 
 struct ColumnEntry {
@@ -68,6 +71,22 @@ struct ColumnEntry {
     xdbc_is_nullable: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ForeignKeyUsage {
+    catalog: Option<String>,
+    schema: Option<String>,
+    table: String,
+    column: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConstraintEntry {
+    name: Option<String>,
+    constraint_type: &'static str,
+    columns: Vec<String>,
+    usage: Vec<ForeignKeyUsage>,
+}
+
 pub(crate) fn execute_get_objects(
     connection: &Connection,
     depth: &ObjectDepth,
@@ -80,12 +99,42 @@ pub(crate) fn execute_get_objects(
     let operation = connection.begin_operation();
     let table_types = table_type.unwrap_or_default();
     let mut objects = ObjectTree::default();
+    // sf_core uses backslash as a LIKE escape, whereas Go's ADBC filters
+    // treat it literally. Avoid its pushdown for such patterns and filter
+    // the returned names locally. Exact catalog/schema filters escape
+    // wildcards for sf_core scope selection and are matched again below.
+    let local_like = !connection.match_exactly
+        && [catalog, db_schema, table_name, column_name]
+            .into_iter()
+            .flatten()
+            .any(|filter| filter.contains('\\'));
+    let core_catalog = catalog.and_then(|value| {
+        if connection.match_exactly {
+            Some(exact_core_filter(value))
+        } else if value.contains('\\') {
+            None
+        } else {
+            Some(Cow::Borrowed(value))
+        }
+    });
+    let core_schema = db_schema.and_then(|value| {
+        if connection.match_exactly {
+            Some(exact_core_filter(value))
+        } else if value.contains('\\') {
+            None
+        } else {
+            Some(Cow::Borrowed(value))
+        }
+    });
+    let core_table = table_name.filter(|value| !connection.match_exactly && !value.contains('\\'));
+    let core_column =
+        column_name.filter(|value| !connection.match_exactly && !value.contains('\\'));
 
     let catalogs = fetch_core_objects(
         connection,
         &operation,
         DEPTH_CATALOGS,
-        catalog,
+        core_catalog.as_deref(),
         None,
         None,
         &[],
@@ -98,8 +147,8 @@ pub(crate) fn execute_get_objects(
             connection,
             &operation,
             DEPTH_DB_SCHEMAS,
-            catalog,
-            db_schema,
+            core_catalog.as_deref(),
+            core_schema.as_deref(),
             None,
             &[],
             None,
@@ -118,9 +167,9 @@ pub(crate) fn execute_get_objects(
             connection,
             &operation,
             DEPTH_TABLES,
-            catalog,
-            db_schema,
-            table_name,
+            core_catalog.as_deref(),
+            core_schema.as_deref(),
+            core_table,
             &table_types,
             None,
         )?;
@@ -132,17 +181,414 @@ pub(crate) fn execute_get_objects(
             connection,
             &operation,
             DEPTH_COLUMNS,
-            catalog,
-            db_schema,
-            table_name,
+            core_catalog.as_deref(),
+            core_schema.as_deref(),
+            core_table,
             &[],
-            column_name,
+            core_column,
         )?;
         merge_columns(&mut objects, columns);
     }
 
+    if connection.match_exactly {
+        retain_matching(
+            &mut objects,
+            catalog,
+            db_schema,
+            table_name,
+            column_name,
+            literal_matches,
+        );
+    } else if local_like {
+        retain_matching(
+            &mut objects,
+            catalog,
+            db_schema,
+            table_name,
+            column_name,
+            like_matches,
+        );
+    }
+    if matches!(depth, ObjectDepth::Columns | ObjectDepth::All) {
+        fetch_constraints(
+            connection,
+            &operation,
+            &mut objects,
+            catalog,
+            db_schema,
+            table_name,
+            connection.match_exactly,
+        )?;
+    }
+
     let batch = build_batch(&objects, depth).map_err(arrow_to_adbc_error)?;
     Ok(single_batch_reader(batch))
+}
+
+fn exact_core_filter(value: &str) -> Cow<'_, str> {
+    if !value.contains(['%', '_', '\\']) {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Cow::Owned(escaped)
+}
+
+fn literal_matches(pattern: &str, value: &str) -> bool {
+    pattern == value
+}
+
+fn like_matches(pattern: &str, value: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let pattern = pattern.to_uppercase().chars().collect::<Vec<_>>();
+    let value = value.to_uppercase().chars().collect::<Vec<_>>();
+    let (mut p, mut v) = (0, 0);
+    let (mut wildcard, mut restart) = (None, 0);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == '_' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == '%' {
+            p += 1;
+            wildcard = Some(p);
+            restart = v;
+        } else if let Some(next) = wildcard {
+            restart += 1;
+            v = restart;
+            p = next;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '%' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn retain_matching(
+    objects: &mut ObjectTree,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+    column: Option<&str>,
+    matches: impl Fn(&str, &str) -> bool,
+) {
+    objects
+        .catalogs
+        .retain(|name, _| catalog.is_none_or(|pattern| matches(pattern, name)));
+    for entry in objects.catalogs.values_mut() {
+        entry
+            .schemas
+            .retain(|name, _| schema.is_none_or(|pattern| matches(pattern, name)));
+        for entry in entry.schemas.values_mut() {
+            entry
+                .tables
+                .retain(|name, _| table.is_none_or(|pattern| matches(pattern, name)));
+            for entry in entry.tables.values_mut() {
+                entry
+                    .columns
+                    .retain(|value| column.is_none_or(|pattern| matches(pattern, &value.name)));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConstraintKind {
+    Primary,
+    Unique,
+    Foreign,
+}
+
+impl ConstraintKind {
+    fn show_command(self) -> &'static str {
+        match self {
+            Self::Primary => "SHOW PRIMARY KEYS",
+            Self::Unique => "SHOW UNIQUE KEYS",
+            Self::Foreign => "SHOW IMPORTED KEYS",
+        }
+    }
+
+    fn constraint_type(self) -> &'static str {
+        match self {
+            Self::Primary => "PRIMARY KEY",
+            Self::Unique => "UNIQUE",
+            Self::Foreign => "FOREIGN KEY",
+        }
+    }
+}
+
+fn scope_constraint_name(name: Option<&str>, exact: bool) -> Option<&str> {
+    name.filter(|name| !name.is_empty() && (exact || !name.contains(['%', '_'])))
+}
+
+fn constraint_sql(
+    kind: ConstraintKind,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+    exact: bool,
+) -> String {
+    let mut sql = String::from(kind.show_command());
+    sql.push_str(" /* ADBC:getObjectsTables */ IN ");
+    if let Some(catalog) = scope_constraint_name(catalog, exact) {
+        if let Some(schema) = scope_constraint_name(schema, exact) {
+            if let Some(table) = scope_constraint_name(table, exact) {
+                sql.push_str("TABLE ");
+                sql.push_str(&quote_identifier(catalog));
+                sql.push('.');
+                sql.push_str(&quote_identifier(schema));
+                sql.push('.');
+                sql.push_str(&quote_identifier(table));
+            } else {
+                sql.push_str("SCHEMA ");
+                sql.push_str(&quote_identifier(catalog));
+                sql.push('.');
+                sql.push_str(&quote_identifier(schema));
+            }
+        } else {
+            sql.push_str("DATABASE ");
+            sql.push_str(&quote_identifier(catalog));
+        }
+    } else {
+        sql.push_str("ACCOUNT");
+    }
+    sql
+}
+
+fn constraint_text(batch: &RecordBatch, column: usize, row: usize) -> AdbcResult<Option<&str>> {
+    let value = batch.column(column);
+    if value.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(strings) = value.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(strings.value(row)));
+    }
+    if let Some(strings) = value.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Some(strings.value(row)));
+    }
+    if let Some(strings) = value
+        .as_any()
+        .downcast_ref::<arrow_array::StringViewArray>()
+    {
+        return Ok(Some(strings.value(row)));
+    }
+    Err(Error::with_message_and_status(
+        format!(
+            "SHOW KEYS column {} is not a string",
+            batch.schema().field(column).name()
+        ),
+        Status::InvalidData,
+    ))
+}
+
+fn key_sequence(batch: &RecordBatch, column: usize, row: usize) -> AdbcResult<i64> {
+    let value = batch.column(column);
+    let sequence = if value.is_null(row) {
+        None
+    } else if let Some(numbers) = value.as_any().downcast_ref::<Int64Array>() {
+        Some(numbers.value(row))
+    } else if let Some(numbers) = value.as_any().downcast_ref::<Int32Array>() {
+        Some(i64::from(numbers.value(row)))
+    } else if let Some(numbers) = value
+        .as_any()
+        .downcast_ref::<arrow_array::Decimal128Array>()
+    {
+        i64::try_from(numbers.value(row)).ok()
+    } else if let Some(strings) = value.as_any().downcast_ref::<StringArray>() {
+        strings.value(row).parse().ok()
+    } else {
+        None
+    };
+    sequence.ok_or_else(|| {
+        Error::with_message_and_status(
+            "SHOW KEYS returned invalid key_sequence",
+            Status::InvalidData,
+        )
+    })
+}
+
+struct ConstraintColumn {
+    sequence: i64,
+    name: String,
+    usage: Option<ForeignKeyUsage>,
+}
+
+type ConstraintTableKey = (String, String, String);
+type ConstraintGroupKey = (String, String, String, Option<String>);
+
+fn collect_constraints(
+    reader: &mut dyn RecordBatchReader,
+    objects: &ObjectTree,
+    kind: ConstraintKind,
+) -> AdbcResult<Vec<(ConstraintTableKey, ConstraintEntry)>> {
+    let mut grouped = BTreeMap::<ConstraintGroupKey, Vec<ConstraintColumn>>::new();
+    for batch in reader {
+        let batch =
+            batch.map_err(|error| Error::with_message_and_status(error.to_string(), Status::IO))?;
+        let fields: &[&str] = match kind {
+            ConstraintKind::Foreign => &[
+                "fk_database_name",
+                "fk_schema_name",
+                "fk_table_name",
+                "fk_name",
+                "fk_column_name",
+                "pk_database_name",
+                "pk_schema_name",
+                "pk_table_name",
+                "pk_column_name",
+                "key_sequence",
+            ],
+            _ => &[
+                "database_name",
+                "schema_name",
+                "table_name",
+                "constraint_name",
+                "column_name",
+                "key_sequence",
+            ],
+        };
+        let indices = fields
+            .iter()
+            .map(|name| {
+                batch.schema().index_of(name).map_err(|_| {
+                    Error::with_message_and_status(
+                        format!("SHOW KEYS omitted column {name}"),
+                        Status::InvalidData,
+                    )
+                })
+            })
+            .collect::<AdbcResult<Vec<_>>>()?;
+        for row in 0..batch.num_rows() {
+            let required = |offset| {
+                constraint_text(&batch, indices[offset], row)?.ok_or_else(|| {
+                    Error::with_message_and_status(
+                        format!("SHOW KEYS returned NULL in {}", fields[offset]),
+                        Status::InvalidData,
+                    )
+                })
+            };
+            let catalog = required(0)?;
+            let schema = required(1)?;
+            let table = required(2)?;
+            if objects
+                .catalogs
+                .get(catalog)
+                .and_then(|entry| entry.schemas.get(schema))
+                .and_then(|entry| entry.tables.get(table))
+                .is_none()
+            {
+                continue;
+            }
+            let name = constraint_text(&batch, indices[3], row)?.map(str::to_owned);
+            let column = required(4)?.to_owned();
+            let sequence = key_sequence(&batch, *indices.last().unwrap(), row)?;
+            let usage = if matches!(kind, ConstraintKind::Foreign) {
+                Some(ForeignKeyUsage {
+                    catalog: constraint_text(&batch, indices[5], row)?.map(str::to_owned),
+                    schema: constraint_text(&batch, indices[6], row)?.map(str::to_owned),
+                    table: required(7)?.to_owned(),
+                    column: required(8)?.to_owned(),
+                })
+            } else {
+                None
+            };
+            grouped
+                .entry((
+                    catalog.to_owned(),
+                    schema.to_owned(),
+                    table.to_owned(),
+                    name,
+                ))
+                .or_default()
+                .push(ConstraintColumn {
+                    sequence,
+                    name: column,
+                    usage,
+                });
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|((catalog, schema, table, name), mut columns)| {
+            columns.sort_by_key(|column| column.sequence);
+            let mut names = Vec::with_capacity(columns.len());
+            let mut usage = Vec::new();
+            for column in columns {
+                names.push(column.name);
+                if let Some(reference) = column.usage {
+                    usage.push(reference);
+                }
+            }
+            let entry = ConstraintEntry {
+                name,
+                constraint_type: kind.constraint_type(),
+                columns: names,
+                usage,
+            };
+            ((catalog, schema, table), entry)
+        })
+        .collect())
+}
+
+fn fetch_constraints(
+    connection: &Connection,
+    operation: &sf_core::apis::operation_ctx::OperationCtx,
+    objects: &mut ObjectTree,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+    exact: bool,
+) -> AdbcResult<()> {
+    if !objects.catalogs.values().any(|catalog| {
+        catalog
+            .schemas
+            .values()
+            .any(|schema| !schema.tables.is_empty())
+    }) {
+        return Ok(());
+    }
+    for kind in [
+        ConstraintKind::Primary,
+        ConstraintKind::Unique,
+        ConstraintKind::Foreign,
+    ] {
+        let sql = constraint_sql(kind, catalog, schema, table, exact);
+        let rows = connection.with_metadata_reader(operation, sql, |reader| {
+            collect_constraints(reader, objects, kind)
+        });
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) if matches!(error.vendor_code, 2003 | 2043) => continue,
+            Err(error) => return Err(error),
+        };
+        attach_constraint_rows(objects, rows);
+    }
+    Ok(())
+}
+
+fn attach_constraint_rows(
+    objects: &mut ObjectTree,
+    rows: Vec<(ConstraintTableKey, ConstraintEntry)>,
+) {
+    for ((catalog, schema, table), constraint) in rows {
+        if let Some(table) = objects
+            .catalogs
+            .get_mut(&catalog)
+            .and_then(|entry| entry.schemas.get_mut(&schema))
+            .and_then(|entry| entry.tables.get_mut(&table))
+        {
+            table.constraints.push(constraint);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -222,6 +668,7 @@ fn merge_tables(target: &mut ObjectTree, source: ObjectTree) {
                     TableEntry {
                         table_type: table.table_type,
                         columns: Vec::new(),
+                        constraints: Vec::new(),
                     },
                 );
             }
@@ -309,6 +756,7 @@ fn parse_core_batch(batch: &RecordBatch) -> Result<ObjectTree, ArrowError> {
                 let mut table = TableEntry {
                     table_type,
                     columns: Vec::new(),
+                    constraints: Vec::new(),
                 };
                 if let Some(column_range) = list_range(column_lists, table_index, "table_columns")?
                 {
@@ -543,10 +991,112 @@ fn build_batch(objects: &ObjectTree, depth: &ObjectDepth) -> Result<RecordBatch,
             None,
         )?
     };
-    let constraint_list = all_null_list(
-        list_item_from_type(&schemas::TABLE_SCHEMA, 3)?,
-        tables.len(),
-    );
+    let constraint_item = list_item_from_type(&schemas::TABLE_SCHEMA, 3)?;
+    let constraint_list = if columns_null {
+        all_null_list(constraint_item, tables.len())
+    } else {
+        let constraints = tables
+            .iter()
+            .flat_map(|(_, table)| table.constraints.iter())
+            .collect::<Vec<_>>();
+        let column_names = constraints
+            .iter()
+            .flat_map(|constraint| constraint.columns.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let name_offsets = offsets_from_counts(
+            constraints
+                .iter()
+                .map(|constraint| constraint.columns.len()),
+            "constraint_column_names",
+        )?;
+        let name_list = ListArray::try_new(
+            list_item_from_type(&schemas::CONSTRAINT_SCHEMA, 2)?,
+            OffsetBuffer::new(ScalarBuffer::from(name_offsets)),
+            Arc::new(StringArray::from(column_names)),
+            None,
+        )?;
+
+        let usage = constraints
+            .iter()
+            .flat_map(|constraint| constraint.usage.iter())
+            .collect::<Vec<_>>();
+        let usage_values = StructArray::try_new(
+            struct_fields(&schemas::USAGE_SCHEMA)?,
+            vec![
+                Arc::new(StringArray::from(
+                    usage
+                        .iter()
+                        .map(|value| value.catalog.as_deref())
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    usage
+                        .iter()
+                        .map(|value| value.schema.as_deref())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    usage
+                        .iter()
+                        .map(|value| value.table.as_str())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    usage
+                        .iter()
+                        .map(|value| value.column.as_str())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        )?;
+        let usage_offsets = offsets_from_counts(
+            constraints.iter().map(|constraint| constraint.usage.len()),
+            "constraint_column_usage",
+        )?;
+        let usage_list = ListArray::try_new(
+            list_item_from_type(&schemas::CONSTRAINT_SCHEMA, 3)?,
+            OffsetBuffer::new(ScalarBuffer::from(usage_offsets)),
+            Arc::new(usage_values),
+            Some(NullBuffer::from(
+                constraints
+                    .iter()
+                    .map(|constraint| constraint.constraint_type == "FOREIGN KEY")
+                    .collect::<Vec<_>>(),
+            )),
+        )?;
+        let constraint_values = StructArray::try_new(
+            struct_fields(&schemas::CONSTRAINT_SCHEMA)?,
+            vec![
+                Arc::new(StringArray::from(
+                    constraints
+                        .iter()
+                        .map(|value| value.name.as_deref())
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    constraints
+                        .iter()
+                        .map(|value| value.constraint_type)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(name_list),
+                Arc::new(usage_list),
+            ],
+            None,
+        )?;
+        let offsets = offsets_from_counts(
+            tables.iter().map(|(_, table)| table.constraints.len()),
+            "table_constraints",
+        )?;
+        ListArray::try_new(
+            constraint_item,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(constraint_values),
+            None,
+        )?
+    };
 
     let table_values = StructArray::try_new(
         struct_fields(&schemas::TABLE_SCHEMA)?,
@@ -816,6 +1366,7 @@ mod tests {
                 TableEntry {
                     table_type: "VIEW".into(),
                     columns: Vec::new(),
+                    constraints: Vec::new(),
                 },
             );
         merge_tables(&mut objects, filtered_tables);
@@ -834,6 +1385,7 @@ mod tests {
             TableEntry {
                 table_type: String::new(),
                 columns: vec![column("amount", "FIXED"), column("label", "TEXT")],
+                constraints: Vec::new(),
             },
         );
         tables.insert(
@@ -841,6 +1393,7 @@ mod tests {
             TableEntry {
                 table_type: String::new(),
                 columns: vec![column("hidden", "FIXED")],
+                constraints: Vec::new(),
             },
         );
         merge_columns(&mut objects, column_results);
@@ -861,7 +1414,9 @@ mod tests {
         let type_names = column_values.column(4).as_string::<i32>();
         assert_eq!(type_names.value(0), "NUMBER");
         assert_eq!(type_names.value(1), "VARCHAR");
-        assert!(table_values.column(3).as_list::<i32>().is_null(0));
+        let constraints = table_values.column(3).as_list::<i32>();
+        assert!(!constraints.is_null(0));
+        assert_eq!(constraints.value_length(0), 0);
     }
 
     #[test]
@@ -890,6 +1445,287 @@ mod tests {
         let db_schemas = build_batch(&objects, &ObjectDepth::Schemas).unwrap();
         let schema_values = db_schemas.column(1).as_list::<i32>().values().as_struct();
         assert!(schema_values.column(1).as_list::<i32>().is_null(0));
+    }
+
+    #[test]
+    fn constraints_scope_like_go_and_quote_identifiers() {
+        assert_eq!(
+            constraint_sql(ConstraintKind::Primary, None, None, None, false),
+            "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN ACCOUNT"
+        );
+        assert_eq!(
+            constraint_sql(ConstraintKind::Unique, Some("DB_%"), Some("S"), None, false),
+            "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN ACCOUNT"
+        );
+        assert_eq!(
+            constraint_sql(ConstraintKind::Foreign, Some("DB"), Some("S_"), None, false),
+            "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE \"DB\""
+        );
+        assert_eq!(
+            constraint_sql(
+                ConstraintKind::Foreign,
+                Some("D\"B%"),
+                Some("S_"),
+                Some("T\"_%"),
+                true,
+            ),
+            "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN TABLE \"D\"\"B%\".\"S_\".\"T\"\"_%\""
+        );
+        assert_eq!(
+            constraint_sql(
+                ConstraintKind::Primary,
+                Some("D"),
+                Some("S"),
+                Some("T_"),
+                false
+            ),
+            "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA \"D\".\"S\""
+        );
+    }
+
+    #[test]
+    fn exact_filters_treat_wildcards_as_literal_and_preserve_case() {
+        assert_eq!(exact_core_filter(r"A_%\B"), r"A\_\%\\B");
+        let mut objects = parent_tree();
+        let tables = &mut objects
+            .catalogs
+            .get_mut("database")
+            .unwrap()
+            .schemas
+            .get_mut("public")
+            .unwrap()
+            .tables;
+        tables.insert(
+            "T_%".into(),
+            TableEntry {
+                table_type: "TABLE".into(),
+                columns: vec![column("col_%!", "TEXT"), column("COL_%!", "TEXT")],
+                constraints: Vec::new(),
+            },
+        );
+        tables.insert("T_X".into(), TableEntry::default());
+        tables.insert("t_%".into(), TableEntry::default());
+        retain_matching(
+            &mut objects,
+            Some("database"),
+            Some("public"),
+            Some("T_%"),
+            Some("col_%!"),
+            literal_matches,
+        );
+        let tables = &objects.catalogs["database"].schemas["public"].tables;
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables["T_%"].columns.len(), 1);
+        assert_eq!(tables["T_%"].columns[0].name, "col_%!");
+
+        retain_matching(
+            &mut objects,
+            Some("DATABASE"),
+            None,
+            None,
+            None,
+            literal_matches,
+        );
+        assert!(objects.catalogs.is_empty());
+    }
+
+    #[test]
+    fn like_filter_treats_backslash_as_literal_without_discarding_constraints() {
+        assert!(like_matches(
+            r"literal_%!\n'quoted",
+            r"literal_abc!\n'quoted"
+        ));
+        assert!(!like_matches(
+            r"literal_%!\n'quoted",
+            "literal_abc!n'quoted"
+        ));
+        assert!(like_matches(r"t_%", "T_ANYTHING"));
+        assert!(!like_matches("t", "t_suffix"));
+
+        let mut objects = parent_tree();
+        objects
+            .catalogs
+            .get_mut("database")
+            .unwrap()
+            .schemas
+            .get_mut("public")
+            .unwrap()
+            .tables
+            .insert(
+                r"literal\table".into(),
+                TableEntry {
+                    table_type: "TABLE".into(),
+                    columns: vec![column("A", "TEXT")],
+                    constraints: vec![ConstraintEntry {
+                        name: Some("PK".into()),
+                        constraint_type: "PRIMARY KEY",
+                        columns: vec!["A".into()],
+                        usage: Vec::new(),
+                    }],
+                },
+            );
+        retain_matching(
+            &mut objects,
+            Some("database"),
+            Some("public"),
+            Some(r"literal\table"),
+            Some(""),
+            like_matches,
+        );
+        let table = &objects.catalogs["database"].schemas["public"].tables[r"literal\table"];
+        assert!(table.columns.is_empty());
+        assert_eq!(table.constraints[0].name.as_deref(), Some("PK"));
+    }
+
+    fn show_batch(fields: &[&str], values: Vec<ArrayRef>) -> RecordBatch {
+        let schema = arrow_schema::Schema::new(
+            fields
+                .iter()
+                .zip(&values)
+                .map(|(name, value)| Field::new(*name, value.data_type().clone(), true))
+                .collect::<Vec<_>>(),
+        );
+        RecordBatch::try_new(Arc::new(schema), values).unwrap()
+    }
+
+    #[test]
+    fn show_keys_builds_ordered_constraints_and_fk_usage() {
+        let mut objects = parent_tree();
+        let tables = &mut objects
+            .catalogs
+            .get_mut("database")
+            .unwrap()
+            .schemas
+            .get_mut("public")
+            .unwrap()
+            .tables;
+        tables.insert(
+            "child".into(),
+            TableEntry {
+                table_type: "TABLE".into(),
+                ..TableEntry::default()
+            },
+        );
+        tables.insert(
+            "parent".into(),
+            TableEntry {
+                table_type: "TABLE".into(),
+                ..TableEntry::default()
+            },
+        );
+        let pk_batch = show_batch(
+            &[
+                "database_name",
+                "schema_name",
+                "table_name",
+                "constraint_name",
+                "column_name",
+                "key_sequence",
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["database", "database"])),
+                Arc::new(StringArray::from(vec!["public", "public"])),
+                Arc::new(StringArray::from(vec!["parent", "parent"])),
+                Arc::new(StringArray::from(vec!["PK_PARENT", "PK_PARENT"])),
+                Arc::new(StringArray::from(vec!["id2", "id1"])),
+                Arc::new(Int64Array::from(vec![2, 1])),
+            ],
+        );
+        let mut reader = single_batch_reader(pk_batch);
+        let rows = collect_constraints(reader.as_mut(), &objects, ConstraintKind::Primary).unwrap();
+        attach_constraint_rows(&mut objects, rows);
+
+        let unique_batch = show_batch(
+            &[
+                "database_name",
+                "schema_name",
+                "table_name",
+                "constraint_name",
+                "column_name",
+                "key_sequence",
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["database"])),
+                Arc::new(StringArray::from(vec!["public"])),
+                Arc::new(StringArray::from(vec!["parent"])),
+                Arc::new(StringArray::from(vec!["U_PARENT"])),
+                Arc::new(StringArray::from(vec!["label"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        );
+        let mut reader = single_batch_reader(unique_batch);
+        let rows = collect_constraints(reader.as_mut(), &objects, ConstraintKind::Unique).unwrap();
+        attach_constraint_rows(&mut objects, rows);
+
+        let fk_batch = show_batch(
+            &[
+                "fk_database_name",
+                "fk_schema_name",
+                "fk_table_name",
+                "fk_name",
+                "fk_column_name",
+                "pk_database_name",
+                "pk_schema_name",
+                "pk_table_name",
+                "pk_column_name",
+                "key_sequence",
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["database", "database", "database"])),
+                Arc::new(StringArray::from(vec!["public", "public", "public"])),
+                Arc::new(StringArray::from(vec!["child", "child", "filtered_out"])),
+                Arc::new(StringArray::from(vec!["FK_CHILD", "FK_CHILD", "FK_OTHER"])),
+                Arc::new(StringArray::from(vec!["ref2", "ref1", "ignored"])),
+                Arc::new(StringArray::from(vec!["database", "database", "database"])),
+                Arc::new(StringArray::from(vec!["public", "public", "public"])),
+                Arc::new(StringArray::from(vec!["parent", "parent", "parent"])),
+                Arc::new(StringArray::from(vec!["id2", "id1", "id1"])),
+                Arc::new(Int64Array::from(vec![2, 1, 1])),
+            ],
+        );
+        let mut reader = single_batch_reader(fk_batch);
+        let rows = collect_constraints(reader.as_mut(), &objects, ConstraintKind::Foreign).unwrap();
+        attach_constraint_rows(&mut objects, rows);
+
+        let tables = build_batch(&objects, &ObjectDepth::Tables).unwrap();
+        let schemas = tables.column(1).as_list::<i32>().values().as_struct();
+        let table_values = schemas.column(1).as_list::<i32>().values().as_struct();
+        assert!(table_values.column(3).as_list::<i32>().is_null(0));
+        let batch = build_batch(&objects, &ObjectDepth::All).unwrap();
+        assert_eq!(batch.schema(), schemas::GET_OBJECTS_SCHEMA.clone());
+        let schemas = batch.column(1).as_list::<i32>().values().as_struct();
+        let table_values = schemas.column(1).as_list::<i32>().values().as_struct();
+        let constraint_lists = table_values.column(3).as_list::<i32>();
+        assert_eq!(constraint_lists.value_length(0), 1);
+        assert_eq!(constraint_lists.value_length(1), 2);
+        let constraints = constraint_lists.values().as_struct();
+        let names = constraints.column(0).as_string::<i32>();
+        let types = constraints.column(1).as_string::<i32>();
+        assert_eq!(names.value(0), "FK_CHILD");
+        assert_eq!(types.value(0), "FOREIGN KEY");
+        assert_eq!(types.value(1), "PRIMARY KEY");
+        assert_eq!(types.value(2), "UNIQUE");
+        let column_lists = constraints.column(2).as_list::<i32>();
+        let columns = column_lists.values().as_string::<i32>();
+        assert_eq!(
+            columns.value(column_lists.value_offsets()[0] as usize),
+            "ref1"
+        );
+        assert_eq!(
+            columns.value(column_lists.value_offsets()[0] as usize + 1),
+            "ref2"
+        );
+        let usages = constraints.column(3).as_list::<i32>();
+        assert_eq!(usages.value_length(0), 2);
+        assert!(!usages.is_null(0));
+        assert!(usages.is_null(1));
+        assert!(usages.is_null(2));
+        let fk = usages.values().as_struct();
+        assert_eq!(fk.column(0).as_string::<i32>().value(0), "database");
+        assert_eq!(fk.column(1).as_string::<i32>().value(0), "public");
+        assert_eq!(fk.column(2).as_string::<i32>().value(0), "parent");
+        assert_eq!(fk.column(3).as_string::<i32>().value(0), "id1");
+        assert_eq!(fk.column(3).as_string::<i32>().value(1), "id2");
     }
 
     #[test]

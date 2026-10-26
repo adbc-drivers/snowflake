@@ -1065,6 +1065,7 @@ impl adbc_core::Database for Database {
             inner: self.inner.clone(),
             conn_handle,
             autocommit: true,
+            match_exactly: false,
             timestamp_precision: self.timestamp_precision,
             geography_output_format: self.geography_output_format,
             geometry_output_format: self.geometry_output_format,

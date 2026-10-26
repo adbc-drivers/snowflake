@@ -18,7 +18,7 @@
 /// Must be kept in sync with the `arrow-array` dependency version in Cargo.toml.
 const ARROW_VERSION: &str = "v58.1.0";
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use adbc_core::{
@@ -28,7 +28,7 @@ use adbc_core::{
     schemas,
 };
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
     StringArray, UInt32Array, UnionArray,
 };
 use arrow_buffer::ScalarBuffer;
@@ -44,6 +44,7 @@ pub struct Connection {
     pub(crate) inner: Arc<Inner>,
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
+    pub(crate) match_exactly: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
     pub(crate) geography_output_format: GeoOutputFormat,
     pub(crate) geometry_output_format: GeoOutputFormat,
@@ -146,11 +147,158 @@ pub(crate) fn qualified_table_identifier(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DescColumn {
+    data_type: String,
+    primary_key: String,
+    comment: Option<String>,
+}
+
+fn desc_text(batch: &RecordBatch, column: usize, row: usize) -> Result<Option<&str>> {
+    let value = batch.column(column);
+    if value.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(strings) = value.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(strings.value(row)));
+    }
+    if let Some(strings) = value
+        .as_any()
+        .downcast_ref::<arrow_array::LargeStringArray>()
+    {
+        return Ok(Some(strings.value(row)));
+    }
+    if let Some(strings) = value
+        .as_any()
+        .downcast_ref::<arrow_array::StringViewArray>()
+    {
+        return Ok(Some(strings.value(row)));
+    }
+    Err(Error::with_message_and_status(
+        format!("DESC TABLE column {column} is not a string"),
+        Status::InvalidData,
+    ))
+}
+
+fn desc_columns(reader: &mut dyn RecordBatchReader) -> Result<HashMap<String, DescColumn>> {
+    let mut columns = HashMap::new();
+    for batch in reader {
+        let batch =
+            batch.map_err(|error| Error::with_message_and_status(error.to_string(), Status::IO))?;
+        if batch.num_columns() < 10 {
+            return Err(Error::with_message_and_status(
+                "DESC TABLE returned fewer than 10 columns",
+                Status::InvalidData,
+            ));
+        }
+        // DESC TABLE returns name, type, kind, null?, default, primary key,
+        // unique key, check, expression, comment, ... in that order.
+        for row in 0..batch.num_rows() {
+            let required = |index| {
+                desc_text(&batch, index, row)?.ok_or_else(|| {
+                    Error::with_message_and_status(
+                        format!("DESC TABLE returned NULL in column {index}"),
+                        Status::InvalidData,
+                    )
+                })
+            };
+            columns.insert(
+                required(0)?.to_owned(),
+                DescColumn {
+                    data_type: required(1)?.to_owned(),
+                    primary_key: required(5)?.to_owned(),
+                    comment: desc_text(&batch, 9, row)?.map(str::to_owned),
+                },
+            );
+        }
+    }
+    Ok(columns)
+}
+
+fn apply_desc_metadata(schema: &Schema, columns: &HashMap<String, DescColumn>) -> Result<Schema> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let desc = columns.get(field.name()).ok_or_else(|| {
+                Error::with_message_and_status(
+                    format!("DESC TABLE omitted column {}", field.name()),
+                    Status::InvalidData,
+                )
+            })?;
+            let extension = field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str);
+            // Go's DESC TABLE mapping replaces metadata on ARRAY and EWKB geo fields.
+            if matches!(extension, Some("arrow.json" | "geoarrow.wkb")) {
+                return Ok(field.as_ref().clone());
+            }
+            let mut metadata = HashMap::from([
+                ("DATA_TYPE".to_owned(), desc.data_type.clone()),
+                ("PRIMARY_KEY".to_owned(), desc.primary_key.clone()),
+            ]);
+            if let Some(comment) = &desc.comment {
+                metadata.insert("COMMENT".to_owned(), comment.clone());
+            }
+            if let Some(extension) = extension {
+                metadata.insert("ARROW:extension:name".to_owned(), extension.to_owned());
+                if let Some(value) = field.metadata().get("ARROW:extension:metadata") {
+                    metadata.insert("ARROW:extension:metadata".to_owned(), value.clone());
+                }
+            }
+            Ok(field.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 impl Connection {
     pub(crate) fn begin_operation(&self) -> Arc<OperationCtx> {
         let operation = Arc::new(OperationCtx::with_own_token());
         *self.operation.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&operation);
         operation
+    }
+
+    pub(crate) fn with_metadata_reader<T>(
+        &self,
+        operation: &OperationCtx,
+        query: String,
+        consume: impl FnOnce(&mut dyn RecordBatchReader) -> Result<T>,
+    ) -> Result<T> {
+        let statement = self
+            .inner
+            .sf
+            .statement_new(self.conn_handle)
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let result = (|| {
+            let mut query_result = self.inner.execute_query_with_timeout(
+                Some(operation),
+                statement,
+                query,
+                None,
+                None,
+            )?;
+            let value = consume(query_result.reader.as_mut());
+            if operation.token().is_cancelled() {
+                return Err(Error::with_message_and_status(
+                    "operation cancelled",
+                    Status::Cancelled,
+                ));
+            }
+            value
+        })();
+        let release = self.inner.sf.statement_release(statement);
+        match result {
+            Ok(value) => {
+                release.map_err(crate::error::api_error_to_adbc_error)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = release;
+                Err(error)
+            }
+        }
     }
 
     fn context_names(&self) -> Result<(Option<String>, Option<String>)> {
@@ -242,10 +390,31 @@ fn parse_autocommit(value: &OptionValue) -> Result<bool> {
     }
 }
 
+const MATCH_EXACTLY: &str = "adbc.connection.get_objects.match_exactly";
+
+fn parse_match_exactly(value: &OptionValue) -> Result<bool> {
+    match value {
+        OptionValue::String(value) if value == "true" => Ok(true),
+        OptionValue::String(value) if value == "false" => Ok(false),
+        OptionValue::String(value) => Err(Error::with_message_and_status(
+            format!("[Snowflake] invalid value for option {MATCH_EXACTLY}: {value}"),
+            Status::InvalidArguments,
+        )),
+        _ => Err(Error::with_message_and_status(
+            format!("[Snowflake] invalid value for option {MATCH_EXACTLY}: {value:?}"),
+            Status::InvalidArguments,
+        )),
+    }
+}
+
 impl Optionable for Connection {
     type Option = OptionConnection;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        if key.as_ref() == MATCH_EXACTLY {
+            self.match_exactly = parse_match_exactly(&value)?;
+            return Ok(());
+        }
         match key {
             OptionConnection::AutoCommit => {
                 let enabled = parse_autocommit(&value)?;
@@ -284,6 +453,9 @@ impl Optionable for Connection {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key.as_ref() == MATCH_EXACTLY {
+            return Ok(if self.match_exactly { "true" } else { "false" }.to_owned());
+        }
         match key {
             OptionConnection::AutoCommit => {
                 Ok(if self.autocommit { "true" } else { "false" }.to_string())
@@ -585,14 +757,18 @@ impl adbc_core::Connection for Connection {
                 ));
             }
             let timezone = self.inner.session_timezone(self.conn_handle)?;
-            Ok(adjust_schema(
+            let adjusted = adjust_schema(
                 &schema,
                 self.timestamp_precision.time_unit(),
                 &timezone,
                 None,
-            )
-            .as_ref()
-            .clone())
+            );
+            let columns = self.with_metadata_reader(
+                &operation,
+                format!("DESC TABLE {qualified}"),
+                desc_columns,
+            )?;
+            apply_desc_metadata(&adjusted, &columns)
         })();
         let release = self.inner.sf.statement_release(stmt_handle);
         match result {
@@ -674,6 +850,7 @@ mod tests {
             inner: driver.inner.clone(),
             conn_handle: Handle { id: 0, magic: 0 },
             autocommit: true,
+            match_exactly: false,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             geography_output_format: GeoOutputFormat::GeoJson,
             geometry_output_format: GeoOutputFormat::GeoJson,
@@ -817,6 +994,130 @@ mod tests {
                 Status::InvalidArguments
             );
         }
+    }
+
+    #[test]
+    fn match_exactly_accepts_only_true_and_false() {
+        let mut conn = fake_connection();
+        let key = OptionConnection::Other(MATCH_EXACTLY.into());
+        assert_eq!(conn.get_option_string(key.clone()).unwrap(), "false");
+        conn.set_option(key.clone(), OptionValue::String("true".into()))
+            .unwrap();
+        assert_eq!(conn.get_option_string(key.clone()).unwrap(), "true");
+        for value in ["enabled", "TRUE", "", "true "] {
+            let error = conn
+                .set_option(key.clone(), OptionValue::String(value.into()))
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert_eq!(
+                error.message,
+                format!("[Snowflake] invalid value for option {MATCH_EXACTLY}: {value}")
+            );
+            assert_eq!(conn.get_option_string(key.clone()).unwrap(), "true");
+        }
+        conn.set_option(key.clone(), OptionValue::String("false".into()))
+            .unwrap();
+        assert_eq!(conn.get_option_string(key).unwrap(), "false");
+    }
+
+    #[test]
+    fn desc_table_rows_supply_field_metadata_without_losing_extensions() {
+        let rows = [
+            vec!["ID", "PAYLOAD", "UUID_COL", "LOCATION"],
+            vec!["NUMBER(10,0)", "ARRAY", "UUID", "GEOGRAPHY"],
+            vec!["COLUMN", "COLUMN", "COLUMN", "COLUMN"],
+            vec!["N", "Y", "Y", "Y"],
+            vec!["", "", "", ""],
+            vec!["Y", "N", "N", "N"],
+            vec!["N", "N", "N", "N"],
+            vec!["", "", "", ""],
+            vec!["", "", "", ""],
+        ];
+        let mut data: Vec<ArrayRef> = rows
+            .into_iter()
+            .map(|row| Arc::new(StringArray::from(row)) as ArrayRef)
+            .collect();
+        data.push(Arc::new(StringArray::from(vec![
+            Some("identifier"),
+            None,
+            Some(""),
+            None,
+        ])));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(
+                (0..10)
+                    .map(|index| Field::new(format!("column_{index}"), DataType::Utf8, true))
+                    .collect::<Vec<_>>(),
+            )),
+            data,
+        )
+        .unwrap();
+        let mut reader = single_batch_reader(batch);
+        let desc = desc_columns(reader.as_mut()).unwrap();
+        assert_eq!(
+            desc["ID"],
+            DescColumn {
+                data_type: "NUMBER(10,0)".into(),
+                primary_key: "Y".into(),
+                comment: Some("identifier".into()),
+            }
+        );
+        let fields = [
+            Field::new("ID", DataType::Int64, false)
+                .with_metadata(HashMap::from([("logicalType".into(), "FIXED".into())])),
+            Field::new("PAYLOAD", DataType::Utf8, true).with_metadata(HashMap::from([(
+                "ARROW:extension:name".into(),
+                "arrow.json".into(),
+            )])),
+            Field::new("UUID_COL", DataType::FixedSizeBinary(16), true).with_metadata(
+                HashMap::from([("ARROW:extension:name".into(), "arrow.uuid".into())]),
+            ),
+            Field::new("LOCATION", DataType::Binary, true).with_metadata(HashMap::from([(
+                "ARROW:extension:name".into(),
+                "geoarrow.wkb".into(),
+            )])),
+        ];
+        let result = apply_desc_metadata(&Schema::new(fields.to_vec()), &desc).unwrap();
+        assert_eq!(
+            result.field(0).metadata(),
+            &HashMap::from([
+                ("DATA_TYPE".into(), "NUMBER(10,0)".into()),
+                ("PRIMARY_KEY".into(), "Y".into()),
+                ("COMMENT".into(), "identifier".into()),
+            ]),
+        );
+        assert_eq!(
+            result.field(1).metadata(),
+            &HashMap::from([("ARROW:extension:name".into(), "arrow.json".into())]),
+        );
+        assert_eq!(
+            result
+                .field(2)
+                .metadata()
+                .get("COMMENT")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            result
+                .field(2)
+                .metadata()
+                .get("DATA_TYPE")
+                .map(String::as_str),
+            Some("UUID")
+        );
+        assert_eq!(
+            result
+                .field(2)
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.uuid")
+        );
+        assert_eq!(
+            result.field(3).metadata(),
+            &HashMap::from([("ARROW:extension:name".into(), "geoarrow.wkb".into())]),
+        );
     }
 
     #[test]
