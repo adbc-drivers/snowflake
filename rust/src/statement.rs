@@ -1025,8 +1025,9 @@ fn compute_target_type(field: &Field, ts_unit: TimeUnit, timezone: &str) -> Data
 
     match logical_type {
         "TIME" => {
+            // Arrow Time32 only supports seconds/milliseconds.
             let unit = scale_to_time_unit(scale as u32);
-            if scale < 6 {
+            if scale <= 3 {
                 DataType::Time32(unit)
             } else {
                 DataType::Time64(unit)
@@ -1134,7 +1135,7 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         match logical_type {
-            "TIME" => arrow_cast::cast(col.as_ref(), target_type),
+            "TIME" => convert_time(col, scale, target_type),
             "REAL" => arrow_cast::cast(col.as_ref(), &DataType::Float64),
             "TIMESTAMP_NTZ" => convert_timestamp_ntz(col, scale, ts_unit, check_overflow, None),
             "TIMESTAMP_LTZ" => convert_timestamp_ntz(
@@ -1148,6 +1149,42 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
             _ => Ok(col.clone()),
         }
     }
+}
+
+/// Snowflake TIME values are integer counts of 10^-scale seconds since
+/// midnight; rescale them to the target Time32/Time64 unit.
+fn convert_time(
+    col: &ArrayRef,
+    scale: i64,
+    target: &DataType,
+) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    use arrow_array::{cast::AsArray, types::Int64Type};
+    let unit_digits = match target {
+        DataType::Time32(TimeUnit::Second) => 0,
+        DataType::Time32(TimeUnit::Millisecond) => 3,
+        DataType::Time64(TimeUnit::Microsecond) => 6,
+        DataType::Time64(TimeUnit::Nanosecond) => 9,
+        other => {
+            return Err(arrow_schema::ArrowError::CastError(format!(
+                "unsupported TIME target type {other}"
+            )));
+        }
+    };
+    let factor = 10i64.pow((unit_digits - scale.clamp(0, 9)).max(0) as u32);
+    let ints = arrow_cast::cast(col.as_ref(), &DataType::Int64)?;
+    let scaled: arrow_array::Int64Array = ints.as_primitive::<Int64Type>().try_unary(|value| {
+        value.checked_mul(factor).ok_or_else(|| {
+            arrow_schema::ArrowError::CastError(format!(
+                "TIME value {value} overflows when rescaled to {target}"
+            ))
+        })
+    })?;
+    let physical = if matches!(target, DataType::Time32(_)) {
+        arrow_cast::cast(&scaled, &DataType::Int32)?
+    } else {
+        Arc::new(scaled)
+    };
+    arrow_cast::cast(physical.as_ref(), target)
 }
 
 fn convert_timestamp_ntz(
@@ -2783,6 +2820,78 @@ pub(crate) mod tests {
             result.field(0).data_type(),
             &DataType::Time64(TimeUnit::Nanosecond)
         );
+    }
+
+    #[test]
+    fn time_values_are_rescaled_to_a_valid_arrow_unit() {
+        for (scale, raw, expected_type, expected) in [
+            // 1234.5 seconds at scale 1 -> milliseconds.
+            (
+                "1",
+                12_345i64,
+                DataType::Time32(TimeUnit::Millisecond),
+                1_234_500i64,
+            ),
+            // 1.2345 seconds at scale 4 -> microseconds (Time32 cannot hold it).
+            (
+                "4",
+                12_345,
+                DataType::Time64(TimeUnit::Microsecond),
+                1_234_500,
+            ),
+            // 1.23456 seconds at scale 5 -> microseconds.
+            (
+                "5",
+                123_456,
+                DataType::Time64(TimeUnit::Microsecond),
+                1_234_560,
+            ),
+            // 1.2345678 seconds at scale 7 -> nanoseconds.
+            (
+                "7",
+                12_345_678,
+                DataType::Time64(TimeUnit::Nanosecond),
+                1_234_567_800,
+            ),
+            // Scales already matching a unit pass through unchanged.
+            ("3", 1_234, DataType::Time32(TimeUnit::Millisecond), 1_234),
+            ("9", 1_234, DataType::Time64(TimeUnit::Nanosecond), 1_234),
+        ] {
+            let field = make_field_with_meta("t", DataType::Int64, "TIME", scale);
+            let schema = Arc::new(Schema::new(vec![field]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![
+                    Some(raw),
+                    None,
+                ]))],
+            )
+            .unwrap();
+            let mut reader = ConvertingReader::new(
+                ConcatReader {
+                    batches: vec![batch].into_iter(),
+                    schema,
+                },
+                TimeUnit::Nanosecond,
+                TimestampPrecision::Nanoseconds,
+                Arc::from("UTC"),
+            );
+            let out = reader.next().unwrap().unwrap();
+            let column = out.column(0);
+            assert_eq!(column.data_type(), &expected_type, "scale {scale}");
+            let as_int64 = if matches!(expected_type, DataType::Time32(_)) {
+                let int32 = arrow_cast::cast(column, &DataType::Int32).unwrap();
+                arrow_cast::cast(&int32, &DataType::Int64).unwrap()
+            } else {
+                arrow_cast::cast(column, &DataType::Int64).unwrap()
+            };
+            let values = as_int64
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            assert_eq!(values.value(0), expected, "scale {scale}");
+            assert!(values.is_null(1));
+        }
     }
 
     #[test]

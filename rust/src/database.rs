@@ -305,6 +305,20 @@ fn adbc_db_param(key: &str) -> Result<&'static str> {
     Ok(param.as_str())
 }
 
+/// Go's max_retry_count counts retries (0 = driver default); sf_core counts
+/// attempts, so N retries are N + 1 attempts and 0 maps to the default of 8.
+fn retry_attempts(key: &str, value: &OptionValue) -> Result<(i64, i64)> {
+    let retries = non_negative_int(key, value)?;
+    let attempts = if retries == 0 {
+        8
+    } else {
+        retries
+            .checked_add(1)
+            .filter(|&attempts| attempts <= i64::from(u32::MAX))
+            .ok_or_else(|| invalid_option_value(key, &retries.to_string()))?
+    };
+    Ok((retries, attempts))
+}
 /// Convert a validated ADBC database option to an sf_core setting.
 fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static str, Setting)>> {
     if key == "uri" {
@@ -342,6 +356,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
             OptionValue::String(protocol) => return Err(invalid_option_value(key, protocol)),
             _ => return Err(invalid_typed_option_value(key, value)),
         },
+        MAX_RETRY_COUNT => Setting::Int(retry_attempts(key, value)?.1),
         _ => option_to_setting(value)?,
     };
     Ok(Some((param, setting)))
@@ -460,17 +475,7 @@ impl Optionable for Database {
             return Ok(());
         }
         if key_str == MAX_RETRY_COUNT {
-            let retries = non_negative_int(key_str, &value)?;
-            let attempts = if retries == 0 {
-                8
-            } else {
-                retries
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_option_value(key_str, &retries.to_string()))?
-            };
-            if attempts > u32::MAX as i64 {
-                return Err(invalid_option_value(key_str, &retries.to_string()));
-            }
+            let (retries, attempts) = retry_attempts(key_str, &value)?;
             self.set_sf_option(
                 param_names::RETRY_MAX_ATTEMPTS.as_str(),
                 Setting::Int(attempts),
@@ -1163,6 +1168,27 @@ mod tests {
         .expect("unknown option must fail");
         assert_eq!(error.status, Status::NotImplemented);
         assert_eq!(error.message, "unrecognized connection option 'adbc.fake'");
+    }
+
+    #[test]
+    fn connection_max_retry_count_uses_database_retry_conversion() {
+        for (retries, attempts) in [("0", 8), ("2", 3)] {
+            let accumulated = accumulate_connection_options(
+                &HashMap::new(),
+                [(
+                    OptionConnection::Other(MAX_RETRY_COUNT.into()),
+                    OptionValue::String(retries.into()),
+                )],
+            )
+            .unwrap();
+            assert_eq!(
+                accumulated
+                    .sf_options
+                    .get(param_names::RETRY_MAX_ATTEMPTS.as_str()),
+                Some(&Setting::Int(attempts)),
+                "{retries}"
+            );
+        }
     }
 
     #[test]
