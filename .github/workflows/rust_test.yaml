@@ -608,8 +608,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: rust
         run: |
-          git tag go/v1000.0.0
-          tag=go/v1000.0.0
+          git tag rust/v1000.0.0
+          tag=rust/v1000.0.0
 
           pixi run release --dry-run "$(pwd)" "$tag"
           find ~/packages -type f \
