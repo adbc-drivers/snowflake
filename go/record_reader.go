@@ -589,6 +589,11 @@ func getArrowTimestampFromTime(val time.Time, unit arrow.TimeUnit, originalArrow
 		return arrow.TimestampFromTime(time.UnixMicro(val.UnixMicro()), arrow.Microsecond)
 	}
 
+	if maxTimestampPrecision == Nanoseconds && unit == arrow.Nanosecond {
+		// Preserve the documented wrapping behavior; Arrow checks for overflow.
+		return arrow.Timestamp(val.UnixNano()), nil
+	}
+
 	return arrow.TimestampFromTime(val, unit)
 }
 

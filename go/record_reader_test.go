@@ -33,6 +33,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGetArrowTimestampFromTimePrecision(t *testing.T) {
+	values := []time.Time{
+		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, 6, 2, 10, 37, 56, 123456789, time.UTC),
+		time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC),
+	}
+	for _, value := range values {
+		t.Run(value.Format(time.RFC3339Nano), func(t *testing.T) {
+			got, err := getArrowTimestampFromTime(value, arrow.Microsecond, arrow.Nanosecond, Microseconds)
+			require.NoError(t, err)
+			assert.Equal(t, arrow.Timestamp(value.UnixMicro()), got)
+
+			got, err = getArrowTimestampFromTime(value, arrow.Nanosecond, arrow.Nanosecond, Nanoseconds)
+			require.NoError(t, err)
+			assert.Equal(t, arrow.Timestamp(value.UnixNano()), got)
+
+			got, err = getArrowTimestampFromTime(value, arrow.Nanosecond, arrow.Nanosecond, NanosecondsNoOverflow)
+			if value.Year() == 2025 {
+				require.NoError(t, err)
+				assert.Equal(t, arrow.Timestamp(value.UnixNano()), got)
+			} else {
+				require.ErrorContains(t, err, "overflows when converted to nanoseconds")
+			}
+
+			// A nanosecond precision limit must not promote lower-precision values.
+			got, err = getArrowTimestampFromTime(value, arrow.Millisecond, arrow.Millisecond, Nanoseconds)
+			require.NoError(t, err)
+			assert.Equal(t, arrow.Timestamp(value.UnixMilli()), got)
+		})
+	}
+}
+
 // mockBatch implements batchStreamer for testing.
 type mockBatch struct {
 	streams []func(context.Context) (io.ReadCloser, error)
