@@ -248,8 +248,8 @@ fn test_execute_ddl_and_dml() {
 
 // ── precision option tests ────────────────────────────────────────────────────
 
-/// Verify that the precision options round-trip correctly on Database
-/// (no live query required — purely option set/get).
+/// Verify that the timestamp precision option round-trips correctly on
+/// Database (no live query required — purely option set/get).
 #[test]
 fn test_precision_options_defaults_and_round_trip() {
     let Some(mut db) = make_db() else {
@@ -260,31 +260,10 @@ fn test_precision_options_defaults_and_round_trip() {
     // Defaults
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.use_high_precision".into()
-        ))
-        .unwrap(),
-        "enabled"
-    );
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
             "adbc.snowflake.sql.client_option.max_timestamp_precision".into()
         ))
         .unwrap(),
         "nanoseconds"
-    );
-
-    // Round-trip: disable high precision
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.client_option.use_high_precision".into()),
-        OptionValue::String("disabled".into()),
-    )
-    .unwrap();
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.use_high_precision".into()
-        ))
-        .unwrap(),
-        "disabled"
     );
 
     // Round-trip: microsecond timestamps
@@ -316,12 +295,11 @@ fn test_precision_options_defaults_and_round_trip() {
     );
 }
 
-/// Mirrors Go's TestUseHighPrecision / TestSchemaWithLowPrecision.
-///
-/// With high precision (default): NUMBER(10,0) → Int64, NUMBER(15,2) → Decimal128(15,2).
-/// With high precision disabled:  NUMBER(10,0) → Int64, NUMBER(15,2) → Float64.
+/// NUMBER columns keep the Arrow types chosen by the server: scale 0 is a
+/// signed integer and scale > 0 is an exact Decimal128 of the declared
+/// precision and scale.
 #[test]
-fn test_high_precision_get_table_schema() {
+fn test_get_table_schema_uses_server_numeric_types() {
     let table_name = format!(
         "ADBC_RUST_PRECISION_TEST_{}_{}",
         std::process::id(),
@@ -335,7 +313,6 @@ fn test_high_precision_get_table_schema() {
         return;
     };
 
-    // Create a permanent table so a second connection can also DESC it.
     {
         let mut stmt = conn.new_statement().unwrap();
         stmt.set_sql_query(format!(
@@ -347,45 +324,22 @@ fn test_high_precision_get_table_schema() {
     }
 
     // Snowflake folds unquoted identifiers to uppercase.
-    // ── high precision (default: enabled) ────────────────────────────────────
-    let schema_hp = conn
+    let schema = conn
         .get_table_schema(None, None, &table_name)
-        .expect("get_table_schema high precision");
+        .expect("get_table_schema");
 
-    assert_eq!(
-        schema_hp.field_with_name("INT_COL").unwrap().data_type(),
-        &DataType::Int64,
-        "INT_COL: expected Int64 (scale=0)"
+    let int_type = schema.field_with_name("INT_COL").unwrap().data_type();
+    assert!(
+        matches!(
+            int_type,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        ),
+        "INT_COL: expected a signed integer type, got {int_type:?}"
     );
     assert_eq!(
-        schema_hp.field_with_name("DEC_COL").unwrap().data_type(),
+        schema.field_with_name("DEC_COL").unwrap().data_type(),
         &DataType::Decimal128(15, 2),
-        "DEC_COL: expected Decimal128(15,2) with high precision"
-    );
-
-    // ── low precision (disabled) ──────────────────────────────────────────────
-    let Some(mut db_lp) = make_db() else { return };
-    db_lp
-        .set_option(
-            OptionDatabase::Other("adbc.snowflake.sql.client_option.use_high_precision".into()),
-            OptionValue::String("disabled".into()),
-        )
-        .unwrap();
-    let conn_lp = db_lp.new_connection().expect("low-precision connection");
-
-    let schema_lp = conn_lp
-        .get_table_schema(None, None, &table_name)
-        .expect("get_table_schema low precision");
-
-    assert_eq!(
-        schema_lp.field_with_name("INT_COL").unwrap().data_type(),
-        &DataType::Int64,
-        "INT_COL: expected Int64 (scale=0)"
-    );
-    assert_eq!(
-        schema_lp.field_with_name("DEC_COL").unwrap().data_type(),
-        &DataType::Float64,
-        "DEC_COL: expected Float64 with low precision"
+        "DEC_COL: expected Decimal128(15,2)"
     );
 
     // Cleanup

@@ -272,7 +272,6 @@ impl adbc_core::Driver for Driver {
             db_handle,
             sf_settings,
             surfaced_warnings: Default::default(),
-            use_high_precision: true,
             timestamp_precision: TimestampPrecision::default(),
         };
         for (key, value) in opts {
