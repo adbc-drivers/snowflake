@@ -3663,3 +3663,81 @@ func (suite *SnowflakeTests) TestGetStatisticsBasic() {
 	// Note: We intentionally don't drop the table to keep it for subsequent test runs,
 	// ensuring consistent results despite INFORMATION_SCHEMA caching
 }
+
+func (suite *SnowflakeTests) TestQueryID() {
+	opts := suite.stmt.(adbc.GetSetOptionsWithContext)
+	getID := func() string {
+		id, err := opts.GetOption(suite.ctx, driver.OptionLastQueryID)
+		suite.Require().NoError(err)
+		return id
+	}
+	suite.Empty(getID())
+	var previous string
+	for _, query := range []string{"SELECT 1", "SELECT 1 WHERE FALSE", "SHOW PARAMETERS LIKE 'TIMEZONE' IN SESSION"} {
+		suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, query))
+		rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+		suite.Require().NoError(err)
+		id := getID()
+		suite.NotEmpty(id)
+		suite.NotEqual(previous, id)
+		actual, ok := rdr.Schema().Metadata().GetValue(driver.MetadataKeyQueryID)
+		suite.True(ok)
+		suite.Equal(id, actual)
+		for rdr.Next() {
+			suite.Equal(rdr.Schema().Metadata(), rdr.RecordBatch().Schema().Metadata())
+		}
+		suite.NoError(rdr.Err())
+		rdr.Release()
+		previous = id
+	}
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT 1"))
+	schema, err := suite.stmt.(adbc.StatementExecuteSchemaWithContext).ExecuteSchema(suite.ctx)
+	suite.Require().NoError(err)
+	_, present := schema.Metadata().GetValue(driver.MetadataKeyQueryID)
+	suite.False(present)
+	suite.Equal(previous, getID())
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TEMPORARY TABLE query_id_test (v INTEGER)"))
+	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.NotEmpty(getID())
+	suite.NotEqual(previous, getID())
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "INSERT INTO query_id_test VALUES (1)"))
+	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.NotEmpty(getID())
+}
+
+func (suite *SnowflakeTests) TestQueryIDBound() {
+	opts := suite.stmt.(adbc.GetSetOptionsWithContext)
+	schema := arrow.NewSchema([]arrow.Field{{Name: "v", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), schema)
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2}, nil)
+	rec := bldr.NewRecordBatch()
+	bldr.Release()
+	defer rec.Release()
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT ?"))
+	suite.Require().NoError(suite.stmt.Bind(suite.ctx, rec))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+	first, err := opts.GetOption(suite.ctx, driver.OptionLastQueryID)
+	suite.Require().NoError(err)
+	suite.NotEmpty(first)
+	frozen := rdr.Schema()
+	count := 0
+	for rdr.Next() {
+		count++
+		id, ok := rdr.RecordBatch().Schema().Metadata().GetValue(driver.MetadataKeyQueryID)
+		suite.True(ok)
+		suite.Equal(first, id)
+	}
+	suite.NoError(rdr.Err())
+	suite.Equal(2, count)
+	last, err := opts.GetOption(suite.ctx, driver.OptionLastQueryID)
+	suite.Require().NoError(err)
+	suite.NotEmpty(last)
+	suite.NotEqual(first, last)
+	id, ok := frozen.Metadata().GetValue(driver.MetadataKeyQueryID)
+	suite.True(ok)
+	suite.Equal(first, id)
+}
