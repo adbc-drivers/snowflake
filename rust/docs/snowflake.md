@@ -98,12 +98,15 @@ Examples:
 
 Database options use the same keys and values as the Go Snowflake driver, including the `adbc.snowflake.sql.auth_type` values (`auth_snowflake`, `auth_oauth`, `auth_ext_browser`, `auth_okta`, `auth_jwt`, `auth_mfa`, `auth_pat`, `auth_wif`). Durations such as `login_timeout` accept Go duration strings (for example `30s` or `1m30s`) and are rounded up to whole seconds.
 
-Setting an option the driver does not recognize, or one it cannot honor, fails with `NOT_IMPLEMENTED` instead of being ignored. The following Go driver options are rejected for this reason: `adbc.snowflake.sql.region`, `adbc.snowflake.sql.client_option.ocsp_fail_open_mode`, `adbc.snowflake.sql.client_option.jwt_expire_timeout`, `adbc.snowflake.sql.client_option.tracing`, `adbc.snowflake.sql.client_option.config_file`, `adbc.snowflake.sql.client_option.use_high_precision`, `adbc.snowflake.sql.client_option.stream_retry_enabled`, `adbc.connection.get_objects.match_exactly`, `adbc.rpc.result_queue_size`, and `adbc.snowflake.rpc.prefetch_concurrency`. Invalid values for recognized options fail with `INVALID_ARGUMENT`.
+Setting an option the driver does not recognize, or one it cannot honor, fails with `NOT_IMPLEMENTED` instead of being ignored. The following Go driver options are rejected for this reason: `adbc.snowflake.sql.region`, `adbc.snowflake.sql.client_option.ocsp_fail_open_mode`, `adbc.snowflake.sql.client_option.jwt_expire_timeout`, `adbc.snowflake.sql.client_option.tracing`, `adbc.snowflake.sql.client_option.config_file`, `adbc.snowflake.sql.client_option.use_high_precision`, `adbc.snowflake.sql.client_option.stream_retry_enabled`, `adbc.rpc.result_queue_size`, and `adbc.snowflake.rpc.prefetch_concurrency`. Invalid values for recognized options fail with `INVALID_ARGUMENT`.
 
 ### Database and Connection Options
 
 - `adbc.snowflake.sql.client_option.max_timestamp_precision`: `nanoseconds` (default), `nanoseconds_error_on_overflow`, or `microseconds`. Also settable per statement.
 - `adbc.snowflake.sql.client_option.geography_output_format` / `adbc.snowflake.sql.client_option.geometry_output_format`: `GeoJSON` (default) or `EWKB`, case-insensitive. Setting either on a connection applies it to the current session with `ALTER SESSION`. With `EWKB`, GEOGRAPHY and GEOMETRY columns are returned as binary `geoarrow.wkb` extension arrays; with `GeoJSON` they are strings.
+- `adbc.connection.get_objects.match_exactly`: connection-only option, `false` (default) or `true`. When true, GetObjects catalog, schema, table, and column filters match literal names case-sensitively, including `%` and `_`; invalid values fail with `INVALID_ARGUMENT`. Without it, filters retain case-insensitive LIKE wildcard semantics.
+
+GetObjects at `columns` and `all` depths includes PRIMARY KEY, FOREIGN KEY, and UNIQUE constraints, with ordered column names and referenced catalog/schema/table/column information for foreign keys. At `tables` depth, the constraint list remains null.
 
 ### Statement Options
 
@@ -128,7 +131,7 @@ Bulk ingestion writes the bound data to Parquet files, uploads them concurrently
 
 - ARRAY columns carry the `arrow.json` extension type; UUID columns are returned as `arrow.uuid` (16-byte fixed-size binary).
 - TIMESTAMP_LTZ columns use the session `TIMEZONE`; TIMESTAMP_TZ columns use UTC; TIMESTAMP_NTZ columns have no time zone.
-- Snowflake field metadata (for example `logicalType`, `precision`, `scale`) is preserved on result and schema fields.
+- GetTableSchema reads `DESC TABLE` for `DATA_TYPE` and `PRIMARY_KEY` field metadata (plus `COMMENT` when set), while keeping Snowflake's Arrow type adjustments and session time zone. ARRAY and EWKB GeoArrow fields carry their extension metadata instead of these DESC keys, as in the Go driver.
 
 ### Cancellation
 

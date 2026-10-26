@@ -15,7 +15,7 @@
 // tests/integration.rs
 use adbc_core::{
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
-    options::{OptionConnection, OptionDatabase, OptionValue},
+    options::{ObjectDepth, OptionConnection, OptionDatabase, OptionValue},
 };
 use adbc_driver_snowflake::{Database, Driver};
 use arrow_array::Array;
@@ -349,6 +349,176 @@ fn test_get_table_schema_uses_server_numeric_types() {
             .unwrap();
         stmt.execute_update().expect("drop precision test table");
     }
+}
+
+#[test]
+fn test_get_objects_constraints_and_table_schema_metadata() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let catalog = conn
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .unwrap();
+    let schema_name = conn
+        .get_option_string(OptionConnection::CurrentSchema)
+        .unwrap();
+    let suffix = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+    let parent = format!("ADBC_RUST_PARENT_{suffix}");
+    let child = format!("ADBC_RUST_CHILD_{suffix}");
+    for sql in [
+        format!(
+            "CREATE TEMPORARY TABLE \"{parent}\" (\
+             \"id_a\" NUMBER(10,0), \"id_b\" NUMBER(10,0), \
+             \"label\" VARCHAR(20) COMMENT 'display label', \
+             CONSTRAINT \"pk_parent\" PRIMARY KEY (\"id_a\", \"id_b\"), \
+             CONSTRAINT \"uq_parent\" UNIQUE (\"label\"))"
+        ),
+        format!(
+            "CREATE TEMPORARY TABLE \"{child}\" (\
+             \"ref_a\" NUMBER(10,0), \"ref_b\" NUMBER(10,0), \
+             CONSTRAINT \"fk_child\" FOREIGN KEY (\"ref_b\", \"ref_a\") \
+             REFERENCES \"{parent}\" (\"id_b\", \"id_a\"))"
+        ),
+    ] {
+        let mut statement = conn.new_statement().unwrap();
+        statement.set_sql_query(sql).unwrap();
+        statement.execute_update().unwrap();
+    }
+
+    let schema = conn.get_table_schema(None, None, &parent).unwrap();
+    assert_eq!(
+        schema.field_with_name("id_a").unwrap().metadata()["PRIMARY_KEY"],
+        "Y"
+    );
+    assert_eq!(
+        schema.field_with_name("id_a").unwrap().metadata()["DATA_TYPE"],
+        "NUMBER(10,0)"
+    );
+    let label = schema.field_with_name("label").unwrap();
+    assert_eq!(label.metadata()["PRIMARY_KEY"], "N");
+    assert_eq!(label.metadata()["COMMENT"], "display label");
+
+    conn.set_option(
+        OptionConnection::Other("adbc.connection.get_objects.match_exactly".into()),
+        OptionValue::String("true".into()),
+    )
+    .unwrap();
+
+    for (table, expected_names, expected_types) in [
+        (
+            &parent,
+            vec!["pk_parent", "uq_parent"],
+            vec!["PRIMARY KEY", "UNIQUE"],
+        ),
+        (&child, vec!["fk_child"], vec!["FOREIGN KEY"]),
+    ] {
+        let mut reader = conn
+            .get_objects(
+                ObjectDepth::All,
+                Some(&catalog),
+                Some(&schema_name),
+                Some(table),
+                None,
+                None,
+            )
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let db_schemas = batch.column(1).as_list::<i32>().values().as_struct();
+        let tables = db_schemas.column(1).as_list::<i32>().values().as_struct();
+        let table_names = tables.column(0).as_string::<i32>();
+        let table_index = (0..tables.len())
+            .find(|&index| table_names.value(index) == table)
+            .expect("created table in GetObjects");
+        let constraints_list = tables.column(3).as_list::<i32>();
+        let constraints = constraints_list.value(table_index);
+        let constraints = constraints.as_struct();
+        let names = constraints.column(0).as_string::<i32>();
+        let types = constraints.column(1).as_string::<i32>();
+        assert_eq!(
+            (0..constraints.len())
+                .map(|index| names.value(index))
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        assert_eq!(
+            (0..constraints.len())
+                .map(|index| types.value(index))
+                .collect::<Vec<_>>(),
+            expected_types
+        );
+        let columns = constraints.column(2).as_list::<i32>();
+        let usages = constraints.column(3).as_list::<i32>();
+        if table == &parent {
+            let pk = columns.value(0);
+            let pk = pk.as_string::<i32>();
+            assert_eq!(pk.value(0), "id_a");
+            assert_eq!(pk.value(1), "id_b");
+            assert!(usages.is_null(0));
+            assert!(usages.is_null(1));
+        } else {
+            let fk = columns.value(0);
+            let fk = fk.as_string::<i32>();
+            assert_eq!(fk.value(0), "ref_b");
+            assert_eq!(fk.value(1), "ref_a");
+            let referenced = usages.value(0);
+            let referenced = referenced.as_struct();
+            assert_eq!(referenced.column(0).as_string::<i32>().value(0), catalog);
+            assert_eq!(
+                referenced.column(1).as_string::<i32>().value(0),
+                schema_name
+            );
+            assert_eq!(referenced.column(2).as_string::<i32>().value(0), parent);
+            assert_eq!(referenced.column(3).as_string::<i32>().value(0), "id_b");
+            assert_eq!(referenced.column(3).as_string::<i32>().value(1), "id_a");
+        }
+    }
+    for filter in [
+        parent.to_ascii_lowercase(),
+        format!("{parent}%"),
+        "%".into(),
+        "_".into(),
+        String::new(),
+    ] {
+        let mut reader = conn
+            .get_objects(
+                ObjectDepth::Columns,
+                Some(&catalog),
+                Some(&schema_name),
+                Some(&filter),
+                None,
+                None,
+            )
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let schemas = batch.column(1).as_list::<i32>().values().as_struct();
+        let tables = schemas.column(1).as_list::<i32>().values().as_struct();
+        assert_eq!(tables.len(), 0, "{filter:?} must not match literally");
+    }
+
+    let mut reader = conn
+        .get_objects(
+            ObjectDepth::Columns,
+            Some(&catalog),
+            Some(&schema_name),
+            Some(&parent),
+            None,
+            Some(""),
+        )
+        .unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    let schemas = batch.column(1).as_list::<i32>().values().as_struct();
+    let tables = schemas.column(1).as_list::<i32>().values().as_struct();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables.column(2).as_list::<i32>().value_length(0), 0);
+    assert_eq!(tables.column(3).as_list::<i32>().value_length(0), 2);
 }
 
 /// Mirrors Go's TestTimestampPrecision.

@@ -32,9 +32,9 @@ class SnowflakeQuirks(model.DriverQuirks):
         connection_set_current_schema=True,
         connection_transactions=True,
         get_objects=True,
-        get_objects_constraints_foreign=False,
-        get_objects_constraints_primary=False,
-        get_objects_constraints_unique=False,
+        get_objects_constraints_foreign=True,
+        get_objects_constraints_primary=True,
+        get_objects_constraints_unique=True,
         statement_bind=True,
         statement_bulk_ingest=True,
         statement_bulk_ingest_catalog=True,
@@ -66,6 +66,25 @@ class SnowflakeQuirks(model.DriverQuirks):
     @property
     def queries_paths(self) -> tuple[Path]:
         return (Path(__file__).parent.parent / "queries",)
+
+    @property
+    def sample_ddl_constraints(self) -> list[str]:
+        # Snowflake folds unquoted names to uppercase. Keep constraint and
+        # column identifiers case-sensitive for the validation assertions.
+        return [
+            'CREATE TABLE "constraint_primary" ("z" INT, "a" INT, "b" STRING, PRIMARY KEY ("a"))',
+            'CREATE TABLE "constraint_primary_multi" ("z" INT, "a" INT, "b" STRING, PRIMARY KEY ("b", "a"))',
+            'CREATE TABLE "constraint_primary_multi2" ("z" INT, "a" STRING, "b" INT, PRIMARY KEY ("a", "b"))',
+            'CREATE TABLE "constraint_unique" ("z" INT, "a" INT, "b" INT, "c" INT, UNIQUE ("a"), UNIQUE ("c", "b"))',
+            'CREATE TABLE "constraint_foreign" ("z" INT, "a" INT, "b" INT, FOREIGN KEY ("b") REFERENCES "constraint_primary" ("a"))',
+            'CREATE TABLE "constraint_foreign_multi" ("z" INT, "a" INT, "b" INT, "c" STRING, FOREIGN KEY ("c", "b") REFERENCES "constraint_primary_multi2" ("a", "b"))',
+            'ALTER TABLE "constraint_primary" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_primary_multi" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_primary_multi2" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_unique" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_foreign" DROP COLUMN "z"',
+            'ALTER TABLE "constraint_foreign_multi" DROP COLUMN "z"',
+        ]
 
     def is_table_not_found(self, table_name: str | None, error: Exception) -> bool:
         error_msg = str(error).lower()
