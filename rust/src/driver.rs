@@ -71,12 +71,19 @@ pub(crate) struct PreparedResult {
 
 impl Inner {
     fn new() -> Result<Self> {
-        let runtime = Runtime::new().map_err(|e| {
-            Error::with_message_and_status(
-                format!("Failed to create tokio runtime: {e}"),
-                Status::IO,
-            )
-        })?;
+        // sf_core's transfer and query futures are large; unoptimized builds
+        // overflow tokio's default 2 MiB worker stacks (e.g. during ingest
+        // uploads), so give workers more room.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(8 * 1024 * 1024)
+            .build()
+            .map_err(|e| {
+                Error::with_message_and_status(
+                    format!("Failed to create tokio runtime: {e}"),
+                    Status::IO,
+                )
+            })?;
         Ok(Self {
             runtime,
             sf: DatabaseDriverV1::with_providers(DriverProviders {

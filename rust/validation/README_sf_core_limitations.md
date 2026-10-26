@@ -69,4 +69,4 @@ This document serves as a reference for future improvements that should ideally 
 
 ## Summary
 
-The current Rust ADBC driver performs "last-mile" data conversion for temporal types (timestamp reconstruction, TIME/TIMESTAMP schema adjustment). Numeric (`FIXED`) columns already pass through with the server's Arrow types. If `sf_core` were to export canonical `Timestamp(unit, tz)` types directly, the `ConvertingReader` in the ADBC driver could be completely eliminated, resulting in a zero-copy, highly performant passthrough.
+The current Rust ADBC driver performs "last-mile" data conversion for temporal types (timestamp reconstruction, TIME/TIMESTAMP schema adjustment) and for `FIXED` columns with a nonzero scale, which Snowflake sends as scaled integers and the driver exposes as exact `Decimal128` values. Integer and full-width decimal columns pass through with the server's Arrow types. If `sf_core` were to export canonical `Timestamp(unit, tz)` and decimal types directly, the `ConvertingReader` in the ADBC driver could be completely eliminated, resulting in a zero-copy, highly performant passthrough.

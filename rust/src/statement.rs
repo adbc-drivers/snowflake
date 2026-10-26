@@ -1009,6 +1009,18 @@ fn compute_target_type(field: &Field, ts_unit: TimeUnit, timezone: &str) -> Data
         .unwrap_or(0);
 
     match logical_type {
+        // Snowflake sends FIXED columns with scale > 0 as scaled integers
+        // (e.g. NUMBER(15,2) 123.45 as Int16 12345); expose them as exact
+        // decimals. Scale-0 integers and real decimals keep the server's type.
+        "FIXED" if scale > 0 && field.data_type().is_integer() => {
+            let precision = field
+                .metadata()
+                .get("precision")
+                .and_then(|p| p.parse::<u8>().ok())
+                .unwrap_or(38)
+                .clamp(1, 38);
+            DataType::Decimal128(precision, scale.clamp(0, 38) as i8)
+        }
         "TIME" => {
             // Arrow Time32 only supports seconds/milliseconds.
             let unit = scale_to_time_unit(scale as u32);
@@ -1120,6 +1132,12 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         match logical_type {
+            "FIXED"
+                if matches!(target_type, DataType::Decimal128(..))
+                    && col.data_type().is_integer() =>
+            {
+                scaled_integer_to_decimal(col, target_type)
+            }
             "TIME" => convert_time(col, scale, target_type),
             "REAL" => arrow_cast::cast(col.as_ref(), &DataType::Float64),
             "TIMESTAMP_NTZ" => convert_timestamp_ntz(col, scale, ts_unit, check_overflow, None),
@@ -1134,6 +1152,27 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
             _ => Ok(col.clone()),
         }
     }
+}
+
+/// Reinterpret scaled integers as Decimal128 without changing the stored
+/// unscaled values (12345 at scale 2 is 123.45).
+fn scaled_integer_to_decimal(
+    col: &ArrayRef,
+    target: &DataType,
+) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    use arrow_array::{cast::AsArray, types::Decimal128Type};
+    let DataType::Decimal128(precision, scale) = *target else {
+        return Err(arrow_schema::ArrowError::CastError(format!(
+            "expected a Decimal128 target, got {target}"
+        )));
+    };
+    let unscaled = arrow_cast::cast(col.as_ref(), &DataType::Decimal128(38, 0))?;
+    Ok(Arc::new(
+        unscaled
+            .as_primitive::<Decimal128Type>()
+            .clone()
+            .with_precision_and_scale(precision, scale)?,
+    ))
 }
 
 /// Snowflake TIME values are integer counts of 10^-scale seconds since
@@ -2401,6 +2440,46 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert_eq!(stmt.query_tag, None);
+    }
+
+    #[test]
+    fn scaled_integer_fixed_columns_become_exact_decimals() {
+        // Live Snowflake sends NUMBER(15,2) 123.45 as Int16 12345 with scale 2.
+        let field = make_field_with_precision("d", DataType::Int16, "FIXED", "2", "15");
+        let schema = Arc::new(Schema::new(vec![field]));
+        assert_eq!(
+            adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None)
+                .field(0)
+                .data_type(),
+            &DataType::Decimal128(15, 2)
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int16Array::from(vec![
+                Some(12345),
+                Some(-150),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let mut reader = ConvertingReader::new(
+            ConcatReader {
+                batches: vec![batch].into_iter(),
+                schema,
+            },
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
+        );
+        let out = reader.next().unwrap().unwrap();
+        let values = arrow_cast::cast(out.column(0), &DataType::Utf8).unwrap();
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "123.45");
+        assert_eq!(values.value(1), "-1.50");
+        assert!(values.is_null(2));
     }
 
     #[test]

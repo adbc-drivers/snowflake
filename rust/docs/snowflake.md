@@ -129,6 +129,7 @@ Bulk ingestion writes the bound data to Parquet files, uploads them concurrently
 
 ### Result Types
 
+- NUMBER columns with a nonzero scale are returned as exact `Decimal128(precision, scale)`; NUMBER columns with scale 0 keep the integer or decimal type Snowflake sends for the result set.
 - ARRAY columns carry the `arrow.json` extension type; UUID columns are returned as `arrow.uuid` (16-byte fixed-size binary).
 - TIMESTAMP_LTZ columns use the session `TIMEZONE`; TIMESTAMP_TZ columns use UTC; TIMESTAMP_NTZ columns have no time zone.
 - GetTableSchema reads `DESC TABLE` for `DATA_TYPE` and `PRIMARY_KEY` field metadata (plus `COMMENT` when set), while keeping Snowflake's Arrow type adjustments and session time zone. ARRAY and EWKB GeoArrow fields carry their extension metadata instead of these DESC keys, as in the Go driver.
