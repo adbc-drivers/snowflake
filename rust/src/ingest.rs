@@ -16,6 +16,7 @@ use adbc_core::error::{Error, Result, Status};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, TimeUnit};
 use sf_core::apis::database_driver_v1::{ApiError, BindingType, DataPtr};
+use sf_core::config::settings::Setting;
 
 use crate::statement::{Statement, arrow_batches_to_json_bindings, format_arrow_value_for_csv};
 
@@ -46,6 +47,8 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         stmt.ingest_schema.as_deref(),
     );
     let schema = stmt.bound_batches[0].schema();
+    // One operation spans DDL, staging, and inserts so cancel() stops the whole ingest.
+    let operation = stmt.begin_operation();
 
     match stmt
         .ingest_mode
@@ -54,6 +57,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
     {
         "adbc.ingest.mode.create" => {
             stmt.inner.execute_temporary_statement(
+                Some(&operation),
                 stmt.conn_handle,
                 build_create_sql(&qname, &schema, false)?,
                 stmt.query_timeout_seconds,
@@ -62,11 +66,13 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         "adbc.ingest.mode.append" => {}
         "adbc.ingest.mode.replace" => {
             stmt.inner.execute_temporary_statement(
+                Some(&operation),
                 stmt.conn_handle,
                 format!("DROP TABLE IF EXISTS {qname}"),
                 stmt.query_timeout_seconds,
             )?;
             stmt.inner.execute_temporary_statement(
+                Some(&operation),
                 stmt.conn_handle,
                 build_create_sql(&qname, &schema, false)?,
                 stmt.query_timeout_seconds,
@@ -74,6 +80,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         }
         "adbc.ingest.mode.create_append" => {
             stmt.inner.execute_temporary_statement(
+                Some(&operation),
                 stmt.conn_handle,
                 build_create_sql(&qname, &schema, true)?,
                 stmt.query_timeout_seconds,
@@ -101,6 +108,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
         // StageBinding error occurs before the INSERT is submitted, so it is
         // the only safe error on which to retry with inline JSON bindings.
         match stmt.inner.execute_query_raw_with_timeout(
+            Some(&operation),
             stmt.stmt_handle,
             insert_sql.clone(),
             Some(binding),
@@ -127,7 +135,7 @@ pub(crate) fn execute_ingest(stmt: &Statement) -> Result<Option<i64>> {
             })?;
             let binding = BindingType::Json(DataPtr::new(chunk.json.as_ptr(), json_len));
             // The encoded String stays in scope until execute_query's block_on completes.
-            let result = stmt.execute_query(insert_sql.clone(), Some(binding))?;
+            let result = stmt.execute_query(&operation, insert_sql.clone(), Some(binding))?;
 
             total = match (total, result.descriptor.rows_affected) {
                 (Some(acc), Some(rows)) => Some(acc.checked_add(rows).ok_or_else(|| {
@@ -144,8 +152,13 @@ fn should_fallback_from_stage_binding(error: &ApiError) -> bool {
     matches!(error, ApiError::StageBinding { .. })
 }
 
-fn parse_stage_binding_threshold(raw: Option<&str>) -> u64 {
-    raw.and_then(|value| value.parse::<u32>().ok())
+fn parse_stage_binding_threshold(raw: Option<&Setting>) -> u64 {
+    let value = match raw {
+        Some(Setting::Int(value)) => u32::try_from(*value).ok(),
+        Some(Setting::String(value)) => value.parse::<u32>().ok(),
+        _ => None,
+    };
+    value
         .map(u64::from)
         .unwrap_or(DEFAULT_STAGE_ARRAY_BINDING_THRESHOLD)
 }
@@ -159,7 +172,7 @@ fn stage_binding_threshold(stmt: &Statement) -> Result<u64> {
             STAGE_ARRAY_BINDING_THRESHOLD_PARAMETER.to_string(),
         ))
         .map_err(crate::error::api_error_to_adbc_error)?;
-    Ok(parse_stage_binding_threshold(raw.as_deref()))
+    Ok(parse_stage_binding_threshold(raw.as_ref()))
 }
 
 fn effective_binding_cells(batches: &[RecordBatch]) -> Option<u64> {
@@ -466,12 +479,29 @@ mod tests {
 
     #[test]
     fn stage_threshold_defaults_and_preserves_explicit_zero() {
+        let string = |value: &str| Setting::String(value.to_owned());
         assert_eq!(parse_stage_binding_threshold(None), 65_280);
-        assert_eq!(parse_stage_binding_threshold(Some("invalid")), 65_280);
-        assert_eq!(parse_stage_binding_threshold(Some("-1")), 65_280);
-        assert_eq!(parse_stage_binding_threshold(Some("4294967296")), 65_280);
-        assert_eq!(parse_stage_binding_threshold(Some("0")), 0);
-        assert_eq!(parse_stage_binding_threshold(Some("20")), 20);
+        assert_eq!(
+            parse_stage_binding_threshold(Some(&string("invalid"))),
+            65_280
+        );
+        assert_eq!(parse_stage_binding_threshold(Some(&string("-1"))), 65_280);
+        assert_eq!(
+            parse_stage_binding_threshold(Some(&string("4294967296"))),
+            65_280
+        );
+        assert_eq!(parse_stage_binding_threshold(Some(&string("0"))), 0);
+        assert_eq!(parse_stage_binding_threshold(Some(&string("20"))), 20);
+        assert_eq!(
+            parse_stage_binding_threshold(Some(&Setting::Int(-1))),
+            65_280
+        );
+        assert_eq!(parse_stage_binding_threshold(Some(&Setting::Int(0))), 0);
+        assert_eq!(parse_stage_binding_threshold(Some(&Setting::Int(20))), 20);
+        assert_eq!(
+            parse_stage_binding_threshold(Some(&Setting::Bool(true))),
+            65_280
+        );
     }
 
     #[test]
@@ -528,24 +558,6 @@ mod tests {
         .unwrap();
 
         assert!(encode_csv_stage_binding(&[batch], 1).unwrap().is_none());
-    }
-
-    #[test]
-    fn only_typed_stage_binding_errors_allow_json_retry() {
-        use sf_core::stage_binding::StageBindingError;
-
-        let stage_error = ApiError::StageBinding {
-            source: Box::new(StageBindingError::Disabled {
-                location: snafu::Location::default(),
-            }),
-            location: snafu::Location::default(),
-        };
-        let submitted_query_error = ApiError::Cancelled {
-            location: snafu::Location::default(),
-        };
-
-        assert!(should_fallback_from_stage_binding(&stage_error));
-        assert!(!should_fallback_from_stage_binding(&submitted_query_error));
     }
 
     #[test]

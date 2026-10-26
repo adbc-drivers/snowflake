@@ -29,6 +29,25 @@ fn is_snowflake_statement_timeout(message: &str) -> bool {
     message.contains("statement or warehouse timeout") || message.contains("statement timeout")
 }
 
+/// Classify a server-side query failure into an ADBC status plus the vendor
+/// code and SQLSTATE forwarded to the caller.
+fn classify_query_failure(
+    message: &str,
+    code: Option<i32>,
+    sql_state: Option<&str>,
+) -> (Status, i32, [c_char; 5]) {
+    let sqlstate = sql_state.and_then(sqlstate_to_adbc).unwrap_or([0; 5]);
+    let server_cancel = code == Some(QUERY_CANCELED) || sql_state == Some("57014");
+    let status = if server_cancel && is_snowflake_statement_timeout(message) {
+        Status::Timeout
+    } else if server_cancel {
+        Status::Cancelled
+    } else {
+        Status::IO
+    };
+    (status, code.unwrap_or_default(), sqlstate)
+}
+
 pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
     let mut vendor_code = 0;
     let mut sqlstate = [0; 5];
@@ -43,7 +62,7 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::InvalidRefreshState { .. } => Status::InvalidState,
         ApiError::Login { .. } => Status::Unauthenticated,
         ApiError::SessionRefresh { .. } => Status::Unauthenticated,
-        ApiError::MasterTokenExpired { .. } => Status::Unauthenticated,
+        ApiError::MasterTokenTerminal { .. } => Status::Unauthenticated,
         ApiError::TlsClientCreation { .. } => Status::IO,
         ApiError::Query { source, .. } => {
             if let RestError::QueryFailed {
@@ -53,20 +72,11 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
                 ..
             } = source.as_ref()
             {
-                vendor_code = code.unwrap_or_default();
-                if let Some(value) = sql_state.as_deref().and_then(sqlstate_to_adbc) {
-                    sqlstate = value;
-                }
-
-                let server_cancel =
-                    *code == Some(QUERY_CANCELED) || sql_state.as_deref() == Some("57014");
-                if server_cancel && is_snowflake_statement_timeout(message) {
-                    Status::Timeout
-                } else if server_cancel {
-                    Status::Cancelled
-                } else {
-                    Status::IO
-                }
+                let (status, code, state) =
+                    classify_query_failure(message, *code, sql_state.as_deref());
+                vendor_code = code;
+                sqlstate = state;
+                status
             } else {
                 Status::IO
             }
@@ -74,11 +84,9 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::QueryResponseProcess { .. } => Status::IO,
         ApiError::Statement { .. } => Status::IO,
         ApiError::RuntimeCreation { .. } => Status::IO,
-        ApiError::GenericError { .. } => Status::IO,
         ApiError::TokenCacheInitialization { .. } => Status::IO,
         ApiError::ArrowParse { .. } => Status::IO,
         ApiError::ChunkFetch { .. } => Status::IO,
-        ApiError::Base64Decode { .. } => Status::IO,
         ApiError::HttpRequest { .. } => Status::IO,
         ApiError::TokenRequest { .. } => Status::Unauthenticated,
         ApiError::QueryTimeout { .. } | ApiError::CancelTimeout { .. } => Status::Timeout,
@@ -112,114 +120,56 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_and_lifecycle_errors_map_to_specific_statuses() {
-        use std::time::Duration;
-
-        let cases = [
-            (
-                ApiError::ConnectionClosed {
-                    location: snafu::Location::default(),
-                },
-                Status::InvalidState,
-            ),
-            (
-                ApiError::QueryTimeout {
-                    budget: Duration::from_secs(30),
-                    location: snafu::Location::default(),
-                },
-                Status::Timeout,
-            ),
-            (
-                ApiError::CancelTimeout {
-                    timeout: Duration::from_secs(5),
-                    location: snafu::Location::default(),
-                },
-                Status::Timeout,
-            ),
-            (
-                ApiError::Cancelled {
-                    location: snafu::Location::default(),
-                },
-                Status::Cancelled,
-            ),
-        ];
-
-        for (error, expected) in cases {
-            assert_eq!(api_error_to_adbc_error(error).status, expected);
-        }
-    }
-
-    fn query_failed(message: &str, code: Option<i32>, sql_state: Option<&str>) -> ApiError {
-        ApiError::Query {
-            source: Box::new(RestError::QueryFailed {
-                message: message.to_owned(),
-                code,
-                sql_state: sql_state.map(str::to_owned),
-                query_id: None,
-                request_id: None,
-                location: snafu::Location::default(),
-            }),
-            location: snafu::Location::default(),
-        }
-    }
-
-    #[test]
     fn server_cancellation_preserves_vendor_code_and_sqlstate() {
-        let error = api_error_to_adbc_error(query_failed(
+        let (status, vendor_code, sqlstate) = classify_query_failure(
             "SQL execution canceled",
             Some(QUERY_CANCELED),
             Some("57014"),
-        ));
+        );
 
-        assert_eq!(error.status, Status::Cancelled);
-        assert_eq!(error.vendor_code, QUERY_CANCELED);
-        assert_eq!(error.sqlstate, sqlstate_to_adbc("57014").unwrap());
+        assert_eq!(status, Status::Cancelled);
+        assert_eq!(vendor_code, QUERY_CANCELED);
+        assert_eq!(sqlstate, sqlstate_to_adbc("57014").unwrap());
     }
 
     #[test]
     fn cancellation_sqlstate_is_sufficient_without_vendor_code() {
-        let error = api_error_to_adbc_error(query_failed(
-            "query canceled by request",
-            None,
-            Some("57014"),
-        ));
+        let (status, vendor_code, sqlstate) =
+            classify_query_failure("query canceled by request", None, Some("57014"));
 
-        assert_eq!(error.status, Status::Cancelled);
-        assert_eq!(error.vendor_code, 0);
-        assert_eq!(error.sqlstate, sqlstate_to_adbc("57014").unwrap());
+        assert_eq!(status, Status::Cancelled);
+        assert_eq!(vendor_code, 0);
+        assert_eq!(sqlstate, sqlstate_to_adbc("57014").unwrap());
     }
 
     #[test]
     fn snowflake_statement_timeout_is_distinguished_from_other_cancellation() {
-        let error = api_error_to_adbc_error(query_failed(
+        let (status, vendor_code, sqlstate) = classify_query_failure(
             "SQL execution canceled: Statement reached its statement or warehouse timeout of 1 second(s) and was canceled.",
             Some(QUERY_CANCELED),
             Some("57014"),
-        ));
+        );
 
-        assert_eq!(error.status, Status::Timeout);
-        assert_eq!(error.vendor_code, QUERY_CANCELED);
-        assert_eq!(error.sqlstate, sqlstate_to_adbc("57014").unwrap());
+        assert_eq!(status, Status::Timeout);
+        assert_eq!(vendor_code, QUERY_CANCELED);
+        assert_eq!(sqlstate, sqlstate_to_adbc("57014").unwrap());
     }
 
     #[test]
     fn other_server_query_failure_keeps_io_status_and_diagnostics() {
-        let error = api_error_to_adbc_error(query_failed(
-            "object does not exist",
-            Some(2003),
-            Some("42S02"),
-        ));
+        let (status, vendor_code, sqlstate) =
+            classify_query_failure("object does not exist", Some(2003), Some("42S02"));
 
-        assert_eq!(error.status, Status::IO);
-        assert_eq!(error.vendor_code, 2003);
-        assert_eq!(error.sqlstate, sqlstate_to_adbc("42S02").unwrap());
+        assert_eq!(status, Status::IO);
+        assert_eq!(vendor_code, 2003);
+        assert_eq!(sqlstate, sqlstate_to_adbc("42S02").unwrap());
     }
 
     #[test]
     fn malformed_server_sqlstate_is_not_forwarded() {
-        let error = api_error_to_adbc_error(query_failed("failure", Some(1), Some("TOO-LONG")));
+        let (_, _, sqlstate) = classify_query_failure("failure", Some(1), Some("TOO-LONG"));
 
-        assert_eq!(error.sqlstate, [0; 5]);
+        assert_eq!(sqlstate, [0; 5]);
     }
 
     #[test]

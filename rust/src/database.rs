@@ -569,6 +569,7 @@ fn wrapper_identity() -> WrapperIdentity {
         language_version: String::new(),
         language_compiler: None,
         release_type: None,
+        application_path: None,
     }
 }
 
@@ -653,6 +654,7 @@ impl adbc_core::Database for Database {
                     conn_handle,
                     sf_options,
                     no_connection_details,
+                    None,
                 ))
                 .map_err(crate::error::api_error_to_adbc_error)?;
             let mut seen_warnings = HashSet::new();
@@ -703,6 +705,7 @@ impl adbc_core::Database for Database {
             // Complete the backend's Arrow handshake after login. Without the
             // connector-specific forced value, query responses remain JSON.
             self.inner.execute_temporary_statement(
+                None,
                 conn_handle,
                 "ALTER SESSION SET PYTHON_CONNECTOR_QUERY_RESULT_FORMAT = 'ARROW_FORCE'",
                 None,
@@ -828,7 +831,7 @@ mod tests {
         let accumulated = accumulate_connection_options(
             &database_options,
             [(
-                OptionConnection::Other("uId".into()),
+                OptionConnection::Other("USER".into()),
                 OptionValue::String("connection-user".into()),
             )],
         )
