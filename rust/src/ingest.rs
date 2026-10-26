@@ -324,59 +324,102 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
         stmt.ingest_schema.as_deref(),
         table,
     );
+    let replace = stmt.ingest_mode.as_deref() == Some("adbc.ingest.mode.replace");
     let operation = stmt.begin_operation();
     // A connection-level ADBC$BIND stage is shared by all statements on that
     // connection in Go. Give each ingest its own stage to avoid dropping or
     // consuming a concurrent statement's files.
-    let stage = format!(
-        "ADBC$BIND_{}_{}",
+    let unique = format!(
+        "{}_{}",
         std::process::id(),
-        NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
+        NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
     );
-    let copy_plan = build_copy_plan(&qname, &schema, &stmt.ingest_options, &stage)?;
+    let stage = format!("ADBC$BIND_{unique}");
+    // Replace loads into a staging table and swaps it in only after COPY
+    // succeeds, so a failed load never destroys the existing table's data.
+    let load_table = if replace {
+        qualified_table_identifier(
+            stmt.ingest_catalog.as_deref(),
+            stmt.ingest_schema.as_deref(),
+            &format!("ADBC$REPLACE_{unique}"),
+        )
+    } else {
+        qname.clone()
+    };
+    let copy_plan = build_copy_plan(&load_table, &schema, &stmt.ingest_options, &stage)?;
     // Reject input Parquet cannot encode (e.g. unions) and invalid writer
     // settings before any DDL, so a failed create-mode ingest leaves no table.
     let normalized = normalize_schema(&schema)?;
     let props = stmt.ingest_options.writer_properties()?;
-    initialize_target(stmt, &operation, &qname, &schema, &copy_plan.overrides)?;
-
-    let stage_sql = create_stage_sql(&stage, stmt.ingest_options.vectorized_scanner);
-    stmt.inner.execute_temporary_statement(
-        Some(&operation),
-        stmt.conn_handle,
-        stage_sql,
-        stmt.query_timeout_seconds,
+    initialize_target(
+        stmt,
+        &operation,
+        &qname,
+        &load_table,
+        &schema,
+        &copy_plan.overrides,
     )?;
-    let result = ingest_batches(
-        IngestJob {
-            inner: stmt.inner.clone(),
-            conn: stmt.conn_handle,
-            op: operation.clone(),
-            stage: stage.clone(),
-            copy_sql: copy_plan.sql,
-            timeout: stmt.query_timeout_seconds,
-            options: stmt.ingest_options.clone(),
-            normalized,
-            props,
-        },
-        batches,
-        schema,
-    );
-    // Cleanup must work even after cancellation. A temporary stage also dies
-    // when the session ends, should DROP itself fail.
-    let cleanup = stmt.inner.execute_temporary_statement(
-        None,
-        stmt.conn_handle,
-        format!("DROP STAGE IF EXISTS {stage}"),
-        stmt.query_timeout_seconds,
-    );
-    match result {
-        Err(err) => Err(err),
-        Ok(rows) => {
-            cleanup?;
-            Ok(Some(rows))
+
+    let load = stmt
+        .inner
+        .execute_temporary_statement(
+            Some(&operation),
+            stmt.conn_handle,
+            create_stage_sql(&stage, stmt.ingest_options.vectorized_scanner),
+            stmt.query_timeout_seconds,
+        )
+        .and_then(|()| {
+            ingest_batches(
+                IngestJob {
+                    inner: stmt.inner.clone(),
+                    conn: stmt.conn_handle,
+                    op: operation.clone(),
+                    stage: stage.clone(),
+                    copy_sql: copy_plan.sql,
+                    timeout: stmt.query_timeout_seconds,
+                    options: stmt.ingest_options.clone(),
+                    normalized,
+                    props,
+                },
+                batches,
+                schema,
+            )
+        });
+    // Cleanup must work even after cancellation, so it runs without the
+    // operation. A temporary stage also dies with the session.
+    let cleanup = |sql: String| {
+        stmt.inner.execute_temporary_statement(
+            None,
+            stmt.conn_handle,
+            sql,
+            stmt.query_timeout_seconds,
+        )
+    };
+    let stage_cleanup = cleanup(format!("DROP STAGE IF EXISTS {stage}"));
+    let rows = match load {
+        Ok(rows) => rows,
+        Err(err) => {
+            if replace {
+                let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
+            }
+            return Err(err);
         }
+    };
+    if replace {
+        // SWAP is atomic; afterwards the staging name holds the old data.
+        if let Err(err) = stmt.inner.execute_temporary_statement(
+            Some(&operation),
+            stmt.conn_handle,
+            format!("ALTER TABLE {load_table} SWAP WITH {qname}"),
+            stmt.query_timeout_seconds,
+        ) {
+            let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
+            return Err(err);
+        }
+        cleanup(format!("DROP TABLE IF EXISTS {load_table}"))?;
     }
+    stage_cleanup?;
+    Ok(Some(rows))
 }
 
 fn create_stage_sql(stage: &str, vectorized: bool) -> String {
@@ -542,10 +585,14 @@ fn geo_metadata(field: &Field) -> (i64, &str) {
     (srid, edges)
 }
 
+/// Prepare the table COPY loads into. For replace mode `load_table` is a
+/// fresh staging table; the target is only ensured to exist so it can be
+/// swapped with the staging table after a successful load.
 fn initialize_target(
     stmt: &Statement,
     op: &OperationCtx,
     qname: &str,
+    load_table: &str,
     schema: &Schema,
     overrides: &[Option<String>],
 ) -> Result<()> {
@@ -553,22 +600,31 @@ fn initialize_target(
         .ingest_mode
         .as_deref()
         .unwrap_or("adbc.ingest.mode.create");
+    let execute = |sql: String| {
+        stmt.inner.execute_temporary_statement(
+            Some(op),
+            stmt.conn_handle,
+            sql,
+            stmt.query_timeout_seconds,
+        )
+    };
     match mode {
-        "adbc.ingest.mode.create" => stmt.inner.execute_temporary_statement(
-            Some(op),
-            stmt.conn_handle,
-            build_create_sql(qname, schema, overrides, CreateMode::Create)?,
-            stmt.query_timeout_seconds,
-        ),
-        // CREATE OR REPLACE is atomic in Snowflake: if the new table cannot
-        // be created (for any reason, including server-side DDL rejection),
-        // the existing table is left untouched.
-        "adbc.ingest.mode.replace" => stmt.inner.execute_temporary_statement(
-            Some(op),
-            stmt.conn_handle,
-            build_create_sql(qname, schema, overrides, CreateMode::Replace)?,
-            stmt.query_timeout_seconds,
-        ),
+        "adbc.ingest.mode.create" => execute(build_create_sql(
+            qname,
+            schema,
+            overrides,
+            CreateMode::Create,
+        )?),
+        "adbc.ingest.mode.replace" => {
+            // Build both statements before running either, so unsupported
+            // input fails without touching any table.
+            let ensure_target =
+                build_create_sql(qname, schema, overrides, CreateMode::IfNotExists)?;
+            let create_staging =
+                build_create_sql(load_table, schema, overrides, CreateMode::Create)?;
+            execute(ensure_target)?;
+            execute(create_staging)
+        }
         "adbc.ingest.mode.create_append" => {
             stmt.inner.execute_temporary_statement(
                 Some(op),
@@ -591,7 +647,6 @@ fn initialize_target(
 #[derive(Clone, Copy)]
 enum CreateMode {
     Create,
-    Replace,
     IfNotExists,
 }
 
@@ -612,7 +667,6 @@ fn build_create_sql(
     }
     let create = match mode {
         CreateMode::Create => "CREATE TABLE",
-        CreateMode::Replace => "CREATE OR REPLACE TABLE",
         CreateMode::IfNotExists => "CREATE TABLE IF NOT EXISTS",
     };
     Ok(format!("{create} {qname} ({})", columns.join(", ")))
@@ -1541,16 +1595,6 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS \"table\" (\"odd\"\"name\" boolean NOT NULL)"
         );
         assert_eq!(
-            build_create_sql(
-                "\"table\"",
-                &Schema::new(vec![Field::new("flag", DataType::Boolean, true)]),
-                &[None],
-                CreateMode::Replace
-            )
-            .unwrap(),
-            "CREATE OR REPLACE TABLE \"table\" (\"flag\" boolean)"
-        );
-        assert_eq!(
             to_sf_ddl(&DataType::Decimal256(38, 37)).unwrap(),
             "NUMERIC(38,37)"
         );
@@ -1569,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_mode_rejects_unsupported_ddl_before_touching_the_table() {
+    fn replace_mode_rejects_unsupported_ddl_before_touching_any_table() {
         // The statement's handles are invalid, so issuing any DDL first would
         // fail inside sf_core instead of reporting the unsupported type.
         let mut stmt = crate::statement::tests::make_stmt();
@@ -1580,7 +1624,15 @@ mod tests {
             true,
         )]);
         let op = OperationCtx::with_own_token();
-        let error = initialize_target(&stmt, &op, "\"target\"", &schema, &[None]).unwrap_err();
+        let error = initialize_target(
+            &stmt,
+            &op,
+            "\"target\"",
+            "\"ADBC$REPLACE_1\"",
+            &schema,
+            &[None],
+        )
+        .unwrap_err();
         assert_eq!(error.status, Status::NotImplemented, "{error:?}");
     }
 

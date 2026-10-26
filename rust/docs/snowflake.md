@@ -113,6 +113,8 @@ Setting an option the driver does not recognize, or one it cannot honor, fails w
 
 Bulk ingestion writes the bound data to Parquet files, uploads them concurrently to a temporary stage, and loads them with `COPY INTO ... MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`. When appending (`adbc.ingest.mode.append` or `adbc.ingest.mode.create_append` with an existing table), the target table must have the same number of columns with matching names (case-insensitive); otherwise ingestion fails with `ALREADY_EXISTS`.
 
+`adbc.ingest.mode.replace` loads into a staging table in the target schema and swaps it with the target (`ALTER TABLE ... SWAP WITH`) only after every file has been copied. If ingestion fails or is cancelled, the existing table and its data are left unchanged. As with any Snowflake table swap, grants on the replaced table are not carried over to the new data.
+
 - `adbc.snowflake.statement.ingest_writer_concurrency`: number of Parquet writers. Defaults to the number of CPUs; `0` resets to the default.
 - `adbc.snowflake.statement.ingest_upload_concurrency`: number of concurrent file uploads. Defaults to `8`; `0` resets to the default.
 - `adbc.snowflake.statement.ingest_copy_concurrency`: number of concurrent background `COPY INTO` operations. Defaults to `4`; `0` removes the limit.
