@@ -921,17 +921,37 @@ fn geo_column_srid(column: &arrow_array::BinaryArray) -> Option<u32> {
     if inconsistent { None } else { observed }
 }
 
-fn strip_geo_srid(column: &ArrayRef) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+/// Rewrite EWKB values as ISO WKB. `declared` is the SRID the field's CRS
+/// metadata was built from; a value carrying any other SRID cannot be
+/// described by that single column CRS, so it is rejected rather than having
+/// its SRID silently dropped.
+fn strip_geo_srid(
+    column: &ArrayRef,
+    field_name: &str,
+    declared: Option<u32>,
+) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
     use std::io::Write as _;
     let binary = column
         .as_any()
         .downcast_ref::<arrow_array::BinaryArray>()
         .ok_or_else(|| arrow_schema::ArrowError::CastError("expected binary EWKB column".into()))?;
-    if !binary
+    let mut has_srid = false;
+    for srid in binary
         .iter()
         .flatten()
-        .any(|value| ewkb_srid(value).is_some_and(|srid| srid.is_some()))
+        .filter_map(|value| ewkb_srid(value).flatten())
     {
+        if declared != Some(srid) {
+            return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
+                "geo column '{field_name}' contains SRID {srid}, but its CRS metadata was \
+                 inferred from the first batch as {}; set the geography/geometry output \
+                 format to GeoJSON to read mixed-SRID results",
+                declared.map_or_else(|| "unknown".to_owned(), |srid| format!("EPSG:{srid}")),
+            )));
+        }
+        has_srid = true;
+    }
+    if !has_srid {
         return Ok(column.clone());
     }
     let mut builder =
@@ -1031,6 +1051,9 @@ pub(crate) struct ConvertingReader<R: RecordBatchReader> {
     original_schema: Arc<Schema>,
     schema: Arc<Schema>,
     pending: Option<std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
+    /// Per-column SRID the GeoArrow CRS metadata was built from (empty when
+    /// the result has no EWKB geo columns or no batches).
+    geo_srids: Vec<Option<u32>>,
     timezone: Arc<str>,
     ts_unit: TimeUnit,
     check_overflow: bool,
@@ -1056,27 +1079,29 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
                     .fields()
                     .iter()
                     .enumerate()
-                    .map(|(i, field)| {
-                        if geo_type(field).is_some() {
-                            batch
-                                .column(i)
-                                .as_any()
-                                .downcast_ref::<arrow_array::BinaryArray>()
-                                .and_then(geo_column_srid)
-                        } else {
-                            None
-                        }
+                    .map(|(i, field)| match geo_type(field) {
+                        Some(geo) => batch
+                            .column(i)
+                            .as_any()
+                            .downcast_ref::<arrow_array::BinaryArray>()
+                            .and_then(geo_column_srid)
+                            // GEOGRAPHY is always EPSG:4326, even when the
+                            // first batch has no SRID to observe.
+                            .or((geo == "GEOGRAPHY").then_some(4326)),
+                        None => None,
                     })
                     .collect::<Vec<_>>()
             })
         });
         let schema = adjust_schema(&original_schema, ts_unit, &timezone, srids.as_deref());
+        let geo_srids = srids.unwrap_or_default();
 
         Self {
             inner,
             original_schema,
             schema,
             pending,
+            geo_srids,
             timezone,
             ts_unit,
             check_overflow: ts_precision == TimestampPrecision::NanosecondsErrorOnOverflow,
@@ -1090,12 +1115,13 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
         ts_unit: TimeUnit,
         check_overflow: bool,
         timezone: &Arc<str>,
+        geo_srid: Option<u32>,
     ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
         if is_uuid_field(source_field) && matches!(target_type, DataType::FixedSizeBinary(16)) {
             return uuid_strings_to_bytes(col);
         }
         if geo_type(source_field).is_some() && matches!(target_type, DataType::Binary) {
-            return strip_geo_srid(col);
+            return strip_geo_srid(col, source_field.name(), geo_srid);
         }
         let logical_type = source_field
             .metadata()
@@ -1366,6 +1392,7 @@ impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
                     self.ts_unit,
                     self.check_overflow,
                     &self.timezone,
+                    self.geo_srids.get(i).copied().flatten(),
                 )
             })
             .collect();
@@ -1614,6 +1641,26 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
         return Ok("{}".to_string());
     };
     let schema = first.schema();
+    // A bind_stream reader can yield batches that disagree with its first
+    // batch; reject them instead of indexing past the end or mislabeling types.
+    for (index, batch) in batches.iter().enumerate().skip(1) {
+        let matches = batch.num_columns() == first.num_columns()
+            && batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .all(|(column, field)| column.data_type() == field.data_type());
+        if !matches {
+            return Err(Error::with_message_and_status(
+                format!(
+                    "bound batch {index} does not match the schema of the first bound batch: \
+                     expected {schema:?}, got {:?}",
+                    batch.schema()
+                ),
+                Status::InvalidData,
+            ));
+        }
+    }
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     let mut json = String::from("{");
     for col_idx in 0..first.num_columns() {
@@ -2616,6 +2663,103 @@ mod tests {
         expected.extend_from_slice(&[0; 16]);
         assert_eq!(geo.value(0), expected);
         assert!(geo.is_null(1));
+    }
+
+    #[test]
+    fn geometry_srid_not_matching_first_batch_crs_is_rejected() {
+        let field = Field::new("geom", DataType::Binary, true).with_metadata(
+            [
+                ("logicalType".to_owned(), "BINARY".to_owned()),
+                ("extTypeName".to_owned(), "GEOMETRY".to_owned()),
+            ]
+            .into(),
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let point = |srid: u32| {
+            let mut ewkb = vec![1, 1, 0, 0, 0x20];
+            ewkb.extend_from_slice(&srid.to_le_bytes());
+            ewkb.extend_from_slice(&[0; 16]);
+            ewkb
+        };
+        let batch = |value: Option<Vec<u8>>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::BinaryArray::from(vec![
+                    value.as_deref(),
+                ]))],
+            )
+            .unwrap()
+        };
+        let reader = |batches: Vec<RecordBatch>| {
+            ConvertingReader::new(
+                ConcatReader {
+                    batches: batches.into_iter(),
+                    schema: schema.clone(),
+                },
+                TimeUnit::Nanosecond,
+                TimestampPrecision::Nanoseconds,
+                Arc::from("UTC"),
+            )
+        };
+
+        // A later batch with the same SRID as the declared CRS is stripped.
+        let mut same = reader(vec![batch(Some(point(3857))), batch(Some(point(3857)))]);
+        assert!(same.next().unwrap().is_ok());
+        assert!(same.next().unwrap().is_ok());
+
+        // A later batch with a different SRID would be mislabeled.
+        let mut different = reader(vec![batch(Some(point(3857))), batch(Some(point(4326)))]);
+        assert!(different.next().unwrap().is_ok());
+        let error = different.next().unwrap().unwrap_err().to_string();
+        assert!(error.contains("SRID 4326"), "{error}");
+
+        // A first batch with no SRID establishes no CRS, so a later SRID is rejected.
+        let mut undeclared = reader(vec![batch(None), batch(Some(point(3857)))]);
+        assert_eq!(
+            undeclared
+                .schema()
+                .field(0)
+                .metadata()
+                .get("ARROW:extension:metadata"),
+            None
+        );
+        assert!(undeclared.next().unwrap().is_ok());
+        assert!(undeclared.next().unwrap().is_err());
+    }
+
+    #[test]
+    fn json_bindings_reject_batches_inconsistent_with_the_first() {
+        let first = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(arrow_array::StringArray::from(vec!["x"])),
+            ],
+        )
+        .unwrap();
+        let fewer_columns = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![2]))],
+        )
+        .unwrap();
+        let different_type = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["2"])),
+                Arc::new(arrow_array::StringArray::from(vec!["y"])),
+            ],
+        )
+        .unwrap();
+        for bad in [fewer_columns, different_type] {
+            let error = arrow_batches_to_json_bindings(&[first.clone(), bad]).unwrap_err();
+            assert_eq!(error.status, Status::InvalidData);
+        }
     }
 
     #[test]
