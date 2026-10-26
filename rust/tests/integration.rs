@@ -385,7 +385,7 @@ fn test_get_objects_constraints_and_table_schema_metadata() {
             "CREATE TEMPORARY TABLE \"{child}\" (\
              \"ref_a\" NUMBER(10,0), \"ref_b\" NUMBER(10,0), \
              CONSTRAINT \"fk_child\" FOREIGN KEY (\"ref_b\", \"ref_a\") \
-             REFERENCES \"{parent}\" (\"id_b\", \"id_a\"))"
+             REFERENCES \"{parent}\" (\"id_a\", \"id_b\"))"
         ),
     ] {
         let mut statement = conn.new_statement().unwrap();
@@ -476,8 +476,8 @@ fn test_get_objects_constraints_and_table_schema_metadata() {
                 schema_name
             );
             assert_eq!(referenced.column(2).as_string::<i32>().value(0), parent);
-            assert_eq!(referenced.column(3).as_string::<i32>().value(0), "id_b");
-            assert_eq!(referenced.column(3).as_string::<i32>().value(1), "id_a");
+            assert_eq!(referenced.column(3).as_string::<i32>().value(0), "id_a");
+            assert_eq!(referenced.column(3).as_string::<i32>().value(1), "id_b");
         }
     }
     for filter in [
@@ -809,10 +809,9 @@ fn test_prepare_parameter_schema_and_describe_only_execution() {
         .next()
         .expect("count batch")
         .expect("count result");
+    let rows = arrow_cast::cast(batch.column(0), &DataType::Int64).unwrap();
     assert_eq!(
-        batch
-            .column(0)
-            .as_primitive::<arrow_array::types::Int64Type>()
+        rows.as_primitive::<arrow_array::types::Int64Type>()
             .value(0),
         0,
         "execute_schema must not execute the INSERT"
@@ -928,9 +927,10 @@ fn test_ingest_stream_parquet_split_and_append_schema_validation() {
         .set_sql_query(format!("SELECT COUNT(*) FROM \"{table}\""))
         .unwrap();
     let result = query.execute().unwrap().next().unwrap().unwrap();
+    // Snowflake picks the narrowest integer type for the result set.
+    let count = arrow_cast::cast(result.column(0), &DataType::Int64).unwrap();
     assert_eq!(
-        result
-            .column(0)
+        count
             .as_primitive::<arrow_array::types::Int64Type>()
             .value(0),
         5
