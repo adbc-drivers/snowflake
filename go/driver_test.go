@@ -40,6 +40,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -70,16 +71,20 @@ func quoteIdentifier(identifier string) string {
 }
 
 type SnowflakeQuirks struct {
-	dsn         string
-	mem         *memory.CheckedAllocator
-	connector   sqldriver.Connector
-	catalogName string
-	schemaName  string
+	dsn           string
+	mem           *memory.CheckedAllocator
+	connector     sqldriver.Connector
+	catalogName   string
+	schemaName    string
+	vendorVersion *regexp.Regexp
 }
 
 func (s *SnowflakeQuirks) SetupDriver(t *testing.T) driverbase.DriverWithContext {
 	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
 	cfg, err := gosnowflake.ParseDSN(s.dsn)
+	require.NoError(t, err)
+
+	s.vendorVersion, err = regexp.Compile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	require.NoError(t, err)
 
 	cfg.Schema = s.schemaName
@@ -180,7 +185,7 @@ func (s *SnowflakeQuirks) CreateSampleTable(tableName string, r arrow.RecordBatc
 			b.WriteString(", ")
 		}
 		f := r.Schema().Field(int(i))
-		b.WriteString(f.Name)
+		b.WriteString(quoteIdentifier(f.Name))
 		b.WriteByte(' ')
 		b.WriteString(s.getSqlTypeFromArrowType(f.Type))
 	}
@@ -255,7 +260,7 @@ func (s *SnowflakeQuirks) GetMetadata(code adbc.InfoCode) any {
 	case adbc.InfoDriverArrowVersion:
 		return "v18.8.0"
 	case adbc.InfoVendorVersion:
-		return "(unknown or development build)"
+		return s.vendorVersion
 	case adbc.InfoVendorArrowVersion:
 		return "(unknown or development build)"
 	case adbc.InfoDriverADBCVersion:
@@ -319,13 +324,20 @@ func dropTempSchema(uri, schema string) {
 	}
 }
 
-func withQuirks(t *testing.T, fn func(*SnowflakeQuirks)) {
+func getSnowflakeURI(t *testing.T) string {
+	t.Helper()
 	uri := os.Getenv("SNOWFLAKE_URI")
-	database := os.Getenv("SNOWFLAKE_DATABASE")
-
 	if uri == "" {
 		t.Skip("no SNOWFLAKE_URI defined, skip snowflake driver tests")
-	} else if database == "" {
+	}
+	return strings.TrimPrefix(uri, "snowflake://")
+}
+
+func withQuirks(t *testing.T, fn func(*SnowflakeQuirks)) {
+	uri := getSnowflakeURI(t)
+	database := os.Getenv("SNOWFLAKE_DATABASE")
+
+	if database == "" {
 		t.Skip("no SNOWFLAKE_DATABASE defined, skip snowflake driver tests")
 	}
 
@@ -1504,16 +1516,16 @@ func (suite *SnowflakeTests) TestMetadataGetObjectsColumnsXdbc() {
 	db := sql.OpenDB(suite.Quirks.connector)
 	defer testutil.CheckedClose(suite.T(), db)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest2" ADD CONSTRAINT bulk_ingest2_pk PRIMARY KEY (int64s, strings)`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest2" ADD CONSTRAINT bulk_ingest2_pk PRIMARY KEY ("int64s", "strings")`)
 	suite.Require().NoError(err)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_pk PRIMARY KEY (int64s, strings)`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_pk PRIMARY KEY ("int64s", "strings")`)
 	suite.Require().NoError(err)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT uniq_col UNIQUE (int64s)`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT uniq_col UNIQUE ("int64s")`)
 	suite.Require().NoError(err)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_fk FOREIGN KEY (int64s, strings) REFERENCES "bulk_ingest2"`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_fk FOREIGN KEY ("int64s", "strings") REFERENCES "bulk_ingest2"`)
 	suite.Require().NoError(err)
 
 	var (
@@ -2389,10 +2401,7 @@ func (suite *SnowflakeTests) TestAdditionalDriverInfo() {
 func TestJwtAuthenticationUnencryptedValue(t *testing.T) {
 	// test doesn't participate in SnowflakeTests because
 	// JWT auth has a different behavior
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_VALUE")
 	if !ok {
@@ -2408,10 +2417,7 @@ func TestJwtAuthenticationUnencryptedValue(t *testing.T) {
 func TestJwtAuthenticationEncryptedValue(t *testing.T) {
 	// test doesn't participate in SnowflakeTests because
 	// JWT auth has a different behavior
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_EN_VALUE")
 	if !ok {
@@ -2790,36 +2796,67 @@ func TestIngestWithQualifiedTableName(t *testing.T) {
 }
 
 func (suite *SnowflakeTests) TestChangeDatabaseAndGetObjects() {
-	// this test demonstrates:
-	// 1. changing the database context
-	// 2. being able to call GetObjects after changing the database context
-	//    (this uses a different connection context but still executes successfully)
-
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		suite.T().Skip("Cannot find the `SNOWFLAKE_URI` value")
+	newCatalog := os.Getenv("SNOWFLAKE_DATABASE_SECONDARY")
+	if newCatalog == "" {
+		suite.T().Skip("no SNOWFLAKE_DATABASE_SECONDARY defined")
+	}
+	newSchema := os.Getenv("SNOWFLAKE_DATABASE_SECONDARY_SCHEMA")
+	if newSchema == "" {
+		suite.T().Skip("no SNOWFLAKE_DATABASE_SECONDARY_SCHEMA defined")
 	}
 
-	newCatalog, ok := os.LookupEnv("SNOWFLAKE_NEW_CATALOG")
-	if !ok {
-		suite.T().Skip("Cannot find the `SNOWFLAKE_NEW_CATALOG` value")
-	}
+	tableName := "ADBC_GETOBJECTS_" + strings.ToUpper(strings.ReplaceAll(uuid.New().String(), "-", ""))
+	qualifiedTable := quoteIdentifier(newCatalog) + "." + quoteIdentifier(newSchema) + "." + quoteIdentifier(tableName)
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TABLE "+qualifiedTable+" (id INTEGER)"))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	defer func() {
+		if suite.NoError(suite.stmt.SetSqlQuery(suite.ctx, "DROP TABLE IF EXISTS "+qualifiedTable)) {
+			_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+			suite.NoError(err)
+		}
+	}()
 
-	getObjectsTable, ok := os.LookupEnv("SNOWFLAKE_TABLE_GETOBJECTS")
-	if !ok {
-		suite.T().Skip("Cannot find the `SNOWFLAKE_TABLE_GETOBJECTS` value")
-	}
-
-	cfg, err := gosnowflake.ParseDSN(uri)
-	suite.NoError(err)
-
+	// GetObjects uses a different connection context; it must still find the
+	// table after changing the current catalog on this connection.
 	cnxnopt, ok := suite.cnxn.(adbc.GetSetOptionsWithContext)
-	suite.True(ok)
-	err = cnxnopt.SetOption(suite.ctx, adbc.OptionKeyCurrentCatalog, newCatalog)
-	suite.NoError(err)
+	suite.Require().True(ok)
+	suite.Require().NoError(cnxnopt.SetOption(suite.ctx, adbc.OptionKeyCurrentCatalog, newCatalog))
 
-	_, err2 := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthAll, &newCatalog, &cfg.Schema, &getObjectsTable, nil, nil)
-	suite.NoError(err2)
+	rdr, err := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthAll, &newCatalog, &newSchema, &tableName, nil, nil)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	foundTable := false
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		catalogNames := rec.Column(0).(*array.String)
+		schemaList := rec.Column(1).(*array.List)
+		schemas := schemaList.ListValues().(*array.Struct)
+		schemaNames := schemas.Field(0).(*array.String)
+		tableList := schemas.Field(1).(*array.List)
+		tables := tableList.ListValues().(*array.Struct)
+		tableNames := tables.Field(0).(*array.String)
+		for row := range rec.NumRows() {
+			if catalogNames.Value(int(row)) != newCatalog {
+				continue
+			}
+			schemaStart, schemaEnd := schemaList.ValueOffsets(int(row))
+			for schemaIdx := schemaStart; schemaIdx < schemaEnd; schemaIdx++ {
+				if schemaNames.Value(int(schemaIdx)) != newSchema {
+					continue
+				}
+				tableStart, tableEnd := tableList.ValueOffsets(int(schemaIdx))
+				for tableIdx := tableStart; tableIdx < tableEnd; tableIdx++ {
+					if tableNames.Value(int(tableIdx)) == tableName {
+						foundTable = true
+					}
+				}
+			}
+		}
+	}
+	suite.NoError(rdr.Err())
+	suite.True(foundTable, "GetObjects did not return %s", qualifiedTable)
 }
 
 func (suite *SnowflakeTests) TestGetSetClientConfigFile() {
@@ -2960,10 +2997,7 @@ func TestInvalidValidateDefaultParameters(t *testing.T) {
 // it reports how the server resolves CLIENT_VALIDATE_DEFAULT_PARAMETERS and
 // confirms that disabling it lets a login succeed that would otherwise fail.
 func TestValidateDefaultParametersAgainstSnowflake(t *testing.T) {
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	ctx := context.Background()
 
@@ -3426,10 +3460,7 @@ func TestSnowflakeURIScheme(t *testing.T) {
 }
 
 func TestInvalidSnowflakeAuthentication(t *testing.T) {
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	cfg, err := gosnowflake.ParseDSN(uri)
 	assert.NoError(t, err)
@@ -3467,10 +3498,7 @@ func TestInvalidSnowflakeAuthentication(t *testing.T) {
 func TestJwtAuthenticationUnencryptedValueUnauthorized(t *testing.T) {
 	// test doesn't participate in SnowflakeTests because
 	// JWT auth has a different behavior
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_VALUE")
 	if !ok {
