@@ -77,15 +77,26 @@ pub(crate) fn execute_get_objects(
     table_type: Option<Vec<&str>>,
     column_name: Option<&str>,
 ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+    let operation = connection.begin_operation();
     let table_types = table_type.unwrap_or_default();
     let mut objects = ObjectTree::default();
 
-    let catalogs = fetch_core_objects(connection, DEPTH_CATALOGS, catalog, None, None, &[], None)?;
+    let catalogs = fetch_core_objects(
+        connection,
+        &operation,
+        DEPTH_CATALOGS,
+        catalog,
+        None,
+        None,
+        &[],
+        None,
+    )?;
     merge_catalogs(&mut objects, catalogs);
 
     if !matches!(depth, ObjectDepth::Catalogs) {
         let db_schemas = fetch_core_objects(
             connection,
+            &operation,
             DEPTH_DB_SCHEMAS,
             catalog,
             db_schema,
@@ -105,6 +116,7 @@ pub(crate) fn execute_get_objects(
         // table_type, so columns are only merged into this filtered table set.
         let tables = fetch_core_objects(
             connection,
+            &operation,
             DEPTH_TABLES,
             catalog,
             db_schema,
@@ -118,6 +130,7 @@ pub(crate) fn execute_get_objects(
     if matches!(depth, ObjectDepth::Columns | ObjectDepth::All) {
         let columns = fetch_core_objects(
             connection,
+            &operation,
             DEPTH_COLUMNS,
             catalog,
             db_schema,
@@ -135,6 +148,7 @@ pub(crate) fn execute_get_objects(
 #[allow(clippy::too_many_arguments)]
 fn fetch_core_objects(
     connection: &Connection,
+    operation: &sf_core::apis::operation_ctx::OperationCtx,
     depth: i32,
     catalog: Option<&str>,
     db_schema: Option<&str>,
@@ -154,14 +168,25 @@ fn fetch_core_objects(
             .collect(),
         column_name: column_name.map(str::to_owned),
     };
+    // sf_core's connection_get_objects does not accept an OperationCtx yet.
+    // Its asynchronous request can still be interrupted at the wrapper boundary.
     let result = connection
         .inner
         .runtime
-        .block_on(connection.inner.sf.connection_get_objects(request))
+        .block_on(operation.run(
+            "connection_get_objects",
+            connection.inner.sf.connection_get_objects(request),
+        ))
         .map_err(crate::error::api_error_to_adbc_error)?;
     let mut reader = connection.inner.acquire_result(result)?.reader;
     let mut objects = ObjectTree::default();
     for batch in &mut reader {
+        if operation.token().is_cancelled() {
+            return Err(Error::with_message_and_status(
+                "operation cancelled",
+                Status::Cancelled,
+            ));
+        }
         let batch = batch.map_err(arrow_to_adbc_error)?;
         merge_all(
             &mut objects,

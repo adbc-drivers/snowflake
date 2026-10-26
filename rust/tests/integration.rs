@@ -694,3 +694,213 @@ fn test_float64_select_precision() {
         .as_primitive::<arrow_array::types::Float64Type>();
     assert!(null_arr.is_null(0), "null_val should be null");
 }
+
+#[test]
+fn test_ingest_stream_parquet_split_and_append_schema_validation() {
+    use adbc_core::{error::Status, options::OptionStatement};
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let table = format!("ADBC_RUST_PARQUET_INGEST_{}", std::process::id());
+    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
+    let batches = [
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap(),
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![4, 5]))]).unwrap(),
+    ];
+    let mut ingest = conn.new_statement().unwrap();
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String(table.clone()),
+        )
+        .unwrap();
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("adbc.ingest.mode.replace".into()),
+        )
+        .unwrap();
+    for (name, value) in [
+        ("ingest_target_file_size", 1),
+        ("ingest_writer_concurrency", 2),
+        ("ingest_upload_concurrency", 2),
+        ("ingest_copy_concurrency", 2),
+    ] {
+        ingest
+            .set_option(
+                OptionStatement::Other(format!("adbc.snowflake.statement.{name}")),
+                OptionValue::Int(value),
+            )
+            .unwrap();
+    }
+    ingest
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        )))
+        .unwrap();
+    assert_eq!(
+        ingest.execute_update().expect("Parquet stream ingest"),
+        Some(5)
+    );
+
+    let mut query = conn.new_statement().unwrap();
+    query
+        .set_sql_query(format!("SELECT COUNT(*) FROM \"{table}\""))
+        .unwrap();
+    let result = query.execute().unwrap().next().unwrap().unwrap();
+    assert_eq!(
+        result
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        5
+    );
+
+    let mut append = conn.new_statement().unwrap();
+    append
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String(table.clone()),
+        )
+        .unwrap();
+    append
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("adbc.ingest.mode.append".into()),
+        )
+        .unwrap();
+    let incompatible_schema = Arc::new(Schema::new(vec![Field::new(
+        "OTHER",
+        DataType::Int64,
+        false,
+    )]));
+    append
+        .bind(
+            RecordBatch::try_new(
+                incompatible_schema,
+                vec![Arc::new(Int64Array::from(vec![6]))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let error = append.execute_update().unwrap_err();
+    assert_eq!(error.status, Status::AlreadyExists);
+
+    let mut cleanup = conn.new_statement().unwrap();
+    cleanup
+        .set_sql_query(format!("DROP TABLE IF EXISTS \"{table}\""))
+        .unwrap();
+    cleanup.execute_update().expect("drop ingest test table");
+}
+
+#[test]
+fn test_geo_formats_and_session_timezone_follow_session_state() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    for key in [
+        "adbc.snowflake.sql.client_option.geography_output_format",
+        "adbc.snowflake.sql.client_option.geometry_output_format",
+    ] {
+        db.set_option(
+            OptionDatabase::Other(key.into()),
+            OptionValue::String("ewkb".into()),
+        )
+        .unwrap();
+    }
+    let mut conn = db.new_connection().unwrap();
+    let mut query = conn.new_statement().unwrap();
+    query
+        .set_sql_query(
+            "SELECT TO_GEOGRAPHY('POINT(1 2)') AS GEO, TO_GEOMETRY('POINT(1 2)') AS GEOM",
+        )
+        .unwrap();
+    let mut reader = query.execute().unwrap();
+    for field in reader.schema().fields() {
+        assert_eq!(field.data_type(), &DataType::Binary);
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("geoarrow.wkb")
+        );
+    }
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .schema()
+            .field(0)
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .map(String::as_str),
+        Some("{\"crs\":\"EPSG:4326\",\"crs_type\":\"authority_code\"}")
+    );
+
+    let mut alter = conn.new_statement().unwrap();
+    alter
+        .set_sql_query("ALTER SESSION SET TIMEZONE = 'America/New_York'")
+        .unwrap();
+    alter.execute_update().unwrap();
+    let mut timestamps = conn.new_statement().unwrap();
+    timestamps
+        .set_sql_query("SELECT CURRENT_TIMESTAMP()::TIMESTAMP_LTZ AS TS")
+        .unwrap();
+    let expected = &DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into()));
+    assert_eq!(
+        timestamps.execute_schema().unwrap().field(0).data_type(),
+        expected
+    );
+    assert_eq!(
+        timestamps.execute().unwrap().schema().field(0).data_type(),
+        expected
+    );
+
+    let table = format!("ADBC_RUST_LTZ_GEO_{}", std::process::id());
+    let mut create = conn.new_statement().unwrap();
+    create
+        .set_sql_query(format!(
+            "CREATE OR REPLACE TEMP TABLE \"{table}\" (TS TIMESTAMP_LTZ, GEO GEOGRAPHY)"
+        ))
+        .unwrap();
+    create.execute_update().unwrap();
+    let schema = conn.get_table_schema(None, None, &table).unwrap();
+    assert_eq!(schema.field(0).data_type(), expected);
+    assert_eq!(
+        schema
+            .field(1)
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(String::as_str),
+        Some("geoarrow.wkb")
+    );
+
+    // A connection option updates the same session rather than only local metadata.
+    conn.set_option(
+        OptionConnection::Other("adbc.snowflake.sql.client_option.geography_output_format".into()),
+        OptionValue::String("geojson".into()),
+    )
+    .unwrap();
+    let mut geojson = conn.new_statement().unwrap();
+    geojson
+        .set_sql_query("SELECT TO_GEOGRAPHY('POINT(1 2)') AS GEO")
+        .unwrap();
+    assert_eq!(
+        geojson.execute().unwrap().schema().field(0).data_type(),
+        &DataType::Utf8
+    );
+    let schema = conn.get_table_schema(None, None, &table).unwrap();
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+}

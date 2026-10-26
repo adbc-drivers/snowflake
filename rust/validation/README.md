@@ -47,3 +47,8 @@ Once configured, run the validation suite with:
 cd rust
 pixi run validate
 ```
+
+Bulk ingest writes Parquet files to an isolated temporary Snowflake stage and
+loads them with `COPY INTO`. The ingest validation suite now includes Arrow
+`STRING_VIEW` and `BINARY_VIEW` inputs; `FLOAT16` is converted to `FLOAT32` in
+Parquet because Snowflake does not read Parquet's half-precision logical type.

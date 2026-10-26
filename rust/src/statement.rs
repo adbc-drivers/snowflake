@@ -15,6 +15,7 @@
 // src/statement.rs
 use std::{
     collections::VecDeque,
+    fmt::Write as _,
     sync::{Arc, Mutex},
 };
 
@@ -29,7 +30,7 @@ use sf_core::apis::database_driver_v1::{BindingType, ColumnMetadata, DataPtr, Ha
 use sf_core::apis::operation_ctx::OperationCtx;
 use sf_core::config::{param_registry::param_names, settings::Setting};
 
-use crate::driver::{Inner, QueryResult, TimestampPrecision};
+use crate::driver::{Inner, PreparedResult, QueryResult, TimestampPrecision};
 
 /// Per-statement Snowflake query timeout, in seconds. A value of zero clears
 /// the override and lets the session/core default apply.
@@ -62,6 +63,15 @@ fn parse_query_timeout(value: &OptionValue) -> Result<Option<u32>> {
     Ok((seconds != 0).then_some(seconds))
 }
 
+/// Data supplied by bind()/bind_stream(). Empty means nothing is bound.
+pub(crate) enum Bound {
+    Empty,
+    /// bind(), or a stream materialized for parameter binding.
+    Batches(Vec<RecordBatch>),
+    /// bind_stream() not yet consumed; bulk ingest streams without materializing.
+    Stream(Box<dyn RecordBatchReader + Send>),
+}
+
 pub struct Statement {
     pub(crate) inner: Arc<Inner>,
     pub(crate) stmt_handle: Handle,
@@ -74,10 +84,8 @@ pub struct Statement {
     pub(crate) query_tag: Option<String>,
     pub(crate) query_timeout_seconds: Option<u32>,
     pub(crate) timestamp_precision: TimestampPrecision,
-    /// Parameter batches stored by bind() / bind_stream(). Each row is one execution.
-    pub(crate) bound_batches: Vec<RecordBatch>,
-    /// Whether bind() / bind_stream() was called, including with an empty stream.
-    pub(crate) binding_supplied: bool,
+    pub(crate) ingest_options: crate::ingest::IngestOptions,
+    pub(crate) bound: Bound,
     pub(crate) last_query_id: Option<String>,
     /// Cached only when sf_core's prepare bind count and metadata agree.
     pub(crate) prepared_parameter_schema: Option<Schema>,
@@ -105,8 +113,7 @@ impl Optionable for Statement {
                 if let OptionValue::String(s) = value {
                     self.query = None;
                     self.target_table = Some(s);
-                    self.prepared_parameter_schema = None;
-                    self.prepared_result_schema = None;
+                    self.clear_prepared_schemas();
                     Ok(())
                 } else {
                     Err(Error::with_message_and_status(
@@ -118,8 +125,7 @@ impl Optionable for Statement {
             OptionStatement::IngestMode => {
                 if let OptionValue::String(s) = value {
                     self.ingest_mode = Some(s);
-                    self.prepared_parameter_schema = None;
-                    self.prepared_result_schema = None;
+                    self.clear_prepared_schemas();
                     Ok(())
                 } else {
                     Err(Error::with_message_and_status(
@@ -131,17 +137,30 @@ impl Optionable for Statement {
             OptionStatement::Other(ref k)
                 if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
             {
-                if let OptionValue::String(s) = value {
-                    self.timestamp_precision = match s.as_str() {
-                        "microseconds" => TimestampPrecision::Microseconds,
-                        "nanoseconds_error_on_overflow" => {
-                            TimestampPrecision::NanosecondsErrorOnOverflow
-                        }
-                        _ => TimestampPrecision::Nanoseconds,
-                    };
-                }
-                self.prepared_parameter_schema = None;
-                self.prepared_result_schema = None;
+                let spelling = match &value {
+                    OptionValue::String(s) => s.as_str(),
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            format!("Invalid value for statement option '{k}': '{value:?}'"),
+                            Status::InvalidArguments,
+                        ));
+                    }
+                };
+                let precision = match spelling {
+                    "nanoseconds" => TimestampPrecision::Nanoseconds,
+                    "microseconds" => TimestampPrecision::Microseconds,
+                    "nanoseconds_error_on_overflow" => {
+                        TimestampPrecision::NanosecondsErrorOnOverflow
+                    }
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            format!("Invalid value for statement option '{k}': '{spelling}'"),
+                            Status::InvalidArguments,
+                        ));
+                    }
+                };
+                self.timestamp_precision = precision;
+                self.clear_prepared_schemas();
                 Ok(())
             }
             OptionStatement::Temporary => match value {
@@ -162,19 +181,25 @@ impl Optionable for Statement {
                 )),
             },
             OptionStatement::TargetCatalog => {
-                if let OptionValue::String(s) = value {
-                    self.ingest_catalog = Some(s);
-                }
-                self.prepared_parameter_schema = None;
-                self.prepared_result_schema = None;
+                let OptionValue::String(catalog) = value else {
+                    return Err(Error::with_message_and_status(
+                        "target_catalog must be a string",
+                        Status::InvalidArguments,
+                    ));
+                };
+                self.ingest_catalog = Some(catalog);
+                self.clear_prepared_schemas();
                 Ok(())
             }
             OptionStatement::TargetDbSchema => {
-                if let OptionValue::String(s) = value {
-                    self.ingest_schema = Some(s);
-                }
-                self.prepared_parameter_schema = None;
-                self.prepared_result_schema = None;
+                let OptionValue::String(schema) = value else {
+                    return Err(Error::with_message_and_status(
+                        "target_db_schema must be a string",
+                        Status::InvalidArguments,
+                    ));
+                };
+                self.ingest_schema = Some(schema);
+                self.clear_prepared_schemas();
                 Ok(())
             }
             OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
@@ -201,9 +226,10 @@ impl Optionable for Statement {
                     ))
                 }
             }
+            OptionStatement::Other(ref k) if self.ingest_options.set(k, &value)? => Ok(()),
             _ => Err(Error::with_message_and_status(
-                format!("unknown statement option: {}", key.as_ref()),
-                Status::NotFound,
+                format!("unrecognized statement option '{}'", key.as_ref()),
+                Status::NotImplemented,
             )),
         }
     }
@@ -224,6 +250,24 @@ impl Optionable for Statement {
                     )
                 })
             }
+            OptionStatement::Other(ref k)
+                if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
+            {
+                Ok(match self.timestamp_precision {
+                    TimestampPrecision::Nanoseconds => "nanoseconds",
+                    TimestampPrecision::Microseconds => "microseconds",
+                    TimestampPrecision::NanosecondsErrorOnOverflow => {
+                        "nanoseconds_error_on_overflow"
+                    }
+                }
+                .into())
+            }
+            OptionStatement::Other(ref k) => self.ingest_options.get(k).ok_or_else(|| {
+                Error::with_message_and_status(
+                    format!("option not found: {}", key.as_ref()),
+                    Status::NotFound,
+                )
+            }),
             _ => Err(Error::with_message_and_status(
                 format!("option not found: {}", key.as_ref()),
                 Status::NotFound,
@@ -243,6 +287,13 @@ impl Optionable for Statement {
             OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
                 Ok(i64::from(self.query_timeout_seconds.unwrap_or(0)))
             }
+            OptionStatement::Other(ref k) => self
+                .ingest_options
+                .get(k)
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    Error::with_message_and_status("option not found", Status::NotFound)
+                }),
             _ => Err(Error::with_message_and_status(
                 "option not found",
                 Status::NotFound,
@@ -259,6 +310,46 @@ impl Optionable for Statement {
 }
 
 impl Statement {
+    fn clear_prepared_schemas(&mut self) {
+        self.prepared_parameter_schema = None;
+        self.prepared_result_schema = None;
+    }
+    fn store_prepared_schemas(&mut self, prepared: &PreparedResult) -> Result<Schema> {
+        let timezone = self.inner.session_timezone(self.conn_handle)?;
+        self.prepared_parameter_schema = parameter_schema_from_prepare(
+            prepared.number_of_binds,
+            &prepared.binds,
+            self.timestamp_precision.time_unit(),
+            &timezone,
+        );
+        let schema = adjust_schema(
+            &prepared.reader.schema(),
+            self.timestamp_precision.time_unit(),
+            &timezone,
+            None,
+        )
+        .as_ref()
+        .clone();
+        self.prepared_result_schema = Some(schema.clone());
+        Ok(schema)
+    }
+
+    /// Parameter binding requires random access; ingest consumes the stream directly.
+    fn materialize_bound_stream(&mut self) -> Result<()> {
+        if matches!(self.bound, Bound::Stream(_)) {
+            let Bound::Stream(reader) = std::mem::replace(&mut self.bound, Bound::Empty) else {
+                unreachable!()
+            };
+            let batches = reader
+                .map(|batch| {
+                    batch.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.bound = Bound::Batches(batches);
+        }
+        Ok(())
+    }
+
     fn execution_timeout_seconds(&self) -> Option<u32> {
         self.query_timeout_seconds
     }
@@ -293,7 +384,11 @@ impl Statement {
         &mut self,
         query: String,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
+        self.materialize_bound_stream()?;
+        let row_count: usize = match &self.bound {
+            Bound::Batches(batches) => batches.iter().map(RecordBatch::num_rows).sum(),
+            _ => unreachable!("execute_bound requires supplied bindings"),
+        };
         let operation = self.begin_operation();
         if row_count == 0 {
             // ADBC defines this as zero executions. Describe-only prepare provides
@@ -305,29 +400,26 @@ impl Statement {
                 let prepared =
                     self.inner
                         .prepare_statement(Some(&operation), self.stmt_handle, query)?;
-                self.prepared_parameter_schema = parameter_schema_from_prepare(
-                    prepared.number_of_binds,
-                    &prepared.binds,
-                    self.timestamp_precision.time_unit(),
-                );
-                let schema = adjust_schema(
-                    &prepared.reader.schema(),
-                    self.timestamp_precision.time_unit(),
-                );
-                self.prepared_result_schema = Some(schema.as_ref().clone());
-                schema
+                Arc::new(self.store_prepared_schemas(&prepared)?)
             };
-            return execute_bound_rows(&self.bound_batches, schema, |_| {
+            let Bound::Batches(batches) = &self.bound else {
+                unreachable!("stream was materialized")
+            };
+            return execute_bound_rows(batches, schema, |_| {
                 unreachable!("zero-row bindings must not execute")
             });
         }
 
         let inner = self.inner.clone();
         let stmt_handle = self.stmt_handle;
+        let conn_handle = self.conn_handle;
         let timeout_seconds = self.execution_timeout_seconds();
         let timestamp_precision = self.timestamp_precision;
         let mut last_query_id = self.last_query_id.clone();
-        let result = execute_bound_rows(&self.bound_batches, Arc::new(Schema::empty()), |row| {
+        let Bound::Batches(batches) = &self.bound else {
+            unreachable!("stream was materialized")
+        };
+        let result = execute_bound_rows(batches, Arc::new(Schema::empty()), |row| {
             let json_bytes = arrow_batches_to_json_bindings(&[row])?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let result = inner.execute_query_with_timeout(
@@ -338,10 +430,12 @@ impl Statement {
                 timeout_seconds,
             )?;
             last_query_id = Some(result.descriptor.query_id.clone());
+            let timezone = inner.session_timezone(conn_handle)?;
             Ok(Box::new(ConvertingReader::new(
                 result.reader,
                 timestamp_precision.time_unit(),
                 timestamp_precision,
+                timezone,
             )))
         });
         // On a later-row failure, retain the ID of the last successful execution.
@@ -352,20 +446,12 @@ impl Statement {
 
 impl adbc_core::Statement for Statement {
     fn bind(&mut self, batch: RecordBatch) -> Result<()> {
-        self.bound_batches = vec![batch];
-        self.binding_supplied = true;
+        self.bound = Bound::Batches(vec![batch]);
         Ok(())
     }
 
     fn bind_stream(&mut self, reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
-        let mut batches = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))?;
-            batches.push(batch);
-        }
-        self.bound_batches = batches;
-        self.binding_supplied = true;
+        self.bound = Bound::Stream(reader);
         Ok(())
     }
 
@@ -374,8 +460,7 @@ impl adbc_core::Statement for Statement {
         if self.target_table.is_some() {
             // Ingest via execute() — run the ingest and return an empty reader.
             let result = crate::ingest::execute_ingest(self);
-            self.bound_batches.clear();
-            self.binding_supplied = false;
+            self.bound = Bound::Empty;
             result?;
             let batch =
                 arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
@@ -385,7 +470,7 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        if self.binding_supplied {
+        if !matches!(self.bound, Bound::Empty) {
             return self.execute_bound(query);
         }
 
@@ -398,14 +483,14 @@ impl adbc_core::Statement for Statement {
             reader,
             self.timestamp_precision.time_unit(),
             self.timestamp_precision,
+            self.inner.session_timezone(self.conn_handle)?,
         )))
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
         if self.target_table.is_some() {
             let result = crate::ingest::execute_ingest(self);
-            self.bound_batches.clear();
-            self.binding_supplied = false;
+            self.bound = Bound::Empty;
             return result;
         }
         let query = self.query.clone().ok_or_else(|| {
@@ -414,17 +499,18 @@ impl adbc_core::Statement for Statement {
 
         // A supplied binding with no rows represents zero executions, so do not
         // run the statement unbound or send an empty binding.
-        if self.binding_supplied {
-            let row_count: usize = self.bound_batches.iter().map(RecordBatch::num_rows).sum();
-            if row_count == 0 {
+        if !matches!(self.bound, Bound::Empty) {
+            self.materialize_bound_stream()?;
+            let Bound::Batches(batches) = &self.bound else {
+                unreachable!("stream was materialized")
+            };
+            if batches.iter().all(|batch| batch.num_rows() == 0) {
                 self.last_query_id = None;
                 return Ok(Some(0));
             }
-        }
 
-        // Parameterised DML: execute once with JSON bindings.
-        if self.binding_supplied {
-            let json_bytes = arrow_batches_to_json_bindings(&self.bound_batches)?;
+            // Parameterised DML: execute once with JSON bindings.
+            let json_bytes = arrow_batches_to_json_bindings(batches)?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
             let binding = BindingType::Json(data_ptr);
 
@@ -432,7 +518,6 @@ impl adbc_core::Statement for Statement {
             let result = self.execute_query(&operation, query, Some(binding))?;
 
             self.last_query_id = Some(result.descriptor.query_id.clone());
-
             return Ok(result.descriptor.rows_affected);
         }
 
@@ -449,26 +534,13 @@ impl adbc_core::Statement for Statement {
             Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
         })?;
 
-        self.prepared_parameter_schema = None;
-        self.prepared_result_schema = None;
+        self.clear_prepared_schemas();
         let operation = self.begin_operation();
         let prepared = self
             .inner
             .prepare_statement(Some(&operation), self.stmt_handle, query)?;
         self.last_query_id = Some(prepared.query_id.clone());
-        self.prepared_parameter_schema = parameter_schema_from_prepare(
-            prepared.number_of_binds,
-            &prepared.binds,
-            self.timestamp_precision.time_unit(),
-        );
-        let schema = adjust_schema(
-            &prepared.reader.schema(),
-            self.timestamp_precision.time_unit(),
-        )
-        .as_ref()
-        .clone();
-        self.prepared_result_schema = Some(schema.clone());
-        Ok(schema)
+        self.store_prepared_schemas(&prepared)
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -491,36 +563,21 @@ impl adbc_core::Statement for Statement {
                 Status::InvalidState,
             )
         })?;
-        self.prepared_parameter_schema = None;
-        self.prepared_result_schema = None;
+        self.clear_prepared_schemas();
         let operation = self.begin_operation();
         let prepared = self
             .inner
             .prepare_statement(Some(&operation), self.stmt_handle, query)?;
-        self.last_query_id = Some(prepared.query_id);
-        self.prepared_parameter_schema = parameter_schema_from_prepare(
-            prepared.number_of_binds,
-            &prepared.binds,
-            self.timestamp_precision.time_unit(),
-        );
-        self.prepared_result_schema = Some(
-            adjust_schema(
-                &prepared.reader.schema(),
-                self.timestamp_precision.time_unit(),
-            )
-            .as_ref()
-            .clone(),
-        );
+        self.last_query_id = Some(prepared.query_id.clone());
+        self.store_prepared_schemas(&prepared)?;
         Ok(())
     }
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.query = Some(query.as_ref().to_string());
         self.target_table = None;
-        self.bound_batches.clear();
-        self.binding_supplied = false;
-        self.prepared_parameter_schema = None;
-        self.prepared_result_schema = None;
+        self.bound = Bound::Empty;
+        self.clear_prepared_schemas();
         Ok(())
     }
 
@@ -631,6 +688,7 @@ fn parameter_schema_from_prepare(
     number_of_binds: i32,
     binds: &[ColumnMetadata],
     ts_unit: TimeUnit,
+    timezone: &str,
 ) -> Option<Schema> {
     let bind_count = usize::try_from(number_of_binds).ok()?;
     if bind_count != binds.len() || binds.iter().any(|bind| bind.r#type.trim().is_empty()) {
@@ -674,11 +732,20 @@ fn parameter_schema_from_prepare(
             if let Some(scale) = bind.scale {
                 metadata.insert("scale".into(), scale.to_string());
             }
+            if let Some(length) = bind.length {
+                metadata.insert("charLength".into(), length.to_string());
+            }
+            if let Some(byte_length) = bind.byte_length {
+                metadata.insert("byteLength".into(), byte_length.to_string());
+            }
+            if !bind.ext_col_type_name.is_empty() {
+                metadata.insert("extTypeName".into(), bind.ext_col_type_name.clone());
+            }
             Field::new(&bind.name, physical_type, bind.nullable).with_metadata(metadata)
         })
         .collect::<Vec<_>>();
     Some(
-        adjust_schema(&Schema::new(fields), ts_unit)
+        adjust_schema(&Schema::new(fields), ts_unit, timezone, None)
             .as_ref()
             .clone(),
     )
@@ -713,15 +780,61 @@ fn time_unit_rank(unit: TimeUnit) -> u32 {
     }
 }
 
-/// Map Snowflake's physical encodings for temporal and REAL columns to their
-/// Arrow types. Numeric (FIXED) and other columns keep the server's type.
-pub(crate) fn adjust_schema(schema: &Schema, ts_unit: TimeUnit) -> Arc<Schema> {
+/// Map Snowflake's physical encodings to Arrow types without losing field
+/// metadata. ARRAY and GeoArrow fields replace their source metadata, as in Go.
+pub(crate) fn adjust_schema(
+    schema: &Schema,
+    ts_unit: TimeUnit,
+    timezone: &str,
+    geo_srids: Option<&[Option<u32>]>,
+) -> Arc<Schema> {
+    use arrow_schema::extension::{Json, Uuid};
     let adjusted_fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| {
-            let target = compute_target_type(f, ts_unit);
-            Field::new(f.name(), target, f.is_nullable())
+        .enumerate()
+        .map(|(index, field)| {
+            let mut adjusted = field
+                .as_ref()
+                .clone()
+                .with_data_type(compute_target_type(field, ts_unit, timezone));
+            if is_uuid_field(field) && matches!(field.data_type(), DataType::Utf8) {
+                return adjusted
+                    .with_data_type(DataType::FixedSizeBinary(16))
+                    .with_extension_type(Uuid);
+            }
+            if field.metadata().get("logicalType").is_some_and(|s| s == "ARRAY")
+                && matches!(adjusted.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+            {
+                return Field::new(field.name(), adjusted.data_type().clone(), field.is_nullable())
+                    .with_extension_type(Json::default());
+            }
+            if let Some(geo_type) = geo_type(field)
+                && matches!(adjusted.data_type(), DataType::Binary)
+            {
+                let srid = geo_srids
+                    .and_then(|srids| srids.get(index))
+                    .copied()
+                    .flatten();
+                let metadata = match (geo_srids, srid, geo_type) {
+                    (Some(_), Some(srid), _) if srid != 0 => Some(format!(
+                        "{{\"crs\":\"EPSG:{srid}\",\"crs_type\":\"authority_code\"}}"
+                    )),
+                    (None, _, "GEOGRAPHY") => Some(
+                        "{\"crs\":\"EPSG:4326\",\"crs_type\":\"authority_code\",\"edges\":\"spherical\"}".to_owned()
+                    ),
+                    _ => None,
+                };
+                let mut extension = std::collections::HashMap::from([(
+                    "ARROW:extension:name".to_owned(),
+                    "geoarrow.wkb".to_owned(),
+                )]);
+                if let Some(metadata) = metadata {
+                    extension.insert("ARROW:extension:metadata".to_owned(), metadata);
+                }
+                adjusted = adjusted.with_metadata(extension);
+            }
+            adjusted
         })
         .collect();
     Arc::new(Schema::new_with_metadata(
@@ -730,11 +843,159 @@ pub(crate) fn adjust_schema(schema: &Schema, ts_unit: TimeUnit) -> Arc<Schema> {
     ))
 }
 
-fn compute_target_type(field: &Field, ts_unit: TimeUnit) -> DataType {
+fn is_uuid_field(field: &Field) -> bool {
+    let metadata = field.metadata();
+    metadata
+        .get("logicalType")
+        .is_some_and(|name| name.eq_ignore_ascii_case("TEXT"))
+        && metadata
+            .get("charLength")
+            .or_else(|| metadata.get("length"))
+            .is_some_and(|n| n == "0")
+        && metadata.get("byteLength").is_none_or(|n| n != "0")
+}
+
+fn geo_type(field: &Field) -> Option<&str> {
+    let name = field
+        .metadata()
+        .get("extTypeName")
+        .or_else(|| field.metadata().get("logicalType"))?;
+    if name.eq_ignore_ascii_case("GEOGRAPHY") {
+        Some("GEOGRAPHY")
+    } else if name.eq_ignore_ascii_case("GEOMETRY") {
+        Some("GEOMETRY")
+    } else {
+        None
+    }
+}
+
+/// Return the embedded SRID if this has a valid OGC/EWKB geometry header.
+fn ewkb_srid(value: &[u8]) -> Option<Option<u32>> {
+    let header: [u8; 4] = value.get(1..5)?.try_into().ok()?;
+    let type_word = match value[0] {
+        0 => u32::from_be_bytes(header),
+        1 => u32::from_le_bytes(header),
+        _ => return None,
+    };
+    let base = type_word & 0x0fff_ffff;
+    if !(1..=7).contains(&base)
+        && !(1001..=1007).contains(&base)
+        && !(2001..=2007).contains(&base)
+        && !(3001..=3007).contains(&base)
+    {
+        return None;
+    }
+    if type_word & 0x2000_0000 == 0 {
+        return Some(None);
+    }
+    let srid: [u8; 4] = value.get(5..9)?.try_into().ok()?;
+    Some(Some(if value[0] == 0 {
+        u32::from_be_bytes(srid)
+    } else {
+        u32::from_le_bytes(srid)
+    }))
+}
+
+fn geo_column_srid(column: &arrow_array::BinaryArray) -> Option<u32> {
+    let mut observed = None;
+    let mut classified = false;
+    let mut inconsistent = false;
+    for value in column.iter().flatten() {
+        let header = ewkb_srid(value);
+        if !classified {
+            classified = true;
+            if header.is_none() {
+                break;
+            }
+        } else if header.is_none() {
+            inconsistent = true;
+        }
+        if let Some(Some(srid)) = header {
+            match observed {
+                Some(previous) if previous != srid => inconsistent = true,
+                None => observed = Some(srid),
+                _ => {}
+            }
+        }
+    }
+    if inconsistent { None } else { observed }
+}
+
+fn strip_geo_srid(column: &ArrayRef) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    use std::io::Write as _;
+    let binary = column
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| arrow_schema::ArrowError::CastError("expected binary EWKB column".into()))?;
+    if !binary
+        .iter()
+        .flatten()
+        .any(|value| ewkb_srid(value).is_some_and(|srid| srid.is_some()))
+    {
+        return Ok(column.clone());
+    }
+    let mut builder =
+        arrow_array::builder::BinaryBuilder::with_capacity(binary.len(), binary.value_data().len());
+    for value in binary.iter() {
+        let Some(value) = value else {
+            builder.append_null();
+            continue;
+        };
+        if ewkb_srid(value).is_some_and(|srid| srid.is_some()) {
+            let header: [u8; 4] = value[1..5].try_into().expect("validated EWKB header");
+            let type_word = if value[0] == 0 {
+                u32::from_be_bytes(header) & !0x2000_0000
+            } else {
+                u32::from_le_bytes(header) & !0x2000_0000
+            };
+            builder.write_all(&value[..1]).expect("in-memory write");
+            builder
+                .write_all(&if value[0] == 0 {
+                    type_word.to_be_bytes()
+                } else {
+                    type_word.to_le_bytes()
+                })
+                .expect("in-memory write");
+            builder.append_value(&value[9..]);
+        } else {
+            builder.append_value(value);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn uuid_strings_to_bytes(
+    column: &ArrayRef,
+) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    let text = column
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .ok_or_else(|| {
+            arrow_schema::ArrowError::CastError(format!(
+                "expected utf8 data for UUID column, got {}",
+                column.data_type()
+            ))
+        })?;
+    let mut builder = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(text.len(), 16);
+    for value in text.iter() {
+        match value {
+            Some(value) => {
+                let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
+                    arrow_schema::ArrowError::ParseError(format!("invalid UUID '{value}': {error}"))
+                })?;
+                builder.append_value(parsed.as_bytes())?;
+            }
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn compute_target_type(field: &Field, ts_unit: TimeUnit, timezone: &str) -> DataType {
     let logical_type = field
         .metadata()
         .get("logicalType")
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .unwrap_or("");
     let scale: i64 = field
         .metadata()
@@ -751,77 +1012,112 @@ fn compute_target_type(field: &Field, ts_unit: TimeUnit) -> DataType {
                 DataType::Time64(unit)
             }
         }
-        "TIMESTAMP_NTZ" => {
-            let unit = timestamp_target_unit(scale, ts_unit);
-            DataType::Timestamp(unit, None)
-        }
+        "TIMESTAMP_NTZ" => DataType::Timestamp(timestamp_target_unit(scale, ts_unit), None),
         "REAL" => DataType::Float64,
-        "TIMESTAMP_LTZ" => {
-            let unit = timestamp_target_unit(scale, ts_unit);
-            DataType::Timestamp(unit, Some(Arc::from("UTC")))
-        }
-        "TIMESTAMP_TZ" => {
-            let unit = timestamp_target_unit(scale, ts_unit);
-            DataType::Timestamp(unit, Some(Arc::from("UTC")))
-        }
+        "TIMESTAMP_LTZ" => DataType::Timestamp(
+            timestamp_target_unit(scale, ts_unit),
+            Some(Arc::from(timezone)),
+        ),
+        "TIMESTAMP_TZ" => DataType::Timestamp(
+            timestamp_target_unit(scale, ts_unit),
+            Some(Arc::from("UTC")),
+        ),
         _ => field.data_type().clone(),
     }
 }
 
 pub(crate) struct ConvertingReader<R: RecordBatchReader> {
     inner: R,
+    original_schema: Arc<Schema>,
     schema: Arc<Schema>,
+    pending: Option<std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
+    timezone: Arc<str>,
     ts_unit: TimeUnit,
     check_overflow: bool,
-    logical_types: Vec<String>,
-    scales: Vec<i64>,
 }
 
 impl<R: RecordBatchReader> ConvertingReader<R> {
-    pub(crate) fn new(inner: R, ts_unit: TimeUnit, ts_precision: TimestampPrecision) -> Self {
-        let orig_schema = inner.schema();
-        let logical_types: Vec<String> = orig_schema
-            .fields()
-            .iter()
-            .map(|f| f.metadata().get("logicalType").cloned().unwrap_or_default())
-            .collect();
-        let scales: Vec<i64> = orig_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                f.metadata()
-                    .get("scale")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0)
+    pub(crate) fn new(
+        mut inner: R,
+        ts_unit: TimeUnit,
+        ts_precision: TimestampPrecision,
+        timezone: Arc<str>,
+    ) -> Self {
+        let original_schema = inner.schema();
+        // GeoArrow CRS metadata comes from the first batch's EWKB SRID. Only
+        // geo result sets need an eager read; all others remain lazy.
+        let has_geo = original_schema.fields().iter().any(|field| {
+            geo_type(field).is_some() && matches!(field.data_type(), DataType::Binary)
+        });
+        let pending = has_geo.then(|| inner.next()).flatten();
+        let srids = pending.as_ref().and_then(|result| {
+            result.as_ref().ok().map(|batch| {
+                original_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        if geo_type(field).is_some() {
+                            batch
+                                .column(i)
+                                .as_any()
+                                .downcast_ref::<arrow_array::BinaryArray>()
+                                .and_then(geo_column_srid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect();
-        let schema = adjust_schema(&orig_schema, ts_unit);
+        });
+        let schema = adjust_schema(&original_schema, ts_unit, &timezone, srids.as_deref());
 
         Self {
             inner,
+            original_schema,
             schema,
+            pending,
+            timezone,
             ts_unit,
             check_overflow: ts_precision == TimestampPrecision::NanosecondsErrorOnOverflow,
-            logical_types,
-            scales,
         }
     }
 
     fn convert_column(
         col: &ArrayRef,
-        logical_type: &str,
-        scale: i64,
+        source_field: &Field,
         target_type: &DataType,
         ts_unit: TimeUnit,
         check_overflow: bool,
+        timezone: &Arc<str>,
     ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+        if is_uuid_field(source_field) && matches!(target_type, DataType::FixedSizeBinary(16)) {
+            return uuid_strings_to_bytes(col);
+        }
+        if geo_type(source_field).is_some() && matches!(target_type, DataType::Binary) {
+            return strip_geo_srid(col);
+        }
+        let logical_type = source_field
+            .metadata()
+            .get("logicalType")
+            .map(String::as_str)
+            .unwrap_or("");
+        let scale = source_field
+            .metadata()
+            .get("scale")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         match logical_type {
             "TIME" => arrow_cast::cast(col.as_ref(), target_type),
             "REAL" => arrow_cast::cast(col.as_ref(), &DataType::Float64),
             "TIMESTAMP_NTZ" => convert_timestamp_ntz(col, scale, ts_unit, check_overflow, None),
-            "TIMESTAMP_LTZ" => {
-                convert_timestamp_ntz(col, scale, ts_unit, check_overflow, Some(Arc::from("UTC")))
-            }
+            "TIMESTAMP_LTZ" => convert_timestamp_ntz(
+                col,
+                scale,
+                ts_unit,
+                check_overflow,
+                Some(Arc::clone(timezone)),
+            ),
             "TIMESTAMP_TZ" => convert_timestamp_tz(col, scale, ts_unit, check_overflow),
             _ => Ok(col.clone()),
         }
@@ -912,27 +1208,30 @@ fn convert_timestamp_tz(
             .ok_or_else(|| arrow_schema::ArrowError::CastError("expected Int32 timezone".into()))?;
 
         build_timestamp_tz_2field(epoch, tzoffset, struct_arr, scale, check_overflow, target)
-    } else {
+    } else if num_fields == 3 {
         let fraction = struct_arr
             .column(1)
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| arrow_schema::ArrowError::CastError("expected Int32 fraction".into()))?;
-        let tzoffset = struct_arr
+        struct_arr
             .column(2)
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| arrow_schema::ArrowError::CastError("expected Int32 timezone".into()))?;
-
-        build_timestamp_tz_3field(
+        // The original display offset does not shift the UTC epoch/fraction.
+        build_timestamp_from_epoch_fraction(
             epoch,
             fraction,
-            tzoffset,
             struct_arr,
             scale,
             check_overflow,
             target,
         )
+    } else {
+        Err(arrow_schema::ArrowError::CastError(format!(
+            "expected two or three TIMESTAMP_TZ fields, got {num_fields}"
+        )))
     }
 }
 
@@ -992,7 +1291,7 @@ fn build_timestamp_from_epoch_fraction(
         int_arr
             .into_data()
             .into_builder()
-            .data_type(target.clone())
+            .data_type(target)
             .build_unchecked()
     };
     Ok(Arc::new(arrow_array::make_array(data)) as ArrayRef)
@@ -1040,52 +1339,7 @@ fn build_timestamp_tz_2field(
         int_arr
             .into_data()
             .into_builder()
-            .data_type(target.clone())
-            .build_unchecked()
-    };
-    Ok(Arc::new(arrow_array::make_array(data)) as ArrayRef)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_timestamp_tz_3field(
-    epoch: &arrow_array::Int64Array,
-    fraction: &arrow_array::Int32Array,
-    _tzoffset: &arrow_array::Int32Array,
-    struct_arr: &arrow_array::StructArray,
-    scale: i64,
-    check_overflow: bool,
-    target: DataType,
-) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
-    let unit = match &target {
-        DataType::Timestamp(u, _) => *u,
-        _ => unreachable!("target must be Timestamp"),
-    };
-
-    let len = epoch.len();
-    let scale = scale.clamp(0, 9);
-    let frac_to_ns: i128 = 10i128.pow((9 - scale) as u32);
-    let mut values: Vec<Option<i64>> = Vec::with_capacity(len);
-
-    for i in 0..len {
-        if struct_arr.is_null(i) {
-            values.push(None);
-        } else {
-            // The epoch/fraction pair is already a UTC instant. The timezone offset
-            // only preserves the original display offset and must not shift the value.
-            let utc_ns: i128 =
-                epoch.value(i) as i128 * 1_000_000_000 + fraction.value(i) as i128 * frac_to_ns;
-            if check_overflow {
-                check_ns_overflow(utc_ns)?;
-            }
-            values.push(Some(ns_to_unit(utc_ns, unit)));
-        }
-    }
-    let int_arr = arrow_array::Int64Array::from(values);
-    let data = unsafe {
-        int_arr
-            .into_data()
-            .into_builder()
-            .data_type(target.clone())
+            .data_type(target)
             .build_unchecked()
     };
     Ok(Arc::new(arrow_array::make_array(data)) as ArrayRef)
@@ -1095,28 +1349,23 @@ impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
     type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = match self.inner.next()? {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e)),
+        let batch = match self.pending.take().or_else(|| self.inner.next())? {
+            Ok(batch) => batch,
+            Err(error) => return Some(Err(error)),
         };
-
-        let check_overflow = self.check_overflow;
 
         let adjusted_columns: std::result::Result<Vec<ArrayRef>, arrow_schema::ArrowError> = batch
             .columns()
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let logical_type = &self.logical_types[i];
-                let scale = self.scales[i];
-                let target_type = self.schema.field(i).data_type();
-                ConvertingReader::<R>::convert_column(
+                Self::convert_column(
                     col,
-                    logical_type,
-                    scale,
-                    target_type,
+                    self.original_schema.field(i),
+                    self.schema.field(i).data_type(),
                     self.ts_unit,
-                    check_overflow,
+                    self.check_overflow,
+                    &self.timezone,
                 )
             })
             .collect();
@@ -1150,7 +1399,7 @@ fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
         | DataType::UInt32
         | DataType::UInt64
         | DataType::Decimal128(_, _) => Ok("FIXED"),
-        DataType::Float32 | DataType::Float64 => Ok("REAL"),
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok("REAL"),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("TEXT"),
         DataType::Boolean => Ok("BOOLEAN"),
         DataType::Date32 | DataType::Date64 => Ok("DATE"),
@@ -1168,8 +1417,7 @@ fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
     }
 }
 
-fn escape_json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn escape_json_string_to(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -1178,81 +1426,222 @@ fn escape_json_string(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                write!(out, "\\u{:04x}", c as u32).expect("String write cannot fail");
             }
             c => out.push(c),
         }
     }
-    out
+}
+
+/// Write a non-null bind value directly where its Arrow storage permits it.
+fn write_json_bind_value(out: &mut String, col: &dyn Array, row: usize) -> Result<()> {
+    use arrow_array::*;
+    let dt = col.data_type();
+    if col.is_null(row) {
+        out.push_str("null");
+        return Ok(());
+    }
+    out.push('"');
+    match dt {
+        DataType::Utf8 => escape_json_string_to(
+            out,
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::LargeUtf8 => escape_json_string_to(
+            out,
+            col.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Utf8View => escape_json_string_to(
+            out,
+            col.as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Int8 => write!(
+            out,
+            "{}",
+            col.as_any().downcast_ref::<Int8Array>().unwrap().value(row)
+        )
+        .unwrap(),
+        DataType::Int16 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::Int32 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::Int64 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::UInt8 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::UInt16 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::UInt32 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::UInt64 => write!(
+            out,
+            "{}",
+            col.as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row)
+        )
+        .unwrap(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_)
+        | DataType::BinaryView => {
+            let bytes: &[u8] = match dt {
+                DataType::Binary => col
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap()
+                    .value(row),
+                DataType::LargeBinary => col
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap()
+                    .value(row),
+                DataType::FixedSizeBinary(_) => col
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .unwrap()
+                    .value(row),
+                DataType::BinaryView => col
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .unwrap()
+                    .value(row),
+                _ => unreachable!(),
+            };
+            for byte in bytes {
+                write!(out, "{byte:02x}").expect("String write cannot fail");
+            }
+        }
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            let value = match dt {
+                DataType::Float16 => col
+                    .as_any()
+                    .downcast_ref::<Float16Array>()
+                    .unwrap()
+                    .value(row)
+                    .to_f32() as f64,
+                DataType::Float32 => col
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(row) as f64,
+                DataType::Float64 => col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row),
+                _ => unreachable!(),
+            };
+            if !value.is_finite() {
+                out.pop();
+                out.push_str("null");
+                return Ok(());
+            }
+            // Float16 and Float32 use f32 Debug formatting, as in format_arrow_value.
+            if matches!(dt, DataType::Float64) {
+                write!(out, "{value:?}").unwrap();
+            } else {
+                write!(out, "{:?}", value as f32).unwrap();
+            }
+        }
+        _ => match format_arrow_value(col, row, dt)? {
+            Some(value) => escape_json_string_to(out, &value),
+            None => {
+                out.pop();
+                out.push_str("null");
+                return Ok(());
+            }
+        },
+    }
+    out.push('"');
+    Ok(())
 }
 
 pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<String> {
-    if batches.is_empty() {
+    let Some(first) = batches.first() else {
         return Ok("{}".to_string());
-    }
-
-    let num_cols = batches[0].num_columns();
-    let schema = batches[0].schema();
-
-    let mut col_types: Vec<&'static str> = Vec::with_capacity(num_cols);
-    for i in 0..num_cols {
-        col_types.push(snowflake_type_name(schema.field(i).data_type())?);
-    }
-
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-
-    let mut col_values: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(total_rows); num_cols];
-
-    for batch in batches {
-        for (col_idx, values) in col_values.iter_mut().enumerate() {
-            let col = batch.column(col_idx);
-            let dt = col.data_type();
-            for row in 0..batch.num_rows() {
-                if col.is_null(row) {
-                    values.push(None);
-                    continue;
-                }
-                let val = format_arrow_value(col.as_ref(), row, dt)?;
-                values.push(val);
-            }
-        }
-    }
-
+    };
+    let schema = first.schema();
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     let mut json = String::from("{");
-    for col_idx in 0..num_cols {
-        if col_idx > 0 {
+    for col_idx in 0..first.num_columns() {
+        if col_idx != 0 {
             json.push(',');
         }
-        let key = col_idx + 1;
-        json.push_str(&format!(
+        write!(
+            json,
             "\"{}\":{{\"type\":\"{}\",\"value\":",
-            key, col_types[col_idx]
-        ));
-
-        if total_rows == 1 {
-            match &col_values[col_idx][0] {
-                None => json.push_str("null"),
-                Some(v) => {
-                    json.push('"');
-                    json.push_str(&escape_json_string(v));
-                    json.push('"');
-                }
-            }
-        } else {
+            col_idx + 1,
+            snowflake_type_name(schema.field(col_idx).data_type())?
+        )
+        .expect("String write cannot fail");
+        if total_rows != 1 {
             json.push('[');
-            for (i, v) in col_values[col_idx].iter().enumerate() {
-                if i > 0 {
+        }
+        let mut emitted = 0;
+        for batch in batches {
+            let col = batch.column(col_idx);
+            for row in 0..batch.num_rows() {
+                if emitted != 0 {
                     json.push(',');
                 }
-                match v {
-                    None => json.push_str("null"),
-                    Some(s) => {
-                        json.push('"');
-                        json.push_str(&escape_json_string(s));
-                        json.push('"');
-                    }
-                }
+                write_json_bind_value(&mut json, col.as_ref(), row)?;
+                emitted += 1;
             }
+        }
+        if total_rows != 1 {
             json.push(']');
         }
         json.push('}');
@@ -1320,6 +1709,15 @@ fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Opti
                 .value(row)
                 .to_string(),
         )),
+        DataType::Float16 => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float16Array>()
+                .unwrap()
+                .value(row)
+                .to_f32();
+            Ok(v.is_finite().then(|| format!("{v:?}")))
+        }
         DataType::Float32 => {
             let v = arr
                 .as_any()
@@ -1506,53 +1904,6 @@ fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Opti
     }
 }
 
-/// Format a value for sf_core's CSV/stage binding path. Snowflake bulk DATE
-/// binding uses epoch milliseconds until that representation reaches the
-/// server overflow boundary, then switches to epoch nanoseconds, matching the
-/// universal-driver Python serializer.
-pub(crate) fn format_arrow_value_for_csv(
-    arr: &dyn Array,
-    row: usize,
-    dt: &DataType,
-) -> Result<Option<String>> {
-    use arrow_array::{Date32Array, Date64Array};
-
-    const DATE_BULK_INSERTION_MS_OVERFLOW: i128 = 31_536_000_000_000;
-    let epoch_ms = match dt {
-        DataType::Date32 => {
-            let array = arr.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
-                Error::with_message_and_status(
-                    "Date32 data type is not backed by Date32Array",
-                    Status::InvalidArguments,
-                )
-            })?;
-            Some(i128::from(array.value(row)) * 86_400_000)
-        }
-        DataType::Date64 => {
-            let array = arr.as_any().downcast_ref::<Date64Array>().ok_or_else(|| {
-                Error::with_message_and_status(
-                    "Date64 data type is not backed by Date64Array",
-                    Status::InvalidArguments,
-                )
-            })?;
-            Some(i128::from(array.value(row)))
-        }
-        _ => None,
-    };
-
-    if let Some(epoch_ms) = epoch_ms {
-        return Ok(Some(
-            if epoch_ms < DATE_BULK_INSERTION_MS_OVERFLOW {
-                epoch_ms
-            } else {
-                epoch_ms * 1_000_000
-            }
-            .to_string(),
-        ));
-    }
-    format_arrow_value(arr, row, dt)
-}
-
 fn decimal128_to_string(value: i128, scale: i8) -> String {
     if scale < 0 {
         return format!("{value}{}", "0".repeat(scale.unsigned_abs() as usize));
@@ -1616,8 +1967,8 @@ mod tests {
             query_tag: None,
             query_timeout_seconds: None,
             timestamp_precision: TimestampPrecision::Nanoseconds,
-            bound_batches: vec![],
-            binding_supplied: false,
+            ingest_options: crate::ingest::IngestOptions::default(),
+            bound: Bound::Empty,
             last_query_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
@@ -1653,6 +2004,30 @@ mod tests {
             .unwrap();
         assert_eq!(stmt.execution_timeout_seconds(), None);
         assert_eq!(stmt.get_option_int(key).unwrap(), 0);
+    }
+
+    #[test]
+    fn timestamp_precision_rejects_invalid_values_without_changing_state() {
+        let mut stmt = make_stmt();
+        let key = OptionStatement::Other(
+            "adbc.snowflake.sql.client_option.max_timestamp_precision".into(),
+        );
+        stmt.set_option(key.clone(), OptionValue::String("microseconds".into()))
+            .unwrap();
+        let schema = Schema::new(vec![Field::new("prepared", DataType::Int64, true)]);
+        stmt.prepared_result_schema = Some(schema.clone());
+        for value in [
+            OptionValue::String("bogus".into()),
+            OptionValue::String(String::new()),
+            OptionValue::Int(1),
+        ] {
+            let error = stmt.set_option(key.clone(), value).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.contains("Invalid value for statement option"));
+            assert_eq!(stmt.timestamp_precision, TimestampPrecision::Microseconds);
+            assert_eq!(stmt.prepared_result_schema.as_ref(), Some(&schema));
+        }
+        assert_eq!(stmt.get_option_string(key).unwrap(), "microseconds");
     }
 
     #[test]
@@ -1733,9 +2108,13 @@ mod tests {
             )])),
         };
         stmt.bind_stream(Box::new(reader)).unwrap();
+        assert!(matches!(stmt.bound, Bound::Stream(_)));
 
         assert_eq!(stmt.execute_update().unwrap(), Some(0));
         assert_eq!(stmt.last_query_id, None);
+        assert!(matches!(stmt.bound, Bound::Batches(ref batches) if batches.is_empty()));
+        stmt.set_sql_query("SELECT 1").unwrap();
+        assert!(matches!(stmt.bound, Bound::Empty));
     }
 
     #[test]
@@ -1776,26 +2155,8 @@ mod tests {
 
     #[test]
     fn execute_with_target_table_no_data_returns_invalid_state() {
-        let driver = crate::driver::Driver::default();
-        let mut stmt = Statement {
-            inner: driver.inner.clone(),
-            stmt_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
-            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
-            query: None,
-            target_table: Some("mytable".into()),
-            ingest_catalog: None,
-            ingest_schema: None,
-            ingest_mode: None,
-            query_tag: None,
-            query_timeout_seconds: None,
-            timestamp_precision: TimestampPrecision::Nanoseconds,
-            bound_batches: vec![],
-            binding_supplied: false,
-            last_query_id: None,
-            prepared_parameter_schema: None,
-            prepared_result_schema: None,
-            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
-        };
+        let mut stmt = make_stmt();
+        stmt.target_table = Some("mytable".into());
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
             Ok(_) => panic!("execute should have returned an error"),
@@ -1804,26 +2165,8 @@ mod tests {
 
     #[test]
     fn set_query_clears_target_table() {
-        let driver = crate::driver::Driver::default();
-        let mut stmt = Statement {
-            inner: driver.inner.clone(),
-            stmt_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
-            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
-            query: None,
-            target_table: Some("mytable".into()),
-            ingest_catalog: None,
-            ingest_schema: None,
-            ingest_mode: None,
-            query_tag: None,
-            query_timeout_seconds: None,
-            timestamp_precision: TimestampPrecision::Nanoseconds,
-            bound_batches: vec![],
-            binding_supplied: false,
-            last_query_id: None,
-            prepared_parameter_schema: None,
-            prepared_result_schema: None,
-            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
-        };
+        let mut stmt = make_stmt();
+        stmt.target_table = Some("mytable".into());
         stmt.set_sql_query("SELECT 1").unwrap();
         assert!(stmt.target_table.is_none());
     }
@@ -1847,6 +2190,7 @@ mod tests {
                 bind_metadata("wide", "FIXED", Some(38), Some(0)),
             ],
             TimeUnit::Nanosecond,
+            "UTC",
         )
         .unwrap();
 
@@ -1868,13 +2212,21 @@ mod tests {
     fn invalid_prepare_bind_metadata_is_not_exposed() {
         let bind = bind_metadata("", "FIXED", Some(10), Some(0));
         assert!(
-            parameter_schema_from_prepare(2, std::slice::from_ref(&bind), TimeUnit::Nanosecond)
-                .is_none()
+            parameter_schema_from_prepare(
+                2,
+                std::slice::from_ref(&bind),
+                TimeUnit::Nanosecond,
+                "UTC"
+            )
+            .is_none()
         );
         let mut missing_type = bind;
         missing_type.r#type.clear();
-        assert!(parameter_schema_from_prepare(1, &[missing_type], TimeUnit::Nanosecond).is_none());
-        assert!(parameter_schema_from_prepare(-1, &[], TimeUnit::Nanosecond).is_none());
+        assert!(
+            parameter_schema_from_prepare(1, &[missing_type], TimeUnit::Nanosecond, "UTC")
+                .is_none()
+        );
+        assert!(parameter_schema_from_prepare(-1, &[], TimeUnit::Nanosecond, "UTC").is_none());
     }
 
     #[test]
@@ -1980,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_option_returns_not_found() {
+    fn unknown_option_is_not_implemented() {
         let mut stmt = make_stmt();
         let err = stmt
             .set_option(
@@ -1988,7 +2340,11 @@ mod tests {
                 OptionValue::String("val".into()),
             )
             .unwrap_err();
-        assert_eq!(err.status, adbc_core::error::Status::NotFound);
+        assert_eq!(err.status, Status::NotImplemented);
+        assert_eq!(
+            err.message,
+            "unrecognized statement option 'unknown.option'"
+        );
     }
 
     #[test]
@@ -2062,6 +2418,7 @@ mod tests {
             reader,
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
         );
         let out = cr.next().unwrap().unwrap();
 
@@ -2093,10 +2450,179 @@ mod tests {
     }
 
     #[test]
+    fn schema_preserves_metadata_and_marks_only_array_json() {
+        let array = make_field_with_meta("items", DataType::Utf8, "ARRAY", "0");
+        let object = make_field_with_meta("object", DataType::Utf8, "OBJECT", "0");
+        let time = make_field_with_meta("time", DataType::Int64, "TIME", "9");
+        let schema = Schema::new(vec![array, object.clone(), time.clone()]);
+        let adjusted = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
+        assert_eq!(
+            adjusted
+                .field(0)
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.json")
+        );
+        assert!(adjusted.field(0).try_canonical_extension_type().is_ok());
+        assert_eq!(adjusted.field(1).metadata(), object.metadata());
+        assert_eq!(adjusted.field(2).metadata(), time.metadata());
+        assert_eq!(
+            adjusted.field(2).data_type(),
+            &DataType::Time64(TimeUnit::Nanosecond)
+        );
+    }
+
+    #[test]
+    fn uuid_text_is_fixed_binary_except_untyped_null() {
+        let uuid_field = Field::new("id", DataType::Utf8, true).with_metadata(
+            [
+                ("logicalType".to_owned(), "TEXT".to_owned()),
+                ("charLength".to_owned(), "0".to_owned()),
+                ("byteLength".to_owned(), "16".to_owned()),
+            ]
+            .into(),
+        );
+        let null_field = Field::new("untyped", DataType::Utf8, true).with_metadata(
+            [
+                ("logicalType".to_owned(), "TEXT".to_owned()),
+                ("charLength".to_owned(), "0".to_owned()),
+                ("byteLength".to_owned(), "0".to_owned()),
+            ]
+            .into(),
+        );
+        let schema = Arc::new(Schema::new(vec![uuid_field.clone(), null_field]));
+        let text = "550e8400-e29b-41d4-a716-446655440000";
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec![Some(text), None])),
+                Arc::new(arrow_array::StringArray::from(vec![None::<&str>, None])),
+            ],
+        )
+        .unwrap();
+        let mut reader = ConvertingReader::new(
+            ConcatReader {
+                batches: vec![batch].into_iter(),
+                schema,
+            },
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
+        );
+        assert_eq!(
+            reader.schema().field(0).data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+        assert!(
+            reader
+                .schema()
+                .field(0)
+                .try_canonical_extension_type()
+                .is_ok()
+        );
+        assert_eq!(reader.schema().field(1).data_type(), &DataType::Utf8);
+        let converted = reader.next().unwrap().unwrap();
+        let ids = converted
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(
+            ids.value(0),
+            uuid::Uuid::parse_str(text).unwrap().as_bytes()
+        );
+        assert!(ids.is_null(1));
+
+        let invalid_schema = Arc::new(Schema::new(vec![uuid_field]));
+        let bad = RecordBatch::try_new(
+            invalid_schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["not-a-uuid"]))],
+        )
+        .unwrap();
+        let mut invalid = ConvertingReader::new(
+            ConcatReader {
+                batches: vec![bad].into_iter(),
+                schema: invalid_schema,
+            },
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
+        );
+        assert!(
+            invalid
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid UUID")
+        );
+    }
+
+    #[test]
+    fn geography_ewkb_lifts_srid_and_strips_prefix() {
+        let field = Field::new("geo", DataType::Binary, true).with_metadata(
+            [
+                ("logicalType".to_owned(), "BINARY".to_owned()),
+                ("extTypeName".to_owned(), "GEOGRAPHY".to_owned()),
+            ]
+            .into(),
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let described = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
+        assert_eq!(
+            described
+                .field(0)
+                .metadata()
+                .get("ARROW:extension:metadata")
+                .map(String::as_str),
+            Some("{\"crs\":\"EPSG:4326\",\"crs_type\":\"authority_code\",\"edges\":\"spherical\"}")
+        );
+        let mut ewkb = vec![1, 1, 0, 0, 0x20, 0xe6, 0x10, 0, 0];
+        ewkb.extend_from_slice(&[0; 16]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::BinaryArray::from(vec![
+                Some(ewkb.as_slice()),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let mut reader = ConvertingReader::new(
+            ConcatReader {
+                batches: vec![batch].into_iter(),
+                schema,
+            },
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
+        );
+        assert_eq!(
+            reader
+                .schema()
+                .field(0)
+                .metadata()
+                .get("ARROW:extension:metadata")
+                .map(String::as_str),
+            Some("{\"crs\":\"EPSG:4326\",\"crs_type\":\"authority_code\"}")
+        );
+        let batch = reader.next().unwrap().unwrap();
+        let geo = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        let mut expected = vec![1, 1, 0, 0, 0];
+        expected.extend_from_slice(&[0; 16]);
+        assert_eq!(geo.value(0), expected);
+        assert!(geo.is_null(1));
+    }
+
+    #[test]
     fn test_adjust_schema_time_scale3_is_time32_millisecond() {
         let f = make_field_with_meta("t", DataType::Int32, "TIME", "3");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Nanosecond);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Time32(TimeUnit::Millisecond)
@@ -2107,7 +2633,7 @@ mod tests {
     fn test_adjust_schema_time_scale9_is_time64_nanosecond() {
         let f = make_field_with_meta("t", DataType::Int64, "TIME", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Nanosecond);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Time64(TimeUnit::Nanosecond)
@@ -2118,7 +2644,7 @@ mod tests {
     fn test_adjust_schema_timestamp_ntz_int64_to_timestamp_ns() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Nanosecond);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
@@ -2126,13 +2652,16 @@ mod tests {
     }
 
     #[test]
-    fn test_adjust_schema_timestamp_ltz_is_utc() {
+    fn test_adjust_schema_timestamp_ltz_uses_session_timezone() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_LTZ", "6");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Microsecond);
+        let result = adjust_schema(&schema, TimeUnit::Microsecond, "America/Los_Angeles", None);
         assert_eq!(
             result.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
+            &DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(Arc::from("America/Los_Angeles"))
+            )
         );
     }
 
@@ -2154,6 +2683,7 @@ mod tests {
             reader,
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
         );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(
@@ -2172,7 +2702,7 @@ mod tests {
     fn test_adjust_schema_timestamp_ntz_capped_by_ts_unit() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Microsecond);
+        let result = adjust_schema(&schema, TimeUnit::Microsecond, "UTC", None);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -2273,75 +2803,35 @@ mod tests {
     }
 
     #[test]
-    fn test_build_timestamp_from_epoch_fraction_negative_scale_clamps() {
+    fn test_build_timestamp_from_epoch_fraction_clamps_scale() {
         let epoch = arrow_array::Int64Array::from(vec![1i64]);
         let fraction = arrow_array::Int32Array::from(vec![5i32]);
-        let fields = [
-            Field::new("epoch", DataType::Int64, true),
-            Field::new("fraction", DataType::Int32, true),
-        ];
         let struct_arr = arrow_array::StructArray::from(vec![
             (
-                Arc::new(fields[0].clone()),
+                Arc::new(Field::new("epoch", DataType::Int64, true)),
                 Arc::new(epoch.clone()) as ArrayRef,
             ),
             (
-                Arc::new(fields[1].clone()),
+                Arc::new(Field::new("fraction", DataType::Int32, true)),
                 Arc::new(fraction.clone()) as ArrayRef,
             ),
         ]);
-        let result = build_timestamp_from_epoch_fraction(
-            &epoch,
-            &fraction,
-            &struct_arr,
-            -1,
-            false,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-        )
-        .expect("should not panic");
-        let ts = result
-            .as_any()
-            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-            .unwrap();
-        // scale -1 clamps to 0. frac_to_ns = 10^9.
-        // ns = 1 * 10^9 + 5 * 10^9 = 6000000000.
-        assert_eq!(ts.value(0), 6_000_000_000);
-    }
-
-    #[test]
-    fn test_build_timestamp_from_epoch_fraction_oversized_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![1i64]);
-        let fraction = arrow_array::Int32Array::from(vec![5i32]);
-        let fields = [
-            Field::new("epoch", DataType::Int64, true),
-            Field::new("fraction", DataType::Int32, true),
-        ];
-        let struct_arr = arrow_array::StructArray::from(vec![
-            (
-                Arc::new(fields[0].clone()),
-                Arc::new(epoch.clone()) as ArrayRef,
-            ),
-            (
-                Arc::new(fields[1].clone()),
-                Arc::new(fraction.clone()) as ArrayRef,
-            ),
-        ]);
-        let result = build_timestamp_from_epoch_fraction(
-            &epoch,
-            &fraction,
-            &struct_arr,
-            10,
-            false,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-        )
-        .expect("should not panic");
-        let ts = result
-            .as_any()
-            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-            .unwrap();
-        // scale 10 clamps to 9. frac_to_ns = 10^0 = 1.
-        // ns = 1 * 10^9 + 5 * 1 = 1000000005.
-        assert_eq!(ts.value(0), 1_000_000_005);
+        for (scale, expected) in [(-1, 6_000_000_000), (10, 1_000_000_005)] {
+            let result = build_timestamp_from_epoch_fraction(
+                &epoch,
+                &fraction,
+                &struct_arr,
+                scale,
+                false,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )
+            .expect("scale is clamped");
+            let ts = result
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(ts.value(0), expected, "scale {scale}");
+        }
     }
 
     #[test]
@@ -2363,14 +2853,11 @@ mod tests {
                 Arc::new(offset.clone()) as ArrayRef,
             ),
         ]);
-        let result = build_timestamp_tz_3field(
-            &epoch,
-            &fraction,
-            &offset,
-            &struct_arr,
+        let result = convert_timestamp_tz(
+            &(Arc::new(struct_arr) as ArrayRef),
             9,
+            TimeUnit::Nanosecond,
             false,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
         )
         .unwrap();
         let timestamps = result
@@ -2378,88 +2865,6 @@ mod tests {
             .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             .unwrap();
         assert_eq!(timestamps.value(0), 1_500_000_000);
-    }
-
-    #[test]
-    fn test_build_timestamp_tz_3field_negative_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![1i64]);
-        let fraction = arrow_array::Int32Array::from(vec![5i32]);
-        let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
-        let fields = [
-            Field::new("epoch", DataType::Int64, true),
-            Field::new("fraction", DataType::Int32, true),
-            Field::new("tzoffset", DataType::Int32, true),
-        ];
-        let struct_arr = arrow_array::StructArray::from(vec![
-            (
-                Arc::new(fields[0].clone()),
-                Arc::new(epoch.clone()) as ArrayRef,
-            ),
-            (
-                Arc::new(fields[1].clone()),
-                Arc::new(fraction.clone()) as ArrayRef,
-            ),
-            (
-                Arc::new(fields[2].clone()),
-                Arc::new(tzoffset.clone()) as ArrayRef,
-            ),
-        ]);
-        let result = build_timestamp_tz_3field(
-            &epoch,
-            &fraction,
-            &tzoffset,
-            &struct_arr,
-            -1,
-            false,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-        )
-        .expect("should not panic");
-        let ts = result
-            .as_any()
-            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-            .unwrap();
-        assert_eq!(ts.value(0), 6_000_000_000);
-    }
-
-    #[test]
-    fn test_build_timestamp_tz_3field_oversized_scale_clamps() {
-        let epoch = arrow_array::Int64Array::from(vec![1i64]);
-        let fraction = arrow_array::Int32Array::from(vec![5i32]);
-        let tzoffset = arrow_array::Int32Array::from(vec![1440i32]);
-        let fields = [
-            Field::new("epoch", DataType::Int64, true),
-            Field::new("fraction", DataType::Int32, true),
-            Field::new("tzoffset", DataType::Int32, true),
-        ];
-        let struct_arr = arrow_array::StructArray::from(vec![
-            (
-                Arc::new(fields[0].clone()),
-                Arc::new(epoch.clone()) as ArrayRef,
-            ),
-            (
-                Arc::new(fields[1].clone()),
-                Arc::new(fraction.clone()) as ArrayRef,
-            ),
-            (
-                Arc::new(fields[2].clone()),
-                Arc::new(tzoffset.clone()) as ArrayRef,
-            ),
-        ]);
-        let result = build_timestamp_tz_3field(
-            &epoch,
-            &fraction,
-            &tzoffset,
-            &struct_arr,
-            10,
-            false,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-        )
-        .expect("should not panic");
-        let ts = result
-            .as_any()
-            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-            .unwrap();
-        assert_eq!(ts.value(0), 1_000_000_005);
     }
 
     #[test]
@@ -2480,6 +2885,64 @@ mod tests {
         let json = arrow_batches_to_json_bindings(&[batch]).unwrap();
         assert!(json.contains("\"1\":{\"type\":\"FIXED\",\"value\":[\"123\",\"456\"]}"));
         assert!(json.contains("\"2\":{\"type\":\"TEXT\",\"value\":[\"hello\",\"world\"]}"));
+    }
+
+    #[test]
+    fn float16_bindings_promote_finite_values_and_null_nonfinite() {
+        let source = arrow_array::Float32Array::from(vec![
+            Some(1.5),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            None,
+        ]);
+        let column = arrow_cast::cast(&source, &DataType::Float16).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "half",
+            DataType::Float16,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[batch.slice(0, 1)]).unwrap(),
+            "{\"1\":{\"type\":\"REAL\",\"value\":\"1.5\"}}"
+        );
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[batch]).unwrap(),
+            "{\"1\":{\"type\":\"REAL\",\"value\":[\"1.5\",null,null,null]}}"
+        );
+    }
+
+    #[test]
+    fn bindings_stream_columns_across_batches_without_changing_encoding() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("binary", DataType::Binary, true),
+            Field::new("date", DataType::Date32, true),
+        ]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec![Some("a\"\u{0001}\n")])),
+                Arc::new(arrow_array::BinaryArray::from(vec![Some(
+                    &[0xff, 0x00][..],
+                )])),
+                Arc::new(arrow_array::Date32Array::from(vec![Some(1)])),
+            ],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow_array::BinaryArray::from(vec![None::<&[u8]>])),
+                Arc::new(arrow_array::Date32Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[first, second]).unwrap(),
+            r#"{"1":{"type":"TEXT","value":["a\"\u0001\n",null]},"2":{"type":"BINARY","value":["ff00",null]},"3":{"type":"DATE","value":["86400000",null]}}"#
+        );
     }
 
     #[test]

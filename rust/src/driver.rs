@@ -23,8 +23,8 @@ use adbc_core::{
 use arrow_array::RecordBatchReader;
 use arrow_schema::TimeUnit;
 use sf_core::apis::database_driver_v1::{
-    ApiError, BindingType, ColumnMetadata, DatabaseDriverV1, ExecuteQueryResult, Handle,
-    ResultSetDescriptor, ResultSetInfo,
+    ApiError, BindingType, ColumnMetadata, DatabaseDriverV1, DriverProviders, ExecuteQueryResult,
+    Handle, ResultSetDescriptor, ResultSetInfo, WrapperPresets,
 };
 use sf_core::apis::operation_ctx::OperationCtx;
 use tokio::runtime::Runtime;
@@ -79,8 +79,45 @@ impl Inner {
         })?;
         Ok(Self {
             runtime,
-            sf: DatabaseDriverV1::new(),
+            sf: DatabaseDriverV1::with_providers(DriverProviders {
+                wrapper_presets: WrapperPresets {
+                    optimistic_alter_session_param_cache: true,
+                    ..WrapperPresets::default()
+                },
+                ..DriverProviders::default()
+            }),
         })
+    }
+
+    /// Read the current session setting on each result/schema creation. The
+    /// optimistic ALTER SESSION cache keeps this fresh when a response omits it.
+    pub(crate) fn session_timezone(&self, connection: Handle) -> Result<Arc<str>> {
+        let setting = self
+            .runtime
+            .block_on(
+                self.sf
+                    .connection_get_parameter(connection, "TIMEZONE".into()),
+            )
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        let timezone = match setting {
+            Some(sf_core::config::settings::Setting::String(value)) => value,
+            None => "UTC".to_string(),
+            Some(value) => {
+                return Err(Error::with_message_and_status(
+                    format!("invalid Snowflake session timezone setting: {value:?}"),
+                    Status::InvalidData,
+                ));
+            }
+        };
+        timezone
+            .parse::<arrow_array::timezone::Tz>()
+            .map_err(|error| {
+                Error::with_message_and_status(
+                    format!("invalid Snowflake session timezone '{timezone}': {error}"),
+                    Status::InvalidData,
+                )
+            })?;
+        Ok(Arc::from(timezone))
     }
 
     /// Execute SQL using a temporary sf_core statement and release the
@@ -253,6 +290,8 @@ impl adbc_core::Driver for Driver {
             sf_settings,
             surfaced_warnings: Default::default(),
             timestamp_precision: TimestampPrecision::default(),
+            geography_output_format: Default::default(),
+            geometry_output_format: Default::default(),
             auth_type: None,
             okta_url: None,
             max_retry_count: None,

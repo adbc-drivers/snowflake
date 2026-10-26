@@ -19,7 +19,7 @@
 const ARROW_VERSION: &str = "v58.1.0";
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use adbc_core::{
     Optionable, constants,
@@ -34,7 +34,9 @@ use arrow_array::{
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use sf_core::apis::database_driver_v1::{ConnectionInfo, Handle};
+use sf_core::apis::operation_ctx::OperationCtx;
 
+use crate::database::{GEOGRAPHY_OUTPUT_FORMAT, GEOMETRY_OUTPUT_FORMAT, GeoOutputFormat};
 use crate::driver::{Inner, TimestampPrecision};
 use crate::statement::{Statement, adjust_schema};
 
@@ -43,6 +45,11 @@ pub struct Connection {
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
+    pub(crate) geography_output_format: GeoOutputFormat,
+    pub(crate) geometry_output_format: GeoOutputFormat,
+    /// Only connection-level operations use this slot; statements retain
+    /// separate contexts and are never cancelled by Connection::cancel().
+    pub(crate) operation: Mutex<Arc<OperationCtx>>,
 }
 
 type CleanupTask = Box<dyn FnOnce() + Send + 'static>;
@@ -106,25 +113,21 @@ enum SessionIdentifierKind {
     Schema,
 }
 
-/// sf_core f9175f07 trims identifiers before quoting them. Keep the standard
-/// core path unless trimming would change the identifier, in which case an
-/// exactly quoted USE statement is required to preserve Snowflake semantics.
-fn exact_identifier_sql(kind: SessionIdentifierKind, name: &str) -> Option<String> {
-    if name == name.trim() {
-        return None;
-    }
+/// Preserve exact Snowflake identifier spelling while using a cancellable
+/// statement for session changes.
+fn session_identifier_sql(kind: SessionIdentifierKind, name: &str) -> String {
     let keyword = match kind {
         SessionIdentifierKind::Database => "DATABASE",
         SessionIdentifierKind::Schema => "SCHEMA",
     };
-    Some(format!("USE {keyword} \"{}\"", name.replace('"', "\"\"")))
+    format!("USE {keyword} {}", quote_identifier(name))
 }
 
 pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn qualified_table_identifier(
+pub(crate) fn qualified_table_identifier(
     catalog: Option<&str>,
     db_schema: Option<&str>,
     table_name: &str,
@@ -144,50 +147,77 @@ fn qualified_table_identifier(
 }
 
 impl Connection {
+    pub(crate) fn begin_operation(&self) -> Arc<OperationCtx> {
+        let operation = Arc::new(OperationCtx::with_own_token());
+        *self.operation.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&operation);
+        operation
+    }
+
     fn context_names(&self) -> Result<(Option<String>, Option<String>)> {
         // Deliberately extract only cached context names. ConnectionInfo also carries
         // sensitive tokens, which must never be surfaced through ADBC options.
+        let operation = self.begin_operation();
         let ConnectionInfo {
             database, schema, ..
         } = self
             .inner
             .runtime
-            .block_on(self.inner.sf.connection_get_info(self.conn_handle))
+            .block_on(operation.run(
+                "connection_get_info",
+                self.inner.sf.connection_get_info(self.conn_handle),
+            ))
             .map_err(crate::error::api_error_to_adbc_error)?;
         Ok((database, schema))
     }
 
     pub(crate) fn set_autocommit(&mut self, enabled: bool) -> Result<()> {
-        self.inner
-            .runtime
-            .block_on(
-                self.inner
-                    .sf
-                    .connection_set_autocommit(self.conn_handle, enabled),
-            )
-            .map_err(crate::error::api_error_to_adbc_error)?;
+        let operation = self.begin_operation();
+        self.inner.execute_temporary_statement(
+            Some(&operation),
+            self.conn_handle,
+            format!("ALTER SESSION SET AUTOCOMMIT = {enabled}"),
+            None,
+        )?;
         self.autocommit = enabled;
         Ok(())
     }
 
     fn set_current_identifier(&self, kind: SessionIdentifierKind, name: &str) -> Result<()> {
-        if let Some(sql) = exact_identifier_sql(kind, name) {
-            return self
-                .inner
-                .execute_temporary_statement(None, self.conn_handle, sql, None);
+        if name.trim().is_empty() {
+            return Err(Error::with_message_and_status(
+                "session identifier must not be empty",
+                Status::InvalidArguments,
+            ));
         }
-        let result = match kind {
-            SessionIdentifierKind::Database => self.inner.runtime.block_on(
-                self.inner
-                    .sf
-                    .connection_use_database(self.conn_handle, name),
-            ),
-            SessionIdentifierKind::Schema => self
-                .inner
-                .runtime
-                .block_on(self.inner.sf.connection_use_schema(self.conn_handle, name)),
+        let operation = self.begin_operation();
+        let sql = session_identifier_sql(kind, name);
+        self.inner
+            .execute_temporary_statement(Some(&operation), self.conn_handle, sql, None)
+    }
+
+    fn set_geo_output_format(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        let format = GeoOutputFormat::parse(key, value)?;
+        let session_parameter = if key == GEOGRAPHY_OUTPUT_FORMAT {
+            "GEOGRAPHY_OUTPUT_FORMAT"
+        } else {
+            "GEOMETRY_OUTPUT_FORMAT"
         };
-        result.map_err(crate::error::api_error_to_adbc_error)
+        let operation = self.begin_operation();
+        self.inner.execute_temporary_statement(
+            Some(&operation),
+            self.conn_handle,
+            format!(
+                "ALTER SESSION SET {session_parameter} = '{}'",
+                format.as_str()
+            ),
+            None,
+        )?;
+        if key == GEOGRAPHY_OUTPUT_FORMAT {
+            self.geography_output_format = format;
+        } else {
+            self.geometry_output_format = format;
+        }
+        Ok(())
     }
 }
 
@@ -241,9 +271,14 @@ impl Optionable for Connection {
                     ))
                 }
             }
+            OptionConnection::Other(ref k)
+                if k == GEOGRAPHY_OUTPUT_FORMAT || k == GEOMETRY_OUTPUT_FORMAT =>
+            {
+                self.set_geo_output_format(k, &value)
+            }
             _ => Err(Error::with_message_and_status(
-                format!("unsupported connection option: {}", key.as_ref()),
-                Status::NotFound,
+                format!("unrecognized connection option '{}'", key.as_ref()),
+                Status::NotImplemented,
             )),
         }
     }
@@ -259,6 +294,12 @@ impl Optionable for Connection {
             OptionConnection::CurrentSchema => self.context_names()?.1.ok_or_else(|| {
                 Error::with_message_and_status("current schema is not set", Status::NotFound)
             }),
+            OptionConnection::Other(ref k) if k == GEOGRAPHY_OUTPUT_FORMAT => {
+                Ok(self.geography_output_format.as_str().to_string())
+            }
+            OptionConnection::Other(ref k) if k == GEOMETRY_OUTPUT_FORMAT => {
+                Ok(self.geometry_output_format.as_str().to_string())
+            }
             _ => Err(Error::with_message_and_status(
                 format!("option not found: {}", key.as_ref()),
                 Status::NotFound,
@@ -309,8 +350,8 @@ impl adbc_core::Connection for Connection {
             query_tag: None,
             query_timeout_seconds: None,
             timestamp_precision: self.timestamp_precision,
-            bound_batches: vec![],
-            binding_supplied: false,
+            ingest_options: crate::ingest::IngestOptions::default(),
+            bound: crate::statement::Bound::Empty,
             last_query_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
@@ -321,7 +362,11 @@ impl adbc_core::Connection for Connection {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(crate::error::not_implemented("cancel"))
+        self.operation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
+        Ok(())
     }
 
     #[allow(refining_impl_trait)]
@@ -333,12 +378,16 @@ impl adbc_core::Connection for Connection {
             .as_ref()
             .is_none_or(|s| s.contains(&InfoCode::VendorVersion));
         let vendor_version = if need_vendor_version {
+            let operation = self.begin_operation();
             self.inner
                 .runtime
                 .block_on(
-                    self.inner
-                        .sf
-                        .connection_get_server_version(self.conn_handle),
+                    operation.run(
+                        "connection_get_server_version",
+                        self.inner
+                            .sf
+                            .connection_get_server_version(self.conn_handle),
+                    ),
                 )
                 .map_err(crate::error::api_error_to_adbc_error)?
                 .unwrap_or_default()
@@ -514,6 +563,7 @@ impl adbc_core::Connection for Connection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
+        let operation = self.begin_operation();
         let qualified = qualified_table_identifier(catalog, db_schema, table_name);
         let stmt_handle = self
             .inner
@@ -523,7 +573,7 @@ impl adbc_core::Connection for Connection {
 
         let result = (|| {
             let prepared = self.inner.prepare_statement(
-                None,
+                Some(&operation),
                 stmt_handle,
                 format!("SELECT * FROM {qualified}"),
             )?;
@@ -534,9 +584,15 @@ impl adbc_core::Connection for Connection {
                     Status::Internal,
                 ));
             }
-            Ok(adjust_schema(&schema, self.timestamp_precision.time_unit())
-                .as_ref()
-                .clone())
+            let timezone = self.inner.session_timezone(self.conn_handle)?;
+            Ok(adjust_schema(
+                &schema,
+                self.timestamp_precision.time_unit(),
+                &timezone,
+                None,
+            )
+            .as_ref()
+            .clone())
         })();
         let release = self.inner.sf.statement_release(stmt_handle);
         match result {
@@ -582,10 +638,9 @@ impl adbc_core::Connection for Connection {
                 Status::InvalidState,
             ));
         }
+        let operation = self.begin_operation();
         self.inner
-            .runtime
-            .block_on(self.inner.sf.connection_commit(self.conn_handle))
-            .map_err(crate::error::api_error_to_adbc_error)
+            .execute_temporary_statement(Some(&operation), self.conn_handle, "COMMIT", None)
     }
 
     fn rollback(&mut self) -> Result<()> {
@@ -595,10 +650,9 @@ impl adbc_core::Connection for Connection {
                 Status::InvalidState,
             ));
         }
+        let operation = self.begin_operation();
         self.inner
-            .runtime
-            .block_on(self.inner.sf.connection_rollback(self.conn_handle))
-            .map_err(crate::error::api_error_to_adbc_error)
+            .execute_temporary_statement(Some(&operation), self.conn_handle, "ROLLBACK", None)
     }
 
     #[allow(refining_impl_trait)]
@@ -613,6 +667,19 @@ impl adbc_core::Connection for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_connection() -> Connection {
+        let driver = crate::driver::Driver::default();
+        Connection {
+            inner: driver.inner.clone(),
+            conn_handle: Handle { id: 0, magic: 0 },
+            autocommit: true,
+            timestamp_precision: TimestampPrecision::Nanoseconds,
+            geography_output_format: GeoOutputFormat::GeoJson,
+            geometry_output_format: GeoOutputFormat::GeoJson,
+            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
+        }
+    }
 
     #[test]
     fn connection_cleanup_waits_for_close_before_release_after_close_panic() {
@@ -649,32 +716,79 @@ mod tests {
     }
 
     #[test]
-    fn exact_identifier_fallback_is_narrow_and_quotes_without_trimming() {
+    fn session_identifiers_are_quoted_without_trimming() {
         assert_eq!(
-            exact_identifier_sql(SessionIdentifierKind::Database, " db\" name "),
-            Some("USE DATABASE \" db\"\" name \"".into())
+            session_identifier_sql(SessionIdentifierKind::Database, " db\" name "),
+            "USE DATABASE \" db\"\" name \""
         );
         assert_eq!(
-            exact_identifier_sql(SessionIdentifierKind::Schema, " schema "),
-            Some("USE SCHEMA \" schema \"".into())
+            session_identifier_sql(SessionIdentifierKind::Schema, " schema "),
+            "USE SCHEMA \" schema \""
         );
         assert_eq!(
-            exact_identifier_sql(SessionIdentifierKind::Database, "normal_name"),
-            None
+            session_identifier_sql(SessionIdentifierKind::Database, "normal_name"),
+            "USE DATABASE \"normal_name\""
         );
     }
 
     #[test]
     fn get_option_string_returns_not_found_for_unknown_key() {
-        let driver = crate::driver::Driver::default();
-        let conn = Connection {
-            inner: driver.inner.clone(),
-            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
-            autocommit: true,
-            timestamp_precision: TimestampPrecision::Nanoseconds,
-        };
+        let conn = fake_connection();
         let result = conn.get_option_string(OptionConnection::Other("unknown".into()));
         assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn connection_cancel_is_scoped_to_current_operation() {
+        use adbc_core::Connection as _;
+        let mut conn = fake_connection();
+        conn.cancel().unwrap();
+        let old = conn.begin_operation();
+        let statement_operation = OperationCtx::with_own_token();
+        conn.cancel().unwrap();
+        let cancelled = conn.inner.runtime.block_on(old.run(
+            "connection_cancel_unit",
+            std::future::ready(Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())),
+        ));
+        assert_eq!(
+            crate::error::api_error_to_adbc_error(cancelled.unwrap_err()).status,
+            Status::Cancelled
+        );
+        assert!(!statement_operation.token().is_cancelled());
+        let next = conn.begin_operation();
+        assert!(!next.token().is_cancelled());
+        assert!(
+            conn.inner
+                .runtime
+                .block_on(next.run(
+                    "connection_cancel_unit",
+                    std::future::ready(Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())),
+                ))
+                .is_ok()
+        );
+        conn.cancel().unwrap();
+    }
+
+    #[test]
+    fn connection_geo_options_validate_before_alter_session() {
+        let mut conn = fake_connection();
+        let key = OptionConnection::Other(GEOGRAPHY_OUTPUT_FORMAT.into());
+        let error = conn
+            .set_option(key.clone(), OptionValue::String("WKT".into()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(conn.get_option_string(key).unwrap(), "GEOJSON");
+        let error = conn
+            .set_option(
+                OptionConnection::Other("unknown.option".into()),
+                OptionValue::String("ignored".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert_eq!(
+            error.message,
+            "unrecognized connection option 'unknown.option'"
+        );
     }
 
     #[test]
@@ -729,13 +843,7 @@ mod tests {
     fn get_table_types_returns_table_and_view() {
         use adbc_core::Connection as _;
         use arrow_array::cast::AsArray;
-        let driver = crate::driver::Driver::default();
-        let conn = Connection {
-            inner: driver.inner.clone(),
-            conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
-            autocommit: true,
-            timestamp_precision: TimestampPrecision::Nanoseconds,
-        };
+        let conn = fake_connection();
         let mut reader = conn.get_table_types().unwrap();
         let batch = reader.next().unwrap().unwrap();
         let types: Vec<&str> = batch
