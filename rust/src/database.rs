@@ -1026,17 +1026,6 @@ impl adbc_core::Database for Database {
                 ))
                 .map_err(crate::error::api_error_to_adbc_error)?;
 
-            let validation_issues = self
-                .inner
-                .runtime
-                .block_on(self.inner.sf.connection_validate_options(conn_handle))
-                .map_err(crate::error::api_error_to_adbc_error)?;
-            process_validation_issues(
-                validation_issues,
-                &mut seen_warnings,
-                &self.surfaced_warnings,
-            )?;
-
             self.inner
                 .runtime
                 .block_on(
@@ -1096,6 +1085,27 @@ mod tests {
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
         driver.new_database().unwrap()
+    }
+
+    #[test]
+    fn missing_required_option_fails_connect_with_invalid_arguments() {
+        use adbc_core::Database as _;
+        // connection_init validates the merged database + connection settings
+        // before any network call, so this fails without a Snowflake account.
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Username,
+            OptionValue::String("alice".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("secret".into()),
+        )
+        .unwrap();
+        let error = db.new_connection().err().expect("account is required");
+        assert_eq!(error.status, Status::InvalidArguments, "{error:?}");
+        assert!(error.message.contains("account"), "{error:?}");
     }
 
     #[test]
