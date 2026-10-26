@@ -424,10 +424,13 @@ impl Database {
 
         let parts: Vec<&str> = path.splitn(3, '/').collect();
         if let Some(authority) = parts.first().filter(|s| !s.is_empty()) {
+            let authority = decode_uri_component(authority, "account/host")?;
             if explicit_account {
                 let (host, port) = authority
                     .rsplit_once(':')
-                    .map_or((*authority, None), |(host, port)| (host, Some(port)));
+                    .map_or((authority.as_str(), None), |(host, port)| {
+                        (host, Some(port))
+                    });
                 self.set_option(
                     OptionDatabase::Other("adbc.snowflake.sql.uri.host".into()),
                     OptionValue::String(host.to_string()),
@@ -441,20 +444,20 @@ impl Database {
             } else {
                 self.set_option(
                     OptionDatabase::Other("adbc.snowflake.sql.account".into()),
-                    OptionValue::String(authority.to_string()),
+                    OptionValue::String(authority),
                 )?;
             }
         }
         if let Some(database) = parts.get(1).filter(|s| !s.is_empty()) {
             self.set_option(
                 OptionDatabase::Other("adbc.snowflake.sql.db".into()),
-                OptionValue::String(database.to_string()),
+                OptionValue::String(decode_uri_component(database, "database")?),
             )?;
         }
         if let Some(schema) = parts.get(2).filter(|s| !s.is_empty()) {
             self.set_option(
                 OptionDatabase::Other("adbc.snowflake.sql.schema".into()),
-                OptionValue::String(schema.to_string()),
+                OptionValue::String(decode_uri_component(schema, "schema")?),
             )?;
         }
 
@@ -492,6 +495,19 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// Percent-decode one URI component, rejecting invalid UTF-8.
+fn decode_uri_component(value: &str, what: &str) -> Result<String> {
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|e| {
+            Error::with_message_and_status(
+                format!("invalid UTF-8 in URI {what}: {e}"),
+                Status::InvalidArguments,
+            )
+        })
 }
 
 fn connection_option_to_setting(value: &OptionValue) -> Result<Setting> {
@@ -1250,5 +1266,31 @@ mod tests {
             db.sf_settings.get(param_names::DATABASE.as_str()).unwrap(),
             &sf_core::config::settings::Setting::String("mydb".into())
         );
+    }
+
+    #[test]
+    fn uri_percent_decodes_database_and_schema() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("snowflake://alice@myaccount/MY%20DB/S%2FX".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::DATABASE.as_str()).unwrap(),
+            &sf_core::config::settings::Setting::String("MY DB".into())
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::SCHEMA.as_str()).unwrap(),
+            &sf_core::config::settings::Setting::String("S/X".into())
+        );
+
+        let err = make_db()
+            .set_option(
+                OptionDatabase::Uri,
+                OptionValue::String("snowflake://myaccount/%FF".into()),
+            )
+            .unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
     }
 }

@@ -212,21 +212,34 @@ impl Connection {
     }
 }
 
+/// Parse an autocommit option value, rejecting anything that is not an
+/// explicit boolean spelling so a typo cannot silently disable autocommit.
+fn parse_autocommit(value: &OptionValue) -> Result<bool> {
+    match value {
+        OptionValue::String(s) => match s.as_str() {
+            "true" | "1" | "enabled" => Ok(true),
+            "false" | "0" | "disabled" => Ok(false),
+            other => Err(Error::with_message_and_status(
+                format!(
+                    "invalid autocommit value {other:?}: expected true/false, 1/0, or enabled/disabled"
+                ),
+                Status::InvalidArguments,
+            )),
+        },
+        _ => Err(Error::with_message_and_status(
+            "autocommit value must be a string",
+            Status::InvalidArguments,
+        )),
+    }
+}
+
 impl Optionable for Connection {
     type Option = OptionConnection;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match key {
             OptionConnection::AutoCommit => {
-                let enabled = match &value {
-                    OptionValue::String(s) => s == "true" || s == "1",
-                    _ => {
-                        return Err(Error::with_message_and_status(
-                            "autocommit value must be a string",
-                            Status::InvalidArguments,
-                        ));
-                    }
-                };
+                let enabled = parse_autocommit(&value)?;
                 self.set_autocommit(enabled)
             }
             OptionConnection::CurrentCatalog => {
@@ -683,6 +696,34 @@ mod tests {
         };
         let result = conn.get_option_string(OptionConnection::Other("unknown".into()));
         assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn autocommit_accepts_only_explicit_boolean_spellings() {
+        for (value, expected) in [
+            ("true", true),
+            ("1", true),
+            ("enabled", true),
+            ("false", false),
+            ("0", false),
+            ("disabled", false),
+        ] {
+            assert_eq!(
+                parse_autocommit(&OptionValue::String(value.into())).unwrap(),
+                expected,
+                "{value}"
+            );
+        }
+        for value in [
+            OptionValue::String("yes".into()),
+            OptionValue::String("TRUE ".into()),
+            OptionValue::Int(1),
+        ] {
+            assert_eq!(
+                parse_autocommit(&value).unwrap_err().status,
+                Status::InvalidArguments
+            );
+        }
     }
 
     #[test]
