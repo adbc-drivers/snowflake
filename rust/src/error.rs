@@ -120,11 +120,30 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::Cancelled { .. } => Status::Cancelled,
         _ => Status::IO,
     };
-    let mut error =
-        Error::with_message_and_status(query_message.unwrap_or_else(|| err.to_string()), status);
+    let mut error = Error::with_message_and_status(
+        query_message.unwrap_or_else(|| message_with_causes(&err)),
+        status,
+    );
     error.vendor_code = vendor_code;
     error.sqlstate = sqlstate;
     error
+}
+
+/// Render an error with its underlying causes. sf_core's messages often omit
+/// their source (e.g. "HTTP request failed after retries: login request"
+/// hides the transport error), so append each cause not already included.
+fn message_with_causes(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut cause = err.source();
+    while let Some(source) = cause {
+        let text = source.to_string();
+        if !text.is_empty() && !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = source.source();
+    }
+    message
 }
 
 pub(crate) fn not_implemented(msg: &str) -> Error {
@@ -251,5 +270,34 @@ mod tests {
         let err = not_implemented("foo");
         assert_eq!(err.status, adbc_core::error::Status::NotImplemented);
         assert!(err.message.contains("foo"));
+    }
+
+    #[test]
+    fn messages_include_causes_not_already_in_the_text() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+        // The middle layer already embeds its cause, so it is not repeated.
+        let err = Layer(
+            "Failed to login: HTTP request failed after retries: login request",
+            Some(Box::new(Layer(
+                "connect error: dns error",
+                Some(Box::new(Layer("dns error", None))),
+            ))),
+        );
+        assert_eq!(
+            message_with_causes(&err),
+            "Failed to login: HTTP request failed after retries: login request: \
+             connect error: dns error"
+        );
     }
 }
