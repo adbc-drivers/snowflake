@@ -721,15 +721,28 @@ impl Database {
                 Some((host, port)) => (host.to_owned(), Some(port.to_owned())),
                 None => (authority.into_owned(), None),
             };
-            let host_key = if explicit_account {
-                "adbc.snowflake.sql.uri.host"
+            // Like gosnowflake's ParseDSN: an authority containing the
+            // Snowflake domain is a full hostname whose first label is the
+            // account (unless account= is given); otherwise it is the account.
+            let is_hostname = host.to_ascii_lowercase().contains(".snowflakecomputing.");
+            if explicit_account || is_hostname {
+                if is_hostname && !explicit_account {
+                    let account = host.split('.').next().unwrap_or_default();
+                    self.set_option(
+                        OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                        OptionValue::String(account.to_owned()),
+                    )?;
+                }
+                self.set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.uri.host".into()),
+                    OptionValue::String(host),
+                )?;
             } else {
-                "adbc.snowflake.sql.account"
-            };
-            self.set_option(
-                OptionDatabase::Other(host_key.into()),
-                OptionValue::String(host),
-            )?;
+                self.set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                    OptionValue::String(host),
+                )?;
+            }
             if let Some(port) = port {
                 self.set_option(
                     OptionDatabase::Other("adbc.snowflake.sql.uri.port".into()),
@@ -1853,6 +1866,26 @@ mod tests {
             &Setting::Int(443)
         );
         assert!(!db.sf_settings.contains_key(param_names::HOST.as_str()));
+    }
+
+    #[test]
+    fn uri_snowflake_hostname_sets_host_and_account_from_first_label() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("user:pass@lgyanbp-im41116.snowflakecomputing.com/db/sc".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::HOST.as_str()),
+            Some(&Setting::String(
+                "lgyanbp-im41116.snowflakecomputing.com".into()
+            ))
+        );
+        assert_eq!(
+            db.sf_settings.get(param_names::ACCOUNT.as_str()),
+            Some(&Setting::String("lgyanbp-im41116".into()))
+        );
     }
 
     #[test]
