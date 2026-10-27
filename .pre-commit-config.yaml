@@ -16,12 +16,17 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 38bfb07c0c64c304f47eb52090f8288150c77730 # frozen: v0.17.1
     hooks:
+      # vendor/ is an unmodified copy of adbc-drivers/dev; keep it identical
+      # to upstream rather than rewriting it with this repo's lint rules.
       - id: ruff-check
         name: "ruff check (isort)"
         args: ["--select", "I", "--fix"]
+        exclude: ^vendor/
       - id: ruff-check
         args: ["--fix"]
+        exclude: ^vendor/
       - id: ruff-format
+        exclude: ^vendor/
 
   - repo: https://github.com/codespell-project/codespell
     rev: 57b21406f092110c18776e39b0bda50d37c945c8 # frozen: v2.4.3
