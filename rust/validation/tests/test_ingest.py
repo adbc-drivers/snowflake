@@ -14,6 +14,7 @@
 
 
 import adbc_drivers_validation.tests.ingest as ingest_tests
+import pytest
 
 from . import snowflake
 
@@ -24,4 +25,9 @@ def pytest_generate_tests(metafunc) -> None:
 
 
 class TestIngest(ingest_tests.TestIngest):
-    pass
+    @pytest.fixture(autouse=True)
+    def normalize_integer_results(self, monkeypatch):
+        # Result NUMBER widths depend on the values, including batch size.
+        monkeypatch.setattr(
+            ingest_tests.compare, "compare_tables", snowflake.compare_ingest_tables
+        )
