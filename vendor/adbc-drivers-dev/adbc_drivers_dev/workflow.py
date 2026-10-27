@@ -61,6 +61,31 @@ def template_not_implemented(message: str) -> str:
     raise NotImplementedError(message)
 
 
+def file_exists(root: Path, path: str) -> bool:
+    return (root / path).is_file()
+
+
+def load_tool_versions() -> dict[str, str]:
+    """Read the Dependabot-managed pins packaged with the templates."""
+    path = Path(__file__).parent / "tools" / "Cargo.toml"
+    with path.open("rb") as source:
+        dependencies = tomlkit.load(source).unwrap()["dependencies"]
+
+    versions = {}
+    for name in ("cargo-deny", "cargo-about"):
+        pin = dependencies.get(name)
+        if not isinstance(pin, str) or not re.fullmatch(r"=\d+\.\d+\.\d+", pin):
+            raise ValueError(f"{path}: {name} must have an exact '=X.Y.Z' version")
+        versions[name] = pin.removeprefix("=")
+
+    pixi = dependencies.get("pixi", {})
+    tag = pixi.get("tag") if isinstance(pixi, dict) else None
+    if not isinstance(tag, str) or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+        raise ValueError(f"{path}: pixi must have a 'vX.Y.Z' Git tag")
+    versions["pixi"] = tag
+    return versions
+
+
 def generate_workflows(args) -> int:
     env = jinja2.Environment(
         loader=jinja2.PackageLoader("adbc_drivers_dev"),
@@ -73,6 +98,7 @@ def generate_workflows(args) -> int:
         undefined=jinja2.StrictUndefined,
     )
     env.globals["not_implemented"] = template_not_implemented
+    env.globals["tool_versions"] = load_tool_versions()
 
     config_path = args.repository / ".github/workflows/generate.toml"
     try:
@@ -133,6 +159,7 @@ def generate_workflows(args) -> int:
             if lang == "go"
             else langs["go"][1]
         )
+        lang_file_exists = functools.partial(file_exists, args.repository / lang_subdir)
         lang_ctx = {
             "lang": lang,
             "lang_human": lang_human,
@@ -142,7 +169,9 @@ def generate_workflows(args) -> int:
             "go_mod_path": go_mod_path,
             "lang_config": lang_config,
             "lang_tools": lang_tools,
+            "file_exists": lang_file_exists,
         }
+
         write_workflow(
             workflows,
             template,
@@ -174,6 +203,7 @@ def generate_workflows(args) -> int:
                 f"{lang}_test_pr.yaml",
                 {
                     **params.to_dict(),
+                    **lang_ctx,
                 },
             )
 
@@ -204,7 +234,7 @@ def generate_workflows(args) -> int:
                 },
             )
 
-    for dev in ["dev.yaml", "dev_issues.yaml", "dev_pr.yaml"]:
+    for dev in ["dev.yaml", "dev_pr.yaml"]:
         template = env.get_template(dev)
         write_workflow(
             workflows,
@@ -215,6 +245,13 @@ def generate_workflows(args) -> int:
                 "go_mod_path": go_mod_path,
             },
         )
+
+    write_workflow(
+        args.repository / ".github",
+        env.get_template("zizmor.yaml"),
+        "zizmor.yaml",
+        params.to_dict(),
+    )
 
     return retcode
 

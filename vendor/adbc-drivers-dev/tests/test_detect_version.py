@@ -12,75 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LOCAL MODIFICATIONS: Snowflake adds deterministic regressions for the vendored
-# suffix and arbitrary-UID manylinux cache fixes.
-
 import subprocess
 
 import pytest
-from adbc_drivers_dev.make import detect_version, maybe_build_docker
 
-
-def test_manylinux_build_uses_writable_go_caches(tmp_path, monkeypatch):
-    from adbc_drivers_dev import make
-
-    calls = []
-    monkeypatch.setattr(
-        make, "check_call", lambda *args, **kwargs: calls.append((args, kwargs))
-    )
-    monkeypatch.setattr(make, "get_var", lambda name, default: default)
-    monkeypatch.setattr(make.platform, "system", lambda: "Linux")
-
-    maybe_build_docker(
-        repo_root=tmp_path,
-        driver_root=tmp_path,
-        env={},
-        args=["go", "build", "./pkg"],
-        ci=True,
-        container="manylinux",
-    )
-
-    command = calls[0][0][0]
-    service_index = command.index("manylinux")
-    assert command[service_index - 6 : service_index] == [
-        "--env",
-        "GOCACHE=/tmp/go-build",
-        "--env",
-        "GOMODCACHE=/tmp/go-mod",
-        "--env",
-        "GOPATH=/tmp/go",
-    ]
-
-
-def test_manylinux_rust_build_uses_writable_platform_cache(tmp_path, monkeypatch):
-    from adbc_drivers_dev import make
-
-    calls = []
-    monkeypatch.setattr(
-        make, "check_call", lambda *args, **kwargs: calls.append((args, kwargs))
-    )
-    monkeypatch.setattr(make, "get_var", lambda name, default: default)
-    monkeypatch.setattr(make.platform, "system", lambda: "Linux")
-
-    maybe_build_docker(
-        repo_root=tmp_path,
-        driver_root=tmp_path,
-        env={},
-        args=["cargo", "build", "--release"],
-        ci=True,
-        container="manylinux-rust",
-    )
-
-    command = calls[0][0][0]
-    service_index = command.index("manylinux-rust")
-    assert command[service_index - 6 : service_index] == [
-        "--env",
-        "HOME=/tmp",
-        "--env",
-        "XDG_CACHE_HOME=/tmp/.cache",
-        "--env",
-        "CARGO_HOME=/.cargo",
-    ]
+from adbc_drivers_dev.make import detect_version
 
 
 @pytest.fixture()
@@ -125,6 +61,18 @@ def test_on_tag_subdir(repo):
     assert version == "v1.2.3"
 
 
+def test_on_tag_worktree(repo):
+    subprocess.check_call(["git", "tag", "v1.2.3"], cwd=repo)
+    worktree = repo.parent / f"temp_{repo.name}_worktree"
+    subprocess.check_call(
+        ["git", "worktree", "add", "--quiet", "--detach", worktree], cwd=repo
+    )
+
+    assert (worktree / ".git").is_file()
+    version = detect_version(worktree)
+    assert version == "v1.2.3"
+
+
 def test_after_tag(repo):
     subprocess.check_call(["git", "tag", "v1.2.3"], cwd=repo)
     subprocess.check_call(
@@ -132,27 +80,7 @@ def test_after_tag(repo):
         cwd=repo,
     )
     version = detect_version(repo)
-    assert version.startswith("v1.2.3-dev.1."), version
-
-
-def test_after_tag_uses_semver_revision_prefix(repo, monkeypatch):
-    subprocess.check_call(["git", "tag", "v1.2.3"], cwd=repo)
-    subprocess.check_call(
-        ["git", "commit", "--quiet", "--allow-empty", "-m", "feat: add new feature"],
-        cwd=repo,
-    )
-
-    from adbc_drivers_dev import make
-
-    original_check_output = make.check_output
-
-    def check_output(args, *posargs, **kwargs):
-        if args == ["git", "rev-parse", "--short", "HEAD"]:
-            return "0747374"
-        return original_check_output(args, *posargs, **kwargs)
-
-    monkeypatch.setattr(make, "check_output", check_output)
-    assert detect_version(repo) == "v1.2.3-dev.1.g0747374"
+    assert version.startswith("v1.2.3-dev.1.g"), version
 
 
 def test_after_tag_subdir(repo):

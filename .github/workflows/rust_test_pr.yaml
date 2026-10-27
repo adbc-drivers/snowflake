@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Based on the vendored adbc-gen-workflow PR template, adapted for Rust.
+# !!!! AUTO-GENERATED FILE.  DO NOT EDIT. !!!!
+# USE adbc-gen-workflow (see adbc-drivers/dev) TO UPDATE THIS FILE.
+
 # This is a common workflow for testing a PR when permissions are needed.
 
 name: Rust Test PR
@@ -109,7 +111,7 @@ jobs:
             echo message=":x: **Test failed:** " | tee -a $GITHUB_OUTPUT
           fi
 
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           INPUTS: ${{ toJSON(inputs) }}
           MESSAGE: ${{ steps.get_run.outputs.message }}

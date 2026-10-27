@@ -16,8 +16,8 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 38bfb07c0c64c304f47eb52090f8288150c77730 # frozen: v0.17.1
     hooks:
-      # vendor/ is an unmodified copy of adbc-drivers/dev; keep it identical
-      # to upstream rather than rewriting it with this repo's lint rules.
+      # vendor/ tracks upstream dev plus the documented Snowflake build patches;
+      # avoid applying this repo's formatting rules to those upstream sources.
       - id: ruff-check
         name: "ruff check (isort)"
         args: ["--select", "I", "--fix"]

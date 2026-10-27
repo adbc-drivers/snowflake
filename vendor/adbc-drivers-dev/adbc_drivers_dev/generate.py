@@ -14,6 +14,7 @@
 
 import typing
 
+import pydantic
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 # Define workflow contexts in a single location
@@ -75,11 +76,9 @@ class LangBuildConfig(BaseModel):
         alias="lang-tools",
         description="Install tools for these languages to use in the build.",
     )
-
-    environment_contexts: list[str] = Field(
-        default_factory=lambda: ["test", "validate"],
-        alias="environment-contexts",
-        description="What parts of the build require the environment.",
+    environment: str | None = Field(
+        default=None,
+        description="Name of a GitHub Actions Environment to activate",
     )
 
 
@@ -93,12 +92,30 @@ class LangValidateSpec(BaseModel):
     }
 
     service_name: str = Field(
+        alias="service-name",
         default="test-service",
         description="docker-compose service to start",
     )
     vendor_version: str = Field(
+        alias="vendor-version",
         default="latest",
         description="version to pass to the validation suite",
+    )
+    environment: str | None = Field(
+        default=None,
+        description="Name of a GitHub Actions Environment to activate",
+    )
+    aws: bool = Field(
+        default=False,
+        description="Log in to AWS in this config. Expects AWS_ROLE, AWS_ROLE_SESSION_NAME secrets",
+    )
+    azure: bool = Field(
+        default=False,
+        description="Log in to Azure in this config. Expects AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET secrets",
+    )
+    gcloud: bool = Field(
+        default=False,
+        description="Log in to Google Cloud in this config. Expects GCLOUD_SERVICE_ACCOUNT, GCLOUD_WORKLOAD_IDENTITY_PROVIDER secrets",
     )
 
 
@@ -134,10 +151,42 @@ class LangTestConfig(BaseModel):
         default=False,
         description="Whether to skip tests in CI (this should only be used temporarily while setting up a driver or for build-only drivers)",
     )
+    timeout_minutes: int = Field(
+        alias="timeout-minutes",
+        default=15,
+        strict=True,
+        gt=0,
+        description="Timeout in minutes for Go and Rust test commands in CI. Must be a positive integer.",
+    )
     service_name: str = Field(
         alias="service-name",
         default="test-service",
         description="docker-compose service to start for tests",
+    )
+    environment: str | None = Field(
+        default=None,
+        description="Name of a GitHub Actions Environment to activate",
+    )
+    aws: bool = Field(
+        default=False,
+        description="Log in to AWS in this config. Expects AWS_ROLE, AWS_ROLE_SESSION_NAME secrets",
+    )
+    azure: bool = Field(
+        default=False,
+        description="Log in to Azure in this config. Expects AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET secrets",
+    )
+    gcloud: bool = Field(
+        default=False,
+        description="Log in to Google Cloud in this config. Expects GCLOUD_SERVICE_ACCOUNT, GCLOUD_WORKLOAD_IDENTITY_PROVIDER secrets",
+    )
+
+
+class LangTestPackagesConfig(BaseModel):
+    """Options for the Test Packages step."""
+
+    environment: str | None = Field(
+        default=None,
+        description="Name of a GitHub Actions Environment to activate",
     )
 
 
@@ -152,6 +201,20 @@ class LangConfig(BaseModel):
         default_factory=LangBuildConfig,
         description="Configuration for building the driver.",
     )
+    exclude_platforms: list[
+        typing.Literal["linux_amd64", "linux_arm64", "macos_arm64", "windows_amd64"]
+    ] = Field(
+        default_factory=list,
+        alias="exclude-platforms",
+        description="Platforms to exclude from build/test.",
+    )
+    github_stack_behavior: typing.Literal["all", "bottom", "top"] = Field(
+        default="all",
+        alias="github-stack-behavior",
+        description=(
+            "Which PRs in a stack run language_test.yaml: 'all', 'bottom' (lowest unmerged), and 'top'."
+        ),
+    )
     subdir: str | None = Field(
         default=None,
         description="Override the default subdirectory for this language. Use '.' to place files at the repository root.",
@@ -160,10 +223,27 @@ class LangConfig(BaseModel):
         default_factory=LangTestConfig,
         description="Configuration for the driver test suite.",
     )
+    test_packages: LangTestPackagesConfig = Field(
+        default_factory=LangTestPackagesConfig,
+        alias="test-packages",
+        description="Configuration for the Test Packages step.",
+    )
     validation: LangValidationConfig = Field(
         default_factory=LangValidationConfig,
         description="Configuration for the driver validation suite.",
     )
+
+    @field_validator("exclude_platforms")
+    @classmethod
+    def require_build_platform(cls, value: list[str]) -> list[str]:
+        if set(value) == {
+            "linux_amd64",
+            "linux_arm64",
+            "macos_arm64",
+            "windows_amd64",
+        }:
+            raise ValueError("exclude-platforms must leave at least one build platform")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -218,6 +298,8 @@ class GenerateConfig(BaseModel):
             "title": "Schema for generate.toml",
             "description": "You can validate your generate.toml against this schema with tools like tombi (https://tombi-toml.github.io/tombi/docs/linter). Requires placing a `#:schema` directive at the top of your generate.toml file.",
         },
+        "validate_by_name": True,
+        "validate_by_alias": True,
     }
 
     repository: str | None = Field(
@@ -229,13 +311,14 @@ class GenerateConfig(BaseModel):
         default="(unknown)",
         description="Driver name. Should be lowercase (e.g., postgresql, sqlite)",
     )
-    environment: str | None = Field(
-        default=None,
-        description="Name of a GitHub Actions Environment to use when including secrets in workflows",
-    )
     private: bool = Field(
         default=False,
         description="Whether the driver is private. Most drivers will be not be private so you can omit this.",
+    )
+    concurrency_key: str | None = Field(
+        default=None,
+        alias="concurrency-key",
+        description="Concurrency group for GitHub Actions. If specified, it effectively blocks test and release pipelines from running concurrently.",
     )
     lang: dict[str, LangConfig | None] = Field(
         default_factory=dict,
@@ -295,11 +378,11 @@ gcloud = true"""
     _processed_secrets: dict[str, dict[str, str]] = PrivateAttr(default_factory=dict)
     _permissions: dict[str, bool] = PrivateAttr(default_factory=dict)
 
-    @field_validator("environment")
+    @field_validator("concurrency_key")
     @classmethod
-    def validate_environment(cls, v: str | None) -> str | None:
+    def validate_concurrency_key(cls, v: str | None) -> str | None:
         if v is not None and not v.strip():
-            raise ValueError("environment must be non-empty if provided")
+            raise ValueError("concurrency-key must be non-empty if provided")
         return v
 
     @field_validator("lang", mode="before")
@@ -310,6 +393,15 @@ gcloud = true"""
             k: LangConfig() if v is True else None if v is False else v
             for k, v in value.items()
         }
+
+    @pydantic.computed_field
+    def azure(self) -> bool:
+        return any(
+            config.azure
+            for lang in self.lang.values()
+            if lang
+            for config in lang.validation.configs
+        ) or any(lang.test.azure for lang in self.lang.values() if lang)
 
     @model_validator(mode="after")
     def default_repository(self) -> "GenerateConfig":
@@ -357,7 +449,7 @@ gcloud = true"""
         self._processed_secrets["all"] = all_secrets
 
         # Set permissions
-        if self.aws or self.gcloud:
+        if self.aws or self.gcloud or self.azure:
             self._permissions["id_token"] = True
 
         return self
@@ -366,12 +458,13 @@ gcloud = true"""
         return {
             "driver": self.driver,
             "repository": self.repository,
-            "environment": self.environment,
             "private": self.private,
+            "concurrency_key": self.concurrency_key,
             "lang": self.lang,
             "secrets": self._processed_secrets,
             "permissions": self._permissions,
             "aws": self.aws.model_dump() if self.aws else None,
+            "azure": self.azure,
             "gcloud": self.gcloud,
             "validation": {
                 "extra_dependencies": self.validation.extra_dependencies,

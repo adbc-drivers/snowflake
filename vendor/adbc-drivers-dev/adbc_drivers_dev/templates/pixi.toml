@@ -31,11 +31,10 @@ platforms = ["linux-64", "osx-arm64", "win-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
+make = "adbc-make run build VERBOSE=true"
 <% if lang == "go" %>
-make = "adbc-make run build DRIVER=<{driver}> VERBOSE=true"
 test = "go test -tags assert -v ./..."
 <% elif lang == "rust" %>
-make = "adbc-make run build DRIVER=<{driver}> VERBOSE=true IMPL_LANG=rust"
 test = "cargo test"
 <% endif %>
 release = "adbc-release"
@@ -49,7 +48,12 @@ python = ">=3.14.3,<3.15"
 <% endfor %>
 
 [pypi-dependencies]
+<% if driver == "snowflake" %>
+# LOCAL DEVIATION: Use vendored Snowflake manylinux cache and Rust image fixes.
+adbc-drivers-dev = { path = "../vendor/adbc-drivers-dev", editable = true }
+<% else %>
 adbc-drivers-dev = { git = "https://github.com/adbc-drivers/dev" }
+<% endif %>
 adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation" }
 <% for key, value in validation["extra_pypi_dependencies"].items() %>
 <{key}> = "<{value}>"

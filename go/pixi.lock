@@ -1477,6 +1477,7 @@ packages:
   - requests
   - ruamel-yaml>=0.18.11,<0.19
   - tomlkit>=0.13.2,<0.14
+  requires_python: '>=3.14'
 - pypi: git+https://github.com/adbc-drivers/validation#2400b6b20f1a200a6a206f1694b7ede0a9f041ae
   name: adbc-drivers-validation
   version: '0.1'
