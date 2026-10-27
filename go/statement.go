@@ -26,10 +26,13 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/adbc-drivers/driverbase-go/driverbase/arrowext"
@@ -45,6 +48,7 @@ import (
 )
 
 const (
+	OptionLastQueryID                      = "snowflake.query.last_query_id"
 	OptionStatementQueryTag                = "adbc.snowflake.statement.query_tag"
 	OptionStatementQueueSize               = "adbc.rpc.result_queue_size"
 	OptionStatementPrefetchConcurrency     = "adbc.snowflake.rpc.prefetch_concurrency"
@@ -79,6 +83,7 @@ type statement struct {
 	ingestMode     string
 	ingestOptions  ingestOptions
 	queryTag       string
+	lastQueryID    atomic.Pointer[string]
 
 	bound      arrow.RecordBatch
 	streamBind array.RecordReader
@@ -138,6 +143,11 @@ func (st *statement) Close(ctx context.Context) (err error) {
 
 func (st *statement) GetOption(ctx context.Context, key string) (string, error) {
 	switch key {
+	case OptionLastQueryID:
+		if id := st.lastQueryID.Load(); id != nil {
+			return *id, nil
+		}
+		return "", nil
 	case OptionStatementQueryTag:
 		return st.queryTag, nil
 	case OptionStreamRetryEnabled:
@@ -197,6 +207,11 @@ func parseCompressionCodec(val string) (compress.Compression, error) {
 // SetOption sets a string option on this statement
 func (st *statement) SetOption(ctx context.Context, key string, val string) error {
 	switch key {
+	case OptionLastQueryID:
+		return adbc.Error{
+			Code: adbc.StatusInvalidArgument,
+			Msg:  fmt.Sprintf("[Snowflake] statement option %s is read-only", key),
+		}
 	case adbc.OptionKeyIngestTargetTable:
 		st.query = ""
 		st.targetTable = val
@@ -911,12 +926,61 @@ func extractSRIDFromMeta(metadata string) (int, string) {
 	return 0, meta.Edges
 }
 
+// Match gosnowflake's file-transfer detection. File transfers reuse the
+// context for follow-up requests after gosnowflake has closed the query-ID
+// channel and would cause a crash otherwise.
+var fileTransferPattern = regexp.MustCompile(`(?i)^(?:/\*.*\*/\s*)*\s*(?:put|get)\s+`)
+
+// captureQueryID records the server ID without waiting when the request failed
+// before Snowflake returned a response. gosnowflake sends and closes the channel.
+func (st *statement) captureQueryID(ids <-chan string, err error) {
+	select {
+	case id := <-ids:
+		st.lastQueryID.Store(&id)
+	default:
+	}
+	var sferr *gosnowflake.SnowflakeError
+	if errors.As(err, &sferr) && sferr.QueryID != "" {
+		id := sferr.QueryID
+		st.lastQueryID.Store(&id)
+	}
+}
+
+func (st *statement) queryArrowStream(ctx context.Context, params ...driver.NamedValue) (gosnowflake.ArrowStreamLoader, error) {
+	st.lastQueryID.Store(nil)
+	if fileTransferPattern.MatchString(st.query) {
+		return st.cnxn.cn.QueryArrowStream(gosnowflake.WithQueryIDChan(ctx, nil), st.query, params...)
+	}
+	ids := make(chan string, 1)
+	loader, err := st.cnxn.cn.QueryArrowStream(gosnowflake.WithQueryIDChan(ctx, ids), st.query, params...)
+	st.captureQueryID(ids, err)
+	return loader, err
+}
+
+func (st *statement) execSQL(ctx context.Context, params []driver.NamedValue) (driver.Result, error) {
+	st.lastQueryID.Store(nil)
+	if fileTransferPattern.MatchString(st.query) {
+		return st.cnxn.cn.ExecContext(gosnowflake.WithQueryIDChan(ctx, nil), st.query, params)
+	}
+	ids := make(chan string, 1)
+	result, err := st.cnxn.cn.ExecContext(gosnowflake.WithQueryIDChan(ctx, ids), st.query, params)
+	st.captureQueryID(ids, err)
+	if err == nil {
+		if result, ok := result.(interface{ GetQueryID() string }); ok && result.GetQueryID() != "" {
+			id := result.GetQueryID()
+			st.lastQueryID.Store(&id)
+		}
+	}
+	return result, err
+}
+
 // ExecuteQuery executes the current query or prepared statement
 // and returns a RecordReader for the results along with the number
 // of rows affected if known, otherwise it will be -1.
 //
 // This invalidates any prior result sets on this statement.
 func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReader, nRows int64, err error) {
+	st.lastQueryID.Store(nil)
 	nRows = -1
 
 	var span trace.Span
@@ -941,20 +1005,25 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 		return
 	}
 
-	// for a bound stream reader we'd need to implement something to
-	// concatenate RecordReaders which doesn't exist yet. let's put
-	// that off for now.
 	if st.streamBind != nil || st.bound != nil {
+		// Keep the combined stream's schema fixed to the first query ID,
+		// while the statement option advances with each execution.
+		var firstQueryID *string
+		firstQuery := true
 		bind := snowflakeBindReader{
 			doQuery: func(params []driver.NamedValue) (array.RecordReader, error) {
 				var loader gosnowflake.ArrowStreamLoader
-				loader, err = st.cnxn.cn.QueryArrowStream(ctx, st.query, params...)
+				loader, err = st.queryArrowStream(ctx, params...)
 				if err != nil {
 					err = errToAdbcErr(adbc.StatusInternal, err)
 					return nil, err
 				}
 
-				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision, st.cnxn.useGeoArrow())
+				if firstQuery {
+					firstQueryID = st.lastQueryID.Load()
+					firstQuery = false
+				}
+				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision, st.cnxn.useGeoArrow(), firstQueryID)
 				return reader, err
 			},
 			currentBatch: st.bound,
@@ -973,13 +1042,13 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 	}
 
 	var loader gosnowflake.ArrowStreamLoader
-	loader, err = st.cnxn.cn.QueryArrowStream(ctx, st.query)
+	loader, err = st.queryArrowStream(ctx)
 	if err != nil {
 		err = errToAdbcErr(adbc.StatusInternal, err)
 		return
 	}
 
-	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision, st.cnxn.useGeoArrow())
+	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.streamRetryEnabled, st.maxTimestampPrecision, st.cnxn.useGeoArrow(), st.lastQueryID.Load())
 	nRows = loader.TotalRows()
 	return
 }
@@ -987,6 +1056,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 // ExecuteUpdate executes a statement that does not generate a result
 // set. It returns the number of rows affected if known, otherwise -1.
 func (st *statement) ExecuteUpdate(ctx context.Context) (numRows int64, err error) {
+	st.lastQueryID.Store(nil)
 	ctx, span := driverbase.StartSpan(ctx, "statement.ExecuteUpdate", st)
 	defer func() {
 		span.SetAttributes(semconv.DBResponseReturnedRowsKey.Int64(numRows))
@@ -1027,7 +1097,7 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (numRows int64, err erro
 				numRows = -1
 				return numRows, err
 			}
-			r, err := st.cnxn.cn.ExecContext(ctx, st.query, params)
+			r, err := st.execSQL(ctx, params)
 			if err != nil {
 				err = errToAdbcErr(adbc.StatusInternal, err)
 				numRows = -1
@@ -1044,7 +1114,7 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (numRows int64, err erro
 		return numRows, err
 	}
 
-	r, err := st.cnxn.cn.ExecContext(ctx, st.query, nil)
+	r, err := st.execSQL(ctx, nil)
 	if err != nil {
 		numRows = -1
 		err = errToAdbcErr(adbc.StatusIO, err)

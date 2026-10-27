@@ -13,25 +13,35 @@
 # limitations under the License.
 
 driver = "snowflake"
-environment = "Snowflake CI"
 private = false
 
+[lang.go]
+github-stack-behavior = "top"
+
+[lang.go.test]
+environment = "Snowflake CI"
+timeout-minutes = 40
+
 [lang.rust]
+
+[lang.rust.test]
+environment = "Snowflake CI"
+
+[lang.rust.build]
+environment = "Snowflake CI"
+
+[[lang.rust.validation.configs]]
+environment = "Snowflake CI"
 [[lang.go.validation.configs]]
+environment = "Snowflake CI"
 
 [secrets]
-SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["validate"] }
-SNOWFLAKE_SCHEMA = { secret = "SNOWFLAKE_SCHEMA", contexts = ["validate"] }
-SNOWFLAKE_URI = { secret = "SNOWFLAKE_URI", contexts = ["validate"] }
-SNOWFLAKE_SCHEMA_SECONDARY = { secret = "SNOWFLAKE_SCHEMA_SECONDARY", contexts = [
-  "validate",
-] }
-SNOWFLAKE_DATABASE_SECONDARY = { secret = "SNOWFLAKE_DATABASE_SECONDARY", contexts = [
-  "validate",
-] }
-SNOWFLAKE_DATABASE_SECONDARY_SCHEMA = { secret = "SNOWFLAKE_DATABASE_SECONDARY_SCHEMA", contexts = [
-  "validate",
-] }
+SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["test", "validate"] }
+SNOWFLAKE_SCHEMA = { secret = "SNOWFLAKE_SCHEMA", contexts = ["test", "validate"] }
+SNOWFLAKE_URI = { secret = "SNOWFLAKE_URI", contexts = ["test", "validate"] }
+SNOWFLAKE_SCHEMA_SECONDARY = { secret = "SNOWFLAKE_SCHEMA_SECONDARY", contexts = ["test", "validate"] }
+SNOWFLAKE_DATABASE_SECONDARY = { secret = "SNOWFLAKE_DATABASE_SECONDARY", contexts = ["test", "validate"] }
+SNOWFLAKE_DATABASE_SECONDARY_SCHEMA = { secret = "SNOWFLAKE_DATABASE_SECONDARY_SCHEMA", contexts = ["test", "validate"] }
 
 [validation]
 [validation.extra-dependencies]

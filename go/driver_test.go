@@ -40,6 +40,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -70,16 +71,20 @@ func quoteIdentifier(identifier string) string {
 }
 
 type SnowflakeQuirks struct {
-	dsn         string
-	mem         *memory.CheckedAllocator
-	connector   sqldriver.Connector
-	catalogName string
-	schemaName  string
+	dsn           string
+	mem           *memory.CheckedAllocator
+	connector     sqldriver.Connector
+	catalogName   string
+	schemaName    string
+	vendorVersion *regexp.Regexp
 }
 
 func (s *SnowflakeQuirks) SetupDriver(t *testing.T) driverbase.DriverWithContext {
 	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
 	cfg, err := gosnowflake.ParseDSN(s.dsn)
+	require.NoError(t, err)
+
+	s.vendorVersion, err = regexp.Compile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	require.NoError(t, err)
 
 	cfg.Schema = s.schemaName
@@ -180,7 +185,7 @@ func (s *SnowflakeQuirks) CreateSampleTable(tableName string, r arrow.RecordBatc
 			b.WriteString(", ")
 		}
 		f := r.Schema().Field(int(i))
-		b.WriteString(f.Name)
+		b.WriteString(quoteIdentifier(f.Name))
 		b.WriteByte(' ')
 		b.WriteString(s.getSqlTypeFromArrowType(f.Type))
 	}
@@ -255,7 +260,7 @@ func (s *SnowflakeQuirks) GetMetadata(code adbc.InfoCode) any {
 	case adbc.InfoDriverArrowVersion:
 		return "v18.8.0"
 	case adbc.InfoVendorVersion:
-		return "(unknown or development build)"
+		return s.vendorVersion
 	case adbc.InfoVendorArrowVersion:
 		return "(unknown or development build)"
 	case adbc.InfoDriverADBCVersion:
@@ -319,13 +324,20 @@ func dropTempSchema(uri, schema string) {
 	}
 }
 
-func withQuirks(t *testing.T, fn func(*SnowflakeQuirks)) {
+func getSnowflakeURI(t *testing.T) string {
+	t.Helper()
 	uri := os.Getenv("SNOWFLAKE_URI")
-	database := os.Getenv("SNOWFLAKE_DATABASE")
-
 	if uri == "" {
 		t.Skip("no SNOWFLAKE_URI defined, skip snowflake driver tests")
-	} else if database == "" {
+	}
+	return strings.TrimPrefix(uri, "snowflake://")
+}
+
+func withQuirks(t *testing.T, fn func(*SnowflakeQuirks)) {
+	uri := getSnowflakeURI(t)
+	database := os.Getenv("SNOWFLAKE_DATABASE")
+
+	if database == "" {
 		t.Skip("no SNOWFLAKE_DATABASE defined, skip snowflake driver tests")
 	}
 
@@ -1414,9 +1426,9 @@ func (suite *SnowflakeTests) TestSqlIngestListType() {
 	defer expectedRecord.Release()
 
 	suite.Truef(array.RecordEqual(expectedRecord, result), "expected: %s\ngot: %s", expectedRecord, result)
-	logicalTypeList, ok := result.Schema().Field(1).Metadata.GetValue("logicalType")
-	suite.True(ok)
-	suite.Equal("ARRAY", logicalTypeList)
+	extensionName, ok := result.Schema().Field(1).Metadata.GetValue("ARROW:extension:name")
+	suite.Require().True(ok)
+	suite.Equal("arrow.json", extensionName)
 
 	suite.False(rdr.Next())
 	suite.Require().NoError(rdr.Err())
@@ -1504,16 +1516,16 @@ func (suite *SnowflakeTests) TestMetadataGetObjectsColumnsXdbc() {
 	db := sql.OpenDB(suite.Quirks.connector)
 	defer testutil.CheckedClose(suite.T(), db)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest2" ADD CONSTRAINT bulk_ingest2_pk PRIMARY KEY (int64s, strings)`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest2" ADD CONSTRAINT bulk_ingest2_pk PRIMARY KEY ("int64s", "strings")`)
 	suite.Require().NoError(err)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_pk PRIMARY KEY (int64s, strings)`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_pk PRIMARY KEY ("int64s", "strings")`)
 	suite.Require().NoError(err)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT uniq_col UNIQUE (int64s)`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT uniq_col UNIQUE ("int64s")`)
 	suite.Require().NoError(err)
 
-	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_fk FOREIGN KEY (int64s, strings) REFERENCES "bulk_ingest2"`)
+	_, err = db.ExecContext(suite.ctx, `ALTER TABLE "bulk_ingest" ADD CONSTRAINT bulk_ingest_fk FOREIGN KEY ("int64s", "strings") REFERENCES "bulk_ingest2"`)
 	suite.Require().NoError(err)
 
 	var (
@@ -1536,7 +1548,9 @@ func (suite *SnowflakeTests) TestMetadataGetObjectsColumnsXdbc() {
 		expectedXdbcScale        = []string{"0", "0"}
 		expectedXdbcNumPrecRadix = []string{"10", "0"}
 		expectedXdbcCharMaxLen   = []string{"38", "16777216"}
-		expectedXdbcCharOctetLen = []string{"0", "16777216"}
+		// Snowflake distinguishes maximum characters from bytes (up to four per UTF-8 character).
+		// https://docs.snowflake.com/en/sql-reference/info-schema/columns
+		expectedXdbcCharOctetLen = []string{"0", "67108864"}
 		expectedXdbcDateTimeSub  = []string{"0", "0"}
 	)
 
@@ -1751,30 +1765,30 @@ func (suite *SnowflakeTests) TestNewDatabaseGetSetOptions() {
 		key1: val1,
 		key2: val2,
 	})
-	suite.NoError(err)
-	suite.NotNil(db)
+	suite.Require().NoError(err)
+	suite.Require().NotNil(db)
 	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
 
-	getSetDB, ok := db.(adbc.GetSetOptions)
-	suite.True(ok)
+	getSetDB, ok := db.(adbc.GetSetOptionsWithContext)
+	suite.Require().True(ok)
 
-	optVal1, err := getSetDB.GetOption(key1)
-	suite.NoError(err)
+	optVal1, err := getSetDB.GetOption(suite.ctx, key1)
+	suite.Require().NoError(err)
 	suite.Equal(optVal1, val1)
-	optVal2, err := getSetDB.GetOption(key2)
-	suite.NoError(err)
+	optVal2, err := getSetDB.GetOption(suite.ctx, key2)
+	suite.Require().NoError(err)
 	suite.Equal(optVal2, val2)
 
 	// set a new value for key1 and check that it was set
 	newVal1 := "newval1"
-	err = getSetDB.SetOption(key1, newVal1)
-	suite.NoError(err)
-	optVal1, err = getSetDB.GetOption(key1)
-	suite.NoError(err)
+	err = getSetDB.SetOption(suite.ctx, key1, newVal1)
+	suite.Require().NoError(err)
+	optVal1, err = getSetDB.GetOption(suite.ctx, key1)
+	suite.Require().NoError(err)
 	suite.Equal(optVal1, newVal1)
 	// check that key2 is unchanged
-	optVal2, err = getSetDB.GetOption(key2)
-	suite.NoError(err)
+	optVal2, err = getSetDB.GetOption(suite.ctx, key2)
+	suite.Require().NoError(err)
 	suite.Equal(optVal2, val2)
 }
 
@@ -1902,15 +1916,17 @@ func (suite *SnowflakeTests) TestUntypedNullLiteral() {
 
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
-	opts[driver.OptionMaxTimestampPrecision] = "microseconds"
+	opts[driver.OptionMaxTimestampPrecision] = driver.OptionValueMicroseconds
 
 	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, opts)
-	suite.NoError(err)
+	suite.Require().NoError(err)
 	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
 	cnxn, err := db.Open(suite.ctx)
-	suite.NoError(err)
+	suite.Require().NoError(err)
 	defer testutil.CheckedCloseWithContext(suite.T(), cnxn, suite.ctx)
-	stmt, _ := cnxn.NewStatement(suite.ctx)
+	stmt, err := cnxn.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), stmt, suite.ctx)
 
 	id := uuid.New()
 	tempTable := "pk_" + strings.ReplaceAll(id.String(), "-", "")
@@ -1922,74 +1938,57 @@ func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, query))
 	_, err = stmt.ExecuteUpdate(suite.ctx)
 	suite.Require().NoError(err)
-	suite.Require().NoError(stmt.Close(suite.ctx))
+	defer func() {
+		cleanup, err := cnxn.NewStatement(suite.ctx)
+		suite.Require().NoError(err)
+		defer testutil.CheckedCloseWithContext(suite.T(), cleanup, suite.ctx)
+		query := fmt.Sprintf("DROP TABLE %s.%s.%s", suite.Quirks.catalogName, suite.Quirks.schemaName, tempTable)
+		suite.Require().NoError(cleanup.SetSqlQuery(suite.ctx, query))
+		_, err = cleanup.ExecuteUpdate(suite.ctx)
+		suite.NoError(err)
+	}()
 
 	query = fmt.Sprintf("SHOW PRIMARY KEYS IN TABLE %s.%s.%s", suite.Quirks.catalogName, suite.Quirks.schemaName, tempTable)
-	stmt, _ = cnxn.NewStatement(suite.ctx)
 	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, query))
 	rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
 	defer rdr.Release()
-	suite.Require().NoError(err)
 
-	suite.True(rdr.Next())
+	hasRecord := rdr.Next()
+	suite.Require().NoError(rdr.Err(), "query: %s", query)
+	suite.Require().True(hasRecord, "query: %s", query)
 	rec := rdr.RecordBatch()
+	suite.Require().NotNil(rec)
+	suite.Require().EqualValues(1, rec.NumRows())
 
-	suite.Equal(1, int(rec.NumRows()))
-
-	// Get column indexes
 	getColIdx := func(name string) int {
-		for i := range rec.NumCols() {
-			if rec.ColumnName(int(i)) == name {
-				return int(i)
-			}
-		}
-		panic("Column not found: " + name)
+		indices := rec.Schema().FieldIndices(name)
+		suite.Require().Len(indices, 1, "column: %s", name)
+		return indices[0]
 	}
 
-	// Expected column names
-	dbIdx := getColIdx("database_name")
-	schemaIdx := getColIdx("schema_name")
-	tableIdx := getColIdx("table_name")
-	colIdx := getColIdx("column_name")
-	seqIdx := getColIdx("key_sequence")
-	createdIdx := getColIdx("created_on")
+	dbName := rec.Column(getColIdx("database_name")).(*array.String).Value(0)
+	schema := rec.Column(getColIdx("schema_name")).(*array.String).Value(0)
+	tbl := rec.Column(getColIdx("table_name")).(*array.String).Value(0)
+	column := rec.Column(getColIdx("column_name")).(*array.String).Value(0)
+	keySeq := rec.Column(getColIdx("key_sequence")).(*array.Int64).Value(0)
 
-	i := 0
-	dbName := rec.Column(dbIdx).(*array.String).Value(i)
-	schema := rec.Column(schemaIdx).(*array.String).Value(i)
-	tbl := rec.Column(tableIdx).(*array.String).Value(i)
-	column := rec.Column(colIdx).(*array.String).Value(i)
-	keySeq := rec.Column(seqIdx).(*array.Int64).Value(i)
+	createdCol, ok := rec.Column(getColIdx("created_on")).(*array.Timestamp)
+	suite.Require().True(ok)
+	suite.Require().False(createdCol.IsNull(0))
+	// The option caps precision; SHOW results can still use milliseconds.
+	unit := createdCol.DataType().(*arrow.TimestampType).Unit
+	created := createdCol.Value(0).ToTime(unit)
 
-	// Created_on should be a timestamp array
-	createdCol := rec.Column(createdIdx).(*array.Timestamp)
-	created := time.Unix(0, int64(createdCol.Value(i))*int64(time.Microsecond)).UTC()
-
-	// Perform checks
-	if strings.EqualFold(dbName, suite.Quirks.catalogName) &&
-		strings.EqualFold(schema, suite.Quirks.schemaName) &&
-		strings.EqualFold(tbl, tempTable) &&
-		strings.EqualFold(column, "id") &&
-		keySeq == 1 {
-
-		now := time.Now().UTC()
-		diff := now.Sub(created)
-		if diff < 0 {
-			diff = -diff
-		}
-		// since this was just created, make sure the times are within a short difference
-		suite.Assert().True(diff <= 2*time.Minute)
-	} else {
-		panic("Invalid values")
-	}
-	suite.Require().NoError(stmt.Close(suite.ctx))
-
-	query = fmt.Sprintf("DROP TABLE %s.%s.%s", suite.Quirks.catalogName, suite.Quirks.schemaName, tempTable)
-	stmt, _ = cnxn.NewStatement(suite.ctx)
-	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, query))
-	_, err = stmt.ExecuteUpdate(suite.ctx)
-	suite.Require().NoError(err)
-	suite.Require().NoError(stmt.Close(suite.ctx))
+	suite.True(strings.EqualFold(dbName, suite.Quirks.catalogName))
+	suite.True(strings.EqualFold(schema, suite.Quirks.schemaName))
+	suite.True(strings.EqualFold(tbl, tempTable))
+	suite.True(strings.EqualFold(column, "id"))
+	suite.EqualValues(1, keySeq)
+	suite.WithinDuration(time.Now().UTC(), created, 2*time.Minute,
+		"created_on: raw=%d type=%s", createdCol.Value(0), createdCol.DataType())
+	suite.False(rdr.Next())
+	suite.Require().NoError(rdr.Err())
 }
 
 func (suite *SnowflakeTests) TestTimestampPrecision() {
@@ -2099,25 +2098,32 @@ func (suite *SnowflakeTests) getTimestamps(query string, maxTimestampPrecision s
 		opts[driver.OptionMaxTimestampPrecision] = maxTimestampPrecision
 	}
 	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, opts)
-	suite.NoError(err)
+	suite.Require().NoError(err, "query: %s, precision: %s", query, maxTimestampPrecision)
 	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
 	cnxn, err := db.Open(suite.ctx)
-	suite.NoError(err)
+	suite.Require().NoError(err, "query: %s, precision: %s", query, maxTimestampPrecision)
 	defer testutil.CheckedCloseWithContext(suite.T(), cnxn, suite.ctx)
-	stmt, _ := cnxn.NewStatement(suite.ctx)
+	stmt, err := cnxn.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), stmt, suite.ctx)
 	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, query))
 	rdr, _, err := stmt.ExecuteQuery(suite.ctx)
-	suite.Require().NoError(err)
+	suite.Require().NoError(err, "query: %s, precision: %s", query, maxTimestampPrecision)
 
 	defer rdr.Release()
 
 	if maxTimestampPrecision == driver.OptionValueNanosecondsNoOverflow {
-		suite.False(rdr.Next())
+		suite.Require().False(rdr.Next(), "query: %s, precision: %s", query, maxTimestampPrecision)
+		suite.Require().ErrorContains(rdr.Err(), "overflows when converted to nanoseconds",
+			"query: %s, precision: %s", query, maxTimestampPrecision)
 		return nil
 	}
 
-	suite.True(rdr.Next())
+	hasRecord := rdr.Next()
+	suite.Require().NoError(rdr.Err(), "query: %s, precision: %s", query, maxTimestampPrecision)
+	suite.Require().True(hasRecord, "query: %s, precision: %s", query, maxTimestampPrecision)
 	rec := rdr.RecordBatch()
+	suite.Require().NotNil(rec)
 	rec.Retain()
 
 	return rec
@@ -2125,11 +2131,13 @@ func (suite *SnowflakeTests) getTimestamps(query string, maxTimestampPrecision s
 
 func (suite *SnowflakeTests) validateTimestamps(query string, rec arrow.RecordBatch, expected []arrow.Timestamp) {
 	if expected != nil {
+		suite.Require().NotNil(rec, "query: %s", query)
+		suite.Require().EqualValues(len(expected), rec.NumCols())
 		for i := range rec.NumCols() {
 			col := rec.Column(int(i)).(*array.Timestamp)
-			suite.EqualValues(1, col.Len())
+			suite.Require().EqualValues(1, col.Len())
 			actual := col.Value(0)
-			suite.Equal(expected[i], actual, "Mismatch in column %d for the query %d", i, query)
+			suite.Equal(expected[i], actual, "Mismatch in column %d for the query %s", i, query)
 		}
 	}
 }
@@ -2389,10 +2397,7 @@ func (suite *SnowflakeTests) TestAdditionalDriverInfo() {
 func TestJwtAuthenticationUnencryptedValue(t *testing.T) {
 	// test doesn't participate in SnowflakeTests because
 	// JWT auth has a different behavior
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_VALUE")
 	if !ok {
@@ -2408,10 +2413,7 @@ func TestJwtAuthenticationUnencryptedValue(t *testing.T) {
 func TestJwtAuthenticationEncryptedValue(t *testing.T) {
 	// test doesn't participate in SnowflakeTests because
 	// JWT auth has a different behavior
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_EN_VALUE")
 	if !ok {
@@ -2645,6 +2647,52 @@ func (suite *SnowflakeTests) TestIngestEmptyChunk() {
 	suite.EqualValues(int64(3), n)
 }
 
+// Many small files with concurrent uploads and COPYs often leave files for
+// the final COPY to load after the background COPYs finish.
+func (suite *SnowflakeTests) TestIngestManySmallFiles() {
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, "bulk_ingest_many_files"))
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "col_int64", Type: arrow.PrimitiveTypes.Int64,
+			Nullable: true,
+		},
+		{
+			Name: "col_string", Type: arrow.BinaryTypes.String,
+			Nullable: true,
+		},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	const numBatches, batchSize = 300, 200
+	recs := make([]arrow.RecordBatch, numBatches)
+	for b := range numBatches {
+		for i := range batchSize {
+			bldr.Field(0).(*array.Int64Builder).Append(int64(b*batchSize + i))
+			bldr.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("row-%d-%d", b, i))
+		}
+		recs[b] = bldr.NewRecordBatch()
+		defer recs[b].Release()
+	}
+
+	rdr, err := array.NewRecordReader(sc, recs)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.Require().NoError(suite.stmt.BindStream(suite.ctx, rdr))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, "bulk_ingest_many_files"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestTargetFileSize, "1024"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestWriterConcurrency, "8"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestUploadConcurrency, "16"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestCopyConcurrency, "8"))
+
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.EqualValues(numBatches*batchSize, n)
+}
+
 func TestIngestCancelContext(t *testing.T) {
 	withQuirks(t, func(q *SnowflakeQuirks) {
 		ctx := context.Background()
@@ -2790,36 +2838,67 @@ func TestIngestWithQualifiedTableName(t *testing.T) {
 }
 
 func (suite *SnowflakeTests) TestChangeDatabaseAndGetObjects() {
-	// this test demonstrates:
-	// 1. changing the database context
-	// 2. being able to call GetObjects after changing the database context
-	//    (this uses a different connection context but still executes successfully)
-
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		suite.T().Skip("Cannot find the `SNOWFLAKE_URI` value")
+	newCatalog := os.Getenv("SNOWFLAKE_DATABASE_SECONDARY")
+	if newCatalog == "" {
+		suite.T().Skip("no SNOWFLAKE_DATABASE_SECONDARY defined")
+	}
+	newSchema := os.Getenv("SNOWFLAKE_DATABASE_SECONDARY_SCHEMA")
+	if newSchema == "" {
+		suite.T().Skip("no SNOWFLAKE_DATABASE_SECONDARY_SCHEMA defined")
 	}
 
-	newCatalog, ok := os.LookupEnv("SNOWFLAKE_NEW_CATALOG")
-	if !ok {
-		suite.T().Skip("Cannot find the `SNOWFLAKE_NEW_CATALOG` value")
-	}
+	tableName := "ADBC_GETOBJECTS_" + strings.ToUpper(strings.ReplaceAll(uuid.New().String(), "-", ""))
+	qualifiedTable := quoteIdentifier(newCatalog) + "." + quoteIdentifier(newSchema) + "." + quoteIdentifier(tableName)
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TABLE "+qualifiedTable+" (id INTEGER)"))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	defer func() {
+		if suite.NoError(suite.stmt.SetSqlQuery(suite.ctx, "DROP TABLE IF EXISTS "+qualifiedTable)) {
+			_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+			suite.NoError(err)
+		}
+	}()
 
-	getObjectsTable, ok := os.LookupEnv("SNOWFLAKE_TABLE_GETOBJECTS")
-	if !ok {
-		suite.T().Skip("Cannot find the `SNOWFLAKE_TABLE_GETOBJECTS` value")
-	}
-
-	cfg, err := gosnowflake.ParseDSN(uri)
-	suite.NoError(err)
-
+	// GetObjects uses a different connection context; it must still find the
+	// table after changing the current catalog on this connection.
 	cnxnopt, ok := suite.cnxn.(adbc.GetSetOptionsWithContext)
-	suite.True(ok)
-	err = cnxnopt.SetOption(suite.ctx, adbc.OptionKeyCurrentCatalog, newCatalog)
-	suite.NoError(err)
+	suite.Require().True(ok)
+	suite.Require().NoError(cnxnopt.SetOption(suite.ctx, adbc.OptionKeyCurrentCatalog, newCatalog))
 
-	_, err2 := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthAll, &newCatalog, &cfg.Schema, &getObjectsTable, nil, nil)
-	suite.NoError(err2)
+	rdr, err := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthAll, &newCatalog, &newSchema, &tableName, nil, nil)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	foundTable := false
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		catalogNames := rec.Column(0).(*array.String)
+		schemaList := rec.Column(1).(*array.List)
+		schemas := schemaList.ListValues().(*array.Struct)
+		schemaNames := schemas.Field(0).(*array.String)
+		tableList := schemas.Field(1).(*array.List)
+		tables := tableList.ListValues().(*array.Struct)
+		tableNames := tables.Field(0).(*array.String)
+		for row := range rec.NumRows() {
+			if catalogNames.Value(int(row)) != newCatalog {
+				continue
+			}
+			schemaStart, schemaEnd := schemaList.ValueOffsets(int(row))
+			for schemaIdx := schemaStart; schemaIdx < schemaEnd; schemaIdx++ {
+				if schemaNames.Value(int(schemaIdx)) != newSchema {
+					continue
+				}
+				tableStart, tableEnd := tableList.ValueOffsets(int(schemaIdx))
+				for tableIdx := tableStart; tableIdx < tableEnd; tableIdx++ {
+					if tableNames.Value(int(tableIdx)) == tableName {
+						foundTable = true
+					}
+				}
+			}
+		}
+	}
+	suite.NoError(rdr.Err())
+	suite.True(foundTable, "GetObjects did not return %s", qualifiedTable)
 }
 
 func (suite *SnowflakeTests) TestGetSetClientConfigFile() {
@@ -2960,10 +3039,7 @@ func TestInvalidValidateDefaultParameters(t *testing.T) {
 // it reports how the server resolves CLIENT_VALIDATE_DEFAULT_PARAMETERS and
 // confirms that disabling it lets a login succeed that would otherwise fail.
 func TestValidateDefaultParametersAgainstSnowflake(t *testing.T) {
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	ctx := context.Background()
 
@@ -3426,10 +3502,7 @@ func TestSnowflakeURIScheme(t *testing.T) {
 }
 
 func TestInvalidSnowflakeAuthentication(t *testing.T) {
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	cfg, err := gosnowflake.ParseDSN(uri)
 	assert.NoError(t, err)
@@ -3467,10 +3540,7 @@ func TestInvalidSnowflakeAuthentication(t *testing.T) {
 func TestJwtAuthenticationUnencryptedValueUnauthorized(t *testing.T) {
 	// test doesn't participate in SnowflakeTests because
 	// JWT auth has a different behavior
-	uri, ok := os.LookupEnv("SNOWFLAKE_URI")
-	if !ok {
-		t.Skip("Cannot find the `SNOWFLAKE_URI` value")
-	}
+	uri := getSnowflakeURI(t)
 
 	keyValue, ok := os.LookupEnv("SNOWFLAKE_TEST_PKCS8_VALUE")
 	if !ok {
@@ -3638,4 +3708,82 @@ func (suite *SnowflakeTests) TestGetStatisticsBasic() {
 
 	// Note: We intentionally don't drop the table to keep it for subsequent test runs,
 	// ensuring consistent results despite INFORMATION_SCHEMA caching
+}
+
+func (suite *SnowflakeTests) TestQueryID() {
+	opts := suite.stmt.(adbc.GetSetOptionsWithContext)
+	getID := func() string {
+		id, err := opts.GetOption(suite.ctx, driver.OptionLastQueryID)
+		suite.Require().NoError(err)
+		return id
+	}
+	suite.Empty(getID())
+	var previous string
+	for _, query := range []string{"SELECT 1", "SELECT 1 WHERE FALSE", "SHOW PARAMETERS LIKE 'TIMEZONE' IN SESSION"} {
+		suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, query))
+		rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+		suite.Require().NoError(err)
+		id := getID()
+		suite.NotEmpty(id)
+		suite.NotEqual(previous, id)
+		actual, ok := rdr.Schema().Metadata().GetValue(driver.MetadataKeyQueryID)
+		suite.True(ok)
+		suite.Equal(id, actual)
+		for rdr.Next() {
+			suite.Equal(rdr.Schema().Metadata(), rdr.RecordBatch().Schema().Metadata())
+		}
+		suite.NoError(rdr.Err())
+		rdr.Release()
+		previous = id
+	}
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT 1"))
+	schema, err := suite.stmt.(adbc.StatementExecuteSchemaWithContext).ExecuteSchema(suite.ctx)
+	suite.Require().NoError(err)
+	_, present := schema.Metadata().GetValue(driver.MetadataKeyQueryID)
+	suite.False(present)
+	suite.Equal(previous, getID())
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TEMPORARY TABLE query_id_test (v INTEGER)"))
+	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.NotEmpty(getID())
+	suite.NotEqual(previous, getID())
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "INSERT INTO query_id_test VALUES (1)"))
+	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.NotEmpty(getID())
+}
+
+func (suite *SnowflakeTests) TestQueryIDBound() {
+	opts := suite.stmt.(adbc.GetSetOptionsWithContext)
+	schema := arrow.NewSchema([]arrow.Field{{Name: "v", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), schema)
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2}, nil)
+	rec := bldr.NewRecordBatch()
+	bldr.Release()
+	defer rec.Release()
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT ?"))
+	suite.Require().NoError(suite.stmt.Bind(suite.ctx, rec))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+	first, err := opts.GetOption(suite.ctx, driver.OptionLastQueryID)
+	suite.Require().NoError(err)
+	suite.NotEmpty(first)
+	frozen := rdr.Schema()
+	count := 0
+	for rdr.Next() {
+		count++
+		id, ok := rdr.RecordBatch().Schema().Metadata().GetValue(driver.MetadataKeyQueryID)
+		suite.True(ok)
+		suite.Equal(first, id)
+	}
+	suite.NoError(rdr.Err())
+	suite.Equal(2, count)
+	last, err := opts.GetOption(suite.ctx, driver.OptionLastQueryID)
+	suite.Require().NoError(err)
+	suite.NotEmpty(last)
+	suite.NotEqual(first, last)
+	id, ok := frozen.Metadata().GetValue(driver.MetadataKeyQueryID)
+	suite.True(ok)
+	suite.Equal(first, id)
 }

@@ -598,7 +598,10 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName
 	var filesToCopy fileSet
 
 	ctx, cancel := context.WithCancel(ctx)
-	g, ctx := errgroup.WithContext(ctx)
+	// The errgroup cancels gCtx as soon as Wait returns, so only the
+	// background COPYs use it. The final COPYs in stopFn run after Wait and
+	// use ctx.
+	g, gCtx := errgroup.WithContext(ctx)
 	if concurrency == 0 {
 		concurrency = -1 // if concurrency is 0, then treat it as unlimited
 	}
@@ -688,7 +691,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName
 			select {
 			case <-stopCh:
 				return
-			case <-ctx.Done():
+			case <-gCtx.Done():
 				return
 			case _, ok := <-readyCh:
 				if !ok {
@@ -698,7 +701,7 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName
 			}
 
 			g.Go(func() error {
-				return executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy)
+				return executeCopyQuery(gCtx, cn, copyQ, tableName, &filesToCopy)
 			})
 		}
 	}()

@@ -54,6 +54,19 @@ import (
 
 const MetadataKeySnowflakeType = "SNOWFLAKE_TYPE"
 
+// MetadataKeyQueryID identifies the query that produced a result stream.
+const MetadataKeyQueryID = "SNOWFLAKE:query_id"
+
+func schemaWithQueryID(schema *arrow.Schema, queryID *string) *arrow.Schema {
+	if queryID == nil || *queryID == "" {
+		return schema
+	}
+	metadata := schema.Metadata().ToMap()
+	metadata[MetadataKeyQueryID] = *queryID
+	meta := arrow.MetadataFrom(metadata)
+	return arrow.NewSchemaWithEndian(schema.Fields(), &meta, schema.Endianness())
+}
+
 // EWKB extension flags. The high four bits of the geometry-type word in the
 // PostGIS-style EWKB encoding carry SRID/Z/M information; the low 28 bits are
 // the OGC geometry type (with optional ISO Z/M offsets).
@@ -589,6 +602,11 @@ func getArrowTimestampFromTime(val time.Time, unit arrow.TimeUnit, originalArrow
 		return arrow.TimestampFromTime(time.UnixMicro(val.UnixMicro()), arrow.Microsecond)
 	}
 
+	if maxTimestampPrecision == Nanoseconds && unit == arrow.Nanosecond {
+		// Preserve the documented wrapping behavior; Arrow checks for overflow.
+		return arrow.Timestamp(val.UnixNano()), nil
+	}
+
 	return arrow.TimestampFromTime(val, unit)
 }
 
@@ -1089,7 +1107,7 @@ func streamBatchToChannel(
 //
 // batch0Data contains the already-read bytes for batches[0] (since its stream
 // was consumed during format detection). Remaining batches are read via GetStream.
-func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool) (array.RecordReader, error) {
+func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool, queryID *string) (array.RecordReader, error) {
 	trace.SpanFromContext(ctx).AddEvent("readJSONBatches", trace.WithAttributes(
 		attribute.Int("batches", len(batches)),
 	))
@@ -1102,6 +1120,7 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 	}
 
+	schema = schemaWithQueryID(schema, queryID)
 	if ld.TotalRows() == 0 && len(batches) == 0 {
 		return array.NewRecordReader(schema, []arrow.RecordBatch{})
 	}
@@ -1186,7 +1205,8 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	return array.NewRecordReader(schema, results)
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision, streamRetryEnabled bool, maxTimestampPrecision MaxTimestampPrecision, useGeoArrow bool) (array.RecordReader, error) {
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision, streamRetryEnabled bool, maxTimestampPrecision MaxTimestampPrecision, useGeoArrow bool, queryID *string) (array.RecordReader, error) {
+	// XXX: we have to take queryID because gosnowflake doesn't expose it anywhere; instead it gets sent through a channel supplied during initial execution.
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
@@ -1206,6 +1226,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			}
 		}
 
+		schema = schemaWithQueryID(schema, queryID)
 		if ld.TotalRows() == 0 && len(rawData) == 0 && len(batches) == 0 {
 			return array.NewRecordReader(schema, []arrow.RecordBatch{})
 		}
@@ -1314,7 +1335,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			done:     make(chan struct{}),
 		}
 		close(rdr.done) // No goroutines to wait for
-		rdr.schema, _ = getTransformer(schema, ld, useHighPrecision, maxTimestampPrecision, nil)
+		rdr.schema, _ = getTransformer(schemaWithQueryID(schema, queryID), ld, useHighPrecision, maxTimestampPrecision, nil)
 		return rdr, nil
 	}
 
@@ -1343,7 +1364,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		trace.SpanFromContext(ctx).AddEvent("newRecordReader.jsonFormat", trace.WithAttributes(
 			attribute.Int("batch0Bytes", len(raw0Data)),
 		))
-		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, maxTimestampPrecision, useHighPrecision)
+		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, maxTimestampPrecision, useHighPrecision, queryID)
 	}
 
 	r := &countingReadCloser{inner: raw0}
@@ -1410,7 +1431,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	}
 
 	var recTransform recordTransformer
-	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision, geoCols)
+	rdr.schema, recTransform = getTransformer(schemaWithQueryID(rr.Schema(), queryID), ld, useHighPrecision, maxTimestampPrecision, geoCols)
 	var totalRowsRead atomic.Int64
 	batch0Target := newBatchStreamTarget(0, &batches[0], chs[0], &totalRowsRead)
 

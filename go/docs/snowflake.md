@@ -449,6 +449,19 @@ Examples:
 
   Can be set on the statement.
 
+`snowflake.query.last_query_id`
+: **Type:** string (read-only)
+
+  The ID of the latest query executed.
+
+  The query ID is also exposed in the schema metadata of the result set under
+  `SNOWFLAKE:query_id`.
+
+  :::{note}
+  Certain operations do not report a query ID through this option
+  (e.g. PUT/GET and bulk ingestion).
+  :::
+
 `adbc.snowflake.statement.query_tag`
 : **Type:** string. **Default:** (unset)
 
