@@ -30,8 +30,10 @@ use arrow_array::{
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
+use driverbase::error::ErrorHelper;
 
 use crate::connection::{Connection, quote_identifier, single_batch_reader};
+use crate::error::SnowflakeError;
 
 const BYTES: i16 = 1024;
 const RETENTION_DAYS: i16 = 1025;
@@ -180,22 +182,22 @@ pub(crate) fn get_statistics(
         builder.finish_catalog(&catalog.name)?;
     }
     if operation.token().is_cancelled() {
-        return Err(Error::with_message_and_status(
-            "operation cancelled",
-            Status::Cancelled,
-        ));
+        return Err(SnowflakeError::cancelled()
+            .context("get statistics")
+            .message("operation cancelled")
+            .into());
     }
     Ok(single_batch_reader(builder.finish()?))
 }
 
 fn check_exact_limit(total_tables: usize, approximate: bool) -> Result<()> {
     if !approximate && total_tables > MAX_EXACT_TABLES {
-        Err(Error::with_message_and_status(
-            format!(
-                "exact statistics requested for more than {MAX_EXACT_TABLES} tables; use approximate=true or narrower catalog/schema/table filters"
-            ),
-            Status::NotImplemented,
-        ))
+        Err(SnowflakeError::not_implemented()
+            .context("get exact statistics")
+            .format(format_args!(
+                "more than {MAX_EXACT_TABLES} tables requested; use approximate=true or narrower catalog/schema/table filters"
+            ))
+            .into())
     } else {
         Ok(())
     }
@@ -297,13 +299,13 @@ fn matching_databases(
         for batch in reader {
             let batch = batch.map_err(io_error)?;
             if batch.num_columns() < 2 {
-                return Err(Error::with_message_and_status(
-                    format!(
-                        "SHOW DATABASES returned {} columns, expected at least 2",
+                return Err(SnowflakeError::internal_no_location()
+                    .context("read SHOW DATABASES metadata")
+                    .format(format_args!(
+                        "returned {} columns, expected at least 2",
                         batch.num_columns()
-                    ),
-                    Status::Internal,
-                ));
+                    ))
+                    .into());
             }
             let names = string_column(&batch, 1, "database name")?;
             for row in 0..batch.num_rows() {
@@ -432,16 +434,19 @@ fn query_clustering_depth(
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| {
-                        Error::with_message_and_status("invalid clustering depth", Status::IO)
+                        SnowflakeError::io()
+                            .context("read clustering depth")
+                            .message("invalid depth value")
+                            .to_adbc()
                     })?;
                 if !depths.is_null(0) {
                     return Ok(depths.value(0));
                 }
             }
-            Err(Error::with_message_and_status(
-                "null clustering depth",
-                Status::IO,
-            ))
+            Err(SnowflakeError::io()
+                .context("read clustering depth")
+                .message("depth is null")
+                .into())
         },
     )
 }
@@ -452,16 +457,19 @@ fn string_column<'a>(batch: &'a RecordBatch, index: usize, field: &str) -> Resul
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
-            Error::with_message_and_status(format!("{field} must be a string"), Status::IO)
+            SnowflakeError::io()
+                .context("read statistics field")
+                .format(format_args!("'{field}' must be a string"))
+                .into()
         })
 }
 
 fn required_string<'a>(array: &'a StringArray, index: usize, field: &str) -> Result<&'a str> {
     if array.is_null(index) {
-        Err(Error::with_message_and_status(
-            format!("{field} is null"),
-            Status::IO,
-        ))
+        Err(SnowflakeError::io()
+            .context("read statistics field")
+            .format(format_args!("'{field}' is null"))
+            .into())
     } else {
         Ok(array.value(index))
     }
@@ -484,21 +492,27 @@ fn numeric_value(array: &Int64Array, row: usize, default: i64) -> i64 {
 }
 
 fn unexpected_columns(source: &str, expected: usize, batch: &RecordBatch) -> Error {
-    Error::with_message_and_status(
-        format!(
+    SnowflakeError::internal_no_location()
+        .context("read statistics metadata")
+        .format(format_args!(
             "{source} returned {} columns; expected {expected}",
             batch.num_columns()
-        ),
-        Status::Internal,
-    )
+        ))
+        .into()
 }
 
 fn io_error(error: impl std::fmt::Display) -> Error {
-    Error::with_message_and_status(error.to_string(), Status::IO)
+    SnowflakeError::io()
+        .context("read statistics metadata")
+        .format(format_args!("{error}"))
+        .into()
 }
 
 fn internal_error(error: impl std::fmt::Display) -> Error {
-    Error::with_message_and_status(error.to_string(), Status::Internal)
+    SnowflakeError::internal_no_location()
+        .context("build statistics result")
+        .format(format_args!("{error}"))
+        .into()
 }
 
 #[derive(Default)]
@@ -708,6 +722,12 @@ mod tests {
         assert!(check_exact_limit(MAX_EXACT_TABLES, false).is_ok());
         let error = check_exact_limit(MAX_EXACT_TABLES + 1, false).unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
+        assert_eq!(
+            error.message,
+            format!(
+                "[Snowflake] could not get exact statistics: more than {MAX_EXACT_TABLES} tables requested; use approximate=true or narrower catalog/schema/table filters"
+            )
+        );
         assert!(check_exact_limit(MAX_EXACT_TABLES + 1, true).is_ok());
     }
 

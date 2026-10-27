@@ -16,8 +16,17 @@
 use std::os::raw::c_char;
 
 use adbc_core::error::{Error, Status};
+use driverbase::error::{Error as DriverError, ErrorHelper};
 use sf_core::apis::database_driver_v1::ApiError;
 use sf_core::rest::snowflake::{QUERY_CANCELED, RestError};
+
+/// Supplies the driver name and common ADBC error constructors.
+#[derive(Clone)]
+pub(crate) struct SnowflakeError;
+
+impl ErrorHelper for SnowflakeError {
+    const NAME: &'static str = "Snowflake";
+}
 
 fn sqlstate_to_adbc(sqlstate: &str) -> Option<[c_char; 5]> {
     let bytes: [u8; 5] = sqlstate.as_bytes().try_into().ok()?;
@@ -62,17 +71,41 @@ fn classify_query_failure(
     (status, code.unwrap_or_default(), sqlstate)
 }
 
-fn format_query_failure_message(message: &str, query_id: Option<&str>) -> String {
-    match query_id.filter(|id| !id.is_empty()) {
-        Some(id) => format!("[snowflake] {message} (query ID: {id})"),
-        None => format!("[snowflake] {message}"),
-    }
+fn query_failure_error(
+    message: &str,
+    code: Option<i32>,
+    sql_state: Option<&str>,
+    query_id: Option<&str>,
+) -> DriverError<SnowflakeError> {
+    let (status, vendor_code, sqlstate) = classify_query_failure(message, code, sql_state);
+    let error = SnowflakeError::status(status).context("execute query");
+    let error = match query_id.filter(|id| !id.is_empty()) {
+        Some(id) => error.format(format_args!("{message} (query ID: {id})")),
+        None => error.message(message),
+    };
+    error.vendor_code(vendor_code).sqlstate(sqlstate)
 }
 
 pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
-    let mut vendor_code = 0;
-    let mut sqlstate = [0; 5];
-    let mut query_message = None;
+    // QueryFailed carries the server's diagnostics directly; keep the full
+    // cause chain as well as its SQLSTATE, vendor code, and query ID.
+    if let ApiError::Query { source, .. } = &err
+        && let RestError::QueryFailed {
+            code,
+            sql_state,
+            ids,
+            ..
+        } = source.as_ref()
+    {
+        let rendered = message_with_causes(&err);
+        return query_failure_error(
+            &rendered,
+            *code,
+            sql_state.as_deref(),
+            ids.query_id.as_deref(),
+        )
+        .into();
+    }
     let status = match &err {
         ApiError::InvalidArgument { .. } => Status::InvalidArguments,
         ApiError::Configuration { .. } => Status::InvalidArguments,
@@ -86,28 +119,7 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::SessionRefresh { .. } => Status::Unauthenticated,
         ApiError::MasterTokenTerminal { .. } => Status::Unauthenticated,
         ApiError::TlsClientCreation { .. } => Status::IO,
-        ApiError::Query { source, .. } => {
-            if let RestError::QueryFailed {
-                message,
-                code,
-                sql_state,
-                ids,
-                ..
-            } = source.as_ref()
-            {
-                let (status, code, state) =
-                    classify_query_failure(message, *code, sql_state.as_deref());
-                vendor_code = code;
-                sqlstate = state;
-                query_message = Some(format_query_failure_message(
-                    message,
-                    ids.query_id.as_deref(),
-                ));
-                status
-            } else {
-                Status::IO
-            }
-        }
+        ApiError::Query { .. } => Status::IO,
         ApiError::QueryResponseProcess { .. } => Status::IO,
         ApiError::Statement { .. } => Status::IO,
         ApiError::RuntimeCreation { .. } => Status::IO,
@@ -120,13 +132,9 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::Cancelled { .. } => Status::Cancelled,
         _ => Status::IO,
     };
-    let mut error = Error::with_message_and_status(
-        query_message.unwrap_or_else(|| message_with_causes(&err)),
-        status,
-    );
-    error.vendor_code = vendor_code;
-    error.sqlstate = sqlstate;
-    error
+    SnowflakeError::status(status)
+        .message(message_with_causes(&err))
+        .into()
 }
 
 /// Render an error with its underlying causes. sf_core's messages often omit
@@ -146,10 +154,6 @@ fn message_with_causes(err: &dyn std::error::Error) -> String {
     message
 }
 
-pub(crate) fn not_implemented(msg: &str) -> Error {
-    Error::with_message_and_status(msg, Status::NotImplemented)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,7 +167,19 @@ mod tests {
         let bogus_handle = Handle { id: 999, magic: 0 };
         let err = driver.database_init(bogus_handle).unwrap_err();
         let adbc_err = api_error_to_adbc_error(err);
+        assert_eq!(adbc_err.vendor_code, 0);
+        assert_eq!(adbc_err.sqlstate, [0; 5]);
+        assert!(adbc_err.message.starts_with("[Snowflake] "));
         assert_eq!(adbc_err.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn invalid_argument_conversion_has_one_driver_prefix() {
+        let error = api_error_to_adbc_error(ApiError::invalid_argument("bad handle"));
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(error.vendor_code, 0);
+        assert_eq!(error.sqlstate, [0; 5]);
+        assert_eq!(error.message, "[Snowflake] Invalid argument: bad handle");
     }
 
     #[test]
@@ -243,19 +259,48 @@ mod tests {
     }
 
     #[test]
-    fn query_failure_message_includes_query_id_when_present() {
+    fn query_failure_preserves_diagnostics_and_query_id() {
+        let error = query_failure_error(
+            "SQL compilation error: syntax error",
+            Some(1003),
+            Some("42000"),
+            Some("01abcdef"),
+        )
+        .to_adbc();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(error.vendor_code, 1003);
+        assert_eq!(error.sqlstate, sqlstate_to_adbc("42000").unwrap());
         assert_eq!(
-            format_query_failure_message("syntax error", Some("01abcdef")),
-            "[snowflake] syntax error (query ID: 01abcdef)"
+            error.message,
+            "[Snowflake] could not execute query: SQL compilation error: syntax error (query ID: 01abcdef)"
         );
         assert_eq!(
-            format_query_failure_message("syntax error", None),
-            "[snowflake] syntax error"
+            query_failure_error("query canceled", Some(QUERY_CANCELED), Some("57014"), None)
+                .to_adbc()
+                .status,
+            Status::Cancelled
         );
         assert_eq!(
-            format_query_failure_message("syntax error", Some("")),
-            "[snowflake] syntax error"
+            query_failure_error("failure", None, None, Some(""))
+                .to_adbc()
+                .message,
+            "[Snowflake] could not execute query: failure"
         );
+        let missing = query_failure_error("missing table", None, Some("42S02"), None).to_adbc();
+        assert_eq!(missing.status, Status::NotFound);
+        assert_eq!(missing.vendor_code, 0);
+        assert_eq!(missing.sqlstate, sqlstate_to_adbc("42S02").unwrap());
+        let timed_out = query_failure_error(
+            "Statement reached its statement or warehouse timeout",
+            Some(QUERY_CANCELED),
+            Some("57014"),
+            Some("01timeout"),
+        )
+        .to_adbc();
+        assert_eq!(timed_out.status, Status::Timeout);
+        assert_eq!(timed_out.vendor_code, QUERY_CANCELED);
+        assert_eq!(timed_out.sqlstate, sqlstate_to_adbc("57014").unwrap());
+        assert!(timed_out.message.ends_with(" (query ID: 01timeout)"));
     }
 
     #[test]
@@ -263,13 +308,6 @@ mod tests {
         let (_, _, sqlstate) = classify_query_failure("failure", Some(1), Some("TOO-LONG"));
 
         assert_eq!(sqlstate, [0; 5]);
-    }
-
-    #[test]
-    fn not_implemented_returns_correct_status() {
-        let err = not_implemented("foo");
-        assert_eq!(err.status, adbc_core::error::Status::NotImplemented);
-        assert!(err.message.contains("foo"));
     }
 
     #[test]
@@ -299,5 +337,22 @@ mod tests {
             "Failed to login: HTTP request failed after retries: login request: \
              connect error: dns error"
         );
+        let converted = SnowflakeError::io()
+            .context("log in")
+            .message(message_with_causes(&err))
+            .to_adbc();
+        assert_eq!(
+            converted.message,
+            "[Snowflake] could not log in: Failed to login: HTTP request failed after retries: login request: \
+             connect error: dns error"
+        );
+        let nested = Layer(
+            "outer",
+            Some(Box::new(Layer(
+                "middle",
+                Some(Box::new(Layer("root cause", None))),
+            ))),
+        );
+        assert_eq!(message_with_causes(&nested), "outer: middle: root cause");
     }
 }

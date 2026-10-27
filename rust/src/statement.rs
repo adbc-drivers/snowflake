@@ -21,16 +21,19 @@ use std::{
 
 use adbc_core::{
     Optionable, PartitionedResult,
-    error::{Error, Result, Status},
+    error::{Error, Result},
     options::{OptionStatement, OptionValue},
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use driverbase::{bulk_ingest::BulkIngestState, error::ErrorHelper};
 use sf_core::apis::database_driver_v1::{BindingType, ColumnMetadata, DataPtr, Handle};
 use sf_core::apis::operation_ctx::OperationCtx;
 use sf_core::config::{param_registry::param_names, settings::Setting};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::driver::{Inner, PreparedResult, QueryResult, TimestampPrecision};
+use crate::driver::{Inner, OperationCancelHandle, QueryResult, TimestampPrecision};
+use crate::error::SnowflakeError;
 
 /// Per-statement Snowflake query timeout, in seconds. A value of zero clears
 /// the override and lets the session/core default apply.
@@ -39,25 +42,24 @@ const QUERY_TIMEOUT_OPTION: &str = "adbc.snowflake.statement.query_timeout";
 fn parse_query_timeout(value: &OptionValue) -> Result<Option<u32>> {
     let seconds = match value {
         OptionValue::Int(value) => u32::try_from(*value).map_err(|_| {
-            Error::with_message_and_status(
-                "query_timeout must be between 0 and 4294967295 seconds",
-                Status::InvalidArguments,
+            Error::from(
+                SnowflakeError::invalid_argument()
+                    .message("query_timeout must be between 0 and 4294967295 seconds"),
             )
         })?,
         OptionValue::String(value) => {
             let raw = value.strip_suffix('s').unwrap_or(value);
             raw.parse::<u32>().map_err(|_| {
-                Error::with_message_and_status(
-                    format!("invalid query_timeout value: {value}"),
-                    Status::InvalidArguments,
+                Error::from(
+                    SnowflakeError::invalid_argument()
+                        .format(format_args!("invalid query_timeout value: {value}")),
                 )
             })?
         }
         _ => {
-            return Err(Error::with_message_and_status(
-                "query_timeout must be a string or int",
-                Status::InvalidArguments,
-            ));
+            return Err(SnowflakeError::invalid_argument()
+                .message("query_timeout must be a string or int")
+                .into());
         }
     };
     Ok((seconds != 0).then_some(seconds))
@@ -76,31 +78,36 @@ pub struct Statement {
     pub(crate) inner: Arc<Inner>,
     pub(crate) stmt_handle: Handle,
     pub(crate) conn_handle: Handle,
+    pub(crate) trace_parent: Option<String>,
+    pub(crate) connection_trace_parent: Option<String>,
     pub(crate) query: Option<String>,
-    pub(crate) target_table: Option<String>,
-    pub(crate) ingest_catalog: Option<String>,
-    pub(crate) ingest_schema: Option<String>,
-    pub(crate) ingest_mode: Option<String>,
+    pub(crate) ingest_state: BulkIngestState<SnowflakeError>,
     pub(crate) query_tag: Option<String>,
     pub(crate) query_timeout_seconds: Option<u32>,
     pub(crate) timestamp_precision: TimestampPrecision,
     pub(crate) ingest_options: crate::ingest::IngestOptions,
     pub(crate) bound: Bound,
     pub(crate) last_query_id: Option<String>,
-    /// Cached only when sf_core's prepare bind count and metadata agree.
-    pub(crate) prepared_parameter_schema: Option<Schema>,
-    /// Truthful result schema returned by Snowflake's describe-only prepare.
-    pub(crate) prepared_result_schema: Option<Schema>,
-    /// The most recently started sf_core operation. `cancel()` may be invoked
-    /// from another thread while an execute is blocked, so it is shared
-    /// through a lock rather than `&mut self`. Cancelling a finished operation
-    /// is a no-op.
-    pub(crate) operation: Mutex<Arc<OperationCtx>>,
+    /// Set by `prepare()`. Like Go's no-op Prepare this costs no round trip;
+    /// the describe runs on first need and is cached in `described`.
+    pub(crate) prepared: bool,
+    pub(crate) described: Mutex<Option<Arc<DescribedSchemas>>>,
+    /// The most recently started sf_core operation. A retained cancellation
+    /// handle can use this slot while an execute borrows the statement.
+    /// Cancelling a finished operation is a no-op.
+    pub(crate) operation: Arc<Mutex<Arc<OperationCtx>>>,
 }
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        let _ = self.inner.sf.statement_release(self.stmt_handle);
+        let inner = Arc::clone(&self.inner);
+        let parent = self.effective_trace_parent();
+        let _ = inner.traced("statement.Close", parent, |_| {
+            inner
+                .sf
+                .statement_release(self.stmt_handle)
+                .map_err(crate::error::api_error_to_adbc_error)
+        });
     }
 }
 
@@ -109,30 +116,22 @@ impl Optionable for Statement {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match key {
-            OptionStatement::TargetTable => {
-                if let OptionValue::String(s) = value {
-                    self.query = None;
-                    self.target_table = Some(s);
-                    self.clear_prepared_schemas();
-                    Ok(())
-                } else {
-                    Err(Error::with_message_and_status(
-                        "target_table must be a string",
-                        Status::InvalidArguments,
-                    ))
-                }
+            key @ OptionStatement::TargetTable => {
+                self.ingest_state
+                    .set_option(&key, &value)
+                    .map_err(Error::from)?;
+                self.query = None;
+                self.unprepare();
+                Ok(())
             }
-            OptionStatement::IngestMode => {
-                if let OptionValue::String(s) = value {
-                    self.ingest_mode = Some(s);
-                    self.clear_prepared_schemas();
-                    Ok(())
-                } else {
-                    Err(Error::with_message_and_status(
-                        "ingest_mode must be a string",
-                        Status::InvalidArguments,
-                    ))
-                }
+            key @ (OptionStatement::IngestMode
+            | OptionStatement::TargetCatalog
+            | OptionStatement::TargetDbSchema) => {
+                self.ingest_state
+                    .set_option(&key, &value)
+                    .map_err(Error::from)?;
+                self.invalidate_described();
+                Ok(())
             }
             OptionStatement::Other(ref k)
                 if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
@@ -140,10 +139,11 @@ impl Optionable for Statement {
                 let spelling = match &value {
                     OptionValue::String(s) => s.as_str(),
                     _ => {
-                        return Err(Error::with_message_and_status(
-                            format!("Invalid value for statement option '{k}': '{value:?}'"),
-                            Status::InvalidArguments,
-                        ));
+                        return Err(SnowflakeError::invalid_argument()
+                            .format(format_args!(
+                                "Invalid value for statement option '{k}': '{value:?}'"
+                            ))
+                            .into());
                     }
                 };
                 let precision = match spelling {
@@ -153,53 +153,38 @@ impl Optionable for Statement {
                         TimestampPrecision::NanosecondsErrorOnOverflow
                     }
                     _ => {
-                        return Err(Error::with_message_and_status(
-                            format!("Invalid value for statement option '{k}': '{spelling}'"),
-                            Status::InvalidArguments,
-                        ));
+                        return Err(SnowflakeError::invalid_argument()
+                            .format(format_args!(
+                                "Invalid value for statement option '{k}': '{spelling}'"
+                            ))
+                            .into());
                     }
                 };
                 self.timestamp_precision = precision;
-                self.clear_prepared_schemas();
+                self.invalidate_described();
                 Ok(())
             }
             OptionStatement::Temporary => match value {
                 OptionValue::String(value) => match value.as_str() {
                     "false" | "0" | "disabled" => Ok(()),
-                    "true" | "1" | "enabled" => Err(Error::with_message_and_status(
-                        "temporary ingestion is not supported",
-                        Status::NotImplemented,
-                    )),
-                    _ => Err(Error::with_message_and_status(
-                        "temporary ingestion must be enabled or disabled",
-                        Status::InvalidArguments,
-                    )),
+                    "true" | "1" | "enabled" => Err(SnowflakeError::not_implemented()
+                        .message("temporary ingestion is not supported")
+                        .into()),
+                    _ => Err(SnowflakeError::invalid_argument()
+                        .message("temporary ingestion must be enabled or disabled")
+                        .into()),
                 },
-                _ => Err(Error::with_message_and_status(
-                    "temporary ingestion must be a string",
-                    Status::InvalidArguments,
-                )),
+                _ => Err(SnowflakeError::invalid_argument()
+                    .message("temporary ingestion must be a string")
+                    .into()),
             },
-            OptionStatement::TargetCatalog => {
-                let OptionValue::String(catalog) = value else {
-                    return Err(Error::with_message_and_status(
-                        "target_catalog must be a string",
-                        Status::InvalidArguments,
-                    ));
+            OptionStatement::Other(k) if k == driverbase::telemetry::TRACE_PARENT => {
+                let OptionValue::String(parent) = value else {
+                    return Err(SnowflakeError::invalid_argument()
+                        .message("trace parent must be a string")
+                        .into());
                 };
-                self.ingest_catalog = Some(catalog);
-                self.clear_prepared_schemas();
-                Ok(())
-            }
-            OptionStatement::TargetDbSchema => {
-                let OptionValue::String(schema) = value else {
-                    return Err(Error::with_message_and_status(
-                        "target_db_schema must be a string",
-                        Status::InvalidArguments,
-                    ));
-                };
-                self.ingest_schema = Some(schema);
-                self.clear_prepared_schemas();
+                self.trace_parent = driverbase::telemetry::validate_trace_parent(&parent)?;
                 Ok(())
             }
             OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
@@ -209,7 +194,6 @@ impl Optionable for Statement {
             OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
                 if let OptionValue::String(s) = value {
                     self.inner
-                        .runtime
                         .block_on(self.inner.sf.statement_set_option(
                             self.stmt_handle,
                             param_names::QUERY_TAG.into(),
@@ -220,22 +204,26 @@ impl Optionable for Statement {
                     self.query_tag = Some(s);
                     Ok(())
                 } else {
-                    Err(Error::with_message_and_status(
-                        "query_tag must be a string",
-                        Status::InvalidArguments,
-                    ))
+                    Err(SnowflakeError::invalid_argument()
+                        .message("query_tag must be a string")
+                        .into())
                 }
             }
             OptionStatement::Other(ref k) if self.ingest_options.set(k, &value)? => Ok(()),
-            _ => Err(Error::with_message_and_status(
-                format!("unrecognized statement option '{}'", key.as_ref()),
-                Status::NotImplemented,
-            )),
+            _ => Err(SnowflakeError::not_implemented()
+                .format(format_args!(
+                    "unrecognized statement option '{}'",
+                    key.as_ref()
+                ))
+                .into()),
         }
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match key {
+            OptionStatement::Other(k) if k == driverbase::telemetry::TRACE_PARENT => {
+                Ok(self.effective_trace_parent().unwrap_or_default().to_owned())
+            }
             OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
                 Ok(self.query_timeout_seconds.unwrap_or(0).to_string())
             }
@@ -244,9 +232,8 @@ impl Optionable for Statement {
             }
             OptionStatement::Other(ref k) if k == "adbc.snowflake.sql.query_id" => {
                 self.last_query_id.clone().ok_or_else(|| {
-                    Error::with_message_and_status(
-                        "no query has been executed yet",
-                        Status::NotFound,
+                    Error::from(
+                        SnowflakeError::not_found().message("no query has been executed yet"),
                     )
                 })
             }
@@ -263,23 +250,21 @@ impl Optionable for Statement {
                 .into())
             }
             OptionStatement::Other(ref k) => self.ingest_options.get(k).ok_or_else(|| {
-                Error::with_message_and_status(
-                    format!("option not found: {}", key.as_ref()),
-                    Status::NotFound,
+                Error::from(
+                    SnowflakeError::not_found()
+                        .format(format_args!("option not found: {}", key.as_ref())),
                 )
             }),
-            _ => Err(Error::with_message_and_status(
-                format!("option not found: {}", key.as_ref()),
-                Status::NotFound,
-            )),
+            _ => Err(SnowflakeError::not_found()
+                .format(format_args!("option not found: {}", key.as_ref()))
+                .into()),
         }
     }
 
     fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
-        Err(Error::with_message_and_status(
-            "option not found",
-            Status::NotFound,
-        ))
+        Err(SnowflakeError::not_found()
+            .message("option not found")
+            .into())
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
@@ -292,46 +277,73 @@ impl Optionable for Statement {
                 .get(k)
                 .and_then(|value| value.parse::<i64>().ok())
                 .ok_or_else(|| {
-                    Error::with_message_and_status("option not found", Status::NotFound)
+                    Error::from(SnowflakeError::not_found().message("option not found"))
                 }),
-            _ => Err(Error::with_message_and_status(
-                "option not found",
-                Status::NotFound,
-            )),
+            _ => Err(SnowflakeError::not_found()
+                .message("option not found")
+                .into()),
         }
     }
 
     fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
-        Err(Error::with_message_and_status(
-            "option not found",
-            Status::NotFound,
-        ))
+        Err(SnowflakeError::not_found()
+            .message("option not found")
+            .into())
     }
 }
 
+/// Result of Snowflake's describe-only prepare for the current query, valid
+/// until the query or a conversion/ingest option changes.
+#[derive(Debug)]
+pub(crate) struct DescribedSchemas {
+    query_id: String,
+    /// Present only when sf_core's prepare bind count and metadata agree.
+    parameters: Option<Schema>,
+    result: Schema,
+}
+
 impl Statement {
-    fn clear_prepared_schemas(&mut self) {
-        self.prepared_parameter_schema = None;
-        self.prepared_result_schema = None;
+    fn unprepare(&mut self) {
+        self.prepared = false;
+        self.invalidate_described();
     }
-    fn store_prepared_schemas(&mut self, prepared: &PreparedResult) -> Result<Schema> {
+
+    fn invalidate_described(&mut self) {
+        *self.described.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Describe the current query once, reusing the cached result.
+    fn describe(&self, operation: &OperationCtx) -> Result<Arc<DescribedSchemas>> {
+        let mut described = self.described.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(described) = described.as_ref() {
+            return Ok(Arc::clone(described));
+        }
+        let query = self.query.clone().ok_or_else(|| {
+            Error::from(SnowflakeError::invalid_state().message("cannot execute without a query"))
+        })?;
+        let prepared = self
+            .inner
+            .prepare_statement(Some(operation), self.stmt_handle, query)?;
         let timezone = self.inner.session_timezone(self.conn_handle)?;
-        self.prepared_parameter_schema = parameter_schema_from_prepare(
-            prepared.number_of_binds,
-            &prepared.binds,
-            self.timestamp_precision.time_unit(),
-            &timezone,
-        );
-        let schema = adjust_schema(
-            &prepared.reader.schema(),
-            self.timestamp_precision.time_unit(),
-            &timezone,
-            None,
-        )
-        .as_ref()
-        .clone();
-        self.prepared_result_schema = Some(schema.clone());
-        Ok(schema)
+        let schemas = Arc::new(DescribedSchemas {
+            parameters: parameter_schema_from_prepare(
+                prepared.number_of_binds,
+                &prepared.binds,
+                self.timestamp_precision.time_unit(),
+                &timezone,
+            ),
+            result: adjust_schema(
+                &prepared.reader.schema(),
+                self.timestamp_precision.time_unit(),
+                &timezone,
+                None,
+            )
+            .as_ref()
+            .clone(),
+            query_id: prepared.query_id,
+        });
+        *described = Some(Arc::clone(&schemas));
+        Ok(schemas)
     }
 
     /// Parameter binding requires random access; ingest consumes the stream directly.
@@ -341,7 +353,7 @@ impl Statement {
             Bound::Batches(batches) => Ok(batches),
             Bound::Stream(reader) => reader
                 .map(|batch| {
-                    batch.map_err(|e| Error::with_message_and_status(e.to_string(), Status::IO))
+                    batch.map_err(|e| Error::from(SnowflakeError::io().format(format_args!("{e}"))))
                 })
                 .collect(),
             Bound::Empty => unreachable!("take_bound_batches requires supplied bindings"),
@@ -352,7 +364,21 @@ impl Statement {
         self.query_timeout_seconds
     }
 
-    /// Start a cancellable sf_core operation and publish it for `cancel()`.
+    fn effective_trace_parent(&self) -> Option<&str> {
+        self.trace_parent
+            .as_deref()
+            .or(self.connection_trace_parent.as_deref())
+    }
+
+    fn trace_parent_for_span(&self) -> Option<String> {
+        if self.inner.telemetry.is_enabled() {
+            self.effective_trace_parent().map(str::to_owned)
+        } else {
+            None
+        }
+    }
+
+    /// Start a cancellable sf_core operation and publish it for the cancel handle.
     /// Each operation needs a fresh context because cancellation is one-shot.
     pub(crate) fn begin_operation(&self) -> Arc<OperationCtx> {
         let operation = Arc::new(OperationCtx::with_own_token());
@@ -381,22 +407,17 @@ impl Statement {
     fn execute_bound(
         &mut self,
         query: String,
+        returned_rows: &mut i64,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let batches = self.take_bound_batches()?;
         let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let operation = self.begin_operation();
+        *returned_rows = 0;
         if row_count == 0 {
             // ADBC defines this as zero executions. Describe-only prepare provides
             // the result schema without accidentally running the SQL unbound.
             self.last_query_id = None;
-            let schema = if let Some(schema) = &self.prepared_result_schema {
-                Arc::new(schema.clone())
-            } else {
-                let prepared =
-                    self.inner
-                        .prepare_statement(Some(&operation), self.stmt_handle, query)?;
-                Arc::new(self.store_prepared_schemas(&prepared)?)
-            };
+            let schema = Arc::new(self.describe(&operation)?.result.clone());
             return execute_bound_rows(&batches, schema, |_| {
                 unreachable!("zero-row bindings must not execute")
             });
@@ -418,6 +439,13 @@ impl Statement {
                 Some(BindingType::Json(data_ptr)),
                 timeout_seconds,
             )?;
+            if *returned_rows >= 0 {
+                *returned_rows = result
+                    .descriptor
+                    .row_count
+                    .and_then(|rows| returned_rows.checked_add(rows))
+                    .unwrap_or(-1);
+            }
             last_query_id = Some(result.descriptor.query_id.clone());
             let timezone = inner.session_timezone(conn_handle)?;
             Ok(Box::new(ConvertingReader::new(
@@ -446,138 +474,187 @@ impl adbc_core::Statement for Statement {
 
     #[allow(refining_impl_trait)]
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        if self.target_table.is_some() {
-            // Ingest via execute() — run the ingest and return an empty reader.
-            let result = crate::ingest::execute_ingest(self);
-            self.bound = Bound::Empty;
-            result?;
-            let batch =
-                arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
-            return Ok(crate::connection::single_batch_reader(batch));
-        }
-        let query = self.query.clone().ok_or_else(|| {
-            Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
-        })?;
+        let inner = Arc::clone(&self.inner);
+        let parent = self.trace_parent_for_span();
+        inner.traced("statement.ExecuteQuery", parent.as_deref(), |span| {
+            let mut returned_rows = -1;
+            let result = (|| {
+                if self.ingest_state.is_set() {
+                    // Ingest via execute() — run the ingest and return an empty reader.
+                    let result = crate::ingest::execute_ingest(self);
+                    self.bound = Bound::Empty;
+                    returned_rows = result?.unwrap_or(-1);
+                    let batch = arrow_array::RecordBatch::new_empty(Arc::new(
+                        arrow_schema::Schema::empty(),
+                    ));
+                    return Ok(crate::connection::single_batch_reader(batch));
+                }
+                let query = self.query.clone().ok_or_else(|| {
+                    Error::from(
+                        SnowflakeError::invalid_state().message("cannot execute without a query"),
+                    )
+                })?;
 
-        if !matches!(self.bound, Bound::Empty) {
-            return self.execute_bound(query);
-        }
+                if !matches!(self.bound, Bound::Empty) {
+                    return self.execute_bound(query, &mut returned_rows);
+                }
 
-        let operation = self.begin_operation();
-        let result = self.execute_query(&operation, query, None)?;
+                let operation = self.begin_operation();
+                let result = self.execute_query(&operation, query, None)?;
+                returned_rows = result.descriptor.row_count.unwrap_or(-1);
 
-        self.last_query_id = Some(result.descriptor.query_id.clone());
-        let reader = result.reader;
-        Ok(Box::new(ConvertingReader::new(
-            reader,
-            self.timestamp_precision.time_unit(),
-            self.timestamp_precision,
-            self.inner.session_timezone(self.conn_handle)?,
-        )))
-    }
-
-    fn execute_update(&mut self) -> Result<Option<i64>> {
-        if self.target_table.is_some() {
-            let result = crate::ingest::execute_ingest(self);
-            self.bound = Bound::Empty;
-            return result;
-        }
-        let query = self.query.clone().ok_or_else(|| {
-            Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
-        })?;
-
-        // A supplied binding with no rows represents zero executions, so do not
-        // run the statement unbound or send an empty binding.
-        if !matches!(self.bound, Bound::Empty) {
-            let batches = self.take_bound_batches()?;
-            if batches.iter().all(|batch| batch.num_rows() == 0) {
-                self.last_query_id = None;
-                return Ok(Some(0));
+                self.last_query_id = Some(result.descriptor.query_id.clone());
+                let reader = result.reader;
+                Ok(Box::new(ConvertingReader::new(
+                    reader,
+                    self.timestamp_precision.time_unit(),
+                    self.timestamp_precision,
+                    self.inner.session_timezone(self.conn_handle)?,
+                )))
+            })();
+            span.record("db.response.returned_rows", returned_rows);
+            if result.is_ok()
+                && self.inner.telemetry.is_enabled()
+                && !self.ingest_state.is_set()
+                && let Some(id) = self.last_query_id.as_deref().filter(|id| !id.is_empty())
+            {
+                span.set_attribute("snowflake.query.id", id.to_owned());
             }
-
-            // Parameterised DML: execute once with JSON bindings.
-            let json_bytes = arrow_batches_to_json_bindings(&batches)?;
-            let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
-            let binding = BindingType::Json(data_ptr);
-
-            let operation = self.begin_operation();
-            let result = self.execute_query(&operation, query, Some(binding))?;
-
-            self.last_query_id = Some(result.descriptor.query_id.clone());
-            return Ok(result.descriptor.rows_affected);
-        }
-
-        let operation = self.begin_operation();
-        let result = self.execute_query(&operation, query, None)?;
-
-        self.last_query_id = Some(result.descriptor.query_id.clone());
-
-        Ok(result.descriptor.rows_affected)
-    }
-
-    fn execute_schema(&mut self) -> Result<Schema> {
-        let query = self.query.clone().ok_or_else(|| {
-            Error::with_message_and_status("cannot execute without a query", Status::InvalidState)
-        })?;
-
-        self.clear_prepared_schemas();
-        let operation = self.begin_operation();
-        let prepared = self
-            .inner
-            .prepare_statement(Some(&operation), self.stmt_handle, query)?;
-        self.last_query_id = Some(prepared.query_id.clone());
-        self.store_prepared_schemas(&prepared)
-    }
-
-    fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        Err(crate::error::not_implemented("execute_partitions"))
-    }
-
-    fn get_parameter_schema(&self) -> Result<Schema> {
-        self.prepared_parameter_schema.clone().ok_or_else(|| {
-            Error::with_message_and_status(
-                "parameter metadata is unavailable; prepare the statement first",
-                Status::NotImplemented,
-            )
+            result
         })
     }
 
-    fn prepare(&mut self) -> Result<()> {
-        let query = self.query.clone().ok_or_else(|| {
-            Error::with_message_and_status(
-                "cannot prepare statement with no query",
-                Status::InvalidState,
-            )
-        })?;
-        self.clear_prepared_schemas();
+    fn execute_update(&mut self) -> Result<Option<i64>> {
+        let inner = Arc::clone(&self.inner);
+        let parent = self.trace_parent_for_span();
+        inner.traced("statement.ExecuteUpdate", parent.as_deref(), |span| {
+            let result = (|| {
+                if self.ingest_state.is_set() {
+                    let result = crate::ingest::execute_ingest(self);
+                    self.bound = Bound::Empty;
+                    return result;
+                }
+                let query = self.query.clone().ok_or_else(|| {
+                    Error::from(
+                        SnowflakeError::invalid_state().message("cannot execute without a query"),
+                    )
+                })?;
+
+                // A supplied binding with no rows represents zero executions, so do not
+                // run the statement unbound or send an empty binding.
+                if !matches!(self.bound, Bound::Empty) {
+                    let batches = self.take_bound_batches()?;
+                    if batches.iter().all(|batch| batch.num_rows() == 0) {
+                        self.last_query_id = None;
+                        return Ok(Some(0));
+                    }
+
+                    // Parameterised DML: execute once with JSON bindings.
+                    let json_bytes = arrow_batches_to_json_bindings(&batches)?;
+                    let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
+                    let binding = BindingType::Json(data_ptr);
+
+                    let operation = self.begin_operation();
+                    let result = self.execute_query(&operation, query, Some(binding))?;
+
+                    self.last_query_id = Some(result.descriptor.query_id.clone());
+                    return Ok(result.descriptor.rows_affected);
+                }
+
+                let operation = self.begin_operation();
+                let result = self.execute_query(&operation, query, None)?;
+
+                self.last_query_id = Some(result.descriptor.query_id.clone());
+
+                Ok(result.descriptor.rows_affected)
+            })();
+            span.record(
+                "db.response.returned_rows",
+                result.as_ref().ok().and_then(|rows| *rows).unwrap_or(-1),
+            );
+            if result.is_ok()
+                && self.inner.telemetry.is_enabled()
+                && !self.ingest_state.is_set()
+                && let Some(id) = self.last_query_id.as_deref().filter(|id| !id.is_empty())
+            {
+                span.set_attribute("snowflake.query.id", id.to_owned());
+            }
+            result
+        })
+    }
+
+    fn execute_schema(&mut self) -> Result<Schema> {
+        let inner = Arc::clone(&self.inner);
+        let parent = self.trace_parent_for_span();
+        inner.traced("statement.ExecuteSchema", parent.as_deref(), |span| {
+            let result = (|| {
+                self.invalidate_described();
+                let operation = self.begin_operation();
+                let described = self.describe(&operation)?;
+                self.last_query_id = Some(described.query_id.clone());
+                Ok(described.result.clone())
+            })();
+            if result.is_ok()
+                && self.inner.telemetry.is_enabled()
+                && let Some(id) = self.last_query_id.as_deref().filter(|id| !id.is_empty())
+            {
+                span.set_attribute("snowflake.query.id", id.to_owned());
+            }
+            result
+        })
+    }
+
+    fn execute_partitions(&mut self) -> Result<PartitionedResult> {
+        Err(SnowflakeError::not_implemented()
+            .message("execute_partitions")
+            .into())
+    }
+
+    fn get_parameter_schema(&self) -> Result<Schema> {
+        if !self.prepared {
+            return Err(SnowflakeError::not_implemented()
+                .message("parameter metadata is unavailable; prepare the statement first")
+                .into());
+        }
         let operation = self.begin_operation();
-        let prepared = self
-            .inner
-            .prepare_statement(Some(&operation), self.stmt_handle, query)?;
-        self.last_query_id = Some(prepared.query_id.clone());
-        self.store_prepared_schemas(&prepared)?;
+        self.describe(&operation)?
+            .parameters
+            .clone()
+            .ok_or_else(|| {
+                Error::from(
+                    SnowflakeError::not_implemented()
+                        .message("parameter metadata is unavailable for this statement"),
+                )
+            })
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        if self.query.is_none() {
+            return Err(SnowflakeError::invalid_state()
+                .message("cannot prepare statement with no query")
+                .into());
+        }
+        self.prepared = true;
         Ok(())
     }
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.query = Some(query.as_ref().to_string());
-        self.target_table = None;
-        self.clear_prepared_schemas();
+        self.ingest_state.clear();
+        self.unprepare();
         Ok(())
     }
 
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
-        Err(crate::error::not_implemented(
-            "Snowflake does not support Substrait plans",
-        ))
+        Err(SnowflakeError::not_implemented()
+            .message("Snowflake does not support Substrait plans")
+            .into())
     }
 
-    fn cancel(&mut self) -> Result<()> {
-        self.operation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancel();
-        Ok(())
+    fn get_cancel_handle(&self) -> Box<dyn adbc_core::CancelHandle> {
+        Box::new(OperationCancelHandle {
+            operation: Arc::clone(&self.operation),
+        })
     }
 }
 
@@ -625,12 +702,11 @@ where
             let schema = reader.schema();
             if let Some(expected) = &result_schema {
                 if schema.as_ref() != expected {
-                    return Err(Error::with_message_and_status(
-                        format!(
+                    return Err(SnowflakeError::invalid_data()
+                        .format(format_args!(
                             "bound query result schema mismatch: expected {expected:?}, got {schema:?}"
-                        ),
-                        Status::InvalidData,
-                    ));
+                        ))
+                        .into());
                 }
             } else {
                 result_schema = Some(schema.as_ref().clone());
@@ -1155,23 +1231,36 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
 }
 
 /// Reinterpret scaled integers as Decimal128 without changing the stored
-/// unscaled values (12345 at scale 2 is 123.45).
+/// unscaled values (12345 at scale 2 is 123.45). The server only sends values
+/// within the column's declared precision, so the widening skips arrow's
+/// per-value precision check.
 fn scaled_integer_to_decimal(
     col: &ArrayRef,
     target: &DataType,
 ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
-    use arrow_array::{cast::AsArray, types::Decimal128Type};
+    use arrow_array::{
+        Decimal128Array,
+        cast::AsArray,
+        types::{Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type},
+    };
     let DataType::Decimal128(precision, scale) = *target else {
         return Err(arrow_schema::ArrowError::CastError(format!(
             "expected a Decimal128 target, got {target}"
         )));
     };
-    let unscaled = arrow_cast::cast(col.as_ref(), &DataType::Decimal128(38, 0))?;
-    Ok(Arc::new(
-        unscaled
+    let unscaled: Decimal128Array = match col.data_type() {
+        DataType::Int8 => col.as_primitive::<Int8Type>().unary(i128::from),
+        DataType::Int16 => col.as_primitive::<Int16Type>().unary(i128::from),
+        DataType::Int32 => col.as_primitive::<Int32Type>().unary(i128::from),
+        DataType::Int64 => col.as_primitive::<Int64Type>().unary(i128::from),
+        // Unsigned integers are not produced by Snowflake; keep the checked
+        // cast for them rather than assuming they fit.
+        _ => arrow_cast::cast(col.as_ref(), &DataType::Decimal128(38, 0))?
             .as_primitive::<Decimal128Type>()
-            .clone()
-            .with_precision_and_scale(precision, scale)?,
+            .clone(),
+    };
+    Ok(Arc::new(
+        unscaled.with_precision_and_scale(precision, scale)?,
     ))
 }
 
@@ -1529,10 +1618,9 @@ fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
         DataType::Time32(_) | DataType::Time64(_) => Ok("TIME"),
         DataType::Timestamp(_, None) => Ok("TIMESTAMP_NTZ"),
         DataType::Timestamp(_, Some(_)) => Ok("TIMESTAMP_LTZ"),
-        _ => Err(Error::with_message_and_status(
-            format!("unsupported bind parameter type: {dt:?}"),
-            Status::NotImplemented,
-        )),
+        _ => Err(SnowflakeError::not_implemented()
+            .format(format_args!("unsupported bind parameter type: {dt:?}"))
+            .into()),
     }
 }
 
@@ -1743,14 +1831,13 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
                 .zip(schema.fields())
                 .all(|(column, field)| column.data_type() == field.data_type());
         if !matches {
-            return Err(Error::with_message_and_status(
-                format!(
+            return Err(SnowflakeError::invalid_data()
+                .format(format_args!(
                     "bound batch {index} does not match the schema of the first bound batch: \
                      expected {schema:?}, got {:?}",
                     batch.schema()
-                ),
-                Status::InvalidData,
-            ));
+                ))
+                .into());
         }
     }
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1894,10 +1981,9 @@ fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Opti
             };
             Ok(Some((v as i128 * multiplier as i128).to_string()))
         }
-        _ => Err(Error::with_message_and_status(
-            format!("unsupported bind parameter type: {dt:?}"),
-            Status::NotImplemented,
-        )),
+        _ => Err(SnowflakeError::not_implemented()
+            .format(format_args!("unsupported bind parameter type: {dt:?}"))
+            .into()),
     }
 }
 
@@ -1922,7 +2008,7 @@ fn decimal128_to_string(value: i128, scale: i8) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use adbc_core::Statement as _;
+    use adbc_core::{Statement as _, error::Status, options::IngestMode};
 
     fn bind_metadata(
         name: &str,
@@ -1957,21 +2043,36 @@ pub(crate) mod tests {
             inner: driver.inner.clone(),
             stmt_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
             conn_handle: sf_core::apis::database_driver_v1::Handle { id: 0, magic: 0 },
+            trace_parent: None,
+            connection_trace_parent: None,
             query: None,
-            target_table: None,
-            ingest_catalog: None,
-            ingest_schema: None,
-            ingest_mode: None,
+            ingest_state: BulkIngestState::new(),
             query_tag: None,
             query_timeout_seconds: None,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             ingest_options: crate::ingest::IngestOptions::default(),
             bound: Bound::Empty,
             last_query_id: None,
-            prepared_parameter_schema: None,
-            prepared_result_schema: None,
-            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
+            prepared: false,
+            described: Mutex::new(None),
+            operation: Arc::new(Mutex::new(Arc::new(OperationCtx::with_own_token()))),
         }
+    }
+
+    fn seed_described(stmt: &mut Statement, parameters: Option<Schema>, result: Schema) {
+        *stmt.described.get_mut().unwrap() = Some(Arc::new(DescribedSchemas {
+            query_id: "described".into(),
+            parameters,
+            result,
+        }));
+    }
+
+    fn described_result(stmt: &Statement) -> Option<Schema> {
+        stmt.described
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|described| described.result.clone())
     }
 
     #[test]
@@ -1995,11 +2096,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         stmt.bind(batch).unwrap();
-        stmt.prepared_parameter_schema = Some(Schema::empty());
+        seed_described(&mut stmt, Some(Schema::empty()), Schema::empty());
+        stmt.prepared = true;
         stmt.set_sql_query("SELECT ?").unwrap();
         stmt.set_sql_query("SELECT ? + 1").unwrap();
         assert_eq!(stmt.query.as_deref(), Some("SELECT ? + 1"));
-        assert!(stmt.prepared_parameter_schema.is_none());
+        assert!(!stmt.prepared);
+        assert!(described_result(&stmt).is_none());
         assert!(matches!(&stmt.bound, Bound::Batches(batches) if batches.len() == 1));
 
         stmt.bind_stream(Box::new(ConcatReader {
@@ -2009,6 +2112,47 @@ pub(crate) mod tests {
         .unwrap();
         stmt.set_sql_query("SELECT ? + 2").unwrap();
         assert!(matches!(stmt.bound, Bound::Stream(_)));
+    }
+
+    #[test]
+    fn trace_parent_inherits_overrides_and_clears() {
+        let mut stmt = make_stmt();
+        let key = OptionStatement::Other(driverbase::telemetry::TRACE_PARENT.into());
+        let connection_parent = "00-11111111111111111111111111111111-2222222222222222-01";
+        let statement_parent = "00-33333333333333333333333333333333-4444444444444444-01";
+        stmt.connection_trace_parent = Some(connection_parent.into());
+        assert_eq!(
+            stmt.get_option_string(key.clone()).unwrap(),
+            connection_parent
+        );
+        stmt.set_option(key.clone(), OptionValue::String(statement_parent.into()))
+            .unwrap();
+        assert_eq!(
+            stmt.get_option_string(key.clone()).unwrap(),
+            statement_parent
+        );
+        assert_eq!(stmt.trace_parent.as_deref(), Some(statement_parent));
+        stmt.set_option(key.clone(), OptionValue::String(String::new()))
+            .unwrap();
+        assert_eq!(stmt.trace_parent, None);
+        assert_eq!(
+            stmt.get_option_string(key.clone()).unwrap(),
+            connection_parent
+        );
+
+        assert_eq!(
+            stmt.set_option(key.clone(), OptionValue::String("invalid".into()))
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
+        assert_eq!(
+            stmt.set_option(key.clone(), OptionValue::Int(1))
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
+        assert_eq!(stmt.get_option_string(key).unwrap(), connection_parent);
     }
 
     #[test]
@@ -2043,7 +2187,7 @@ pub(crate) mod tests {
         stmt.set_option(key.clone(), OptionValue::String("microseconds".into()))
             .unwrap();
         let schema = Schema::new(vec![Field::new("prepared", DataType::Int64, true)]);
-        stmt.prepared_result_schema = Some(schema.clone());
+        seed_described(&mut stmt, None, schema.clone());
         for value in [
             OptionValue::String("bogus".into()),
             OptionValue::String(String::new()),
@@ -2053,7 +2197,7 @@ pub(crate) mod tests {
             assert_eq!(error.status, Status::InvalidArguments);
             assert!(error.message.contains("Invalid value for statement option"));
             assert_eq!(stmt.timestamp_precision, TimestampPrecision::Microseconds);
-            assert_eq!(stmt.prepared_result_schema.as_ref(), Some(&schema));
+            assert_eq!(described_result(&stmt), Some(schema.clone()));
         }
         assert_eq!(stmt.get_option_string(key).unwrap(), "microseconds");
     }
@@ -2084,11 +2228,57 @@ pub(crate) mod tests {
         stmt.conn_handle = conn_handle;
         stmt.stmt_handle = inner.sf.statement_new(conn_handle).unwrap();
 
-        stmt.cancel().unwrap();
+        stmt.get_cancel_handle().try_cancel().unwrap();
 
         drop(stmt);
         // Statement::drop released the statement; release the core connection.
         inner.sf.connection_release(conn_handle).unwrap();
+    }
+
+    #[test]
+    fn statement_cancel_handle_tracks_current_operation() {
+        let stmt = make_stmt();
+        let handle = stmt.get_cancel_handle();
+        handle.try_cancel().unwrap();
+        let old = stmt.begin_operation();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        let cancelled = std::thread::scope(|scope| {
+            let cancel = &handle;
+            let cancelling = scope.spawn(move || {
+                waiting.recv().unwrap();
+                cancel.try_cancel().unwrap();
+            });
+            let result = stmt.inner.block_on(old.run(
+                "statement_cancel_unit",
+                std::future::poll_fn(move |_| {
+                    if let Some(started) = started.take() {
+                        started.send(()).unwrap();
+                    }
+                    std::task::Poll::Pending::<
+                        std::result::Result<(), sf_core::apis::database_driver_v1::ApiError>,
+                    >
+                }),
+            ));
+            cancelling.join().unwrap();
+            result
+        });
+        assert_eq!(
+            crate::error::api_error_to_adbc_error(cancelled.unwrap_err()).status,
+            Status::Cancelled
+        );
+        let next = stmt.begin_operation();
+        assert!(!next.token().is_cancelled());
+        assert!(
+            stmt.inner
+                .block_on(next.run(
+                    "statement_cancel_unit",
+                    std::future::ready(Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())),
+                ))
+                .is_ok()
+        );
+        handle.try_cancel().unwrap();
+        assert!(next.token().is_cancelled());
     }
 
     #[test]
@@ -2109,7 +2299,7 @@ pub(crate) mod tests {
             DataType::Int64,
             true,
         )]));
-        stmt.prepared_result_schema = Some(schema.as_ref().clone());
+        seed_described(&mut stmt, None, schema.as_ref().clone());
         stmt.last_query_id = Some("previous-query-id".into());
         stmt.bind(RecordBatch::new_empty(Arc::new(Schema::new(vec![
             Field::new("parameter", DataType::Int64, false),
@@ -2209,7 +2399,11 @@ pub(crate) mod tests {
     #[test]
     fn execute_with_target_table_no_data_returns_invalid_state() {
         let mut stmt = make_stmt();
-        stmt.target_table = Some("mytable".into());
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("mytable".into()),
+        )
+        .unwrap();
         match stmt.execute() {
             Err(err) => assert_eq!(err.status, adbc_core::error::Status::InvalidState),
             Ok(_) => panic!("execute should have returned an error"),
@@ -2219,9 +2413,32 @@ pub(crate) mod tests {
     #[test]
     fn set_query_clears_target_table() {
         let mut stmt = make_stmt();
-        stmt.target_table = Some("mytable".into());
+        stmt.set_option(
+            OptionStatement::TargetCatalog,
+            OptionValue::String("db".into()),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::TargetDbSchema,
+            OptionValue::String("sch".into()),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(adbc_core::constants::ADBC_INGEST_OPTION_MODE_APPEND.into()),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("mytable".into()),
+        )
+        .unwrap();
         stmt.set_sql_query("SELECT 1").unwrap();
-        assert!(stmt.target_table.is_none());
+        assert!(!stmt.ingest_state.is_set());
+        assert_eq!(stmt.query.as_deref(), Some("SELECT 1"));
+        assert_eq!(stmt.ingest_state.catalog.as_deref(), Some("db"));
+        assert_eq!(stmt.ingest_state.schema.as_deref(), Some("sch"));
+        assert_eq!(stmt.ingest_state.mode, IngestMode::Append);
     }
 
     #[test]
@@ -2289,10 +2506,18 @@ pub(crate) mod tests {
             stmt.get_parameter_schema().unwrap_err().status,
             Status::NotImplemented
         );
-        stmt.prepared_parameter_schema = Some(Schema::empty());
+        // Prepare is local: no connection exists, so any describe would fail.
+        stmt.set_sql_query("SELECT ?").unwrap();
+        stmt.prepare().unwrap();
+        seed_described(&mut stmt, Some(Schema::empty()), Schema::empty());
         assert!(stmt.get_parameter_schema().unwrap().fields().is_empty());
         stmt.set_sql_query("SELECT 1").unwrap();
-        assert!(stmt.prepared_parameter_schema.is_none());
+        assert!(!stmt.prepared);
+        assert!(described_result(&stmt).is_none());
+        assert_eq!(
+            stmt.get_parameter_schema().unwrap_err().status,
+            Status::NotImplemented
+        );
     }
 
     #[test]
@@ -2310,7 +2535,7 @@ pub(crate) mod tests {
             ),
             (
                 OptionStatement::IngestMode,
-                OptionValue::String("append".into()),
+                OptionValue::String(adbc_core::constants::ADBC_INGEST_OPTION_MODE_APPEND.into()),
             ),
             (
                 OptionStatement::TargetCatalog,
@@ -2324,16 +2549,145 @@ pub(crate) mod tests {
 
         for (option, value) in cases {
             let mut stmt = make_stmt();
-            stmt.prepared_parameter_schema = Some(Schema::empty());
+            seed_described(&mut stmt, Some(Schema::empty()), Schema::empty());
             stmt.set_option(option, value).unwrap();
-            assert!(stmt.prepared_parameter_schema.is_none());
+            assert!(described_result(&stmt).is_none());
         }
+    }
+
+    #[test]
+    fn shared_ingest_options_store_identifiers_and_canonical_modes() {
+        use adbc_core::constants;
+
+        let mut stmt = make_stmt();
+        assert!(!stmt.ingest_state.is_set());
+        assert_eq!(stmt.ingest_state.mode, IngestMode::Create);
+        stmt.set_option(
+            OptionStatement::TargetCatalog,
+            OptionValue::String("catalog".into()),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::TargetDbSchema,
+            OptionValue::String("schema".into()),
+        )
+        .unwrap();
+        assert!(!stmt.ingest_state.is_set());
+        assert_eq!(stmt.ingest_state.catalog.as_deref(), Some("catalog"));
+        assert_eq!(stmt.ingest_state.schema.as_deref(), Some("schema"));
+
+        for (value, expected) in [
+            (
+                constants::ADBC_INGEST_OPTION_MODE_CREATE,
+                IngestMode::Create,
+            ),
+            (
+                constants::ADBC_INGEST_OPTION_MODE_APPEND,
+                IngestMode::Append,
+            ),
+            (
+                constants::ADBC_INGEST_OPTION_MODE_REPLACE,
+                IngestMode::Replace,
+            ),
+            (
+                constants::ADBC_INGEST_OPTION_MODE_CREATE_APPEND,
+                IngestMode::CreateAppend,
+            ),
+        ] {
+            stmt.set_option(
+                OptionStatement::IngestMode,
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+            assert_eq!(stmt.ingest_state.mode, expected);
+        }
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("table".into()),
+        )
+        .unwrap();
+        assert!(stmt.ingest_state.is_set());
+        assert_eq!(stmt.ingest_state.table.as_deref(), Some("table"));
+    }
+
+    #[test]
+    fn invalid_shared_ingest_options_preserve_sql_and_cached_metadata() {
+        let mut stmt = make_stmt();
+        stmt.set_sql_query("SELECT 1").unwrap();
+        stmt.prepare().unwrap();
+        let schema = Schema::new(vec![Field::new("one", DataType::Int64, true)]);
+        seed_described(&mut stmt, None, schema.clone());
+        for key in [
+            OptionStatement::TargetTable,
+            OptionStatement::TargetCatalog,
+            OptionStatement::TargetDbSchema,
+            OptionStatement::IngestMode,
+        ] {
+            let error = stmt.set_option(key, OptionValue::Int(1)).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.starts_with("[Snowflake] invalid option "));
+            assert_eq!(stmt.query.as_deref(), Some("SELECT 1"));
+            assert!(stmt.prepared);
+            assert!(!stmt.ingest_state.is_set());
+            assert!(stmt.ingest_state.catalog.is_none());
+            assert!(stmt.ingest_state.schema.is_none());
+            assert_eq!(stmt.ingest_state.mode, IngestMode::Create);
+            assert_eq!(described_result(&stmt), Some(schema.clone()));
+        }
+
+        let error = stmt
+            .set_option(
+                OptionStatement::IngestMode,
+                OptionValue::String("append".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(
+            error.message,
+            "[Snowflake] invalid option adbc.ingest.mode=append"
+        );
+        assert!(stmt.prepared);
+        assert_eq!(described_result(&stmt), Some(schema));
+        assert_eq!(stmt.ingest_state.mode, IngestMode::Create);
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("valid".into()),
+        )
+        .unwrap();
+        let error = stmt
+            .set_option(OptionStatement::TargetTable, OptionValue::Int(1))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(stmt.ingest_state.table.as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn invalid_ingest_mode_keeps_previously_selected_mode() {
+        let mut stmt = make_stmt();
+        stmt.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(adbc_core::constants::ADBC_INGEST_OPTION_MODE_REPLACE.into()),
+        )
+        .unwrap();
+        let error = stmt
+            .set_option(
+                OptionStatement::IngestMode,
+                OptionValue::String("replace".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(stmt.ingest_state.mode, IngestMode::Replace);
     }
 
     #[test]
     fn temporary_ingestion_rejects_enabled_values() {
         for value in ["true", "1", "enabled"] {
             let mut stmt = make_stmt();
+            stmt.set_option(
+                OptionStatement::TargetTable,
+                OptionValue::String("table".into()),
+            )
+            .unwrap();
             let error = stmt
                 .set_option(
                     OptionStatement::Temporary,
@@ -2341,6 +2695,11 @@ pub(crate) mod tests {
                 )
                 .unwrap_err();
             assert_eq!(error.status, Status::NotImplemented, "value {value}");
+            assert_eq!(
+                error.message,
+                "[Snowflake] temporary ingestion is not supported"
+            );
+            assert_eq!(stmt.ingest_state.table.as_deref(), Some("table"));
         }
     }
 
@@ -2349,16 +2708,27 @@ pub(crate) mod tests {
         for value in ["false", "0", "disabled"] {
             let mut stmt = make_stmt();
             stmt.set_option(
+                OptionStatement::TargetTable,
+                OptionValue::String("table".into()),
+            )
+            .unwrap();
+            stmt.set_option(
                 OptionStatement::Temporary,
                 OptionValue::String(value.into()),
             )
             .unwrap();
+            assert_eq!(stmt.ingest_state.table.as_deref(), Some("table"));
         }
     }
 
     #[test]
     fn temporary_ingestion_rejects_invalid_values() {
         let mut stmt = make_stmt();
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("table".into()),
+        )
+        .unwrap();
         let error = stmt
             .set_option(
                 OptionStatement::Temporary,
@@ -2366,22 +2736,57 @@ pub(crate) mod tests {
             )
             .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(
+            error.message,
+            "[Snowflake] temporary ingestion must be enabled or disabled"
+        );
 
         let error = stmt
             .set_option(OptionStatement::Temporary, OptionValue::Int(0))
             .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(
+            error.message,
+            "[Snowflake] temporary ingestion must be a string"
+        );
+        assert_eq!(stmt.ingest_state.table.as_deref(), Some("table"));
     }
 
     #[test]
     fn set_target_table_option() {
         let mut stmt = make_stmt();
+        stmt.set_sql_query("SELECT 1").unwrap();
+        stmt.prepare().unwrap();
+        seed_described(&mut stmt, Some(Schema::empty()), Schema::empty());
         stmt.set_option(
             OptionStatement::TargetTable,
             OptionValue::String("mytable".into()),
         )
         .unwrap();
-        assert_eq!(stmt.target_table.as_deref(), Some("mytable"));
+        assert!(stmt.ingest_state.is_set());
+        assert_eq!(stmt.ingest_state.table.as_deref(), Some("mytable"));
+        assert!(stmt.query.is_none());
+        assert!(!stmt.prepared);
+        assert!(described_result(&stmt).is_none());
+    }
+
+    #[test]
+    fn snowflake_ingest_tuning_remains_independent_of_shared_state() {
+        let mut stmt = make_stmt();
+        let key = OptionStatement::Other("adbc.snowflake.statement.ingest_copy_concurrency".into());
+        stmt.set_option(key.clone(), OptionValue::Int(2)).unwrap();
+        assert_eq!(stmt.get_option_int(key.clone()).unwrap(), 2);
+        assert_eq!(stmt.get_option_string(key.clone()).unwrap(), "2");
+        assert!(!stmt.ingest_state.is_set());
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("table".into()),
+        )
+        .unwrap();
+        assert_eq!(stmt.get_option_int(key.clone()).unwrap(), 2);
+        stmt.set_sql_query("SELECT 1").unwrap();
+        assert!(!stmt.ingest_state.is_set());
+        assert_eq!(stmt.get_option_int(key).unwrap(), 2);
     }
 
     #[test]
@@ -2396,7 +2801,7 @@ pub(crate) mod tests {
         assert_eq!(err.status, Status::NotImplemented);
         assert_eq!(
             err.message,
-            "unrecognized statement option 'unknown.option'"
+            "[Snowflake] unrecognized statement option 'unknown.option'"
         );
     }
 
@@ -3466,10 +3871,9 @@ pub(crate) mod tests {
         let error = match execute_bound_rows(&[batch], Arc::new(Schema::empty()), |_| {
             executions += 1;
             if executions == 2 {
-                return Err(Error::with_message_and_status(
-                    "injected execution failure",
-                    Status::InvalidData,
-                ));
+                return Err(SnowflakeError::invalid_data()
+                    .message("injected execution failure")
+                    .into());
             }
             Ok(Box::new(ConcatReader {
                 batches: Vec::new().into_iter(),

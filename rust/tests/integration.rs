@@ -98,6 +98,109 @@ fn test_select_one() {
     assert_eq!(batch.num_columns(), 1);
 }
 
+/// Verify that the database options export the driver and sf_core spans in the
+/// same remote trace without configuring a process-global telemetry provider.
+#[test]
+fn test_adbcfile_trace_parent_and_sf_core_children() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let folder = std::env::temp_dir().join(format!("adbc-snowflake-otel-{}", uuid::Uuid::new_v4()));
+    let trace_parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    db.set_option(
+        OptionDatabase::Other("adbc.telemetry.traces_exporter".into()),
+        OptionValue::String("adbcfile".into()),
+    )
+    .expect("set traces exporter");
+    db.set_option(
+        OptionDatabase::Other("adbc.telemetry.traces_folder_path".into()),
+        OptionValue::String(folder.to_string_lossy().into_owned()),
+    )
+    .expect("set traces folder path");
+    db.set_option(
+        OptionDatabase::Other("adbc.telemetry.trace_parent".into()),
+        OptionValue::String(trace_parent.into()),
+    )
+    .expect("set trace parent");
+
+    let mut conn = db.new_connection().expect("new_connection");
+    let mut stmt = conn.new_statement().expect("new_statement");
+    stmt.set_sql_query("SELECT 1").expect("set_sql_query");
+    let mut reader = stmt.execute().expect("execute");
+    assert_eq!(
+        reader
+            .next()
+            .expect("no batch")
+            .expect("batch error")
+            .num_rows(),
+        1
+    );
+    drop(reader);
+    drop(stmt);
+    drop(conn);
+    drop(db); // the last Inner drops and synchronously flushes its batch exporter
+
+    let spans: Vec<serde_json::Value> = std::fs::read_dir(&folder)
+        .expect("tracing folder")
+        .flat_map(|file| {
+            std::fs::read_to_string(file.expect("trace file").path())
+                .expect("read trace file")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("valid span JSON"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let open = spans
+        .iter()
+        .find(|span| span["Name"] == "databaseImpl.Open")
+        .expect("Open span");
+    let execute = spans
+        .iter()
+        .find(|span| span["Name"] == "statement.ExecuteQuery")
+        .expect("ExecuteQuery span");
+    for span in [open, execute] {
+        assert_eq!(span["SpanContext"]["TraceID"], trace_id);
+    }
+    assert!(
+        spans.iter().any(|span| {
+            let name = span["Name"].as_str().unwrap_or_default();
+            name != "databaseImpl.Open"
+                && name != "statement.ExecuteQuery"
+                && span["SpanContext"]["TraceID"] == trace_id
+                && (span["Parent"]["SpanID"] == open["SpanContext"]["SpanID"]
+                    || span["Parent"]["SpanID"] == execute["SpanContext"]["SpanID"])
+        }),
+        "expected an sf_core span nested below Open or ExecuteQuery"
+    );
+    if std::env::var_os("ADBC_TRACE_REPORT_TREE").is_some() {
+        fn print_subtree(root: &serde_json::Value, spans: &[serde_json::Value], depth: usize) {
+            let start = chrono::DateTime::parse_from_rfc3339(root["StartTime"].as_str().unwrap())
+                .expect("span start");
+            let end = chrono::DateTime::parse_from_rfc3339(root["EndTime"].as_str().unwrap())
+                .expect("span end");
+            let duration_ms = (end - start).num_microseconds().unwrap_or_default() as f64 / 1000.0;
+            eprintln!(
+                "{}{} {:.3} ms",
+                "  ".repeat(depth),
+                root["Name"].as_str().unwrap_or_default(),
+                duration_ms,
+            );
+            for child in spans.iter().filter(|child| {
+                child["SpanContext"]["TraceID"] == root["SpanContext"]["TraceID"]
+                    && child["Parent"]["SpanID"] == root["SpanContext"]["SpanID"]
+            }) {
+                print_subtree(child, spans, depth + 1);
+            }
+        }
+        eprintln!("SELECT 1 trace (trace_id={trace_id}):");
+        print_subtree(open, &spans, 0);
+        print_subtree(execute, &spans, 0);
+    }
+    std::fs::remove_dir_all(folder).expect("remove trace folder");
+}
+
 #[test]
 fn test_get_table_types() {
     let Some(conn) = make_connection() else {
@@ -519,6 +622,61 @@ fn test_get_objects_constraints_and_table_schema_metadata() {
     assert_eq!(tables.len(), 1);
     assert_eq!(tables.column(2).as_list::<i32>().value_length(0), 0);
     assert_eq!(tables.column(3).as_list::<i32>().value_length(0), 2);
+
+    // SHOW COLUMNS renumbers a filtered result; the original third-column
+    // ordinal must survive both a LIKE column filter and a case-insensitive
+    // table filter, without losing that table's constraints.
+    conn.set_option(
+        OptionConnection::Other("adbc.connection.get_objects.match_exactly".into()),
+        OptionValue::String("false".into()),
+    )
+    .unwrap();
+    let lowercase_parent = parent.to_ascii_lowercase();
+    let mut reader = conn
+        .get_objects(
+            ObjectDepth::Columns,
+            Some(&catalog),
+            Some(&schema_name),
+            Some(&lowercase_parent),
+            None,
+            Some("lab_l"),
+        )
+        .unwrap();
+    let (batch, catalog_index) = reader
+        .find_map(|batch| {
+            let batch = batch.unwrap();
+            let names = batch.column(0).as_string::<i32>();
+            let index = (0..batch.num_rows()).find(|&index| names.value(index) == catalog);
+            index.map(|index| (batch, index))
+        })
+        .expect("GetObjects must include the current catalog");
+    let schema_values = batch.column(1).as_list::<i32>().value(catalog_index);
+    let schemas = schema_values.as_struct();
+    let schema_names = schemas.column(0).as_string::<i32>();
+    let schema_index = (0..schemas.len())
+        .find(|&index| schema_names.value(index) == schema_name)
+        .expect("GetObjects must include the current schema");
+    let table_values = schemas.column(1).as_list::<i32>().value(schema_index);
+    let tables = table_values.as_struct();
+    let table_names = tables.column(0).as_string::<i32>();
+    let table_index = (0..tables.len())
+        .find(|&index| table_names.value(index) == parent)
+        .expect("case-insensitive table filter must include created table");
+    let columns = tables.column(2).as_list::<i32>().value(table_index);
+    let columns = columns.as_struct();
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns.column(0).as_string::<i32>().value(0), "label");
+    assert_eq!(
+        columns
+            .column(1)
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(0),
+        3
+    );
+    assert_eq!(
+        tables.column(3).as_list::<i32>().value_length(table_index),
+        2
+    );
 }
 
 /// Mirrors Go's TestTimestampPrecision.
