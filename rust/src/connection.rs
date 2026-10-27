@@ -15,8 +15,8 @@
 // src/connection.rs
 
 /// Arrow library version reported via get_info(DriverArrowVersion).
-/// Must be kept in sync with the `arrow-array` dependency version in Cargo.toml.
-const ARROW_VERSION: &str = "v58.1.0";
+/// Must match the `arrow-array` version resolved in Cargo.lock.
+const ARROW_VERSION: &str = "v58.4.1";
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
