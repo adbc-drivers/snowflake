@@ -17,8 +17,8 @@ import functools
 import re
 from pathlib import Path
 
-import adbc_drivers_validation.model as model
 import adbc_drivers_validation.tests.query as query_tests
+from adbc_drivers_validation import model
 
 from . import snowflake
 
