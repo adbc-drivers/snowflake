@@ -55,9 +55,7 @@ pub(crate) enum GeoOutputFormat {
 
 impl GeoOutputFormat {
     pub(crate) fn parse(key: &str, value: &OptionValue) -> Result<Self> {
-        let OptionValue::String(value) = value else {
-            return Err(invalid_typed_option_value(key, value));
-        };
+        let value = database_option_as_string(key, value)?;
         if value.eq_ignore_ascii_case("EWKB") {
             Ok(Self::Ewkb)
         } else if value.eq_ignore_ascii_case("GEOJSON") {
@@ -99,11 +97,9 @@ fn invalid_option_value(key: &str, value: impl std::fmt::Display) -> Error {
         .into()
 }
 
-fn invalid_typed_option_value(key: &str, value: &OptionValue) -> Error {
-    SnowflakeError::invalid_argument()
-        .context("set database option")
-        .format(format_args!("option '{key}': invalid value {value:?}"))
-        .into()
+fn database_option_as_string<'v>(key: &str, value: &'v OptionValue) -> Result<&'v str> {
+    SnowflakeError::option_as_string(&key, value)
+        .map_err(|error| error.context("set database option").into())
 }
 
 fn unrecognized_option(key: &str) -> Error {
@@ -112,20 +108,13 @@ fn unrecognized_option(key: &str) -> Error {
         .into()
 }
 
-fn option_not_found(key: &str) -> Error {
-    SnowflakeError::not_found()
-        .context("get database option")
-        .format(format_args!("option not found: {key}"))
-        .into()
-}
-
-fn option_to_setting(value: &OptionValue) -> Result<Setting> {
+fn option_to_setting(key: &str, value: &OptionValue) -> Result<Setting> {
     match value {
         OptionValue::String(value) => Ok(Setting::String(value.clone())),
         OptionValue::Int(value) => Ok(Setting::Int(*value)),
         OptionValue::Double(value) => Ok(Setting::Double(*value)),
         OptionValue::Bytes(value) => Ok(Setting::Bytes(value.clone())),
-        _ => Err(SnowflakeError::invalid_argument()
+        _ => Err(SnowflakeError::set_invalid_option(&key, value)
             .context("set database option")
             .message("unsupported option value type")
             .into()),
@@ -209,19 +198,18 @@ fn duration_setting(key: &str, value: &OptionValue) -> Result<Setting> {
         OptionValue::Int(seconds) => seconds
             .checked_abs()
             .ok_or_else(|| invalid_option_value(key, seconds))?,
-        _ => return Err(invalid_typed_option_value(key, value)),
+        _ => {
+            return Err(SnowflakeError::set_invalid_option(&key, value)
+                .context("set database option")
+                .into());
+        }
     };
     Ok(Setting::Int(seconds))
 }
 
 fn non_negative_int(key: &str, value: &OptionValue) -> Result<i64> {
-    let number = match value {
-        OptionValue::String(number) => number
-            .parse::<i64>()
-            .map_err(|_| invalid_option_value(key, number))?,
-        OptionValue::Int(number) => *number,
-        _ => return Err(invalid_typed_option_value(key, value)),
-    };
+    let number = SnowflakeError::option_as_int(&key, value)
+        .map_err(|error| error.context("set database option"))?;
     if number < 0 {
         return Err(invalid_option_value(key, number));
     }
@@ -352,18 +340,15 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         "adbc.snowflake.sql.client_option.disable_telemetry" => {
             Setting::Bool(!adbc_option_enabled(value)?)
         }
-        "adbc.snowflake.sql.client_option.proxy_protocol" => match value {
-            OptionValue::String(protocol)
-                if protocol.eq_ignore_ascii_case("http")
-                    || protocol.eq_ignore_ascii_case("https") =>
-            {
-                Setting::String(protocol.to_ascii_lowercase())
+        "adbc.snowflake.sql.client_option.proxy_protocol" => {
+            let protocol = database_option_as_string(key, value)?;
+            if !protocol.eq_ignore_ascii_case("http") && !protocol.eq_ignore_ascii_case("https") {
+                return Err(invalid_option_value(key, protocol));
             }
-            OptionValue::String(protocol) => return Err(invalid_option_value(key, protocol)),
-            _ => return Err(invalid_typed_option_value(key, value)),
-        },
+            Setting::String(protocol.to_ascii_lowercase())
+        }
         MAX_RETRY_COUNT => Setting::Int(retry_attempts(key, value)?.1),
-        _ => option_to_setting(value)?,
+        _ => option_to_setting(key, value)?,
     };
     Ok(Some((param, setting)))
 }
@@ -427,40 +412,28 @@ impl Optionable for Database {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         let key_str = key.as_ref();
         if key_str == TRACE_PARENT {
-            let OptionValue::String(parent) = &value else {
-                return Err(invalid_typed_option_value(key_str, &value));
-            };
+            let parent = database_option_as_string(key_str, &value)?;
             self.trace_parent = validate_trace_parent(parent)?;
             return Ok(());
         }
         if key_str == TRACES_EXPORTER {
-            let OptionValue::String(exporter) = &value else {
-                return Err(invalid_typed_option_value(key_str, &value));
-            };
+            let exporter = database_option_as_string(key_str, &value)?;
             self.traces_exporter = Some(Exporter::parse(exporter)?);
             return Ok(());
         }
         if key_str == TRACES_FOLDER_PATH {
-            let OptionValue::String(folder) = &value else {
-                return Err(invalid_typed_option_value(key_str, &value));
-            };
-            self.traces_folder_path = (!folder.is_empty()).then(|| folder.clone());
+            let folder = database_option_as_string(key_str, &value)?;
+            self.traces_folder_path = (!folder.is_empty()).then(|| folder.to_owned());
             return Ok(());
         }
         if key_str == "uri" {
-            if let OptionValue::String(uri) = value {
-                return self.apply_uri(&uri);
-            }
-            return Err(SnowflakeError::invalid_argument()
-                .context("set URI database option")
-                .message("must be a string")
-                .into());
+            let uri = SnowflakeError::option_as_string(&key_str, &value)
+                .map_err(|error| error.context("set URI database option"))?;
+            return self.apply_uri(uri);
         }
         if key_str == MAX_TIMESTAMP_PRECISION {
-            let OptionValue::String(precision) = &value else {
-                return Err(invalid_typed_option_value(key_str, &value));
-            };
-            self.timestamp_precision = match precision.as_str() {
+            let precision = database_option_as_string(key_str, &value)?;
+            self.timestamp_precision = match precision {
                 "microseconds" => TimestampPrecision::Microseconds,
                 "nanoseconds_error_on_overflow" => TimestampPrecision::NanosecondsErrorOnOverflow,
                 "nanoseconds" => TimestampPrecision::Nanoseconds,
@@ -477,12 +450,10 @@ impl Optionable for Database {
             return Ok(());
         }
         if key_str == AUTH_TYPE {
-            let OptionValue::String(auth) = &value else {
-                return Err(invalid_typed_option_value(key_str, &value));
-            };
+            let auth = database_option_as_string(key_str, &value)?;
             let &(go_value, core_value) = AUTH_TYPES
                 .iter()
-                .find(|&&(go_value, _)| go_value == auth.as_str())
+                .find(|&&(go_value, _)| go_value == auth)
                 .ok_or_else(|| invalid_option_value(key_str, auth))?;
             if let Some(authenticator) = core_value.or(self.okta_url.as_deref()) {
                 self.set_sf_option(
@@ -494,16 +465,14 @@ impl Optionable for Database {
             return Ok(());
         }
         if key_str == OKTA_URL {
-            let OptionValue::String(url) = &value else {
-                return Err(invalid_typed_option_value(key_str, &value));
-            };
+            let url = database_option_as_string(key_str, &value)?;
             if self.auth_type == Some("auth_okta") {
                 self.set_sf_option(
                     param_names::AUTHENTICATOR.as_str(),
-                    Setting::String(url.clone()),
+                    Setting::String(url.to_owned()),
                 )?;
             }
-            self.okta_url = Some(url.clone());
+            self.okta_url = Some(url.to_owned());
             return Ok(());
         }
         if key_str == MAX_RETRY_COUNT {
@@ -623,10 +592,11 @@ impl Optionable for Database {
             }
         }
         if key_str == OKTA_URL {
-            return self
-                .okta_url
-                .clone()
-                .ok_or_else(|| option_not_found(key_str));
+            return self.okta_url.clone().ok_or_else(|| {
+                SnowflakeError::get_unknown_option(&key_str)
+                    .context("get database option")
+                    .into()
+            });
         }
         if key_str == MAX_RETRY_COUNT
             && let Some(count) = self.max_retry_count
@@ -657,7 +627,9 @@ impl Optionable for Database {
                     .into()),
             };
         }
-        Err(option_not_found(key_str))
+        Err(SnowflakeError::get_unknown_option(&key_str)
+            .context("get database option")
+            .into())
     }
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -667,7 +639,9 @@ impl Optionable for Database {
         {
             return Ok(b.clone());
         }
-        Err(option_not_found(key_str))
+        Err(SnowflakeError::get_unknown_option(&key_str)
+            .context("get database option")
+            .into())
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
@@ -682,7 +656,9 @@ impl Optionable for Database {
         {
             return Ok(*i);
         }
-        Err(option_not_found(key_str))
+        Err(SnowflakeError::get_unknown_option(&key_str)
+            .context("get database option")
+            .into())
     }
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
@@ -692,7 +668,9 @@ impl Optionable for Database {
         {
             return Ok(*d);
         }
-        Err(option_not_found(key_str))
+        Err(SnowflakeError::get_unknown_option(&key_str)
+            .context("get database option")
+            .into())
     }
 }
 
@@ -896,9 +874,7 @@ fn accumulate_connection_options(
                 continue;
             }
             if name == TRACE_PARENT {
-                let OptionValue::String(parent) = &value else {
-                    return Err(invalid_typed_option_value(name, &value));
-                };
+                let parent = database_option_as_string(name, &value)?;
                 validate_trace_parent(parent)?;
                 post_connect_options.push((key, value));
                 continue;
@@ -1304,7 +1280,7 @@ mod tests {
                         "[Snowflake] could not set database option: option '{key}': invalid value '{value}' (must be 'EWKB' or 'GeoJSON')"
                     ),
                     other => format!(
-                        "[Snowflake] could not set database option: option '{key}': invalid value {other:?}"
+                        "[Snowflake] could not set database option: could not invalid option \"{key}\"={other:?}: must be a string"
                     ),
                 };
                 let err = db.set_option(option.clone(), value).unwrap_err();
@@ -1602,14 +1578,22 @@ mod tests {
                 format!("[Snowflake] could not set database option: unknown option \"{key}\"")
             );
             assert!(!db.sf_settings.contains_key(key));
-            let missing = db
-                .get_option_string(OptionDatabase::Other(key.into()))
-                .unwrap_err();
-            assert_eq!(missing.status, Status::NotFound);
-            assert_eq!(
-                missing.message,
-                format!("[Snowflake] could not get database option: option not found: {key}")
-            );
+            for missing in [
+                db.get_option_string(OptionDatabase::Other(key.into()))
+                    .unwrap_err(),
+                db.get_option_bytes(OptionDatabase::Other(key.into()))
+                    .unwrap_err(),
+                db.get_option_int(OptionDatabase::Other(key.into()))
+                    .unwrap_err(),
+                db.get_option_double(OptionDatabase::Other(key.into()))
+                    .unwrap_err(),
+            ] {
+                assert_eq!(missing.status, Status::NotFound);
+                assert_eq!(
+                    missing.message,
+                    format!("[Snowflake] could not get database option: unknown option \"{key}\"")
+                );
+            }
         }
         assert!(db.sf_settings.is_empty());
     }
@@ -1873,7 +1857,7 @@ mod tests {
                     "[Snowflake] could not set database option: option '{MAX_TIMESTAMP_PRECISION}': invalid value '{value}'"
                 ),
                 other => format!(
-                    "[Snowflake] could not set database option: option '{MAX_TIMESTAMP_PRECISION}': invalid value {other:?}"
+                    "[Snowflake] could not set database option: could not invalid option \"{MAX_TIMESTAMP_PRECISION}\"={other:?}: must be a string"
                 ),
             };
             let error = db.set_option(option.clone(), invalid).unwrap_err();
@@ -1941,6 +1925,28 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
             assert_eq!(db.get_option_int(option.clone()).unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn non_negative_integer_options_accept_strings_and_ints() {
+        let key = "adbc.snowflake.sql.uri.port";
+        for (value, expected) in [
+            (OptionValue::String("443".into()), 443),
+            (OptionValue::String("+443".into()), 443),
+            (OptionValue::Int(443), 443),
+        ] {
+            assert_eq!(non_negative_int(key, &value).unwrap(), expected);
+        }
+        for value in [
+            OptionValue::String("abc".into()),
+            OptionValue::Int(-1),
+            OptionValue::Double(443.0),
+        ] {
+            assert_eq!(
+                non_negative_int(key, &value).unwrap_err().status,
+                Status::InvalidArguments
+            );
         }
     }
 

@@ -24,8 +24,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 adbc_core = "0.25"
 adbc_ffi = "0.25"
-# Temporary integration pin; move the rev to main after driverbase-rs PRs #44, #45, and #46 merge.
-driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "f905161bbe3b1daf30186ad98af281e1445d5d43", features = ["telemetry"] }
+# Integration branch includes driverbase-rs #44, #45, and #46 (through 7110b7b).
+# Move the rev to main after those PRs merge.
+driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "cd48242de679cb89cec950eed03625cc22c35577", features = ["telemetry"] }
 sf_core = { git = "https://github.com/snowflakedb/universal-driver", rev = "fcebbccd845e6b6f8589eb20f84f95a60ba82ea4" }
 arrow-array = { version = ">=58.3,<59", default-features = false, features = [
   "ffi",
