@@ -13,6 +13,8 @@
 # limitations under the License.
 
 .github/pull_request_template.md
+vendor/adbc-drivers-dev/.github/pull_request_template.md
+vendor/adbc-drivers-dev/schema/generate-schema.json
 .gitmodules
 */go.sum
 */pixi.lock

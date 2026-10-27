@@ -75,9 +75,10 @@ on:
 <% endif %>
 
 concurrency:
-<% if environment %>
-  # Must share concurrency group with release workflow since it also builds/tests
-  group: ${{ github.repository }}-${{ github.ref }}-<{environment.replace(' ', '-')}>
+<% if concurrency_key %>
+  # Effectively prevents parallel tests - usually used for cloud workflows
+  # Not necessary if you use environments + manual approval + trust the manual approval
+  group: ${{ github.repository }}-<{concurrency_key}>
 <% else %>
   group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
 <% endif %>
@@ -90,26 +91,58 @@ defaults:
 permissions:
   contents: read
 
+<% set has_test_platforms = ["linux_amd64", "macos_arm64", "windows_amd64"] | reject("in", lang_config.exclude_platforms) | list %>
+<% set run_tests = not lang_config.test.skip and has_test_platforms %>
+
+<% set stack_condition = none %>
+<% if not release %>
+<% if lang_config.github_stack_behavior == "bottom" %>
+<% set stack_condition = "github.event_name != 'pull_request' || github.event.pull_request.stack == null || github.event.pull_request.stack.base.ref == github.event.pull_request.base.ref" %>
+<% elif lang_config.github_stack_behavior == "top" %>
+<% set stack_condition = "github.event_name != 'pull_request' || github.event.pull_request.stack == null || github.event.pull_request.stack.position == github.event.pull_request.stack.size" %>
+<% endif %>
+<% endif %>
+
 jobs:
-<% if not lang_config.test.skip %>
+<% if run_tests %>
   test:
+<% if stack_condition %>
+    if: <{stack_condition}>
+<% endif %>
     name: "Test/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
     strategy:
+<% if driver == "snowflake" and lang == "rust" %>
+      # LOCAL MODIFICATIONS: retain all Snowflake Rust matrix results.
+      fail-fast: false
+<% else %>
       fail-fast: true
+<% endif %>
       matrix:
         include:
+<% if "linux_amd64" not in lang_config.exclude_platforms %>
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
+<% endif %>
+<% if "macos_arm64" not in lang_config.exclude_platforms %>
           - { platform: macos, arch: arm64, runner: macos-latest }
+<% endif %>
+<% if "windows_amd64" not in lang_config.exclude_platforms %>
           - { platform: windows, arch: amd64, runner: windows-latest }
-<% if environment and "test" in lang_config.build.environment_contexts or "build:test" in lang_config.build.environment_contexts %>
-    environment: <{environment}>
+<% endif %>
+<% if lang_config.test.environment %>
+    environment: <{lang_config.test.environment}>
+<% endif %>
+<% if driver == "snowflake" and lang == "rust" %>
+    # LOCAL MODIFICATIONS: avoid Rust incremental cache pressure in Snowflake CI.
+    env:
+      CARGO_INCREMENTAL: 0
 <% endif %>
     permissions:
       contents: read
 <% if permissions.get("id_token") %>
       id-token: write
 <% endif %>
+      packages: read
     steps:
       - name: free up disk space
         if: runner.os != 'Windows'
@@ -119,13 +152,13 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
 <% if release or not secrets["all"] %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: 'recursive'
 <% else %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
@@ -133,7 +166,7 @@ jobs:
           submodules: 'recursive'
 
       - name: "checkout remote"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
@@ -144,7 +177,7 @@ jobs:
 <% endif %>
 
 <% if "go" in lang_tools %>
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           cache: <{"false" if release else "true"}>
           cache-dependency-path: <{go_mod_path}>/go.sum
@@ -152,32 +185,39 @@ jobs:
           go-version-file: <{go_mod_path}>/go.mod
 <% endif %>
 <% if "rust" in lang_tools %>
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
         with:
           cache: <{"false" if release else "true"}>
           components: "clippy"
 <% endif %>
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
         with:
-          pixi-version: v0.63.2
+          pixi-version: <{tool_versions["pixi"]}>
           run-install: false
 
-<% if aws %>
+<% if aws and lang_config.test.aws %>
       - name: AWS Login
-        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885  # v6.1.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
         with:
           aws-region: <{aws.region}>
           role-to-assume: ${{ secrets.aws_role }}
           role-session-name: ${{ secrets.aws_role_session_name }}
 <% endif %>
-<% if gcloud %>
+<% if gcloud and lang_config.test.gcloud %>
       - name: Google Cloud Login
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
         with:
           service_account: ${{ secrets.gcloud_service_account }}
           workload_identity_provider: ${{ secrets.gcloud_workload_identity_provider }}
 <% endif %>
+
+      - name: Log in to ghcr.io
+        if: runner.os == 'Linux'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Build
 <% if secrets["build:test"] %>
@@ -248,22 +288,58 @@ jobs:
 
           if [[ -f ci/scripts/pre-test.sh ]]; then
             echo "Loading pre-test"
-            ./ci/scripts/pre-test.sh ${{ matrix.platform }} ${{ matrix.arch }}
+            ./ci/scripts/pre-test.sh ${{ matrix.platform }} ${{ matrix.arch }} "<{lang_config.test.service_name}>"
           fi
 
+          # if pre-test.sh needs to override env vars, it can generate this file
+          set -a
+          if [[ -f .env.override ]]; then
+            source .env.override
+          fi
+          set +a
+
 <% if lang == "go" %>
-          go test -tags assert -v ./...
+          go test -timeout <{lang_config.test.timeout_minutes}>m -tags assert -v ./...
 <% elif lang == "rust" %>
-          cargo test
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            /usr/bin/perl -e 'alarm shift; exec @ARGV' <{lang_config.test.timeout_minutes * 60}> cargo test
+          else
+            timeout <{lang_config.test.timeout_minutes}>m cargo test
+          fi
 <% elif lang == "script" %>
           ./ci/scripts/test.sh ${{ matrix.platform }} ${{ matrix.arch }}
 <% else %>
 <{not_implemented(lang)}>
 <% endif %>
 
-          if [[ -f ci/scripts/post-test.sh ]]; then
-            ./ci/scripts/post-test.sh
+<% if file_exists("ci/scripts/post-test.sh") %>
+      - name: Post-Test
+        if: always()
+<% if secrets["test"] %>
+        env:
+<% for name, val in secrets["test"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          set -a
+          if [[ -f .env ]]; then
+            source .env
           fi
+          if [[ -f .env.${{ matrix.platform }} ]]; then
+            source .env.${{ matrix.platform }}
+          fi
+          if [[ -f .env.ci ]]; then
+            source .env.ci
+          fi
+          if [[ -f .env.override ]]; then
+            source .env.override
+          fi
+          set +a
+
+          ./ci/scripts/post-test.sh
+<% endif %>
 
 <% if lang == "go" %>
       - name: go mod tidy
@@ -275,35 +351,62 @@ jobs:
       - name: clippy
         working-directory: <{ lang_subdir }>
         run: |
+<% if driver == "snowflake" and lang == "rust" %>
+          # LOCAL MODIFICATIONS: keep Snowflake Rust formatting in the lint job.
+          cargo fmt --check
+<% endif %>
           cargo clippy --locked --no-deps -- -A unused_variables -D warnings
+<% if file_exists("deny.toml") %>
+
+      - name: cargo deny
+        if: runner.os == 'Linux'
+        working-directory: <{ lang_subdir }>
+        run: |
+          cargo install cargo-deny --version <{tool_versions["cargo-deny"]}> --locked
+          cargo deny --all-features --locked check
+<% endif %>
 <% endif %>
 <% endif %>
 
 <% if not lang_config.validation.skip %>
   validate:
+<% if stack_condition %>
+    if: <{stack_condition}>
+<% endif %>
     name: "Validate <{driver}> ${{ matrix.vendor_version }}/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
 <% if driver == "snowflake" %>
-    # Go and Rust validation use fixed table names in the same live schema.
+    # LOCAL MODIFICATIONS: Go and Rust share fixed Snowflake validation tables.
     concurrency:
       group: snowflake-live-validation
       cancel-in-progress: false
 <% endif %>
     strategy:
+<% if driver == "snowflake" and lang == "rust" %>
+      # LOCAL MODIFICATIONS: retain all Snowflake Rust matrix results.
+      fail-fast: false
+<% else %>
       fail-fast: true
+<% endif %>
+      max-parallel: 4
       matrix:
         include:
           # I think we only need to test one platform, but we can change that later
 <% for config in lang_config.validation.configs %>
-          - { platform: linux, arch: amd64, runner: ubuntu-latest, service_name: "<{config.service_name}>", vendor_version: "<{config.vendor_version}>" }
+          - { platform: linux, arch: amd64, runner: ubuntu-latest, service_name: "<{config.service_name}>", vendor_version: "<{config.vendor_version}>", environment: <% if config.environment %>"<{config.environment}>"<% else %>null<% endif %>, aws: <{ "true" if config.aws else "false" }>, azure: <{ "true" if config.azure else "false" }>, gcloud: <{ "true" if config.gcloud else "false" }> }
 <% endfor %>
-<% if environment and "validate" in lang_config.build.environment_contexts or "build:test" in lang_config.build.environment_contexts %>
-    environment: <{environment}>
-<% endif %>
+    environment: ${{ matrix.environment }}
     permissions:
       contents: read
 <% if permissions.get("id_token") %>
       id-token: write
+<% endif %>
+      packages: read
+    env:
+      FOUNDRY_GH_ENVIRONMENT: ${{ matrix.environment || '' }}
+<% if driver == "snowflake" and lang == "rust" %>
+      # LOCAL MODIFICATIONS: avoid Rust incremental cache pressure in Snowflake CI.
+      CARGO_INCREMENTAL: 0
 <% endif %>
     steps:
       - name: free up disk space
@@ -314,13 +417,13 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
 <% if release or not secrets["all"] %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: 'recursive'
 <% else %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
@@ -328,7 +431,7 @@ jobs:
           submodules: 'recursive'
 
       - name: "checkout remote"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
@@ -339,7 +442,7 @@ jobs:
 <% endif %>
 
 <% if "go" in lang_tools %>
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           cache: <{"false" if release else "true"}>
           cache-dependency-path: <{go_mod_path}>/go.sum
@@ -347,20 +450,21 @@ jobs:
           go-version-file: <{go_mod_path}>/go.mod
 <% endif %>
 <% if "rust" in lang_tools %>
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
         with:
           cache: <{"false" if release else "true"}>
           components: "clippy"
 <% endif %>
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
         with:
-          pixi-version: v0.63.2
+          pixi-version: <{tool_versions["pixi"]}>
           run-install: false
 
 <% if aws %>
       - name: AWS Login
-        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885  # v6.1.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        if: matrix.aws
         with:
           aws-region: <{aws.region}>
           role-to-assume: ${{ secrets.aws_role }}
@@ -369,9 +473,19 @@ jobs:
 <% if gcloud %>
       - name: Google Cloud Login
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        if: matrix.gcloud
         with:
           service_account: ${{ secrets.gcloud_service_account }}
           workload_identity_provider: ${{ secrets.gcloud_workload_identity_provider }}
+<% endif %>
+<% if azure %>
+      - name: Azure Login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3.1.0
+        if: matrix.azure
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 <% endif %>
 
       - name: Log in to ghcr.io
@@ -402,14 +516,14 @@ jobs:
             source .env.test
           fi
           set +a
-          pixi run adbc-make build DEBUG=true VERBOSE=true DRIVER=<{driver}> IMPL_LANG=<{lang}> <{' '.join(lang_config.build.additional_make_args) }>
+          pixi run adbc-make build DEBUG=true VERBOSE=true <{' '.join(lang_config.build.additional_make_args) }>
       - name: Start Test Dependencies
         # Can't use Docker on macOS AArch64 runners, and Windows containers
         # work but often the container doesn't support Windows
         if: runner.os == 'Linux'
         working-directory: <{ lang_subdir }>
         run: |
-          if [[ -f compose.yaml ]]; then
+          if [[ -f compose.yaml ]] && [[ -n "${{ matrix.service_name }}" ]]; then
             if ! docker compose up --detach --wait ${{ matrix.service_name }}; then
               echo "Service failed to start"
               echo "Logs:"
@@ -445,6 +559,13 @@ jobs:
             ./ci/scripts/pre-test.sh ${{ matrix.platform }} ${{ matrix.arch }} ${{ matrix.service_name }}
           fi
 
+          # if pre-test.sh needs to override env vars, it can generate this file
+          set -a
+          if [[ -f .env.override ]]; then
+            source .env.override
+          fi
+          set +a
+
           docker ps
           if [[ -n "${{ matrix.vendor_version }}" ]]; then
             pixi run validate --vendor-version "${{ matrix.vendor_version }}"
@@ -452,13 +573,38 @@ jobs:
             pixi run validate
           fi
 
-          if [[ -f ci/scripts/post-test.sh ]]; then
-            ./ci/scripts/post-test.sh
-          fi
-
           cp validation-report.xml validation-report-${{ matrix.vendor_version }}.xml
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+<% if file_exists("ci/scripts/post-test.sh") %>
+      - name: Post-Test
+        if: always()
+<% if secrets["validate"] %>
+        env:
+<% for name, val in secrets["validate"].items() %>
+          <{name}>: ${{ secrets.<{val}> }} # zizmor: ignore[secrets-outside-env]
+<% endfor %>
+<% endif %>
+        working-directory: <{ lang_subdir }>
+        run: |
+          set -a
+          if [[ -f .env ]]; then
+            source .env
+          fi
+          if [[ -f .env.${{ matrix.platform }} ]]; then
+            source .env.${{ matrix.platform }}
+          fi
+          if [[ -f .env.ci ]]; then
+            source .env.ci
+          fi
+          if [[ -f .env.override ]]; then
+            source .env.override
+          fi
+          set +a
+
+          ./ci/scripts/post-test.sh
+<% endif %>
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: validation-report-${{ matrix.vendor_version }}
           path: "<{ lang_subdir }>/validation-report-${{ matrix.vendor_version }}.xml"
@@ -469,7 +615,7 @@ jobs:
         run: |
           pixi run gendocs --output generated
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: docs-${{ matrix.vendor_version }}
           path: "<{ lang_subdir }>/generated/<{driver}>.md"
@@ -477,35 +623,56 @@ jobs:
 <% endif %>
 
   build:
+<% if stack_condition %>
+    if: <{stack_condition}>
+<% endif %>
     name: "Build <{driver}>/${{ matrix.platform }}_${{ matrix.arch }}"
-<% if not lang_config.test.skip %>
+<% if run_tests %>
     needs: test
 <% endif %>
     runs-on: ${{ matrix.runner }}
     strategy:
+<% if driver == "snowflake" and lang == "rust" %>
+      # LOCAL MODIFICATIONS: retain all Snowflake Rust matrix results.
+      fail-fast: false
+<% else %>
       fail-fast: true
+<% endif %>
       matrix:
         include:
+<% if "linux_amd64" not in lang_config.exclude_platforms %>
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
+<% endif %>
+<% if "linux_arm64" not in lang_config.exclude_platforms %>
           - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
+<% endif %>
+<% if "macos_arm64" not in lang_config.exclude_platforms %>
           - { platform: macos, arch: arm64, runner: macos-latest }
+<% endif %>
+<% if "windows_amd64" not in lang_config.exclude_platforms %>
           - { platform: windows, arch: amd64, runner: windows-latest }
-<% if environment and "build:release" in lang_config.build.environment_contexts %>
-    environment: <{environment}>
+<% endif %>
+<% if lang_config.build.environment  %>
+    environment: <{lang_config.build.environment}>
 <% endif %>
     permissions:
       contents: read
       packages: read
+<% if driver == "snowflake" and lang == "rust" %>
+    # LOCAL MODIFICATIONS: avoid Rust incremental cache pressure in Snowflake CI.
+    env:
+      CARGO_INCREMENTAL: 0
+<% endif %>
 
     steps:
 <% if release or not secrets["all"] %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: 'recursive'
 <% else %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
@@ -513,7 +680,7 @@ jobs:
           submodules: 'recursive'
 
       - name: "checkout remote"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
@@ -524,7 +691,7 @@ jobs:
 <% endif %>
 
 <% if "go" in lang_tools %>
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           cache: <{"false" if release else "true"}>
           cache-dependency-path: <{go_mod_path}>/go.sum
@@ -532,15 +699,15 @@ jobs:
           go-version-file: <{go_mod_path}>/go.mod
 <% endif %>
 <% if "rust" in lang_tools %>
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
         with:
           cache: <{"false" if release else "true"}>
           components: "clippy"
 <% endif %>
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
         with:
-          pixi-version: v0.63.2
+          pixi-version: <{tool_versions["pixi"]}>
           run-install: false
 
       - name: Install dev tools
@@ -554,6 +721,17 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Add dumpbin to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) {
+            throw "Could not find dumpbin.exe using vswhere"
+          }
+          Split-Path $dumpbin -Parent | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build Library
         working-directory: <{ lang_subdir }>
@@ -576,15 +754,22 @@ jobs:
             source .env.release
           fi
           set +a
-          pixi run adbc-make check CI=true VERBOSE=true DRIVER=<{driver}> IMPL_LANG=<{lang}> <{' '.join(lang_config.build.additional_make_args) }><% if release %> RELEASE=true<% endif %>
+          pixi run adbc-make check CI=true VERBOSE=true <{' '.join(lang_config.build.additional_make_args) }><% if release %> RELEASE=true<% endif %>
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+          if [[ -f ci/scripts/post-build.sh ]]; then
+            ./ci/scripts/post-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: drivers-${{ matrix.platform }}-${{ matrix.arch }}
           path: "<{ lang_subdir }>/build/libadbc_driver_<{driver}>.*"
           retention-days: 2
 
   package:
+<% if stack_condition %>
+    if: <{stack_condition}>
+<% endif %>
     name: "Generate Packages"
     runs-on: ubuntu-latest
     needs:
@@ -597,13 +782,13 @@ jobs:
 
     steps:
 <% if release or not secrets["all"] %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: 'recursive'
 <% else %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
@@ -611,7 +796,7 @@ jobs:
           submodules: 'recursive'
 
       - name: "checkout remote"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
@@ -622,25 +807,25 @@ jobs:
 <% endif %>
 
 <% if "go" in lang_tools %>
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           cache: <{"false" if release else "true"}>
           check-latest: true
           go-version: "stable"
 <% endif %>
 <% if "rust" in lang_tools %>
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
         with:
           cache: <{"false" if release else "true"}>
           components: "clippy"
 <% endif %>
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
         with:
-          pixi-version: v0.63.2
+          pixi-version: <{tool_versions["pixi"]}>
           run-install: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: "drivers-*"
           path: "~/drivers"
@@ -656,7 +841,7 @@ jobs:
           go install github.com/lidavidm/go-licenses@master
 <% endif %>
 <% if "rust" in lang_tools %>
-          cargo install cargo-about@0.9.0 --locked -F cli
+          cargo install cargo-about --version <{tool_versions["cargo-about"]}> --locked -F cli
 <% endif %>
 
       - name: Generate packages
@@ -666,22 +851,22 @@ jobs:
 
           pixi run adbc-gen-package \
             --name <{driver}> \
-            --root "$(pwd)" \
-            --manifest-template "$(pwd)/manifest.toml" \
+            --root $(pwd) \
+            --manifest-template $(pwd)/manifest.toml \
             <% if release %>--release<% endif %> \
             -o ~/packages \
             ~/drivers/drivers-*-*/
 
           ls ~/packages
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: all-packages
           path: ~/packages
           retention-days: 7
 
 <% if not lang_config.validation.skip %>
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: "validation-report-*"
           path: "~/validation-report"
@@ -695,14 +880,18 @@ jobs:
           ls *.xml
           pixi run gendocs --output generated
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: docs
           path: "<{ lang_subdir }>/generated/<{driver}>.md"
           retention-days: 2
 <% endif %>
 
+<% if has_test_platforms %>
   test-packages:
+<% if stack_condition %>
+    if: <{stack_condition}>
+<% endif %>
     name: "Test Packages/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
     needs:
@@ -711,23 +900,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+<% if "linux_amd64" not in lang_config.exclude_platforms %>
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
+<% endif %>
+<% if "macos_arm64" not in lang_config.exclude_platforms %>
           - { platform: macos, arch: arm64, runner: macos-latest }
+<% endif %>
+<% if "windows_amd64" not in lang_config.exclude_platforms %>
           - { platform: windows, arch: amd64, runner: windows-latest }
-<% if environment and "build:test" in lang_config.build.environment_contexts %>
-    environment: <{environment}>
+<% endif %>
+<% if lang_config.test_packages.environment %>
+    environment: <{lang_config.test_packages.environment}>
 <% endif %>
     steps:
       # for now, install dbc from main
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           cache: <{"false" if release else "true"}>
           go-version: 'stable'
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
         with:
-          pixi-version: v0.63.2
+          pixi-version: <{tool_versions["pixi"]}>
           run-install: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: "all-packages"
           path: "~/packages"
@@ -745,20 +940,20 @@ jobs:
           ./dbc install --no-verify "${driver_pkg}"
           echo "Installed ${driver_pkg}"
 <% if release or not secrets["all"] %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
           submodules: 'recursive'
 <% else %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 1
           persist-credentials: false
           submodules: 'recursive'
       - name: "checkout remote"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
@@ -799,7 +994,12 @@ jobs:
 <% endif %>
           pixi exec -s adbc-driver-manager -s pyarrow -s pytest python -m pytest -vs ci/test_package.py
 
+<% endif %>
+
   release:
+<% if stack_condition %>
+    if: <{stack_condition}>
+<% endif %>
 <% if release %>
     name: "Release"
 <% else %>
@@ -808,7 +1008,9 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - package
+<% if has_test_platforms %>
       - test-packages
+<% endif %>
 <% if not lang_config.validation.skip %>
       - validate
 <% endif %>
@@ -821,13 +1023,13 @@ jobs:
 
     steps:
 <% if release or not secrets["all"] %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: 'recursive'
 <% else %>
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 0
@@ -835,7 +1037,7 @@ jobs:
           submodules: 'recursive'
 
       - name: "checkout remote"
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ inputs.repository }}
@@ -845,18 +1047,18 @@ jobs:
           submodules: 'recursive'
 <% endif %>
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11  # v0.9.6
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
         with:
-          pixi-version: v0.63.2
+          pixi-version: <{tool_versions["pixi"]}>
           run-install: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: "all-packages"
           path: "~/packages"
 
 <% if not lang_config.validation.skip %>
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: "docs"
           path: "~/packages"

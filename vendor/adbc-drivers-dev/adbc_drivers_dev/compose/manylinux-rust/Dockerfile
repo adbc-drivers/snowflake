@@ -15,6 +15,7 @@
 ARG MANYLINUX
 FROM quay.io/pypa/${MANYLINUX}:latest
 
+# LOCAL MODIFICATIONS: vendored OpenSSL builds need these Perl modules.
 RUN ulimit -n 1024 \
     && yum install -y wget openssl openssl-devel openssl-static perl-IPC-Cmd perl-Time-Piece \
     && yum clean all

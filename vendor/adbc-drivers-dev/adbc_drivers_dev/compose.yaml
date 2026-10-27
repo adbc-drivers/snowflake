@@ -42,7 +42,7 @@ services:
       - ${SOURCE_ROOT:-.}:/source:rw
 
   manylinux-rust:
-    # Local suffix prevents reuse of the upstream image, which lacks IPC::Cmd.
+    # LOCAL MODIFICATIONS: do not reuse upstream's Rust image without the Perl modules.
     image: ghcr.io/adbc-drivers/dev:${MANYLINUX}-rust${RUST}-snowflake2
     build:
       context: ./compose/manylinux-rust

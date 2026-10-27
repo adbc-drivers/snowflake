@@ -18,15 +18,16 @@
 
 Source: <https://github.com/adbc-drivers/dev>
 
-Exact upstream revision: `eea5591d7d1c7fe0047c7d1a1109afe1be50e4b4`
+Exact upstream revision: `1253650a6bbb64cc97e6d92d5b3335e4bb4a5e27`
 
 License: Apache-2.0; the upstream license and notice are included as `LICENSE.txt` and `NOTICE.txt`.
 
-Included scope: the complete installable `adbc_drivers_dev` package, `pyproject.toml`, `MANIFEST.in`, `LICENSE.txt`, `NOTICE.txt`, and the complete upstream `tests/test_detect_version.py` module from the revision above.
+Included scope: the complete Git-tracked source tree at that revision, including `.github/`, `adbc_drivers_dev/`, `docs/`, `schema/`, `tests/`, build metadata, and `pixi.lock`. The upstream root `README.md` is replaced by this vendor-specific README. Git metadata and untracked or ignored artifacts (such as caches, `__pycache__/`, and `*.egg-info/`) are not included. Upstream `.env` pins Go 1.27.3 and Rust 1.99.0.
 
 Local modifications:
 
-1. `adbc_drivers_dev/make.py` prefixes the development-version git revision with `g`, producing SemVer-compatible versions such as `v1.2.3-dev.1.g0747374`.
-2. Linux Go and Rust builds use writable `/tmp` caches when manylinux containers run with the host UID.
-3. The manylinux Rust image uses Rust 1.94.0, matching `sf_core`'s declared minimum supported Rust version, installs the Perl IPC and time modules required by vendored OpenSSL builds, and uses a project-specific image suffix so Compose builds the modified image instead of reusing the upstream image.
-4. `tests/test_detect_version.py` includes deterministic regressions for the build-script changes.
+1. `adbc_drivers_dev/make_config.py` sets writable Go (`GOCACHE=/tmp/go-build`, `GOMODCACHE=/tmp/go-mod`, `GOPATH=/tmp/go`) and Rust (`HOME=/tmp`, `XDG_CACHE_HOME=/tmp/.cache`, `CARGO_HOME=/.cargo`) cache locations in the inner manylinux `docker exec` build commands, which run under arbitrary host UIDs.
+2. `adbc_drivers_dev/compose/manylinux-rust/Dockerfile` installs `perl-IPC-Cmd` and `perl-Time-Piece` for vendored OpenSSL builds; `adbc_drivers_dev/compose.yaml` gives this changed Rust image a `-snowflake2` suffix to prevent pulling an upstream image without those modules.
+3. `adbc_drivers_dev/templates/test.yaml` serializes Snowflake live validation jobs across Go and Rust with `snowflake-live-validation` and `cancel-in-progress: false`, because they share fixed table names. Snowflake Rust test, validation, and build matrices keep `fail-fast: false` and disable incremental compilation to limit CI cache pressure; Rust lint runs `cargo fmt --check` before Clippy.
+4. `adbc_drivers_dev/templates/pixi.toml` keeps Snowflake Go and Rust on the editable `../vendor/adbc-drivers-dev` package when generated, rather than resetting to upstream Git; other drivers retain the upstream Git dependency.
+5. `tests/test_make.py` asserts the Go and Rust cache variables appear in the actual inner `docker exec` command rather than only the outer Compose environment; `tests/test_workflow.py` checks the generated Pixi dependency source for Snowflake Go/Rust and other drivers.
