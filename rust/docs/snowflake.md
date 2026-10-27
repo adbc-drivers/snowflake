@@ -116,6 +116,8 @@ GetObjects at `columns` and `all` depths includes PRIMARY KEY, FOREIGN KEY, and 
 
 Bulk ingestion writes the bound data to Parquet files, uploads them concurrently to a temporary stage, and loads them with `COPY INTO ... MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`. When appending (`adbc.ingest.mode.append` or `adbc.ingest.mode.create_append` with an existing table), the target table must have the same number of columns with matching names (case-insensitive); otherwise ingestion fails with `ALREADY_EXISTS`.
 
+Arrow `Time32(Second)` input is converted to millisecond units in the Parquet files before `COPY INTO`; the Snowflake target remains `TIME(0)` and values retain their second precision.
+
 `adbc.ingest.mode.replace` loads into a staging table in the target schema and swaps it with the target (`ALTER TABLE ... SWAP WITH`) only after every file has been copied. If ingestion fails or is cancelled, the existing table and its data are left unchanged. As with any Snowflake table swap, grants on the replaced table are not carried over to the new data.
 
 - `adbc.snowflake.statement.ingest_writer_concurrency`: number of Parquet writers. Defaults to the number of CPUs; `0` resets to the default.
@@ -129,7 +131,7 @@ Bulk ingestion writes the bound data to Parquet files, uploads them concurrently
 
 ### Result Types
 
-- NUMBER columns with a nonzero scale are returned as exact `Decimal128(precision, scale)`; NUMBER columns with scale 0 keep the integer or decimal type Snowflake sends for the result set.
+- NUMBER columns with a nonzero scale are returned as exact `Decimal128(precision, scale)`. Scale-0 NUMBER result batches keep the signed integer width Snowflake sends (Int8, Int16, Int32, or Int64, depending on the values), while schema-only inspection (ExecuteSchema, GetTableSchema, and describe) reports Int64. A schema-only result can therefore differ from the subsequent result batch.
 - ARRAY columns carry the `arrow.json` extension type; UUID columns are returned as `arrow.uuid` (16-byte fixed-size binary).
 - TIMESTAMP_LTZ columns use the session `TIMEZONE`; TIMESTAMP_TZ columns use UTC; TIMESTAMP_NTZ columns have no time zone.
 - GetTableSchema reads `DESC TABLE` for `DATA_TYPE` and `PRIMARY_KEY` field metadata (plus `COMMENT` when set), while keeping Snowflake's Arrow type adjustments and session time zone. ARRAY and EWKB GeoArrow fields carry their extension metadata instead of these DESC keys, as in the Go driver.

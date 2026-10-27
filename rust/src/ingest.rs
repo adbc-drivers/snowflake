@@ -873,7 +873,10 @@ fn validate_target_schema(
 
 fn requires_normalization(ty: &DataType) -> Result<bool> {
     match ty {
-        DataType::Float16 | DataType::Dictionary(_, _) | DataType::RunEndEncoded(_, _) => Ok(true),
+        DataType::Float16
+        | DataType::Time32(arrow_schema::TimeUnit::Second)
+        | DataType::Dictionary(_, _)
+        | DataType::RunEndEncoded(_, _) => Ok(true),
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
@@ -898,6 +901,9 @@ fn requires_normalization(ty: &DataType) -> Result<bool> {
 fn normalized_type(ty: &DataType) -> Result<DataType> {
     Ok(match ty {
         DataType::Float16 => DataType::Float32,
+        DataType::Time32(arrow_schema::TimeUnit::Second) => {
+            DataType::Time32(arrow_schema::TimeUnit::Millisecond)
+        }
         DataType::Dictionary(_, value) => return normalized_type(value),
         DataType::RunEndEncoded(_, value) => return normalized_type(value.data_type()),
         DataType::List(child) => DataType::List(Arc::new(normalized_field(child)?)),
@@ -1472,7 +1478,8 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
         FixedSizeBinaryArray, Float32Array, Int32Array, Int64Array, ListArray, StringArray,
-        StringViewArray, Time64NanosecondArray, TimestampMicrosecondArray, types::Int8Type,
+        StringViewArray, Time32MillisecondArray, Time32SecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, types::Int8Type,
     };
     use arrow_schema::extension::Uuid;
     use bytes::Bytes;
@@ -2079,6 +2086,58 @@ mod tests {
         )
         .unwrap();
         files.into_inner().unwrap()
+    }
+
+    #[test]
+    fn parquet_normalizes_time32_seconds_to_milliseconds() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_s",
+            DataType::Time32(arrow_schema::TimeUnit::Second),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Time32SecondArray::from(vec![
+                Some(0),
+                Some(3661),
+                Some(43200),
+                Some(86399),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let files = encode(vec![batch], usize::MAX);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Time32(arrow_schema::TimeUnit::Second)
+        );
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(
+            files.into_iter().next().unwrap().1,
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        let result = reader.into_iter().next().unwrap().unwrap();
+        assert_eq!(
+            result.schema().field(0).data_type(),
+            &DataType::Time32(arrow_schema::TimeUnit::Millisecond)
+        );
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Time32MillisecondArray>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![
+                Some(0),
+                Some(3_661_000),
+                Some(43_200_000),
+                Some(86_399_000),
+                None
+            ]
+        );
     }
 
     #[test]

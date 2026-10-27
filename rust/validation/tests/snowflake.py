@@ -16,7 +16,31 @@ import functools
 import re
 from pathlib import Path
 
-from adbc_drivers_validation import model, quirks
+import pyarrow
+from adbc_drivers_validation import compare, model, quirks
+
+_compare_tables = compare.compare_tables
+
+
+def compare_ingest_tables(
+    expected: pyarrow.Table, actual: pyarrow.Table, metadata=None
+) -> None:
+    """Compare ingest data exactly while allowing Snowflake's narrow NUMBER results."""
+    for index, (expected_field, actual_field) in enumerate(
+        zip(expected.schema, actual.schema)
+    ):
+        if (
+            expected_field.name == actual_field.name
+            and pyarrow.types.is_integer(expected_field.type)
+            and pyarrow.types.is_integer(actual_field.type)
+            and expected_field.type != actual_field.type
+        ):
+            actual = actual.set_column(
+                index,
+                actual_field.with_type(expected_field.type),
+                actual.column(index).cast(expected_field.type, safe=True),
+            )
+    _compare_tables(expected, actual, metadata)
 
 
 class SnowflakeQuirks(model.DriverQuirks):
