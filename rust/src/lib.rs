@@ -30,6 +30,7 @@ pub use connection::Connection;
 mod get_objects;
 mod ingest;
 mod statistics;
+mod telemetry;
 
 mod statement;
 pub use statement::Statement;

@@ -21,6 +21,7 @@ use adbc_core::{
     error::{Error, Result, Status},
     options::{OptionConnection, OptionDatabase, OptionValue},
 };
+use driverbase::error::ErrorHelper;
 use sf_core::apis::database_driver_v1::{
     Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
 };
@@ -29,6 +30,10 @@ use sf_core::config::settings::Setting;
 
 use crate::connection::{Connection, cleanup_connection_handle};
 use crate::driver::{Inner, TimestampPrecision};
+use crate::error::SnowflakeError;
+use driverbase::telemetry::{
+    Exporter, TRACE_PARENT, TRACES_EXPORTER, TRACES_FOLDER_PATH, validate_trace_parent,
+};
 
 const AUTH_TYPE: &str = "adbc.snowflake.sql.auth_type";
 const OKTA_URL: &str = "adbc.snowflake.sql.client_option.okta_url";
@@ -58,12 +63,12 @@ impl GeoOutputFormat {
         } else if value.eq_ignore_ascii_case("GEOJSON") {
             Ok(Self::GeoJson)
         } else {
-            Err(Error::with_message_and_status(
-                format!(
-                    "[snowflake] invalid value for database option '{key}': '{value}' (must be 'EWKB' or 'GeoJSON')"
-                ),
-                Status::InvalidArguments,
-            ))
+            Err(SnowflakeError::invalid_argument()
+                .context("set database option")
+                .format(format_args!(
+                    "option '{key}': invalid value '{value}' (must be 'EWKB' or 'GeoJSON')"
+                ))
+                .into())
         }
     }
 
@@ -87,28 +92,31 @@ const AUTH_TYPES: [(&str, Option<&str>); 8] = [
     ("auth_wif", Some("WORKLOAD_IDENTITY")),
 ];
 
-fn invalid_option_value(key: &str, value: &str) -> Error {
-    Error::with_message_and_status(
-        format!("Invalid value for database option '{key}': '{value}'"),
-        Status::InvalidArguments,
-    )
+fn invalid_option_value(key: &str, value: impl std::fmt::Display) -> Error {
+    SnowflakeError::invalid_argument()
+        .context("set database option")
+        .format(format_args!("option '{key}': invalid value '{value}'"))
+        .into()
 }
 
 fn invalid_typed_option_value(key: &str, value: &OptionValue) -> Error {
-    match value {
-        OptionValue::String(value) => invalid_option_value(key, value),
-        OptionValue::Int(value) => invalid_option_value(key, &value.to_string()),
-        OptionValue::Double(value) => invalid_option_value(key, &value.to_string()),
-        OptionValue::Bytes(value) => invalid_option_value(key, &format!("{value:?}")),
-        _ => invalid_option_value(key, &format!("{value:?}")),
-    }
+    SnowflakeError::invalid_argument()
+        .context("set database option")
+        .format(format_args!("option '{key}': invalid value {value:?}"))
+        .into()
 }
 
 fn unrecognized_option(key: &str) -> Error {
-    Error::with_message_and_status(
-        format!("unrecognized database option '{key}'"),
-        Status::NotImplemented,
-    )
+    SnowflakeError::set_unknown_option(&key)
+        .context("set database option")
+        .into()
+}
+
+fn option_not_found(key: &str) -> Error {
+    SnowflakeError::not_found()
+        .context("get database option")
+        .format(format_args!("option not found: {key}"))
+        .into()
 }
 
 fn option_to_setting(value: &OptionValue) -> Result<Setting> {
@@ -117,10 +125,10 @@ fn option_to_setting(value: &OptionValue) -> Result<Setting> {
         OptionValue::Int(value) => Ok(Setting::Int(*value)),
         OptionValue::Double(value) => Ok(Setting::Double(*value)),
         OptionValue::Bytes(value) => Ok(Setting::Bytes(value.clone())),
-        _ => Err(Error::with_message_and_status(
-            "unsupported option value type",
-            Status::InvalidArguments,
-        )),
+        _ => Err(SnowflakeError::invalid_argument()
+            .context("set database option")
+            .message("unsupported option value type")
+            .into()),
     }
 }
 
@@ -200,7 +208,7 @@ fn duration_setting(key: &str, value: &OptionValue) -> Result<Setting> {
         }
         OptionValue::Int(seconds) => seconds
             .checked_abs()
-            .ok_or_else(|| invalid_option_value(key, &seconds.to_string()))?,
+            .ok_or_else(|| invalid_option_value(key, seconds))?,
         _ => return Err(invalid_typed_option_value(key, value)),
     };
     Ok(Setting::Int(seconds))
@@ -215,7 +223,7 @@ fn non_negative_int(key: &str, value: &OptionValue) -> Result<i64> {
         _ => return Err(invalid_typed_option_value(key, value)),
     };
     if number < 0 {
-        return Err(invalid_option_value(key, &number.to_string()));
+        return Err(invalid_option_value(key, number));
     }
     Ok(number)
 }
@@ -236,15 +244,15 @@ fn adbc_option_enabled(value: &OptionValue) -> Result<bool> {
         {
             Ok(false)
         }
-        OptionValue::String(_) => Err(Error::with_message_and_status(
-            "boolean option must be enabled, true, 1, disabled, false, or 0",
-            Status::InvalidArguments,
-        )),
+        OptionValue::String(_) => Err(SnowflakeError::invalid_argument()
+            .context("set boolean database option")
+            .message("must be enabled, true, 1, disabled, false, or 0")
+            .into()),
         OptionValue::Int(value) => Ok(*value != 0),
-        _ => Err(Error::with_message_and_status(
-            "boolean option must be a string or int",
-            Status::InvalidArguments,
-        )),
+        _ => Err(SnowflakeError::invalid_argument()
+            .context("set boolean database option")
+            .message("must be a string or int")
+            .into()),
     }
 }
 
@@ -313,7 +321,7 @@ fn retry_attempts(key: &str, value: &OptionValue) -> Result<(i64, i64)> {
         retries
             .checked_add(1)
             .filter(|&attempts| attempts <= i64::from(u32::MAX))
-            .ok_or_else(|| invalid_option_value(key, &retries.to_string()))?
+            .ok_or_else(|| invalid_option_value(key, retries))?
     };
     Ok((retries, attempts))
 }
@@ -327,7 +335,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         "adbc.snowflake.sql.uri.port" | "adbc.snowflake.sql.client_option.proxy_port" => {
             let port = non_negative_int(key, value)?;
             if key.ends_with("proxy_port") && !(1..=65535).contains(&port) {
-                return Err(invalid_option_value(key, &port.to_string()));
+                return Err(invalid_option_value(key, port));
             }
             Setting::Int(port)
         }
@@ -377,11 +385,17 @@ pub struct Database {
     pub(crate) timestamp_precision: TimestampPrecision,
     pub(crate) geography_output_format: GeoOutputFormat,
     pub(crate) geometry_output_format: GeoOutputFormat,
+    pub(crate) trace_parent: Option<String>,
+    pub(crate) traces_exporter: Option<Exporter>,
+    pub(crate) traces_folder_path: Option<String>,
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
         let _ = self.inner.sf.database_release(self.db_handle);
+        // The batch exporter owns its own thread, so this does not enter the
+        // Tokio runtime even when a database is dropped on a runtime worker.
+        self.inner.telemetry.flush();
     }
 }
 
@@ -389,7 +403,6 @@ impl Database {
     fn set_sf_options(&mut self, options: HashMap<String, Setting>) -> Result<()> {
         let warnings = self
             .inner
-            .runtime
             .block_on(self.inner.sf.database_set_options(self.db_handle, options))
             .map_err(crate::error::api_error_to_adbc_error)?;
         for warning in warnings {
@@ -413,14 +426,35 @@ impl Optionable for Database {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         let key_str = key.as_ref();
+        if key_str == TRACE_PARENT {
+            let OptionValue::String(parent) = &value else {
+                return Err(invalid_typed_option_value(key_str, &value));
+            };
+            self.trace_parent = validate_trace_parent(parent)?;
+            return Ok(());
+        }
+        if key_str == TRACES_EXPORTER {
+            let OptionValue::String(exporter) = &value else {
+                return Err(invalid_typed_option_value(key_str, &value));
+            };
+            self.traces_exporter = Some(Exporter::parse(exporter)?);
+            return Ok(());
+        }
+        if key_str == TRACES_FOLDER_PATH {
+            let OptionValue::String(folder) = &value else {
+                return Err(invalid_typed_option_value(key_str, &value));
+            };
+            self.traces_folder_path = (!folder.is_empty()).then(|| folder.clone());
+            return Ok(());
+        }
         if key_str == "uri" {
             if let OptionValue::String(uri) = value {
                 return self.apply_uri(&uri);
             }
-            return Err(Error::with_message_and_status(
-                "uri option must be a string",
-                Status::InvalidArguments,
-            ));
+            return Err(SnowflakeError::invalid_argument()
+                .context("set URI database option")
+                .message("must be a string")
+                .into());
         }
         if key_str == MAX_TIMESTAMP_PRECISION {
             let OptionValue::String(precision) = &value else {
@@ -537,6 +571,19 @@ impl Optionable for Database {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let key_str = key.as_ref();
+        if key_str == TRACE_PARENT {
+            return Ok(self.trace_parent.clone().unwrap_or_default());
+        }
+        if key_str == TRACES_EXPORTER {
+            return Ok(self
+                .traces_exporter
+                .map(Exporter::as_str)
+                .unwrap_or_default()
+                .to_owned());
+        }
+        if key_str == TRACES_FOLDER_PATH {
+            return Ok(self.traces_folder_path.clone().unwrap_or_default());
+        }
         if key_str == MAX_TIMESTAMP_PRECISION {
             return Ok(match self.timestamp_precision {
                 TimestampPrecision::Microseconds => "microseconds",
@@ -576,12 +623,10 @@ impl Optionable for Database {
             }
         }
         if key_str == OKTA_URL {
-            return self.okta_url.clone().ok_or_else(|| {
-                Error::with_message_and_status(
-                    format!("option not found: {key_str}"),
-                    Status::NotFound,
-                )
-            });
+            return self
+                .okta_url
+                .clone()
+                .ok_or_else(|| option_not_found(key_str));
         }
         if key_str == MAX_RETRY_COUNT
             && let Some(count) = self.max_retry_count
@@ -606,16 +651,13 @@ impl Optionable for Database {
                     Ok(if *value { "disabled" } else { "enabled" }.into())
                 }
                 Setting::Bool(value) => Ok(if *value { "enabled" } else { "disabled" }.into()),
-                Setting::Bytes(_) => Err(Error::with_message_and_status(
-                    format!("option is not a string: {key_str}"),
-                    Status::InvalidArguments,
-                )),
+                Setting::Bytes(_) => Err(SnowflakeError::invalid_argument()
+                    .context("get database option as string")
+                    .format(format_args!("option '{key_str}' is bytes"))
+                    .into()),
             };
         }
-        Err(Error::with_message_and_status(
-            format!("option not found: {key_str}"),
-            Status::NotFound,
-        ))
+        Err(option_not_found(key_str))
     }
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -625,10 +667,7 @@ impl Optionable for Database {
         {
             return Ok(b.clone());
         }
-        Err(Error::with_message_and_status(
-            format!("option not found: {key_str}"),
-            Status::NotFound,
-        ))
+        Err(option_not_found(key_str))
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
@@ -643,10 +682,7 @@ impl Optionable for Database {
         {
             return Ok(*i);
         }
-        Err(Error::with_message_and_status(
-            format!("option not found: {key_str}"),
-            Status::NotFound,
-        ))
+        Err(option_not_found(key_str))
     }
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
@@ -656,10 +692,7 @@ impl Optionable for Database {
         {
             return Ok(*d);
         }
-        Err(Error::with_message_and_status(
-            format!("option not found: {key_str}"),
-            Status::NotFound,
-        ))
+        Err(option_not_found(key_str))
     }
 }
 
@@ -801,10 +834,10 @@ fn decode_uri_component<'a>(value: &'a str, what: &str) -> Result<std::borrow::C
         return Ok(std::borrow::Cow::Borrowed(value));
     }
     let invalid_escape = || {
-        Error::with_message_and_status(
-            format!("invalid percent escape in URI {what}"),
-            Status::InvalidArguments,
-        )
+        SnowflakeError::invalid_argument()
+            .context("decode URI component")
+            .format(format_args!("invalid percent escape in {what}"))
+            .to_adbc()
     };
     let hex = |byte: u8| match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -832,10 +865,10 @@ fn decode_uri_component<'a>(value: &'a str, what: &str) -> Result<std::borrow::C
     String::from_utf8(decoded)
         .map(std::borrow::Cow::Owned)
         .map_err(|e| {
-            Error::with_message_and_status(
-                format!("invalid UTF-8 in URI {what}: {e}"),
-                Status::InvalidArguments,
-            )
+            SnowflakeError::invalid_argument()
+                .context("decode URI component")
+                .format(format_args!("invalid UTF-8 in {what}: {e}"))
+                .into()
         })
 }
 
@@ -862,21 +895,26 @@ fn accumulate_connection_options(
                 post_connect_options.push((key, value));
                 continue;
             }
+            if name == TRACE_PARENT {
+                let OptionValue::String(parent) = &value else {
+                    return Err(invalid_typed_option_value(name, &value));
+                };
+                validate_trace_parent(parent)?;
+                post_connect_options.push((key, value));
+                continue;
+            }
             match adbc_db_opt_to_sf(name, &value) {
                 Ok(Some((param, setting))) => {
                     sf_options.insert(param.to_string(), setting);
                 }
-                Ok(None) => {
-                    return Err(Error::with_message_and_status(
-                        format!("unrecognized connection option '{name}'"),
-                        Status::NotImplemented,
-                    ));
-                }
-                Err(error) if error.status == Status::NotImplemented => {
-                    return Err(Error::with_message_and_status(
-                        format!("unrecognized connection option '{name}'"),
-                        Status::NotImplemented,
-                    ));
+                Ok(None)
+                | Err(Error {
+                    status: Status::NotImplemented,
+                    ..
+                }) => {
+                    return Err(SnowflakeError::set_unknown_option(&name)
+                        .context("set connection option")
+                        .into());
                 }
                 Err(error) => return Err(error),
             }
@@ -925,13 +963,10 @@ fn process_validation_issues(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(Error::with_message_and_status(
-            format!(
-                "invalid Snowflake connection options: {}",
-                errors.join("; ")
-            ),
-            Status::InvalidArguments,
-        ))
+        Err(SnowflakeError::invalid_argument()
+            .context("validate connection options")
+            .message(errors.join("; "))
+            .into())
     }
 }
 
@@ -960,129 +995,135 @@ impl adbc_core::Database for Database {
         &self,
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> Result<Self::ConnectionType> {
-        let AccumulatedConnectionOptions {
-            mut sf_options,
-            post_connect_options,
-            no_connection_details,
-        } = accumulate_connection_options(&self.sf_settings, opts)?;
-        // Snowflake currently gates Arrow result transport on this protocol ID.
-        // Keep the visible application and wrapper telemetry driver-specific.
-        sf_options.insert(
-            "client_app_id".to_string(),
-            Setting::String("PythonConnector".to_string()),
-        );
-        if !self
-            .sf_settings
-            .contains_key(param_names::APPLICATION.as_str())
-            && !sf_options
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case(param_names::APPLICATION.as_str()))
-        {
-            sf_options.insert(
-                param_names::APPLICATION.into(),
-                Setting::String("ADBC Snowflake Driver (Rust)".to_string()),
-            );
-        }
-        if self.auth_type == Some("auth_okta") && self.okta_url.as_deref().unwrap_or("").is_empty()
-        {
-            return Err(Error::with_message_and_status(
-                format!("database option '{OKTA_URL}' is required for '{AUTH_TYPE}=auth_okta'"),
-                Status::InvalidArguments,
-            ));
-        }
-        let conn_handle = self.inner.sf.connection_new();
-
-        let setup = (|| -> Result<()> {
-            // Batch all pre-connect options in one validation/resolution pass.
-            let warnings = self
-                .inner
-                .runtime
-                .block_on(self.inner.sf.connection_set_options(
-                    conn_handle,
-                    sf_options,
+        self.inner
+            .configure_tracing(self.traces_exporter, self.traces_folder_path.as_deref())?;
+        self.inner
+            .traced("databaseImpl.Open", self.trace_parent.as_deref(), |_| {
+                let AccumulatedConnectionOptions {
+                    mut sf_options,
+                    post_connect_options,
                     no_connection_details,
-                    None,
-                ))
-                .map_err(crate::error::api_error_to_adbc_error)?;
-            let mut seen_warnings = HashSet::new();
-            process_validation_issues(warnings, &mut seen_warnings, &self.surfaced_warnings)?;
+                } = accumulate_connection_options(&self.sf_settings, opts)?;
+                // Snowflake currently gates Arrow result transport on this protocol ID.
+                // Keep the visible application and wrapper telemetry driver-specific.
+                sf_options.insert(
+                    "client_app_id".to_string(),
+                    Setting::String("PythonConnector".to_string()),
+                );
+                if !self
+                    .sf_settings
+                    .contains_key(param_names::APPLICATION.as_str())
+                    && !sf_options
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case(param_names::APPLICATION.as_str()))
+                {
+                    sf_options.insert(
+                        param_names::APPLICATION.into(),
+                        Setting::String("ADBC Snowflake Driver (Rust)".to_string()),
+                    );
+                }
+                if self.auth_type == Some("auth_okta")
+                    && self.okta_url.as_deref().unwrap_or("").is_empty()
+                {
+                    return Err(SnowflakeError::invalid_argument()
+                        .context("open connection")
+                        .format(format_args!(
+                            "database option '{OKTA_URL}' is required for '{AUTH_TYPE}=auth_okta'"
+                        ))
+                        .into());
+                }
+                let conn_handle = self.inner.sf.connection_new();
 
-            self.inner
-                .runtime
-                .block_on(
+                let setup = (|| -> Result<()> {
+                    // Batch all pre-connect options in one validation/resolution pass.
+                    let warnings = self
+                        .inner
+                        .block_on(self.inner.sf.connection_set_options(
+                            conn_handle,
+                            sf_options,
+                            no_connection_details,
+                            None,
+                        ))
+                        .map_err(crate::error::api_error_to_adbc_error)?;
+                    let mut seen_warnings = HashSet::new();
+                    process_validation_issues(
+                        warnings,
+                        &mut seen_warnings,
+                        &self.surfaced_warnings,
+                    )?;
+
                     self.inner
-                        .sf
-                        .set_wrapper_identity(conn_handle, wrapper_identity()),
-                )
-                .map_err(crate::error::api_error_to_adbc_error)?;
+                        .block_on(
+                            self.inner
+                                .sf
+                                .set_wrapper_identity(conn_handle, wrapper_identity()),
+                        )
+                        .map_err(crate::error::api_error_to_adbc_error)?;
 
-            // Seed Arrow format in the login payload; the backend requires this in
-            // addition to the post-login ARROW_FORCE switch below.
-            self.inner
-                .runtime
-                .block_on(self.inner.sf.connection_set_session_parameters(
+                    // Request Arrow results in the login payload. ARROW_FORCE (rather
+                    // than ARROW) is what makes the backend answer this connector ID
+                    // with Arrow instead of JSON, so no post-login ALTER SESSION
+                    // round trip is needed.
+                    self.inner
+                        .block_on(self.inner.sf.connection_set_session_parameters(
+                            conn_handle,
+                            HashMap::from([
+                                (
+                                    "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".to_string(),
+                                    "ARROW_FORCE".to_string(),
+                                ),
+                                (
+                                    "GEOGRAPHY_OUTPUT_FORMAT".to_string(),
+                                    self.geography_output_format.as_str().to_string(),
+                                ),
+                                (
+                                    "GEOMETRY_OUTPUT_FORMAT".to_string(),
+                                    self.geometry_output_format.as_str().to_string(),
+                                ),
+                            ]),
+                        ))
+                        .map_err(crate::error::api_error_to_adbc_error)?;
+
+                    self.inner
+                        .block_on(
+                            self.inner
+                                .sf
+                                .connection_init(None, conn_handle, self.db_handle),
+                        )
+                        .map_err(crate::error::api_error_to_adbc_error)
+                })();
+
+                if let Err(error) = setup {
+                    // Initialization may have established a partial session. Attempt
+                    // close before release, while still guaranteeing release on error.
+                    cleanup_connection_handle(
+                        &self.inner,
+                        conn_handle,
+                        self.trace_parent.as_deref(),
+                    );
+                    return Err(error);
+                }
+
+                let mut conn = Connection {
+                    inner: self.inner.clone(),
                     conn_handle,
-                    HashMap::from([
-                        (
-                            "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".to_string(),
-                            "ARROW".to_string(),
-                        ),
-                        (
-                            "GEOGRAPHY_OUTPUT_FORMAT".to_string(),
-                            self.geography_output_format.as_str().to_string(),
-                        ),
-                        (
-                            "GEOMETRY_OUTPUT_FORMAT".to_string(),
-                            self.geometry_output_format.as_str().to_string(),
-                        ),
-                    ]),
-                ))
-                .map_err(crate::error::api_error_to_adbc_error)?;
+                    autocommit: true,
+                    trace_parent: self.trace_parent.clone(),
+                    match_exactly: false,
+                    timestamp_precision: self.timestamp_precision,
+                    geography_output_format: self.geography_output_format,
+                    geometry_output_format: self.geometry_output_format,
+                    operation: std::sync::Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
+                        sf_core::apis::operation_ctx::OperationCtx::with_own_token(),
+                    ))),
+                };
+                // From this point Connection::drop owns cleanup on every error path.
+                for (key, value) in post_connect_options {
+                    conn.set_option(key, value)?;
+                }
 
-            self.inner
-                .runtime
-                .block_on(
-                    self.inner
-                        .sf
-                        .connection_init(None, conn_handle, self.db_handle),
-                )
-                .map_err(crate::error::api_error_to_adbc_error)?;
-
-            // Complete the backend's Arrow handshake after login. Without the
-            // connector-specific forced value, query responses remain JSON.
-            self.inner.execute_temporary_statement(
-                None,
-                conn_handle,
-                "ALTER SESSION SET PYTHON_CONNECTOR_QUERY_RESULT_FORMAT = 'ARROW_FORCE'",
-                None,
-            )
-        })();
-
-        if let Err(error) = setup {
-            // Initialization may have established a partial session. Attempt
-            // close before release, while still guaranteeing release on error.
-            cleanup_connection_handle(&self.inner, conn_handle);
-            return Err(error);
-        }
-
-        let mut conn = Connection {
-            inner: self.inner.clone(),
-            conn_handle,
-            autocommit: true,
-            match_exactly: false,
-            timestamp_precision: self.timestamp_precision,
-            geography_output_format: self.geography_output_format,
-            geometry_output_format: self.geometry_output_format,
-            operation: std::sync::Mutex::new(std::sync::Arc::new(
-                sf_core::apis::operation_ctx::OperationCtx::with_own_token(),
-            )),
-        };
-        // From this point Connection::drop owns cleanup on every error path.
-        for (key, value) in post_connect_options {
-            conn.set_option(key, value)?;
-        }
-
-        Ok(conn)
+                Ok(conn)
+            })
     }
 }
 
@@ -1098,6 +1139,93 @@ mod tests {
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
         driver.new_database().unwrap()
+    }
+
+    #[test]
+    fn telemetry_options_round_trip_and_reject_invalid_values() {
+        let mut db = make_db();
+        let parent_key = OptionDatabase::Other(TRACE_PARENT.into());
+        let exporter_key = OptionDatabase::Other(TRACES_EXPORTER.into());
+        let folder_key = OptionDatabase::Other(TRACES_FOLDER_PATH.into());
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+
+        assert_eq!(db.get_option_string(parent_key.clone()).unwrap(), "");
+        db.set_option(parent_key.clone(), OptionValue::String(parent.into()))
+            .unwrap();
+        assert_eq!(db.get_option_string(parent_key.clone()).unwrap(), parent);
+        for value in [OptionValue::String("invalid".into()), OptionValue::Int(1)] {
+            assert_eq!(
+                db.set_option(parent_key.clone(), value).unwrap_err().status,
+                Status::InvalidArguments,
+            );
+            assert_eq!(db.get_option_string(parent_key.clone()).unwrap(), parent);
+        }
+        db.set_option(parent_key.clone(), OptionValue::String(String::new()))
+            .unwrap();
+        assert_eq!(db.get_option_string(parent_key).unwrap(), "");
+
+        assert_eq!(db.get_option_string(exporter_key.clone()).unwrap(), "");
+        db.set_option(exporter_key.clone(), OptionValue::String("adbcfile".into()))
+            .unwrap();
+        assert_eq!(
+            db.get_option_string(exporter_key.clone()).unwrap(),
+            "adbcfile"
+        );
+        for value in [OptionValue::String("invalid".into()), OptionValue::Int(1)] {
+            assert_eq!(
+                db.set_option(exporter_key.clone(), value)
+                    .unwrap_err()
+                    .status,
+                Status::InvalidArguments,
+            );
+            assert_eq!(
+                db.get_option_string(exporter_key.clone()).unwrap(),
+                "adbcfile"
+            );
+        }
+
+        db.set_option(
+            folder_key.clone(),
+            OptionValue::String("/tmp/traces".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(folder_key.clone()).unwrap(),
+            "/tmp/traces"
+        );
+        assert_eq!(
+            db.set_option(folder_key.clone(), OptionValue::Int(1))
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
+        db.set_option(folder_key.clone(), OptionValue::String(String::new()))
+            .unwrap();
+        assert_eq!(db.get_option_string(folder_key).unwrap(), "");
+        assert!(db.sf_settings.is_empty());
+    }
+
+    #[test]
+    fn trace_parent_connection_option_is_validated_before_connect() {
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let option = OptionConnection::Other(TRACE_PARENT.into());
+        let accumulated = accumulate_connection_options(
+            &HashMap::new(),
+            [(option.clone(), OptionValue::String(parent.into()))],
+        )
+        .unwrap();
+        assert!(accumulated.sf_options.is_empty());
+        assert!(matches!(
+            &accumulated.post_connect_options[..],
+            [(OptionConnection::Other(key), OptionValue::String(value))]
+                if key == TRACE_PARENT && value == parent
+        ));
+        for value in [OptionValue::String("invalid".into()), OptionValue::Int(1)] {
+            let err = accumulate_connection_options(&HashMap::new(), [(option.clone(), value)])
+                .err()
+                .expect("invalid trace_parent");
+            assert_eq!(err.status, Status::InvalidArguments);
+        }
     }
 
     #[test]
@@ -1171,8 +1299,17 @@ mod tests {
                 .unwrap();
             assert_eq!(db.get_option_string(option.clone()).unwrap(), "EWKB");
             for value in [OptionValue::String("WKT".into()), OptionValue::Int(1)] {
+                let expected = match &value {
+                    OptionValue::String(value) => format!(
+                        "[Snowflake] could not set database option: option '{key}': invalid value '{value}' (must be 'EWKB' or 'GeoJSON')"
+                    ),
+                    other => format!(
+                        "[Snowflake] could not set database option: option '{key}': invalid value {other:?}"
+                    ),
+                };
                 let err = db.set_option(option.clone(), value).unwrap_err();
                 assert_eq!(err.status, Status::InvalidArguments);
+                assert_eq!(err.message, expected);
                 assert_eq!(db.get_option_string(option.clone()).unwrap(), "EWKB");
             }
             db.set_option(option.clone(), OptionValue::String("geojson".into()))
@@ -1193,7 +1330,10 @@ mod tests {
         .err()
         .expect("unknown option must fail");
         assert_eq!(error.status, Status::NotImplemented);
-        assert_eq!(error.message, "unrecognized connection option 'adbc.fake'");
+        assert_eq!(
+            error.message,
+            "[Snowflake] could not set connection option: unknown option \"adbc.fake\""
+        );
     }
 
     #[test]
@@ -1459,14 +1599,16 @@ mod tests {
             assert_eq!(error.status, Status::NotImplemented, "{key}");
             assert_eq!(
                 error.message,
-                format!("unrecognized database option '{key}'")
+                format!("[Snowflake] could not set database option: unknown option \"{key}\"")
             );
             assert!(!db.sf_settings.contains_key(key));
+            let missing = db
+                .get_option_string(OptionDatabase::Other(key.into()))
+                .unwrap_err();
+            assert_eq!(missing.status, Status::NotFound);
             assert_eq!(
-                db.get_option_string(OptionDatabase::Other(key.into()))
-                    .unwrap_err()
-                    .status,
-                Status::NotFound
+                missing.message,
+                format!("[Snowflake] could not get database option: option not found: {key}")
             );
         }
         assert!(db.sf_settings.is_empty());
@@ -1726,19 +1868,17 @@ mod tests {
             OptionValue::String("".into()),
             OptionValue::Int(0),
         ] {
-            let displayed = match &invalid {
-                OptionValue::String(value) => value.clone(),
-                OptionValue::Int(value) => value.to_string(),
-                _ => unreachable!(),
+            let expected = match &invalid {
+                OptionValue::String(value) => format!(
+                    "[Snowflake] could not set database option: option '{MAX_TIMESTAMP_PRECISION}': invalid value '{value}'"
+                ),
+                other => format!(
+                    "[Snowflake] could not set database option: option '{MAX_TIMESTAMP_PRECISION}': invalid value {other:?}"
+                ),
             };
             let error = db.set_option(option.clone(), invalid).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
-            assert_eq!(
-                error.message,
-                format!(
-                    "Invalid value for database option '{MAX_TIMESTAMP_PRECISION}': '{displayed}'"
-                )
-            );
+            assert_eq!(error.message, expected);
             assert_eq!(
                 db.get_option_string(option.clone()).unwrap(),
                 "microseconds"

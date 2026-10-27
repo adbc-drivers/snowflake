@@ -25,12 +25,13 @@ use std::{
 };
 
 use adbc_core::{
-    error::{Error, Result, Status},
-    options::OptionValue,
+    error::{Error, Result},
+    options::{IngestMode, OptionValue},
 };
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_cast::{cast, display::array_value_to_string};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+use driverbase::error::ErrorHelper;
 use parquet::{
     arrow::ArrowWriter,
     basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel},
@@ -41,10 +42,12 @@ use tokio::{
     sync::Semaphore,
     task::{JoinHandle, JoinSet},
 };
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use crate::{
     connection::{qualified_table_identifier, quote_identifier},
     driver::Inner,
+    error::SnowflakeError,
     statement::{Bound, Statement},
 };
 
@@ -127,12 +130,11 @@ impl IngestOptions {
                     codec.as_str(),
                     "UNCOMPRESSED" | "SNAPPY" | "GZIP" | "BROTLI" | "ZSTD" | "LZ4_RAW"
                 ) {
-                    return Err(Error::with_message_and_status(
-                        format!(
-                            "[Snowflake] invalid compression codec '{val}': must be one of uncompressed, snappy, gzip, brotli, zstd, lz4_raw"
-                        ),
-                        Status::InvalidArguments,
-                    ));
+                    return Err(SnowflakeError::invalid_argument()
+                        .format(format_args!(
+                            "invalid compression codec '{val}': must be one of uncompressed, snappy, gzip, brotli, zstd, lz4_raw"
+                        ))
+                        .into());
                 }
                 self.compression_codec = codec;
             }
@@ -142,12 +144,11 @@ impl IngestOptions {
                     "true" | "TRUE" | "True" | "1" | "t" | "T" => true,
                     "false" | "FALSE" | "False" | "0" | "f" | "F" => false,
                     _ => {
-                        return Err(Error::with_message_and_status(
-                            format!(
-                                "[Snowflake] could not parse '{val}' as bool for option '{key}'"
-                            ),
-                            Status::InvalidArguments,
-                        ));
+                        return Err(SnowflakeError::invalid_argument()
+                            .format(format_args!(
+                                "could not parse '{val}' as bool for option '{key}'"
+                            ))
+                            .into());
                     }
                 };
             }
@@ -163,12 +164,11 @@ impl IngestOptions {
                         self.geo_type_explicit = false;
                     }
                     _ => {
-                        return Err(Error::with_message_and_status(
-                            format!(
-                                "[Snowflake] invalid geo type '{val}': must be 'geography' or 'geometry'"
-                            ),
-                            Status::InvalidArguments,
-                        ));
+                        return Err(SnowflakeError::invalid_argument()
+                            .format(format_args!(
+                                "invalid geo type '{val}': must be 'geography' or 'geometry'"
+                            ))
+                            .into());
                     }
                 }
             }
@@ -234,40 +234,38 @@ impl IngestOptions {
             if srid == 4326 {
                 return Ok("geography");
             }
-            return Err(Error::with_message_and_status(
-                format!(
-                    "[snowflake] field #{} ({}) is a GeoArrow array with spherical edges but an SRID of {srid}; Snowflake GEOGRAPHY is always SRID 4326, so explicitly set {GEO_TYPE_OPTION} to choose whether to ingest this as GEOGRAPHY or GEOMETRY",
+            return Err(SnowflakeError::invalid_data()
+                .format(format_args!(
+                    "field #{} ({}) is a GeoArrow array with spherical edges but an SRID of {srid}; Snowflake GEOGRAPHY is always SRID 4326, so explicitly set {GEO_TYPE_OPTION} to choose whether to ingest this as GEOGRAPHY or GEOMETRY",
                     index + 1,
                     quote_identifier(field.name())
-                ),
-                Status::InvalidData,
-            ));
+                ))
+                .into());
         }
         Ok("geometry")
     }
 }
 
 fn invalid_option(key: &str, n: i64) -> Error {
-    Error::with_message_and_status(
-        format!("invalid value ('{n}') for option '{key}', must be >= 0"),
-        Status::InvalidArguments,
-    )
+    SnowflakeError::invalid_argument()
+        .format(format_args!(
+            "invalid value ('{n}') for option '{key}', must be >= 0"
+        ))
+        .into()
 }
 
 fn invalid_level(level: i64) -> Error {
-    Error::with_message_and_status(
-        format!("invalid Parquet compression level {level}"),
-        Status::InvalidArguments,
-    )
+    SnowflakeError::invalid_argument()
+        .format(format_args!("invalid Parquet compression level {level}"))
+        .into()
 }
 
 fn ingest_string<'a>(key: &str, value: &'a OptionValue) -> Result<&'a str> {
     match value {
         OptionValue::String(s) => Ok(s),
-        _ => Err(Error::with_message_and_status(
-            format!("option '{key}' must be a string"),
-            Status::InvalidArguments,
-        )),
+        _ => Err(SnowflakeError::invalid_argument()
+            .format(format_args!("option '{key}' must be a string"))
+            .into()),
     }
 }
 
@@ -275,28 +273,34 @@ fn ingest_int(key: &str, value: &OptionValue) -> Result<i64> {
     match value {
         OptionValue::Int(n) => Ok(*n),
         OptionValue::String(s) => s.parse().map_err(|_| {
-            Error::with_message_and_status(
-                format!("[Snowflake] could not parse '{s}' as int for option '{key}'"),
-                Status::InvalidArguments,
-            )
+            SnowflakeError::invalid_argument()
+                .format(format_args!(
+                    "could not parse '{s}' as int for option '{key}'"
+                ))
+                .into()
         }),
-        _ => Err(Error::with_message_and_status(
-            format!("option '{key}' must be an int"),
-            Status::InvalidArguments,
-        )),
+        _ => Err(SnowflakeError::invalid_argument()
+            .format(format_args!("option '{key}' must be an int"))
+            .into()),
     }
 }
 
 fn parquet_error(err: impl std::fmt::Display) -> Error {
-    Error::with_message_and_status(format!("Parquet ingest: {err}"), Status::InvalidData)
+    SnowflakeError::invalid_data()
+        .format(format_args!("Parquet ingest: {err}"))
+        .into()
 }
 
 fn cancelled() -> Error {
-    Error::with_message_and_status("ingest cancelled", Status::Cancelled)
+    SnowflakeError::cancelled()
+        .message("ingest cancelled")
+        .into()
 }
 
 fn join_error(err: tokio::task::JoinError) -> Error {
-    Error::with_message_and_status(format!("ingest worker failed: {err}"), Status::Internal)
+    SnowflakeError::internal_no_location()
+        .format(format_args!("ingest worker failed: {err}"))
+        .into()
 }
 
 /// Record the first failure before cancelling: other workers may subsequently
@@ -393,127 +397,128 @@ fn reap_uploads(
 /// A single cancellable operation spans DDL, uploads, and all COPY tasks.
 /// Taking the binding first ensures a failed ingest also consumes it.
 pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
-    let bound = std::mem::replace(&mut stmt.bound, Bound::Empty);
-    let (schema, batches): (SchemaRef, BatchIter) = match bound {
-        Bound::Empty => {
-            return Err(Error::with_message_and_status(
-                "ingest requires bound data — call bind() or bind_stream() first",
-                Status::InvalidState,
-            ));
-        }
-        Bound::Batches(v) if v.is_empty() => {
-            return Err(Error::with_message_and_status(
-                "ingest requires bound data — call bind() or bind_stream() first",
-                Status::InvalidState,
-            ));
-        }
-        Bound::Batches(v) => (v[0].schema(), Box::new(v.into_iter().map(Ok))),
-        Bound::Stream(reader) => (reader.schema(), Box::new(reader)),
-    };
-    let table = stmt.target_table.as_deref().ok_or_else(|| {
-        Error::with_message_and_status("target_table not set", Status::InvalidState)
-    })?;
-    let qname = qualified_table_identifier(
-        stmt.ingest_catalog.as_deref(),
-        stmt.ingest_schema.as_deref(),
-        table,
-    );
-    let replace = stmt.ingest_mode.as_deref() == Some("adbc.ingest.mode.replace");
-    let operation = stmt.begin_operation();
-    // A connection-level ADBC$BIND stage is shared by all statements on that
-    // connection in Go. Give each ingest its own stage to avoid dropping or
-    // consuming a concurrent statement's files.
-    let unique = format!(
-        "{}_{}",
-        std::process::id(),
-        NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
-    );
-    let stage = format!("ADBC$BIND_{unique}");
-    // Replace loads into a staging table and swaps it in only after COPY
-    // succeeds, so a failed load never destroys the existing table's data.
-    let load_table = if replace {
-        qualified_table_identifier(
-            stmt.ingest_catalog.as_deref(),
-            stmt.ingest_schema.as_deref(),
-            &format!("ADBC$REPLACE_{unique}"),
-        )
-    } else {
-        qname.clone()
-    };
-    let copy_plan = build_copy_plan(&load_table, &schema, &stmt.ingest_options, &stage)?;
-    // Reject input Parquet cannot encode (e.g. unions) and invalid writer
-    // settings before any DDL, so a failed create-mode ingest leaves no table.
-    let normalized = normalize_schema(&schema)?;
-    let props = stmt.ingest_options.writer_properties()?;
-    initialize_target(
-        stmt,
-        &operation,
-        &qname,
-        &load_table,
-        &schema,
-        &copy_plan.overrides,
-    )?;
-
-    let load = stmt
-        .inner
-        .execute_temporary_statement(
-            Some(&operation),
-            stmt.conn_handle,
-            create_stage_sql(&stage, stmt.ingest_options.vectorized_scanner),
-            stmt.query_timeout_seconds,
-        )
-        .and_then(|()| {
-            ingest_batches(
-                IngestJob {
-                    inner: stmt.inner.clone(),
-                    conn: stmt.conn_handle,
-                    op: operation.clone(),
-                    stage: stage.clone(),
-                    copy_sql: copy_plan.sql,
-                    timeout: stmt.query_timeout_seconds,
-                    options: stmt.ingest_options.clone(),
-                    normalized,
-                    props,
-                },
-                batches,
-                schema,
-            )
-        });
-    // Cleanup must work even after cancellation, so it runs without the
-    // operation. A temporary stage also dies with the session.
-    let cleanup = |sql: String| {
-        stmt.inner.execute_temporary_statement(
-            None,
-            stmt.conn_handle,
-            sql,
-            stmt.query_timeout_seconds,
-        )
-    };
-    let stage_cleanup = cleanup(format!("DROP STAGE IF EXISTS {stage}"));
-    let rows = match load {
-        Ok(rows) => rows,
-        Err(err) => {
-            if replace {
-                let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
+    let inner = Arc::clone(&stmt.inner);
+    inner.traced("statement.Ingest", None, |_span| {
+        let bound = std::mem::replace(&mut stmt.bound, Bound::Empty);
+        let (schema, batches): (SchemaRef, BatchIter) = match bound {
+            Bound::Empty => {
+                return Err(SnowflakeError::invalid_state()
+                    .message("ingest requires bound data — call bind() or bind_stream() first")
+                    .into());
             }
-            return Err(err);
+            Bound::Batches(v) if v.is_empty() => {
+                return Err(SnowflakeError::invalid_state()
+                    .message("ingest requires bound data — call bind() or bind_stream() first")
+                    .into());
+            }
+            Bound::Batches(v) => (v[0].schema(), Box::new(v.into_iter().map(Ok))),
+            Bound::Stream(reader) => (reader.schema(), Box::new(reader)),
+        };
+        let table = stmt.ingest_state.table.as_deref().ok_or_else(|| {
+            Error::from(SnowflakeError::invalid_state().message("target_table not set"))
+        })?;
+        let qname = qualified_table_identifier(
+            stmt.ingest_state.catalog.as_deref(),
+            stmt.ingest_state.schema.as_deref(),
+            table,
+        );
+        let replace = stmt.ingest_state.mode == IngestMode::Replace;
+        let operation = stmt.begin_operation();
+        // A connection-level ADBC$BIND stage is shared by all statements on that
+        // connection in Go. Give each ingest its own stage to avoid dropping or
+        // consuming a concurrent statement's files.
+        let unique = format!(
+            "{}_{}",
+            std::process::id(),
+            NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
+        );
+        let stage = format!("ADBC$BIND_{unique}");
+        // Replace loads into a staging table and swaps it in only after COPY
+        // succeeds, so a failed load never destroys the existing table's data.
+        let load_table = if replace {
+            qualified_table_identifier(
+                stmt.ingest_state.catalog.as_deref(),
+                stmt.ingest_state.schema.as_deref(),
+                &format!("ADBC$REPLACE_{unique}"),
+            )
+        } else {
+            qname.clone()
+        };
+        let copy_plan = build_copy_plan(&load_table, &schema, &stmt.ingest_options, &stage)?;
+        // Reject input Parquet cannot encode (e.g. unions) and invalid writer
+        // settings before any DDL, so a failed create-mode ingest leaves no table.
+        let normalized = normalize_schema(&schema)?;
+        let props = stmt.ingest_options.writer_properties()?;
+        initialize_target(
+            stmt,
+            &operation,
+            &qname,
+            &load_table,
+            &schema,
+            &copy_plan.overrides,
+        )?;
+
+        let load = stmt
+            .inner
+            .execute_temporary_statement(
+                Some(&operation),
+                stmt.conn_handle,
+                create_stage_sql(&stage, stmt.ingest_options.vectorized_scanner),
+                stmt.query_timeout_seconds,
+            )
+            .and_then(|()| {
+                ingest_batches(
+                    IngestJob {
+                        inner: stmt.inner.clone(),
+                        conn: stmt.conn_handle,
+                        op: operation.clone(),
+                        stage: stage.clone(),
+                        copy_sql: copy_plan.sql,
+                        timeout: stmt.query_timeout_seconds,
+                        options: stmt.ingest_options.clone(),
+                        normalized,
+                        props,
+                    },
+                    batches,
+                    schema,
+                )
+            });
+        // Cleanup must work even after cancellation, so it runs without the
+        // operation. A temporary stage also dies with the session.
+        let cleanup = |sql: String| {
+            stmt.inner.execute_temporary_statement(
+                None,
+                stmt.conn_handle,
+                sql,
+                stmt.query_timeout_seconds,
+            )
+        };
+        let stage_cleanup = cleanup(format!("DROP STAGE IF EXISTS {stage}"));
+        let rows = match load {
+            Ok(rows) => rows,
+            Err(err) => {
+                if replace {
+                    let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
+                }
+                return Err(err);
+            }
+        };
+        if replace {
+            // SWAP is atomic; afterwards the staging name holds the old data.
+            if let Err(err) = stmt.inner.execute_temporary_statement(
+                Some(&operation),
+                stmt.conn_handle,
+                format!("ALTER TABLE {load_table} SWAP WITH {qname}"),
+                stmt.query_timeout_seconds,
+            ) {
+                let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
+                return Err(err);
+            }
+            cleanup(format!("DROP TABLE IF EXISTS {load_table}"))?;
         }
-    };
-    if replace {
-        // SWAP is atomic; afterwards the staging name holds the old data.
-        if let Err(err) = stmt.inner.execute_temporary_statement(
-            Some(&operation),
-            stmt.conn_handle,
-            format!("ALTER TABLE {load_table} SWAP WITH {qname}"),
-            stmt.query_timeout_seconds,
-        ) {
-            let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
-            return Err(err);
-        }
-        cleanup(format!("DROP TABLE IF EXISTS {load_table}"))?;
-    }
-    stage_cleanup?;
-    Ok(Some(rows))
+        stage_cleanup?;
+        Ok(Some(rows))
+    })
 }
 
 fn create_stage_sql(stage: &str, vectorized: bool) -> String {
@@ -690,10 +695,7 @@ fn initialize_target(
     schema: &Schema,
     overrides: &[Option<String>],
 ) -> Result<()> {
-    let mode = stmt
-        .ingest_mode
-        .as_deref()
-        .unwrap_or("adbc.ingest.mode.create");
+    let mode = stmt.ingest_state.mode;
     let execute = |sql: String| {
         stmt.inner.execute_temporary_statement(
             Some(op),
@@ -703,13 +705,13 @@ fn initialize_target(
         )
     };
     match mode {
-        "adbc.ingest.mode.create" => execute(build_create_sql(
+        IngestMode::Create => execute(build_create_sql(
             qname,
             schema,
             overrides,
             CreateMode::Create,
         )?),
-        "adbc.ingest.mode.replace" => {
+        IngestMode::Replace => {
             // Build both statements before running either, so unsupported
             // input fails without touching any table.
             let ensure_target =
@@ -719,7 +721,7 @@ fn initialize_target(
             execute(ensure_target)?;
             execute(create_staging)
         }
-        "adbc.ingest.mode.create_append" => {
+        IngestMode::CreateAppend => {
             stmt.inner.execute_temporary_statement(
                 Some(op),
                 stmt.conn_handle,
@@ -728,13 +730,9 @@ fn initialize_target(
             )?;
             validate_target_schema(&stmt.inner, stmt.conn_handle, op, qname, schema)
         }
-        "adbc.ingest.mode.append" => {
+        IngestMode::Append => {
             validate_target_schema(&stmt.inner, stmt.conn_handle, op, qname, schema)
         }
-        other => Err(Error::with_message_and_status(
-            format!("unknown ingest mode: {other}"),
-            Status::InvalidArguments,
-        )),
     }
 }
 
@@ -782,13 +780,12 @@ fn to_sf_ddl(ty: &DataType) -> Result<String> {
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
             // Snowflake NUMBER: precision 1..=38, scale 0..=37 and <= precision.
             if *p > 38 || *s < 0 || *s > 37 || i16::from(*s) > i16::from(*p) {
-                return Err(Error::with_message_and_status(
-                    format!(
+                return Err(SnowflakeError::not_implemented()
+                    .format(format_args!(
                         "decimal({p},{s}) cannot be ingested: Snowflake NUMBER supports \
                          precision up to 38 and scale from 0 to 37 (not exceeding precision)"
-                    ),
-                    Status::NotImplemented,
-                ));
+                    ))
+                    .into());
             }
             format!("NUMERIC({p},{s})")
         }
@@ -814,10 +811,9 @@ fn to_sf_ddl(ty: &DataType) -> Result<String> {
         DataType::Struct(_) | DataType::Map(_, _) => "object".into(),
         DataType::Union(_, _) => "variant".into(),
         other => {
-            return Err(Error::with_message_and_status(
-                format!("unsupported ingest type: {other:?}"),
-                Status::NotImplemented,
-            ));
+            return Err(SnowflakeError::not_implemented()
+                .format(format_args!("unsupported ingest type: {other:?}"))
+                .into());
         }
     })
 }
@@ -864,10 +860,11 @@ fn validate_target_schema(
     if column_names_equivalent(expected, &schema) {
         Ok(())
     } else {
-        Err(Error::with_message_and_status(
-            format!("[Snowflake] target table {qname} already exists with an incompatible schema"),
-            Status::AlreadyExists,
-        ))
+        Err(SnowflakeError::already_exists()
+            .format(format_args!(
+                "target table {qname} already exists with an incompatible schema"
+            ))
+            .into())
     }
 }
 
@@ -890,10 +887,9 @@ fn requires_normalization(ty: &DataType) -> Result<bool> {
             }
             Ok(changed)
         }
-        DataType::Union(_, _) => Err(Error::with_message_and_status(
-            "Parquet writing of Arrow union arrays is not supported",
-            Status::NotImplemented,
-        )),
+        DataType::Union(_, _) => Err(SnowflakeError::not_implemented()
+            .message("Parquet writing of Arrow union arrays is not supported")
+            .into()),
         _ => Ok(false),
     }
 }
@@ -926,10 +922,9 @@ fn normalized_type(ty: &DataType) -> Result<DataType> {
         // parquet-rs cannot encode Arrow unions. Return an error rather than
         // entering its ArrowSchemaConverter's unimplemented!() branch.
         DataType::Union(_, _) => {
-            return Err(Error::with_message_and_status(
-                "Parquet writing of Arrow union arrays is not supported",
-                Status::NotImplemented,
-            ));
+            return Err(SnowflakeError::not_implemented()
+                .message("Parquet writing of Arrow union arrays is not supported")
+                .into());
         }
         other => other.clone(),
     })
@@ -1031,10 +1026,9 @@ fn write_files(
                     if !Arc::ptr_eq(batch.schema_ref(), &input_schema)
                         && batch.schema_ref() != &input_schema
                     {
-                        return Err(Error::with_message_and_status(
-                            "bound stream batch schema does not match its declared schema",
-                            Status::InvalidData,
-                        ));
+                        return Err(SnowflakeError::invalid_data()
+                            .message("bound stream batch schema does not match its declared schema")
+                            .into());
                     }
                     let batch = normalize_batch(batch, &schema)?;
                     writer.write(&batch).map_err(parquet_error)?;
@@ -1073,10 +1067,11 @@ fn record_copy_completion(
     match result {
         Ok(Some(rows)) => match loaded.checked_add(rows) {
             Some(total) => *loaded = total,
-            None => failure.report(Error::with_message_and_status(
-                "ingest row count overflow",
-                Status::Internal,
-            )),
+            None => failure.report(
+                SnowflakeError::internal_no_location()
+                    .message("ingest row count overflow")
+                    .into(),
+            ),
         },
         Ok(None) => {}
         Err(error) => failure.report(join_error(error)),
@@ -1095,6 +1090,8 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         normalized,
         props,
     } = job;
+    let span = tracing::Span::current();
+    let dispatch = inner.dispatch.clone();
     let failure = Arc::new(IngestFailure::new(Arc::clone(&op)));
     let uploads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let outstanding = Arc::new(Mutex::new(HashSet::<String>::new()));
@@ -1117,6 +1114,8 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         let op = Arc::clone(&op);
         let failure = Arc::clone(&failure);
         let copy_sql = Arc::clone(&copy_sql);
+        let copy_span = span.clone();
+        let copy_dispatch = dispatch.clone();
         runtime.spawn(async move {
             let mut copies = JoinSet::new();
             let mut loaded = 0i64;
@@ -1159,7 +1158,11 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                         let failure = Arc::clone(&failure);
                         let outstanding = Arc::clone(&outstanding);
                         let copy_sql = Arc::clone(&copy_sql);
+                        let task_span = copy_span.clone();
+                        let task_dispatch = copy_dispatch.clone();
                         copies.spawn_blocking(move || {
+                            let _default = tracing::dispatcher::set_default(&task_dispatch);
+                            let _entered = task_span.enter();
                             let _permit = permit;
                             if op.token().is_cancelled() {
                                 return None;
@@ -1180,7 +1183,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                 record_copy_completion(result, &mut loaded, &failure);
             }
             loaded
-        })
+        }.instrument(span.clone()).with_subscriber(dispatch.clone()))
     };
     let (sender, receiver) = mpsc::sync_channel(options.writer_concurrency);
     let receiver = Arc::new(Mutex::new(receiver));
@@ -1200,7 +1203,11 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         let stage = Arc::clone(&stage);
         let worker_runtime = runtime.clone();
         let failure = Arc::clone(&failure);
+        let worker_span = span.clone();
+        let worker_dispatch = dispatch.clone();
         writers.push(runtime.spawn_blocking(move || {
+            let _default = tracing::dispatcher::set_default(&worker_dispatch);
+            let _entered = worker_span.enter();
             let result = write_files(
                 receiver,
                 &op,
@@ -1236,26 +1243,30 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                     let outstanding = Arc::clone(&outstanding);
                     let copy_ready = copy_ready.clone();
                     let upload_sql = put_sql(&stage, &filename);
-                    let spawned = worker_runtime.spawn(async move {
-                        let _permit = permit;
-                        if op.token().is_cancelled() {
-                            return;
+                    let spawned = worker_runtime.spawn(
+                        async move {
+                            let _permit = permit;
+                            if op.token().is_cancelled() {
+                                return;
+                            }
+                            if let Err(error) =
+                                upload_parquet(&inner, conn, &op, upload_sql, bytes).await
+                            {
+                                failure.report(error);
+                                return;
+                            }
+                            if op.token().is_cancelled() {
+                                return;
+                            }
+                            outstanding
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(filename);
+                            let _ = copy_ready.try_send(());
                         }
-                        if let Err(error) =
-                            upload_parquet(&inner, conn, &op, upload_sql, bytes).await
-                        {
-                            failure.report(error);
-                            return;
-                        }
-                        if op.token().is_cancelled() {
-                            return;
-                        }
-                        outstanding
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(filename);
-                        let _ = copy_ready.try_send(());
-                    });
+                        .instrument(worker_span.clone())
+                        .with_subscriber(worker_dispatch.clone()),
+                    );
                     uploads
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1284,10 +1295,13 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                     .map(String::as_str)
                     .or_else(|| payload.downcast_ref::<&str>().copied())
                     .unwrap_or("unknown panic");
-                failure.report(Error::with_message_and_status(
-                    format!("failed to read record batch from bound stream: {message}"),
-                    Status::InvalidArguments,
-                ));
+                failure.report(
+                    SnowflakeError::invalid_argument()
+                        .format(format_args!(
+                            "failed to read record batch from bound stream: {message}"
+                        ))
+                        .into(),
+                );
                 break;
             }
         };
@@ -1300,28 +1314,31 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                 }
             }
             Err(error) => {
-                failure.report(Error::with_message_and_status(
-                    format!("failed to read record batch from bound stream: {error}"),
-                    Status::InvalidArguments,
-                ));
+                failure.report(
+                    SnowflakeError::invalid_argument()
+                        .format(format_args!(
+                            "failed to read record batch from bound stream: {error}"
+                        ))
+                        .into(),
+                );
                 break;
             }
         }
     }
     drop(sender);
     for writer in writers {
-        if let Err(error) = inner.runtime.block_on(writer) {
+        if let Err(error) = inner.block_on(writer) {
             failure.report(join_error(error));
         }
     }
     let upload_handles = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     for upload in upload_handles {
-        if let Err(error) = inner.runtime.block_on(upload) {
+        if let Err(error) = inner.block_on(upload) {
             failure.report(join_error(error));
         }
     }
     drop(copy_ready);
-    let mut loaded = match inner.runtime.block_on(copy_dispatch) {
+    let mut loaded = match inner.block_on(copy_dispatch) {
         Ok(loaded) => loaded,
         Err(error) => {
             failure.report(join_error(error));
@@ -1335,10 +1352,9 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         return Err(cancelled());
     }
     if next_file.load(Ordering::Relaxed) == 0 {
-        return Err(Error::with_message_and_status(
-            "no records in stream to write",
-            Status::InvalidArguments,
-        ));
+        return Err(SnowflakeError::invalid_argument()
+            .message("no records in stream to write")
+            .into());
     }
     // A COPY may return before an uploaded file becomes visible in the stage;
     // retry any such files with Go's 100/200/400/800/1600 ms backoff.
@@ -1355,14 +1371,15 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         }
         let n = execute_copy(&inner, conn, &op, copy_sql.as_str(), timeout, &outstanding)?;
         loaded = loaded.checked_add(n).ok_or_else(|| {
-            Error::with_message_and_status("ingest row count overflow", Status::Internal)
+            Error::from(SnowflakeError::internal_no_location().message("ingest row count overflow"))
         })?;
     }
     let remaining = outstanding.lock().unwrap_or_else(|e| e.into_inner()).len();
-    Err(Error::with_message_and_status(
-        format!("some files not loaded by COPY command, {remaining} files remain after 5 retries"),
-        Status::IO,
-    ))
+    Err(SnowflakeError::io()
+        .format(format_args!(
+            "some files not loaded by COPY command, {remaining} files remain after 5 retries"
+        ))
+        .into())
 }
 
 async fn upload_parquet(
@@ -1464,7 +1481,9 @@ fn count_copied_rows(
                 let count = array_value_to_string(rows, row).map_err(parquet_error)?;
                 let count = count.parse::<i64>().map_err(parquet_error)?;
                 loaded = loaded.checked_add(count).ok_or_else(|| {
-                    Error::with_message_and_status("ingest row count overflow", Status::Internal)
+                    Error::from(
+                        SnowflakeError::internal_no_location().message("ingest row count overflow"),
+                    )
                 })?;
             }
         }
@@ -1475,6 +1494,7 @@ fn count_copied_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adbc_core::{Optionable as _, error::Status, options::OptionStatement};
     use arrow_array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
         FixedSizeBinaryArray, Float32Array, Int32Array, Int64Array, ListArray, StringArray,
@@ -1493,18 +1513,12 @@ mod tests {
     fn ingest_failure_cancels_and_preserves_original_error() {
         let op = Arc::new(OperationCtx::with_own_token());
         let failure = IngestFailure::new(Arc::clone(&op));
-        failure.report(Error::with_message_and_status(
-            "first COPY failed",
-            Status::IO,
-        ));
+        failure.report(SnowflakeError::io().message("first COPY failed").into());
         assert!(op.token().is_cancelled());
         failure.report(cancelled());
-        failure.report(Error::with_message_and_status(
-            "later upload failed",
-            Status::IO,
-        ));
+        failure.report(SnowflakeError::io().message("later upload failed").into());
         let error = failure.take().unwrap();
-        assert_eq!(error.message, "first COPY failed");
+        assert_eq!(error.message, "[Snowflake] first COPY failed");
         assert_eq!(error.status, Status::IO);
     }
 
@@ -1534,12 +1548,7 @@ mod tests {
                     target_size: 0,
                 },
                 Arc::new(AtomicUsize::new(0)),
-                |_, _| {
-                    Err(Error::with_message_and_status(
-                        "first upload failed",
-                        Status::IO,
-                    ))
-                },
+                |_, _| Err(SnowflakeError::io().message("first upload failed").into()),
             );
             if let Err(error) = result {
                 writer_failure.report(error);
@@ -1558,7 +1567,7 @@ mod tests {
         assert!(sent < 100, "producer continued after the upload failed");
         assert!(op.token().is_cancelled());
         let error = failure.take().unwrap();
-        assert_eq!(error.message, "first upload failed");
+        assert_eq!(error.message, "[Snowflake] first upload failed");
         assert_eq!(error.status, Status::IO);
     }
 
@@ -1569,9 +1578,9 @@ mod tests {
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         let (sender, _receiver) = mpsc::sync_channel(1);
         assert!(send_batch(&sender, batch.clone(), &op));
-        failure.report(Error::with_message_and_status("COPY failed", Status::IO));
+        failure.report(SnowflakeError::io().message("COPY failed").into());
         assert!(!send_batch(&sender, batch, &op));
-        assert_eq!(failure.take().unwrap().message, "COPY failed");
+        assert_eq!(failure.take().unwrap().message, "[Snowflake] COPY failed");
     }
 
     #[test]
@@ -1711,7 +1720,7 @@ mod tests {
             assert_eq!(
                 error.message,
                 format!(
-                    "invalid value ('-1') for option '{}', must be >= 0",
+                    "[Snowflake] invalid value ('-1') for option '{}', must be >= 0",
                     option(key)
                 )
             );
@@ -1886,7 +1895,11 @@ mod tests {
         // The statement's handles are invalid, so issuing any DDL first would
         // fail inside sf_core instead of reporting the unsupported type.
         let mut stmt = crate::statement::tests::make_stmt();
-        stmt.ingest_mode = Some("adbc.ingest.mode.replace".into());
+        stmt.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(adbc_core::constants::ADBC_INGEST_OPTION_MODE_REPLACE.into()),
+        )
+        .unwrap();
         let schema = Schema::new(vec![Field::new(
             "elapsed",
             DataType::Duration(TimeUnit::Second),

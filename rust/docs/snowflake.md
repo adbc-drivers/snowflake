@@ -106,7 +106,9 @@ Setting an option the driver does not recognize, or one it cannot honor, fails w
 - `adbc.snowflake.sql.client_option.geography_output_format` / `adbc.snowflake.sql.client_option.geometry_output_format`: `GeoJSON` (default) or `EWKB`, case-insensitive. Setting either on a connection applies it to the current session with `ALTER SESSION`. With `EWKB`, GEOGRAPHY and GEOMETRY columns are returned as binary `geoarrow.wkb` extension arrays; with `GeoJSON` they are strings.
 - `adbc.connection.get_objects.match_exactly`: connection-only option, `false` (default) or `true`. When true, GetObjects catalog, schema, table, and column filters match literal names case-sensitively, including `%` and `_`; invalid values fail with `INVALID_ARGUMENT`. Without it, filters retain case-insensitive LIKE wildcard semantics.
 
-GetObjects at `columns` and `all` depths includes PRIMARY KEY, FOREIGN KEY, and UNIQUE constraints, with ordered column names and referenced catalog/schema/table/column information for foreign keys. At `tables` depth, the constraint list remains null.
+GetObjects fetches catalog, schema, table, and column metadata by resolved scope, concurrently within each level, and filters the resulting names before narrowing subsequent scopes. Column-name filters are applied locally after fetching the original column positions: pushing those filters into Snowflake's `SHOW COLUMNS` would renumber the results. Constraints are fetched for the selected tables before the prefetched tree is handed to the `driverbase` GetObjects adapter; reading its Arrow batches does not issue more Snowflake requests.
+
+At `columns` and `all` depths, the adapter retains original column ordinal positions and available remarks/XDBC metadata and includes PRIMARY KEY, FOREIGN KEY, and UNIQUE constraints with ordered column names and referenced catalog/schema/table/column information for foreign keys. At shallower depths, child lists remain null (`catalog_db_schemas` at `catalogs`, `db_schema_tables` at `schemas`, and table columns and constraints at `tables`).
 
 ### Statement Options
 
@@ -115,6 +117,8 @@ GetObjects at `columns` and `all` depths includes PRIMARY KEY, FOREIGN KEY, and 
 ### Bulk Ingestion Options
 
 Bulk ingestion writes the bound data to Parquet files, uploads them concurrently to a temporary stage, and loads them with `COPY INTO ... MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`. When appending (`adbc.ingest.mode.append` or `adbc.ingest.mode.create_append` with an existing table), the target table must have the same number of columns with matching names (case-insensitive); otherwise ingestion fails with `ALREADY_EXISTS`.
+
+The standard target table, catalog, schema, and mode options use `driverbase::bulk_ingest::BulkIngestState`. Invalid modes are rejected with `INVALID_ARGUMENT` when the option is set, rather than when ingestion starts. Setting a SQL query clears the target table but retains the catalog, schema, and mode.
 
 Arrow `Time32(Second)` input is converted to millisecond units in the Parquet files before `COPY INTO`; the Snowflake target remains `TIME(0)` and values retain their second precision.
 
@@ -139,6 +143,20 @@ Arrow `Time32(Second)` input is converted to millisecond units in the Parquet fi
 ### Cancellation
 
 `AdbcStatementCancel` cancels the statement's in-progress query or ingestion. `AdbcConnectionCancel` cancels the connection's in-progress metadata or transaction operation (for example GetObjects, GetTableSchema, GetStatistics, commit, or rollback); it does not cancel statements, and the connection remains usable.
+
+## Telemetry
+
+The cross-driver exporter, traceparent validation, and span lifecycle are provided by `driverbase-rs`'s `telemetry` feature; Snowflake-specific integration attaches its `sf_core` child spans to the same traces.
+
+Set `adbc.telemetry.traces_exporter` on the database to select an OpenTelemetry trace exporter: `none`, `otlp`, `console` (one JSON span per stdout line), or `adbcfile`. This option takes precedence over `OTEL_TRACES_EXPORTER`; when neither is set, no ADBC-local traces are exported. An unsupported value fails with `INVALID_ARGUMENT`. `otlp` sends batched HTTP/protobuf spans (not gRPC) and reads the `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`, and `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` environment variables. The OpenTelemetry Rust 0.30 HTTP transport does not implement the compression environment variables.
+
+With `adbcfile`, `adbc.telemetry.traces_folder_path` selects the output directory (created if needed). The default is `~/Library/Application Support/ADBC/Traces` on macOS, `%LOCALAPPDATA%/ADBC/Traces` on Windows, and `$XDG_STATE_HOME/adbc/traces` on Linux and other platforms (or `~/.local/state/adbc/traces` if `XDG_STATE_HOME` is unset). JSONL trace files named `apache.arrow.adbc.snowflake-<UTC timestamp>.jsonl` rotate at 1024 KiB, retaining at most 100 files. The folder option has no effect with other exporters.
+
+Set `adbc.telemetry.trace_parent` to a W3C `traceparent` value on a database, connection, or statement to parent operation spans. Connections inherit the database value when created; statements inherit their connection value when created. A value on a more specific object overrides its inherited value. Set the option to an empty string to clear it on that object; an empty statement value falls back to its inherited connection value.
+
+The tracer is `apache.arrow.adbc.snowflake` (version: driver crate version) with resource `service.name=apache.arrow.adbc`. ADBC operation spans are `databaseImpl.Open`, `connectionImpl.Close`, `connectionImpl.Release`, `connectionImpl.GetObjects`, `connectionImpl.GetTableSchema`, `connectionImpl.GetInfo`, `connectionImpl.GetTableTypes`, `connectionImpl.GetStatistics`, `connectionImpl.Commit`, `connectionImpl.Rollback`, `statement.ExecuteQuery`, `statement.ExecuteUpdate`, `statement.ExecuteSchema`, `statement.Ingest`, and `statement.Close`. Local traces also include `sf_core` child spans for connection, query, and result work. Every span includes `db.system.name=snowflake` and `db.operation.name=<span name>`; failures record an error event, status, and `error.type`. Execution spans include `snowflake.query.id` when available and `db.response.returned_rows` (or `-1` when the row count is unknown). Query text is not recorded in ADBC spans or mirrored `sf_core` spans.
+
+These ADBC exporters are separate from `sf_core`'s in-band Snowflake telemetry. `adbc.snowflake.sql.client_option.disable_telemetry` disables the in-band telemetry upload, not local ADBC trace export; `sf_core` spans may still appear in an `adbcfile` trace even when in-band telemetry is disabled.
 
 ## Feature & Type Support
 

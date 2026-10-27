@@ -23,34 +23,51 @@ use std::sync::{Arc, Mutex};
 
 use adbc_core::{
     Optionable, constants,
-    error::{Error, Result, Status},
+    error::Result,
     options::{InfoCode, ObjectDepth, OptionConnection, OptionValue},
     schemas,
 };
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
-    StringArray, UInt32Array, UnionArray,
-};
-use arrow_buffer::ScalarBuffer;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_schema::Schema;
+use driverbase::InfoRegistry;
+use driverbase::error::ErrorHelper;
+use driverbase::telemetry::{TRACE_PARENT, validate_trace_parent};
 use sf_core::apis::database_driver_v1::{ConnectionInfo, Handle};
 use sf_core::apis::operation_ctx::OperationCtx;
 
 use crate::database::{GEOGRAPHY_OUTPUT_FORMAT, GEOMETRY_OUTPUT_FORMAT, GeoOutputFormat};
-use crate::driver::{Inner, TimestampPrecision};
+use crate::driver::{Inner, OperationCancelHandle, TimestampPrecision};
+use crate::error::SnowflakeError;
 use crate::statement::{Statement, adjust_schema};
+
+fn info_registry(vendor_version: &str) -> InfoRegistry {
+    let mut registry = InfoRegistry::new();
+    registry.add_string(InfoCode::VendorName, "Snowflake");
+    registry.add_bool(InfoCode::VendorSql, true);
+    registry.add_bool(InfoCode::VendorSubstrait, false);
+    registry.add_string(InfoCode::DriverName, "ADBC Snowflake Driver (Rust)");
+    registry.add_string(InfoCode::DriverVersion, env!("CARGO_PKG_VERSION"));
+    registry.add_int64(
+        InfoCode::DriverAdbcVersion,
+        constants::ADBC_VERSION_1_1_0 as i64,
+    );
+    registry.add_string(InfoCode::VendorVersion, vendor_version);
+    registry.add_string(InfoCode::DriverArrowVersion, ARROW_VERSION);
+    registry
+}
 
 pub struct Connection {
     pub(crate) inner: Arc<Inner>,
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
+    pub(crate) trace_parent: Option<String>,
     pub(crate) match_exactly: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
     pub(crate) geography_output_format: GeoOutputFormat,
     pub(crate) geometry_output_format: GeoOutputFormat,
-    /// Only connection-level operations use this slot; statements retain
-    /// separate contexts and are never cancelled by Connection::cancel().
-    pub(crate) operation: Mutex<Arc<OperationCtx>>,
+    /// Only connection-level operations use this slot; statement operations
+    /// have separate contexts and are not cancelled by this handle.
+    pub(crate) operation: Arc<Mutex<Arc<OperationCtx>>>,
 }
 
 type CleanupTask = Box<dyn FnOnce() + Send + 'static>;
@@ -76,16 +93,28 @@ fn attempt_connection_cleanup(
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(release));
 }
 
-pub(crate) fn cleanup_connection_handle(inner: &Arc<Inner>, conn_handle: Handle) {
+pub(crate) fn cleanup_connection_handle(
+    inner: &Arc<Inner>,
+    conn_handle: Handle,
+    trace_parent: Option<&str>,
+) {
     let close_inner = Arc::clone(inner);
+    let close_parent = trace_parent.map(str::to_owned);
     attempt_connection_cleanup(
         move || {
-            let _ = close_inner
-                .runtime
-                .block_on(close_inner.sf.connection_close(conn_handle));
+            let _ = close_inner.traced("connectionImpl.Close", close_parent.as_deref(), |_| {
+                close_inner
+                    .block_on(close_inner.sf.connection_close(conn_handle))
+                    .map_err(crate::error::api_error_to_adbc_error)
+            });
         },
         || {
-            let _ = inner.sf.connection_release(conn_handle);
+            let _ = inner.traced("connectionImpl.Release", trace_parent, |_| {
+                inner
+                    .sf
+                    .connection_release(conn_handle)
+                    .map_err(crate::error::api_error_to_adbc_error)
+            });
         },
         |close| {
             std::thread::Builder::new()
@@ -97,7 +126,7 @@ pub(crate) fn cleanup_connection_handle(inner: &Arc<Inner>, conn_handle: Handle)
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        cleanup_connection_handle(&self.inner, self.conn_handle);
+        cleanup_connection_handle(&self.inner, self.conn_handle, self.trace_parent.as_deref());
     }
 }
 
@@ -174,31 +203,30 @@ fn desc_text(batch: &RecordBatch, column: usize, row: usize) -> Result<Option<&s
     {
         return Ok(Some(strings.value(row)));
     }
-    Err(Error::with_message_and_status(
-        format!("DESC TABLE column {column} is not a string"),
-        Status::InvalidData,
-    ))
+    Err(SnowflakeError::invalid_data()
+        .message(format!("DESC TABLE column {column} is not a string"))
+        .into())
 }
 
 fn desc_columns(reader: &mut dyn RecordBatchReader) -> Result<HashMap<String, DescColumn>> {
     let mut columns = HashMap::new();
     for batch in reader {
-        let batch =
-            batch.map_err(|error| Error::with_message_and_status(error.to_string(), Status::IO))?;
+        let batch = batch.map_err(|error| {
+            adbc_core::error::Error::from(SnowflakeError::io().message(error.to_string()))
+        })?;
         if batch.num_columns() < 10 {
-            return Err(Error::with_message_and_status(
-                "DESC TABLE returned fewer than 10 columns",
-                Status::InvalidData,
-            ));
+            return Err(SnowflakeError::invalid_data()
+                .message("DESC TABLE returned fewer than 10 columns")
+                .into());
         }
         // DESC TABLE returns name, type, kind, null?, default, primary key,
         // unique key, check, expression, comment, ... in that order.
         for row in 0..batch.num_rows() {
             let required = |index| {
                 desc_text(&batch, index, row)?.ok_or_else(|| {
-                    Error::with_message_and_status(
-                        format!("DESC TABLE returned NULL in column {index}"),
-                        Status::InvalidData,
+                    adbc_core::error::Error::from(
+                        SnowflakeError::invalid_data()
+                            .message(format!("DESC TABLE returned NULL in column {index}")),
                     )
                 })
             };
@@ -221,9 +249,9 @@ fn apply_desc_metadata(schema: &Schema, columns: &HashMap<String, DescColumn>) -
         .iter()
         .map(|field| {
             let desc = columns.get(field.name()).ok_or_else(|| {
-                Error::with_message_and_status(
-                    format!("DESC TABLE omitted column {}", field.name()),
-                    Status::InvalidData,
+                adbc_core::error::Error::from(
+                    SnowflakeError::invalid_data()
+                        .message(format!("DESC TABLE omitted column {}", field.name())),
                 )
             })?;
             let extension = field
@@ -281,10 +309,9 @@ impl Connection {
             )?;
             let value = consume(query_result.reader.as_mut());
             if operation.token().is_cancelled() {
-                return Err(Error::with_message_and_status(
-                    "operation cancelled",
-                    Status::Cancelled,
-                ));
+                return Err(SnowflakeError::cancelled()
+                    .message("operation cancelled")
+                    .into());
             }
             value
         })();
@@ -309,7 +336,6 @@ impl Connection {
             database, schema, ..
         } = self
             .inner
-            .runtime
             .block_on(operation.run(
                 "connection_get_info",
                 self.inner.sf.connection_get_info(self.conn_handle),
@@ -332,10 +358,9 @@ impl Connection {
 
     fn set_current_identifier(&self, kind: SessionIdentifierKind, name: &str) -> Result<()> {
         if name.trim().is_empty() {
-            return Err(Error::with_message_and_status(
-                "session identifier must not be empty",
-                Status::InvalidArguments,
-            ));
+            return Err(SnowflakeError::invalid_argument()
+                .message("session identifier must not be empty")
+                .into());
         }
         let operation = self.begin_operation();
         let sql = session_identifier_sql(kind, name);
@@ -376,17 +401,15 @@ fn parse_autocommit(value: &OptionValue) -> Result<bool> {
         OptionValue::String(s) => match s.as_str() {
             "true" | "1" | "enabled" => Ok(true),
             "false" | "0" | "disabled" => Ok(false),
-            other => Err(Error::with_message_and_status(
-                format!(
+            other => Err(SnowflakeError::invalid_argument()
+                .message(format!(
                     "invalid autocommit value {other:?}: expected true/false, 1/0, or enabled/disabled"
-                ),
-                Status::InvalidArguments,
-            )),
+                ))
+                .into()),
         },
-        _ => Err(Error::with_message_and_status(
-            "autocommit value must be a string",
-            Status::InvalidArguments,
-        )),
+        _ => Err(SnowflakeError::invalid_argument()
+            .message("autocommit value must be a string")
+            .into()),
     }
 }
 
@@ -396,14 +419,14 @@ fn parse_match_exactly(value: &OptionValue) -> Result<bool> {
     match value {
         OptionValue::String(value) if value == "true" => Ok(true),
         OptionValue::String(value) if value == "false" => Ok(false),
-        OptionValue::String(value) => Err(Error::with_message_and_status(
-            format!("[Snowflake] invalid value for option {MATCH_EXACTLY}: {value}"),
-            Status::InvalidArguments,
-        )),
-        _ => Err(Error::with_message_and_status(
-            format!("[Snowflake] invalid value for option {MATCH_EXACTLY}: {value:?}"),
-            Status::InvalidArguments,
-        )),
+        OptionValue::String(value) => Err(SnowflakeError::invalid_argument()
+            .message(format!("invalid value for option {MATCH_EXACTLY}: {value}"))
+            .into()),
+        _ => Err(SnowflakeError::invalid_argument()
+            .message(format!(
+                "invalid value for option {MATCH_EXACTLY}: {value:?}"
+            ))
+            .into()),
     }
 }
 
@@ -411,6 +434,12 @@ impl Optionable for Connection {
     type Option = OptionConnection;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        if key.as_ref() == TRACE_PARENT {
+            let parent = SnowflakeError::option_as_string(&TRACE_PARENT, &value)
+                .map_err(adbc_core::error::Error::from)?;
+            self.trace_parent = validate_trace_parent(parent)?;
+            return Ok(());
+        }
         if key.as_ref() == MATCH_EXACTLY {
             self.match_exactly = parse_match_exactly(&value)?;
             return Ok(());
@@ -421,38 +450,30 @@ impl Optionable for Connection {
                 self.set_autocommit(enabled)
             }
             OptionConnection::CurrentCatalog => {
-                if let OptionValue::String(s) = &value {
-                    self.set_current_identifier(SessionIdentifierKind::Database, s)
-                } else {
-                    Err(Error::with_message_and_status(
-                        "current_catalog value must be a string",
-                        Status::InvalidArguments,
-                    ))
-                }
+                let name = SnowflakeError::option_as_string(&key, &value)
+                    .map_err(adbc_core::error::Error::from)?;
+                self.set_current_identifier(SessionIdentifierKind::Database, name)
             }
             OptionConnection::CurrentSchema => {
-                if let OptionValue::String(s) = &value {
-                    self.set_current_identifier(SessionIdentifierKind::Schema, s)
-                } else {
-                    Err(Error::with_message_and_status(
-                        "current_schema value must be a string",
-                        Status::InvalidArguments,
-                    ))
-                }
+                let name = SnowflakeError::option_as_string(&key, &value)
+                    .map_err(adbc_core::error::Error::from)?;
+                self.set_current_identifier(SessionIdentifierKind::Schema, name)
             }
             OptionConnection::Other(ref k)
                 if k == GEOGRAPHY_OUTPUT_FORMAT || k == GEOMETRY_OUTPUT_FORMAT =>
             {
                 self.set_geo_output_format(k, &value)
             }
-            _ => Err(Error::with_message_and_status(
-                format!("unrecognized connection option '{}'", key.as_ref()),
-                Status::NotImplemented,
-            )),
+            _ => Err(SnowflakeError::not_implemented()
+                .message(format!("unrecognized connection option '{}'", key.as_ref()))
+                .into()),
         }
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key.as_ref() == TRACE_PARENT {
+            return Ok(self.trace_parent.clone().unwrap_or_default());
+        }
         if key.as_ref() == MATCH_EXACTLY {
             return Ok(if self.match_exactly { "true" } else { "false" }.to_owned());
         }
@@ -461,10 +482,14 @@ impl Optionable for Connection {
                 Ok(if self.autocommit { "true" } else { "false" }.to_string())
             }
             OptionConnection::CurrentCatalog => self.context_names()?.0.ok_or_else(|| {
-                Error::with_message_and_status("current catalog is not set", Status::NotFound)
+                SnowflakeError::not_found()
+                    .message("current catalog is not set")
+                    .into()
             }),
             OptionConnection::CurrentSchema => self.context_names()?.1.ok_or_else(|| {
-                Error::with_message_and_status("current schema is not set", Status::NotFound)
+                SnowflakeError::not_found()
+                    .message("current schema is not set")
+                    .into()
             }),
             OptionConnection::Other(ref k) if k == GEOGRAPHY_OUTPUT_FORMAT => {
                 Ok(self.geography_output_format.as_str().to_string())
@@ -472,32 +497,28 @@ impl Optionable for Connection {
             OptionConnection::Other(ref k) if k == GEOMETRY_OUTPUT_FORMAT => {
                 Ok(self.geometry_output_format.as_str().to_string())
             }
-            _ => Err(Error::with_message_and_status(
-                format!("option not found: {}", key.as_ref()),
-                Status::NotFound,
-            )),
+            _ => Err(SnowflakeError::not_found()
+                .message(format!("option not found: {}", key.as_ref()))
+                .into()),
         }
     }
 
     fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
-        Err(Error::with_message_and_status(
-            "option not found",
-            Status::NotFound,
-        ))
+        Err(SnowflakeError::not_found()
+            .message("option not found")
+            .into())
     }
 
     fn get_option_int(&self, _key: Self::Option) -> Result<i64> {
-        Err(Error::with_message_and_status(
-            "option not found",
-            Status::NotFound,
-        ))
+        Err(SnowflakeError::not_found()
+            .message("option not found")
+            .into())
     }
 
     fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
-        Err(Error::with_message_and_status(
-            "option not found",
-            Status::NotFound,
-        ))
+        Err(SnowflakeError::not_found()
+            .message("option not found")
+            .into())
     }
 }
 
@@ -514,31 +535,26 @@ impl adbc_core::Connection for Connection {
             inner: self.inner.clone(),
             stmt_handle,
             conn_handle: self.conn_handle,
+            trace_parent: None,
+            connection_trace_parent: self.trace_parent.clone(),
             query: None,
-            target_table: None,
-            ingest_catalog: None,
-            ingest_schema: None,
-            ingest_mode: None,
+            ingest_state: driverbase::bulk_ingest::BulkIngestState::new(),
             query_tag: None,
             query_timeout_seconds: None,
             timestamp_precision: self.timestamp_precision,
             ingest_options: crate::ingest::IngestOptions::default(),
             bound: crate::statement::Bound::Empty,
             last_query_id: None,
-            prepared_parameter_schema: None,
-            prepared_result_schema: None,
-            operation: std::sync::Mutex::new(std::sync::Arc::new(
-                sf_core::apis::operation_ctx::OperationCtx::with_own_token(),
-            )),
+            prepared: false,
+            described: Mutex::new(None),
+            operation: Arc::new(Mutex::new(Arc::new(OperationCtx::with_own_token()))),
         })
     }
 
-    fn cancel(&mut self) -> Result<()> {
-        self.operation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancel();
-        Ok(())
+    fn get_cancel_handle(&self) -> Box<dyn adbc_core::CancelHandle> {
+        Box::new(OperationCancelHandle {
+            operation: Arc::clone(&self.operation),
+        })
     }
 
     #[allow(refining_impl_trait)]
@@ -546,167 +562,33 @@ impl adbc_core::Connection for Connection {
         &self,
         codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let need_vendor_version = codes
-            .as_ref()
-            .is_none_or(|s| s.contains(&InfoCode::VendorVersion));
-        let vendor_version = if need_vendor_version {
-            let operation = self.begin_operation();
-            self.inner
-                .runtime
-                .block_on(
-                    operation.run(
-                        "connection_get_server_version",
-                        self.inner
-                            .sf
-                            .connection_get_server_version(self.conn_handle),
-                    ),
-                )
-                .map_err(crate::error::api_error_to_adbc_error)?
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        self.inner.traced(
+            "connectionImpl.GetInfo",
+            self.trace_parent.as_deref(),
+            |_| {
+                let need_vendor_version = codes
+                    .as_ref()
+                    .is_none_or(|s| s.contains(&InfoCode::VendorVersion));
+                let vendor_version = if need_vendor_version {
+                    let operation = self.begin_operation();
+                    self.inner
+                        .block_on(
+                            operation.run(
+                                "connection_get_server_version",
+                                self.inner
+                                    .sf
+                                    .connection_get_server_version(self.conn_handle),
+                            ),
+                        )
+                        .map_err(crate::error::api_error_to_adbc_error)?
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
 
-        // (InfoCode, type_id, offset_within_arm_array)
-        let all_entries: &[(InfoCode, i8, i32)] = &[
-            (InfoCode::VendorName, 0, 0),
-            (InfoCode::VendorSql, 1, 0),
-            (InfoCode::VendorSubstrait, 1, 1),
-            (InfoCode::DriverName, 0, 1),
-            (InfoCode::DriverVersion, 0, 2),
-            (InfoCode::DriverAdbcVersion, 2, 0),
-            (InfoCode::VendorVersion, 0, 3),
-            (InfoCode::DriverArrowVersion, 0, 4),
-        ];
-
-        let capacity = codes
-            .as_ref()
-            .map_or(all_entries.len(), |set| set.len().min(all_entries.len()));
-        let mut name_vals = Vec::with_capacity(capacity);
-        let mut type_ids = Vec::with_capacity(capacity);
-        let mut offsets = Vec::with_capacity(capacity);
-        for &(code, type_id, offset) in all_entries {
-            if codes.as_ref().is_none_or(|set| set.contains(&code)) {
-                name_vals.push(u32::from(&code));
-                type_ids.push(type_id);
-                offsets.push(offset);
-            }
-        }
-        if name_vals.is_empty() {
-            let batch = RecordBatch::new_empty(schemas::GET_INFO_SCHEMA.clone());
-            return Ok(single_batch_reader(batch));
-        }
-
-        use arrow_schema::UnionFields;
-
-        let string_values = Arc::new(StringArray::from(vec![
-            "Snowflake",
-            "ADBC Snowflake Driver (Rust)",
-            env!("CARGO_PKG_VERSION"),
-            vendor_version.as_str(),
-            ARROW_VERSION,
-        ])) as ArrayRef;
-        let bool_values = Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef;
-        let int64_values =
-            Arc::new(Int64Array::from(vec![constants::ADBC_VERSION_1_1_0 as i64])) as ArrayRef;
-        let int32_values = Arc::new(arrow_array::Int32Array::from(vec![0i32])) as ArrayRef;
-        let list_values = Arc::new(arrow_array::ListArray::new_null(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            0,
-        )) as ArrayRef;
-        // arm 5: int32_to_int32_list_map — proper empty MapArray to satisfy schema type check
-        // (This arm is never selected, but must have the right type for RecordBatch::try_new)
-        let empty_int32_list_inner = arrow_array::Int32Array::from(Vec::<i32>::new());
-        let empty_int32_list = arrow_array::ListArray::new(
-            Arc::new(Field::new_list_field(DataType::Int32, true)),
-            arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32])),
-            Arc::new(empty_int32_list_inner),
-            None,
-        );
-        let empty_entries = arrow_array::StructArray::new(
-            arrow_schema::Fields::from(vec![
-                Field::new("key", DataType::Int32, false),
-                Field::new_list("value", Field::new_list_field(DataType::Int32, true), true),
-            ]),
-            vec![
-                Arc::new(arrow_array::Int32Array::from(Vec::<i32>::new())) as ArrayRef,
-                Arc::new(empty_int32_list) as ArrayRef,
-            ],
-            None,
-        );
-        let map_values = Arc::new(
-            arrow_array::MapArray::try_new(
-                Arc::new(Field::new_struct(
-                    "entries",
-                    vec![
-                        Field::new("key", DataType::Int32, false),
-                        Field::new_list(
-                            "value",
-                            Field::new_list_field(DataType::Int32, true),
-                            true,
-                        ),
-                    ],
-                    false,
-                )),
-                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32])),
-                empty_entries,
-                None,
-                false,
-            )
-            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?,
-        ) as ArrayRef;
-
-        let union_array = UnionArray::try_new(
-            #[allow(deprecated)]
-            UnionFields::new(
-                [0i8, 1, 2, 3, 4, 5],
-                [
-                    Field::new("string_value", DataType::Utf8, true),
-                    Field::new("bool_value", DataType::Boolean, true),
-                    Field::new("int64_value", DataType::Int64, true),
-                    Field::new("int32_bitmask", DataType::Int32, true),
-                    Field::new_list(
-                        "string_list",
-                        Field::new_list_field(DataType::Utf8, true),
-                        true,
-                    ),
-                    Field::new_map(
-                        "int32_to_int32_list_map",
-                        "entries",
-                        Field::new("key", DataType::Int32, false),
-                        Field::new_list(
-                            "value",
-                            Field::new_list_field(DataType::Int32, true),
-                            true,
-                        ),
-                        false,
-                        true,
-                    ),
-                ],
-            ),
-            type_ids.into_iter().collect::<ScalarBuffer<i8>>(),
-            Some(offsets.into_iter().collect::<ScalarBuffer<i32>>()),
-            vec![
-                string_values,
-                bool_values,
-                int64_values,
-                int32_values,
-                list_values,
-                map_values,
-            ],
+                Ok(info_registry(&vendor_version).get_info(codes).build())
+            },
         )
-        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
-
-        let batch = RecordBatch::try_new(
-            schemas::GET_INFO_SCHEMA.clone(),
-            vec![
-                Arc::new(UInt32Array::from(name_vals)) as ArrayRef,
-                Arc::new(union_array) as ArrayRef,
-            ],
-        )
-        .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
-
-        Ok(single_batch_reader(batch))
     }
 
     #[allow(refining_impl_trait)]
@@ -719,14 +601,20 @@ impl adbc_core::Connection for Connection {
         table_type: Option<Vec<&str>>,
         column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        crate::get_objects::execute_get_objects(
-            self,
-            &depth,
-            catalog,
-            db_schema,
-            table_name,
-            table_type,
-            column_name,
+        self.inner.traced(
+            "connectionImpl.GetObjects",
+            self.trace_parent.as_deref(),
+            |_| {
+                crate::get_objects::execute_get_objects(
+                    self,
+                    &depth,
+                    catalog,
+                    db_schema,
+                    table_name,
+                    table_type,
+                    column_name,
+                )
+            },
         )
     }
 
@@ -736,60 +624,78 @@ impl adbc_core::Connection for Connection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
-        let operation = self.begin_operation();
-        let qualified = qualified_table_identifier(catalog, db_schema, table_name);
-        let stmt_handle = self
-            .inner
-            .sf
-            .statement_new(self.conn_handle)
-            .map_err(crate::error::api_error_to_adbc_error)?;
+        self.inner.traced(
+            "connectionImpl.GetTableSchema",
+            self.trace_parent.as_deref(),
+            |_| {
+                let operation = self.begin_operation();
+                let qualified = qualified_table_identifier(catalog, db_schema, table_name);
+                let stmt_handle = self
+                    .inner
+                    .sf
+                    .statement_new(self.conn_handle)
+                    .map_err(crate::error::api_error_to_adbc_error)?;
 
-        let result = (|| {
-            let prepared = self.inner.prepare_statement(
-                Some(&operation),
-                stmt_handle,
-                format!("SELECT * FROM {qualified}"),
-            )?;
-            let schema = prepared.reader.schema();
-            if schema.fields().is_empty() {
-                return Err(Error::with_message_and_status(
-                    format!("sf_core prepared an empty schema for table {qualified}"),
-                    Status::Internal,
-                ));
-            }
-            let timezone = self.inner.session_timezone(self.conn_handle)?;
-            let adjusted = adjust_schema(
-                &schema,
-                self.timestamp_precision.time_unit(),
-                &timezone,
-                None,
-            );
-            let columns = self.with_metadata_reader(
-                &operation,
-                format!("DESC TABLE {qualified}"),
-                desc_columns,
-            )?;
-            apply_desc_metadata(&adjusted, &columns)
-        })();
-        let release = self.inner.sf.statement_release(stmt_handle);
-        match result {
-            Ok(schema) => {
-                release.map_err(crate::error::api_error_to_adbc_error)?;
-                Ok(schema)
-            }
-            Err(error) => {
-                let _ = release;
-                Err(error)
-            }
-        }
+                let result = (|| {
+                    let prepared = self.inner.prepare_statement(
+                        Some(&operation),
+                        stmt_handle,
+                        format!("SELECT * FROM {qualified}"),
+                    )?;
+                    let schema = prepared.reader.schema();
+                    if schema.fields().is_empty() {
+                        return Err(SnowflakeError::internal_no_location()
+                            .message(format!(
+                                "sf_core prepared an empty schema for table {qualified}"
+                            ))
+                            .into());
+                    }
+                    let timezone = self.inner.session_timezone(self.conn_handle)?;
+                    let adjusted = adjust_schema(
+                        &schema,
+                        self.timestamp_precision.time_unit(),
+                        &timezone,
+                        None,
+                    );
+                    let columns = self.with_metadata_reader(
+                        &operation,
+                        format!("DESC TABLE {qualified}"),
+                        desc_columns,
+                    )?;
+                    apply_desc_metadata(&adjusted, &columns)
+                })();
+                let release = self.inner.sf.statement_release(stmt_handle);
+                match result {
+                    Ok(schema) => {
+                        release.map_err(crate::error::api_error_to_adbc_error)?;
+                        Ok(schema)
+                    }
+                    Err(error) => {
+                        let _ = release;
+                        Err(error)
+                    }
+                }
+            },
+        )
     }
 
     #[allow(refining_impl_trait)]
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let array = Arc::new(StringArray::from(vec!["TABLE", "VIEW"]));
-        let batch = RecordBatch::try_new(schemas::GET_TABLE_TYPES_SCHEMA.clone(), vec![array])
-            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
-        Ok(single_batch_reader(batch))
+        self.inner.traced(
+            "connectionImpl.GetTableTypes",
+            self.trace_parent.as_deref(),
+            |_| {
+                let array = Arc::new(StringArray::from(vec!["TABLE", "VIEW"]));
+                let batch =
+                    RecordBatch::try_new(schemas::GET_TABLE_TYPES_SCHEMA.clone(), vec![array])
+                        .map_err(|e| {
+                            adbc_core::error::Error::from(
+                                SnowflakeError::internal_no_location().message(e.to_string()),
+                            )
+                        })?;
+                Ok(single_batch_reader(batch))
+            },
+        )
     }
 
     #[allow(refining_impl_trait)]
@@ -805,31 +711,57 @@ impl adbc_core::Connection for Connection {
         table_name: Option<&str>,
         approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        crate::statistics::get_statistics(self, catalog, db_schema, table_name, approximate)
+        self.inner.traced(
+            "connectionImpl.GetStatistics",
+            self.trace_parent.as_deref(),
+            |_| {
+                crate::statistics::get_statistics(self, catalog, db_schema, table_name, approximate)
+            },
+        )
     }
 
     fn commit(&mut self) -> Result<()> {
-        if self.autocommit {
-            return Err(Error::with_message_and_status(
-                "cannot commit: autocommit is enabled",
-                Status::InvalidState,
-            ));
-        }
-        let operation = self.begin_operation();
-        self.inner
-            .execute_temporary_statement(Some(&operation), self.conn_handle, "COMMIT", None)
+        let inner = Arc::clone(&self.inner);
+        inner.traced(
+            "connectionImpl.Commit",
+            self.trace_parent.as_deref(),
+            |_| {
+                if self.autocommit {
+                    return Err(SnowflakeError::invalid_state()
+                        .message("cannot commit: autocommit is enabled")
+                        .into());
+                }
+                let operation = self.begin_operation();
+                self.inner.execute_temporary_statement(
+                    Some(&operation),
+                    self.conn_handle,
+                    "COMMIT",
+                    None,
+                )
+            },
+        )
     }
 
     fn rollback(&mut self) -> Result<()> {
-        if self.autocommit {
-            return Err(Error::with_message_and_status(
-                "cannot rollback: autocommit is enabled",
-                Status::InvalidState,
-            ));
-        }
-        let operation = self.begin_operation();
-        self.inner
-            .execute_temporary_statement(Some(&operation), self.conn_handle, "ROLLBACK", None)
+        let inner = Arc::clone(&self.inner);
+        inner.traced(
+            "connectionImpl.Rollback",
+            self.trace_parent.as_deref(),
+            |_| {
+                if self.autocommit {
+                    return Err(SnowflakeError::invalid_state()
+                        .message("cannot rollback: autocommit is enabled")
+                        .into());
+                }
+                let operation = self.begin_operation();
+                self.inner.execute_temporary_statement(
+                    Some(&operation),
+                    self.conn_handle,
+                    "ROLLBACK",
+                    None,
+                )
+            },
+        )
     }
 
     #[allow(refining_impl_trait)]
@@ -837,13 +769,19 @@ impl adbc_core::Connection for Connection {
         &self,
         _partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(crate::error::not_implemented("read_partition"))
+        Err(SnowflakeError::not_implemented()
+            .context("read partition")
+            .message("reading partitions is not supported")
+            .into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adbc_core::error::Status;
+    use arrow_array::ArrayRef;
+    use arrow_schema::{DataType, Field};
 
     fn fake_connection() -> Connection {
         let driver = crate::driver::Driver::default();
@@ -851,12 +789,135 @@ mod tests {
             inner: driver.inner.clone(),
             conn_handle: Handle { id: 0, magic: 0 },
             autocommit: true,
+            trace_parent: None,
             match_exactly: false,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             geography_output_format: GeoOutputFormat::GeoJson,
             geometry_output_format: GeoOutputFormat::GeoJson,
-            operation: Mutex::new(Arc::new(OperationCtx::with_own_token())),
+            operation: Arc::new(Mutex::new(Arc::new(OperationCtx::with_own_token()))),
         }
+    }
+
+    #[test]
+    fn info_registry_reports_standard_strings_booleans_and_int64() {
+        use arrow_array::{BooleanArray, Int64Array, UInt32Array, UnionArray};
+
+        let registry = info_registry("10.1.2");
+        for (code, expected) in [
+            (InfoCode::VendorName, "Snowflake"),
+            (InfoCode::DriverName, "ADBC Snowflake Driver (Rust)"),
+            (InfoCode::DriverVersion, env!("CARGO_PKG_VERSION")),
+            (InfoCode::VendorVersion, "10.1.2"),
+            (InfoCode::DriverArrowVersion, ARROW_VERSION),
+        ] {
+            let mut reader = registry.get_info(Some(HashSet::from([code]))).build();
+            let batch = reader.next().unwrap().unwrap();
+            assert_eq!(batch.schema(), schemas::GET_INFO_SCHEMA.clone());
+            assert_eq!(batch.num_rows(), 1);
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            assert_eq!(names.value(0), u32::from(&code));
+            let union = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UnionArray>()
+                .unwrap();
+            assert_eq!(union.type_id(0), 0);
+            let value = union.value(0);
+            assert_eq!(
+                value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+
+        for (code, expected) in [
+            (InfoCode::VendorSql, true),
+            (InfoCode::VendorSubstrait, false),
+        ] {
+            let mut reader = registry.get_info(Some(HashSet::from([code]))).build();
+            let batch = reader.next().unwrap().unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            assert_eq!(names.value(0), u32::from(&code));
+            let union = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UnionArray>()
+                .unwrap();
+            assert_eq!(union.type_id(0), 1);
+            let value = union.value(0);
+            assert_eq!(
+                value
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+
+        let code = InfoCode::DriverAdbcVersion;
+        let mut reader = registry.get_info(Some(HashSet::from([code]))).build();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(names.value(0), u32::from(&code));
+        let union = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .unwrap();
+        assert_eq!(union.type_id(0), 2);
+        let value = union.value(0);
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            constants::ADBC_VERSION_1_1_0 as i64
+        );
+    }
+
+    #[test]
+    fn info_registry_ignores_unsupported_codes() {
+        use arrow_array::UInt32Array;
+
+        let registry = info_registry("10.1.2");
+        let unsupported = InfoCode::VendorArrowVersion;
+        let mut reader = registry
+            .get_info(Some(HashSet::from([unsupported])))
+            .build();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.schema(), schemas::GET_INFO_SCHEMA.clone());
+        assert_eq!(batch.num_rows(), 0);
+
+        let mut reader = registry
+            .get_info(Some(HashSet::from([unsupported, InfoCode::VendorSql])))
+            .build();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(names.value(0), u32::from(&InfoCode::VendorSql));
     }
 
     #[test]
@@ -917,17 +978,56 @@ mod tests {
     }
 
     #[test]
+    fn trace_parent_option_validates_and_clears() {
+        let mut conn = fake_connection();
+        let key = OptionConnection::Other(TRACE_PARENT.into());
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        assert_eq!(conn.get_option_string(key.clone()).unwrap(), "");
+        conn.set_option(key.clone(), OptionValue::String(parent.into()))
+            .unwrap();
+        assert_eq!(conn.get_option_string(key.clone()).unwrap(), parent);
+        for value in [OptionValue::String("invalid".into()), OptionValue::Int(1)] {
+            assert_eq!(
+                conn.set_option(key.clone(), value).unwrap_err().status,
+                Status::InvalidArguments,
+            );
+            assert_eq!(conn.get_option_string(key.clone()).unwrap(), parent);
+        }
+        conn.set_option(key.clone(), OptionValue::String(String::new()))
+            .unwrap();
+        assert_eq!(conn.get_option_string(key).unwrap(), "");
+    }
+
+    #[test]
     fn connection_cancel_is_scoped_to_current_operation() {
         use adbc_core::Connection as _;
-        let mut conn = fake_connection();
-        conn.cancel().unwrap();
+        let conn = fake_connection();
+        let handle = conn.get_cancel_handle();
+        handle.try_cancel().unwrap();
         let old = conn.begin_operation();
         let statement_operation = OperationCtx::with_own_token();
-        conn.cancel().unwrap();
-        let cancelled = conn.inner.runtime.block_on(old.run(
-            "connection_cancel_unit",
-            std::future::ready(Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())),
-        ));
+        let (started, waiting) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        let cancelled = std::thread::scope(|scope| {
+            let cancel = &handle;
+            let cancelling = scope.spawn(move || {
+                waiting.recv().unwrap();
+                cancel.try_cancel().unwrap();
+            });
+            let result = conn.inner.block_on(old.run(
+                "connection_cancel_unit",
+                std::future::poll_fn(move |_| {
+                    if let Some(started) = started.take() {
+                        started.send(()).unwrap();
+                    }
+                    std::task::Poll::Pending::<
+                        std::result::Result<(), sf_core::apis::database_driver_v1::ApiError>,
+                    >
+                }),
+            ));
+            cancelling.join().unwrap();
+            result
+        });
         assert_eq!(
             crate::error::api_error_to_adbc_error(cancelled.unwrap_err()).status,
             Status::Cancelled
@@ -937,14 +1037,13 @@ mod tests {
         assert!(!next.token().is_cancelled());
         assert!(
             conn.inner
-                .runtime
                 .block_on(next.run(
                     "connection_cancel_unit",
                     std::future::ready(Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())),
                 ))
                 .is_ok()
         );
-        conn.cancel().unwrap();
+        handle.try_cancel().unwrap();
     }
 
     #[test]
@@ -965,7 +1064,7 @@ mod tests {
         assert_eq!(error.status, Status::NotImplemented);
         assert_eq!(
             error.message,
-            "unrecognized connection option 'unknown.option'"
+            "[Snowflake] unrecognized connection option 'unknown.option'"
         );
     }
 

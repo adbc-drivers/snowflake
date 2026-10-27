@@ -22,21 +22,28 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-adbc_core = ">=0.22.0"
-adbc_ffi = ">=0.22.0"
+adbc_core = "0.25"
+adbc_ffi = "0.25"
+# Temporary integration pin; move the rev to main after driverbase-rs PRs #44, #45, and #46 merge.
+driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "f905161bbe3b1daf30186ad98af281e1445d5d43", features = ["telemetry"] }
 sf_core = { git = "https://github.com/snowflakedb/universal-driver", rev = "fcebbccd845e6b6f8589eb20f84f95a60ba82ea4" }
-arrow-array = { version = "58.1.0", default-features = false, features = [
+arrow-array = { version = ">=58.3,<59", default-features = false, features = [
   "ffi",
   "chrono-tz",
 ] }
-arrow-buffer = { version = "58.1.0", default-features = false }
-arrow-schema = { version = "58.1.0", default-features = false, features = ["canonical_extension_types"] }
-arrow-cast = { version = "58.1.0", default-features = false }
-parquet = { version = "58.1.0", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "snap", "flate2-zlib-rs", "brotli", "zstd", "lz4"] }
+arrow-buffer = { version = ">=58.3,<59", default-features = false }
+arrow-schema = { version = ">=58.3,<59", default-features = false, features = ["canonical_extension_types"] }
+arrow-cast = { version = ">=58.3,<59", default-features = false }
+parquet = { version = ">=58.3,<59", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "snap", "flate2-zlib-rs", "brotli", "zstd", "lz4"] }
 serde_json = "1"
 uuid = "1"
 log = "0.4.22"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-opentelemetry = "0.31"
+opentelemetry = "0.30"
+opentelemetry_sdk = "0.30"
 
 # Force vendored (static) OpenSSL on Linux for manylinux compatibility.
 # This crate doesn't call openssl APIs directly; it exists to ensure
@@ -46,6 +53,7 @@ openssl = { version = "0.10.76", features = ["vendored"] }
 
 [dev-dependencies]
 bytes = "1"
+chrono = "0.4"
 
 # sf_core pins rustls-webpki =0.103.16 but caps aws-lc-rs <1.18, while
 # crates.io rustls-webpki 0.103.14+ requires aws-lc-rs ^1.18. Upstream resolves
