@@ -1429,7 +1429,7 @@ checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 [[package]]
 name = "driverbase"
 version = "0.1.0"
-source = "git+https://github.com/adbc-drivers/driverbase-rs.git?rev=f905161bbe3b1daf30186ad98af281e1445d5d43#f905161bbe3b1daf30186ad98af281e1445d5d43"
+source = "git+https://github.com/adbc-drivers/driverbase-rs.git?rev=cd48242de679cb89cec950eed03625cc22c35577#cd48242de679cb89cec950eed03625cc22c35577"
 dependencies = [
  "adbc_core",
  "arrow-array",

@@ -415,36 +415,22 @@ fn parse_autocommit(value: &OptionValue) -> Result<bool> {
 
 const MATCH_EXACTLY: &str = "adbc.connection.get_objects.match_exactly";
 
-fn parse_match_exactly(value: &OptionValue) -> Result<bool> {
-    match value {
-        OptionValue::String(value) if value == "true" => Ok(true),
-        OptionValue::String(value) if value == "false" => Ok(false),
-        OptionValue::String(value) => Err(SnowflakeError::invalid_argument()
-            .message(format!("invalid value for option {MATCH_EXACTLY}: {value}"))
-            .into()),
-        _ => Err(SnowflakeError::invalid_argument()
-            .message(format!(
-                "invalid value for option {MATCH_EXACTLY}: {value:?}"
-            ))
-            .into()),
-    }
-}
-
 impl Optionable for Connection {
     type Option = OptionConnection;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
-        if key.as_ref() == TRACE_PARENT {
+        let key_str = key.as_ref();
+        if key_str == TRACE_PARENT {
             let parent = SnowflakeError::option_as_string(&TRACE_PARENT, &value)
                 .map_err(adbc_core::error::Error::from)?;
             self.trace_parent = validate_trace_parent(parent)?;
             return Ok(());
         }
-        if key.as_ref() == MATCH_EXACTLY {
-            self.match_exactly = parse_match_exactly(&value)?;
+        if key_str == MATCH_EXACTLY {
+            self.match_exactly = SnowflakeError::option_as_bool(&MATCH_EXACTLY, &value)?;
             return Ok(());
         }
-        match key {
+        match &key {
             OptionConnection::AutoCommit => {
                 let enabled = parse_autocommit(&value)?;
                 self.set_autocommit(enabled)
@@ -459,25 +445,24 @@ impl Optionable for Connection {
                     .map_err(adbc_core::error::Error::from)?;
                 self.set_current_identifier(SessionIdentifierKind::Schema, name)
             }
-            OptionConnection::Other(ref k)
+            OptionConnection::Other(k)
                 if k == GEOGRAPHY_OUTPUT_FORMAT || k == GEOMETRY_OUTPUT_FORMAT =>
             {
                 self.set_geo_output_format(k, &value)
             }
-            _ => Err(SnowflakeError::not_implemented()
-                .message(format!("unrecognized connection option '{}'", key.as_ref()))
-                .into()),
+            _ => Err(SnowflakeError::set_unknown_option(&key_str).into()),
         }
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        if key.as_ref() == TRACE_PARENT {
+        let key_str = key.as_ref();
+        if key_str == TRACE_PARENT {
             return Ok(self.trace_parent.clone().unwrap_or_default());
         }
-        if key.as_ref() == MATCH_EXACTLY {
+        if key_str == MATCH_EXACTLY {
             return Ok(if self.match_exactly { "true" } else { "false" }.to_owned());
         }
-        match key {
+        match &key {
             OptionConnection::AutoCommit => {
                 Ok(if self.autocommit { "true" } else { "false" }.to_string())
             }
@@ -491,34 +476,29 @@ impl Optionable for Connection {
                     .message("current schema is not set")
                     .into()
             }),
-            OptionConnection::Other(ref k) if k == GEOGRAPHY_OUTPUT_FORMAT => {
+            OptionConnection::Other(k) if k == GEOGRAPHY_OUTPUT_FORMAT => {
                 Ok(self.geography_output_format.as_str().to_string())
             }
-            OptionConnection::Other(ref k) if k == GEOMETRY_OUTPUT_FORMAT => {
+            OptionConnection::Other(k) if k == GEOMETRY_OUTPUT_FORMAT => {
                 Ok(self.geometry_output_format.as_str().to_string())
             }
-            _ => Err(SnowflakeError::not_found()
-                .message(format!("option not found: {}", key.as_ref()))
-                .into()),
+            _ => Err(SnowflakeError::get_unknown_option(&key_str).into()),
         }
     }
 
-    fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
-        Err(SnowflakeError::not_found()
-            .message("option not found")
-            .into())
+    fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
+        let key_str = key.as_ref();
+        Err(SnowflakeError::get_unknown_option(&key_str).into())
     }
 
-    fn get_option_int(&self, _key: Self::Option) -> Result<i64> {
-        Err(SnowflakeError::not_found()
-            .message("option not found")
-            .into())
+    fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+        let key_str = key.as_ref();
+        Err(SnowflakeError::get_unknown_option(&key_str).into())
     }
 
-    fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
-        Err(SnowflakeError::not_found()
-            .message("option not found")
-            .into())
+    fn get_option_double(&self, key: Self::Option) -> Result<f64> {
+        let key_str = key.as_ref();
+        Err(SnowflakeError::get_unknown_option(&key_str).into())
     }
 }
 
@@ -971,10 +951,18 @@ mod tests {
     }
 
     #[test]
-    fn get_option_string_returns_not_found_for_unknown_key() {
+    fn get_options_return_unknown_key_for_missing_values() {
         let conn = fake_connection();
-        let result = conn.get_option_string(OptionConnection::Other("unknown".into()));
-        assert_eq!(result.unwrap_err().status, Status::NotFound);
+        let key = OptionConnection::Other("unknown".into());
+        for error in [
+            conn.get_option_string(key.clone()).unwrap_err(),
+            conn.get_option_bytes(key.clone()).unwrap_err(),
+            conn.get_option_int(key.clone()).unwrap_err(),
+            conn.get_option_double(key).unwrap_err(),
+        ] {
+            assert_eq!(error.status, Status::NotFound);
+            assert_eq!(error.message, "[Snowflake] unknown option \"unknown\"");
+        }
     }
 
     #[test]
@@ -1064,7 +1052,7 @@ mod tests {
         assert_eq!(error.status, Status::NotImplemented);
         assert_eq!(
             error.message,
-            "[Snowflake] unrecognized connection option 'unknown.option'"
+            "[Snowflake] unknown option \"unknown.option\""
         );
     }
 
@@ -1109,12 +1097,15 @@ mod tests {
                 .set_option(key.clone(), OptionValue::String(value.into()))
                 .unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
-            assert_eq!(
-                error.message,
-                format!("[Snowflake] invalid value for option {MATCH_EXACTLY}: {value}")
-            );
+            assert!(error.message.contains("must be 'true' or 'false'"));
             assert_eq!(conn.get_option_string(key.clone()).unwrap(), "true");
         }
+        let error = conn
+            .set_option(key.clone(), OptionValue::Int(1))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("must be a string"));
+        assert_eq!(conn.get_option_string(key.clone()).unwrap(), "true");
         conn.set_option(key.clone(), OptionValue::String("false".into()))
             .unwrap();
         assert_eq!(conn.get_option_string(key).unwrap(), "false");

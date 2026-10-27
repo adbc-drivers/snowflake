@@ -136,16 +136,7 @@ impl Optionable for Statement {
             OptionStatement::Other(ref k)
                 if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
             {
-                let spelling = match &value {
-                    OptionValue::String(s) => s.as_str(),
-                    _ => {
-                        return Err(SnowflakeError::invalid_argument()
-                            .format(format_args!(
-                                "Invalid value for statement option '{k}': '{value:?}'"
-                            ))
-                            .into());
-                    }
-                };
+                let spelling = SnowflakeError::option_as_string(k, &value)?;
                 let precision = match spelling {
                     "nanoseconds" => TimestampPrecision::Nanoseconds,
                     "microseconds" => TimestampPrecision::Microseconds,
@@ -179,12 +170,8 @@ impl Optionable for Statement {
                     .into()),
             },
             OptionStatement::Other(k) if k == driverbase::telemetry::TRACE_PARENT => {
-                let OptionValue::String(parent) = value else {
-                    return Err(SnowflakeError::invalid_argument()
-                        .message("trace parent must be a string")
-                        .into());
-                };
-                self.trace_parent = driverbase::telemetry::validate_trace_parent(&parent)?;
+                let parent = SnowflakeError::option_as_string(&k, &value)?;
+                self.trace_parent = driverbase::telemetry::validate_trace_parent(parent)?;
                 Ok(())
             }
             OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
@@ -204,40 +191,36 @@ impl Optionable for Statement {
                     self.query_tag = Some(s);
                     Ok(())
                 } else {
-                    Err(SnowflakeError::invalid_argument()
+                    Err(SnowflakeError::set_invalid_option(k, &value)
                         .message("query_tag must be a string")
                         .into())
                 }
             }
             OptionStatement::Other(ref k) if self.ingest_options.set(k, &value)? => Ok(()),
-            _ => Err(SnowflakeError::not_implemented()
-                .format(format_args!(
-                    "unrecognized statement option '{}'",
-                    key.as_ref()
-                ))
-                .into()),
+            _ => Err(SnowflakeError::set_unknown_option(&key.as_ref()).into()),
         }
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        match key {
+        let key_str = key.as_ref();
+        match &key {
             OptionStatement::Other(k) if k == driverbase::telemetry::TRACE_PARENT => {
                 Ok(self.effective_trace_parent().unwrap_or_default().to_owned())
             }
-            OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
+            OptionStatement::Other(k) if k == QUERY_TIMEOUT_OPTION => {
                 Ok(self.query_timeout_seconds.unwrap_or(0).to_string())
             }
-            OptionStatement::Other(ref k) if k == "adbc.snowflake.statement.query_tag" => {
+            OptionStatement::Other(k) if k == "adbc.snowflake.statement.query_tag" => {
                 Ok(self.query_tag.clone().unwrap_or_default())
             }
-            OptionStatement::Other(ref k) if k == "adbc.snowflake.sql.query_id" => {
+            OptionStatement::Other(k) if k == "adbc.snowflake.sql.query_id" => {
                 self.last_query_id.clone().ok_or_else(|| {
                     Error::from(
                         SnowflakeError::not_found().message("no query has been executed yet"),
                     )
                 })
             }
-            OptionStatement::Other(ref k)
+            OptionStatement::Other(k)
                 if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
             {
                 Ok(match self.timestamp_precision {
@@ -249,46 +232,37 @@ impl Optionable for Statement {
                 }
                 .into())
             }
-            OptionStatement::Other(ref k) => self.ingest_options.get(k).ok_or_else(|| {
-                Error::from(
-                    SnowflakeError::not_found()
-                        .format(format_args!("option not found: {}", key.as_ref())),
-                )
-            }),
-            _ => Err(SnowflakeError::not_found()
-                .format(format_args!("option not found: {}", key.as_ref()))
-                .into()),
+            OptionStatement::Other(k) => self
+                .ingest_options
+                .get(k)
+                .ok_or_else(|| SnowflakeError::get_unknown_option(&key_str).into()),
+            _ => Err(SnowflakeError::get_unknown_option(&key_str).into()),
         }
     }
 
-    fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
-        Err(SnowflakeError::not_found()
-            .message("option not found")
-            .into())
+    fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
+        let key_str = key.as_ref();
+        Err(SnowflakeError::get_unknown_option(&key_str).into())
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-        match key {
-            OptionStatement::Other(ref k) if k == QUERY_TIMEOUT_OPTION => {
+        let key_str = key.as_ref();
+        match &key {
+            OptionStatement::Other(k) if k == QUERY_TIMEOUT_OPTION => {
                 Ok(i64::from(self.query_timeout_seconds.unwrap_or(0)))
             }
-            OptionStatement::Other(ref k) => self
+            OptionStatement::Other(k) => self
                 .ingest_options
                 .get(k)
                 .and_then(|value| value.parse::<i64>().ok())
-                .ok_or_else(|| {
-                    Error::from(SnowflakeError::not_found().message("option not found"))
-                }),
-            _ => Err(SnowflakeError::not_found()
-                .message("option not found")
-                .into()),
+                .ok_or_else(|| SnowflakeError::get_unknown_option(&key_str).into()),
+            _ => Err(SnowflakeError::get_unknown_option(&key_str).into()),
         }
     }
 
-    fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
-        Err(SnowflakeError::not_found()
-            .message("option not found")
-            .into())
+    fn get_option_double(&self, key: Self::Option) -> Result<f64> {
+        let key_str = key.as_ref();
+        Err(SnowflakeError::get_unknown_option(&key_str).into())
     }
 }
 
@@ -2193,9 +2167,14 @@ pub(crate) mod tests {
             OptionValue::String(String::new()),
             OptionValue::Int(1),
         ] {
+            let is_string = matches!(&value, OptionValue::String(_));
             let error = stmt.set_option(key.clone(), value).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
-            assert!(error.message.contains("Invalid value for statement option"));
+            assert!(error.message.contains(if is_string {
+                "Invalid value for statement option"
+            } else {
+                "must be a string"
+            }));
             assert_eq!(stmt.timestamp_precision, TimestampPrecision::Microseconds);
             assert_eq!(described_result(&stmt), Some(schema.clone()));
         }
@@ -2799,10 +2778,25 @@ pub(crate) mod tests {
             )
             .unwrap_err();
         assert_eq!(err.status, Status::NotImplemented);
-        assert_eq!(
-            err.message,
-            "[Snowflake] unrecognized statement option 'unknown.option'"
-        );
+        assert_eq!(err.message, "[Snowflake] unknown option \"unknown.option\"");
+    }
+
+    #[test]
+    fn unknown_get_options_name_the_key() {
+        let stmt = make_stmt();
+        let key = OptionStatement::Other("unknown.option".into());
+        for error in [
+            stmt.get_option_string(key.clone()).unwrap_err(),
+            stmt.get_option_bytes(key.clone()).unwrap_err(),
+            stmt.get_option_int(key.clone()).unwrap_err(),
+            stmt.get_option_double(key).unwrap_err(),
+        ] {
+            assert_eq!(error.status, Status::NotFound);
+            assert_eq!(
+                error.message,
+                "[Snowflake] unknown option \"unknown.option\""
+            );
+        }
     }
 
     #[test]

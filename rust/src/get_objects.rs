@@ -54,38 +54,8 @@ struct SchemaEntry {
 #[derive(Default)]
 struct TableEntry {
     table_type: String,
-    columns: Vec<ColumnEntry>,
-    constraints: Vec<ConstraintEntry>,
-}
-
-struct ColumnEntry {
-    name: String,
-    ordinal_position: i32,
-    remarks: Option<String>,
-    xdbc_type_name: Option<String>,
-    xdbc_column_size: Option<i32>,
-    xdbc_decimal_digits: Option<i16>,
-    xdbc_num_prec_radix: Option<i16>,
-    xdbc_nullable: Option<i16>,
-    column_default: Option<String>,
-    xdbc_char_octet_length: Option<i32>,
-    xdbc_is_nullable: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ForeignKeyUsage {
-    catalog: Option<String>,
-    schema: Option<String>,
-    table: String,
-    column: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ConstraintEntry {
-    name: Option<String>,
-    constraint_type: &'static str,
-    columns: Vec<String>,
-    usage: Vec<ForeignKeyUsage>,
+    columns: Vec<ColumnInfo>,
+    constraints: Vec<ConstraintInfo>,
 }
 
 pub(crate) fn execute_get_objects(
@@ -112,6 +82,7 @@ pub(crate) fn execute_get_objects(
     let core_catalog = catalog.and_then(|value| core_filter(value, connection.match_exactly));
     let core_schema = db_schema.and_then(|value| core_filter(value, connection.match_exactly));
     let core_table = table_name.and_then(|value| core_filter(value, connection.match_exactly));
+    let core_column = column_name.and_then(|value| core_filter(value, connection.match_exactly));
 
     // Local filtering must run before scope selection so the resolved names
     // used for narrower SHOW scopes are exactly those the caller asked for.
@@ -140,11 +111,14 @@ pub(crate) fn execute_get_objects(
     let catalogs = fetch_core_objects(
         connection,
         &operation,
-        DEPTH_CATALOGS,
-        core_catalog.as_deref(),
-        None,
-        None,
-        &[],
+        ScopedRequest {
+            depth: DEPTH_CATALOGS,
+            catalog: core_catalog.as_deref(),
+            db_schema: None,
+            table_name: None,
+            table_type: &[],
+            column_name: None,
+        },
     )?;
     merge_catalogs(&mut objects, catalogs);
     filter_locally(&mut objects);
@@ -164,6 +138,7 @@ pub(crate) fn execute_get_objects(
                 db_schema: core_schema.as_deref(),
                 table_name: None,
                 table_type: &[],
+                column_name: None,
             },
         )? {
             merge_schemas(&mut objects, db_schemas);
@@ -189,6 +164,7 @@ pub(crate) fn execute_get_objects(
                 db_schema: core_schema.as_deref(),
                 table_name: core_table.as_deref(),
                 table_type: &table_types,
+                column_name: None,
             },
         )? {
             merge_tables(&mut objects, tables);
@@ -197,6 +173,7 @@ pub(crate) fn execute_get_objects(
 
     if matches!(depth, ObjectDepth::Columns | ObjectDepth::All) {
         let scopes = schema_scopes(&objects, |schema| !schema.tables.is_empty());
+        let mut discovered = column_name.map(|_| ObjectTree::default());
         for columns in fetch_scoped(
             connection,
             &operation,
@@ -207,9 +184,37 @@ pub(crate) fn execute_get_objects(
                 db_schema: core_schema.as_deref(),
                 table_name: core_table.as_deref(),
                 table_type: &[],
+                column_name: core_column.as_deref(),
             },
         )? {
-            merge_columns(&mut objects, columns);
+            if let Some(discovered) = &mut discovered {
+                merge_all(discovered, columns);
+            } else {
+                merge_columns(&mut objects, columns);
+            }
+        }
+
+        if let Some(mut discovered) = discovered {
+            // sf_core renumbers columns when SHOW COLUMNS has a name filter.
+            // Prune the discovery tree to choose narrow scopes, but keep the
+            // output tree's unmatched tables and constraints as before.
+            filter_locally(&mut discovered);
+            let scopes = matching_column_scopes(&mut discovered);
+            for columns in fetch_scoped(
+                connection,
+                &operation,
+                &scopes,
+                ScopedRequest {
+                    depth: DEPTH_COLUMNS,
+                    catalog: core_catalog.as_deref(),
+                    db_schema: core_schema.as_deref(),
+                    table_name: core_table.as_deref(),
+                    table_type: &[],
+                    column_name: None,
+                },
+            )? {
+                merge_columns(&mut objects, columns);
+            }
         }
     }
 
@@ -312,6 +317,17 @@ fn schema_scopes(
         .collect()
 }
 
+/// Keep only tables discovered by the filtered column request; retain parent
+/// catalog/schema nodes so GetObjects still emits them with empty child lists.
+fn matching_column_scopes(objects: &mut ObjectTree) -> Vec<MetadataScope> {
+    for catalog in objects.catalogs.values_mut() {
+        for schema in catalog.schemas.values_mut() {
+            schema.tables.retain(|_, table| !table.columns.is_empty());
+        }
+    }
+    schema_scopes(objects, |schema| !schema.tables.is_empty())
+}
+
 #[derive(Clone, Copy)]
 struct ScopedRequest<'a> {
     depth: i32,
@@ -319,6 +335,7 @@ struct ScopedRequest<'a> {
     db_schema: Option<&'a str>,
     table_name: Option<&'a str>,
     table_type: &'a [&'a str],
+    column_name: Option<&'a str>,
 }
 
 /// Run `request` once per scope, concurrently, in scope order.
@@ -334,11 +351,11 @@ fn fetch_scoped(
             fetch_core_objects(
                 connection,
                 operation,
-                request.depth,
-                catalog.as_deref(),
-                db_schema.as_deref(),
-                request.table_name,
-                request.table_type,
+                ScopedRequest {
+                    catalog: catalog.as_deref(),
+                    db_schema: db_schema.as_deref(),
+                    ..request
+                },
             )
         }
     }))
@@ -443,9 +460,9 @@ fn retain_matching(
                 .tables
                 .retain(|name, _| table.is_none_or(|pattern| matches(pattern, name)));
             for entry in entry.tables.values_mut() {
-                entry
-                    .columns
-                    .retain(|value| column.is_none_or(|pattern| matches(pattern, &value.name)));
+                entry.columns.retain(|value| {
+                    column.is_none_or(|pattern| matches(pattern, &value.column_name))
+                });
             }
         }
     }
@@ -585,7 +602,7 @@ fn key_sequence(batch: &RecordBatch, column: usize, row: usize) -> AdbcResult<i6
 struct ConstraintColumn {
     sequence: i64,
     name: String,
-    usage: Option<ForeignKeyUsage>,
+    usage: Option<ConstraintColumnUsage>,
 }
 
 type ConstraintTableKey = (String, String, String);
@@ -595,7 +612,7 @@ fn collect_constraints(
     reader: &mut dyn RecordBatchReader,
     objects: &ObjectTree,
     kind: ConstraintKind,
-) -> AdbcResult<Vec<(ConstraintTableKey, ConstraintEntry)>> {
+) -> AdbcResult<Vec<(ConstraintTableKey, ConstraintInfo)>> {
     let mut grouped = BTreeMap::<ConstraintGroupKey, Vec<ConstraintColumn>>::new();
     for batch in reader {
         let batch =
@@ -659,11 +676,11 @@ fn collect_constraints(
             let column = required(4)?.to_owned();
             let sequence = key_sequence(&batch, *indices.last().unwrap(), row)?;
             let usage = if matches!(kind, ConstraintKind::Foreign) {
-                Some(ForeignKeyUsage {
-                    catalog: constraint_text(&batch, indices[5], row)?.map(str::to_owned),
-                    schema: constraint_text(&batch, indices[6], row)?.map(str::to_owned),
-                    table: required(7)?.to_owned(),
-                    column: required(8)?.to_owned(),
+                Some(ConstraintColumnUsage {
+                    fk_catalog: constraint_text(&batch, indices[5], row)?.map(str::to_owned),
+                    fk_db_schema: constraint_text(&batch, indices[6], row)?.map(str::to_owned),
+                    fk_table: required(7)?.to_owned(),
+                    fk_column_name: required(8)?.to_owned(),
                 })
             } else {
                 None
@@ -695,11 +712,11 @@ fn collect_constraints(
                     usage.push(reference);
                 }
             }
-            let entry = ConstraintEntry {
-                name,
-                constraint_type: kind.constraint_type(),
-                columns: names,
-                usage,
+            let entry = ConstraintInfo {
+                constraint_name: name,
+                constraint_type: kind.constraint_type().to_owned(),
+                constraint_column_names: names,
+                constraint_column_usage: matches!(kind, ConstraintKind::Foreign).then_some(usage),
             };
             ((catalog, schema, table), entry)
         })
@@ -748,7 +765,7 @@ fn fetch_constraints(
 
 fn attach_constraint_rows(
     objects: &mut ObjectTree,
-    rows: Vec<(ConstraintTableKey, ConstraintEntry)>,
+    rows: Vec<(ConstraintTableKey, ConstraintInfo)>,
 ) {
     for ((catalog, schema, table), constraint) in rows {
         if let Some(table) = objects
@@ -765,25 +782,22 @@ fn attach_constraint_rows(
 fn fetch_core_objects(
     connection: &Connection,
     operation: &sf_core::apis::operation_ctx::OperationCtx,
-    depth: i32,
-    catalog: Option<&str>,
-    db_schema: Option<&str>,
-    table_name: Option<&str>,
-    table_type: &[&str],
+    request: ScopedRequest<'_>,
 ) -> AdbcResult<ObjectTree> {
     let request = GetObjectsRequest {
         conn_handle: connection.conn_handle,
-        depth,
-        catalog: catalog.map(str::to_owned),
-        db_schema: db_schema.map(str::to_owned),
-        table_name: table_name.map(str::to_owned),
-        table_type: table_type
+        depth: request.depth,
+        catalog: request.catalog.map(str::to_owned),
+        db_schema: request.db_schema.map(str::to_owned),
+        table_name: request.table_name.map(str::to_owned),
+        table_type: request
+            .table_type
             .iter()
             .map(|table_type| (*table_type).to_owned())
             .collect(),
-        // sf_core renumbers SHOW COLUMNS when filtering at the source.
-        // Always fetch original positions and apply column filters locally.
-        column_name: None,
+        // Filtered results are used only to discover table identities: sf_core
+        // renumbers column ordinals in its filtered SHOW COLUMNS output.
+        column_name: request.column_name.map(str::to_owned),
     };
     // sf_core's connection_get_objects does not accept an OperationCtx yet.
     // Its asynchronous request can still be interrupted at the wrapper boundary.
@@ -802,10 +816,11 @@ fn fetch_core_objects(
                 .message("operation cancelled")
                 .into());
         }
-        let batch = batch.map_err(arrow_to_adbc_error)?;
+        let batch = batch.map_err(|error| SnowflakeError::from_arrow(error).to_adbc())?;
         merge_all(
             &mut objects,
-            parse_core_batch(&batch).map_err(arrow_to_adbc_error)?,
+            parse_core_batch(&batch)
+                .map_err(|error| SnowflakeError::from_arrow(error).to_adbc())?,
         );
     }
     Ok(objects)
@@ -973,16 +988,16 @@ impl<'a> CoreColumnArrays<'a> {
         })
     }
 
-    fn column(&self, index: usize) -> Result<ColumnEntry, ArrowError> {
+    fn column(&self, index: usize) -> Result<ColumnInfo, ArrowError> {
         let logical_type = optional_string(self.logical_types, index);
         let nullable = (!self.nullables.is_null(index)).then(|| self.nullables.value(index));
-        Ok(ColumnEntry {
-            name: required_string(self.names, index, "column_name")?.to_owned(),
-            ordinal_position: if self.ordinals.is_null(index) {
+        Ok(ColumnInfo {
+            column_name: required_string(self.names, index, "column_name")?.to_owned(),
+            ordinal_position: Some(if self.ordinals.is_null(index) {
                 return Err(schema_error("sf_core ordinal_position is null"));
             } else {
                 self.ordinals.value(index)
-            },
+            }),
             remarks: optional_string(self.remarks, index).map(str::to_owned),
             xdbc_type_name: logical_type.map(public_snowflake_type_name),
             xdbc_column_size: if !self.char_lengths.is_null(index) {
@@ -1003,11 +1018,12 @@ impl<'a> CoreColumnArrays<'a> {
                 _ => None,
             }),
             xdbc_nullable: nullable.map(|value| if value { 1 } else { 0 }),
-            column_default: optional_string(self.defaults, index).map(str::to_owned),
+            xdbc_column_def: optional_string(self.defaults, index).map(str::to_owned),
             xdbc_char_octet_length: optional_i64(self.byte_lengths, index)
                 .map(|value| checked_i64_to_i32(value, "byte_length"))
                 .transpose()?,
             xdbc_is_nullable: nullable.map(|value| if value { "YES" } else { "NO" }.to_owned()),
+            ..ColumnInfo::default()
         })
     }
 }
@@ -1104,24 +1120,7 @@ impl GetObjectsImpl<SnowflakeError> for ObjectTree {
                             table_name: name.clone(),
                             table_type: table.table_type.clone(),
                         },
-                        columns: table
-                            .columns
-                            .iter()
-                            .map(|column| ColumnInfo {
-                                column_name: column.name.clone(),
-                                ordinal_position: Some(column.ordinal_position),
-                                remarks: column.remarks.clone(),
-                                xdbc_type_name: column.xdbc_type_name.clone(),
-                                xdbc_column_size: column.xdbc_column_size,
-                                xdbc_decimal_digits: column.xdbc_decimal_digits,
-                                xdbc_num_prec_radix: column.xdbc_num_prec_radix,
-                                xdbc_nullable: column.xdbc_nullable,
-                                xdbc_column_def: column.column_default.clone(),
-                                xdbc_char_octet_length: column.xdbc_char_octet_length,
-                                xdbc_is_nullable: column.xdbc_is_nullable.clone(),
-                                ..ColumnInfo::default()
-                            })
-                            .collect(),
+                        columns: table.columns.clone(),
                     })
                     .collect()
             }))
@@ -1138,30 +1137,7 @@ impl GetObjectsImpl<SnowflakeError> for ObjectTree {
             .get(catalog)
             .and_then(|entry| entry.schemas.get(db_schema))
             .and_then(|entry| entry.tables.get(table))
-            .map_or_else(Vec::new, |table| {
-                table
-                    .constraints
-                    .iter()
-                    .map(|constraint| ConstraintInfo {
-                        constraint_name: constraint.name.clone(),
-                        constraint_type: constraint.constraint_type.to_owned(),
-                        constraint_column_names: constraint.columns.clone(),
-                        constraint_column_usage: (constraint.constraint_type == "FOREIGN KEY")
-                            .then(|| {
-                                constraint
-                                    .usage
-                                    .iter()
-                                    .map(|usage| ConstraintColumnUsage {
-                                        fk_catalog: usage.catalog.clone(),
-                                        fk_db_schema: usage.schema.clone(),
-                                        fk_table: usage.table.clone(),
-                                        fk_column_name: usage.column.clone(),
-                                    })
-                                    .collect()
-                            }),
-                    })
-                    .collect()
-            }))
+            .map_or_else(Vec::new, |table| table.constraints.clone()))
     }
 }
 
@@ -1226,12 +1202,6 @@ fn schema_error(message: impl Into<String>) -> ArrowError {
     ArrowError::SchemaError(message.into())
 }
 
-fn arrow_to_adbc_error(error: ArrowError) -> adbc_core::error::Error {
-    SnowflakeError::internal_no_location()
-        .message(error.to_string())
-        .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,19 +1232,17 @@ mod tests {
             .unwrap()
     }
 
-    fn column(name: &str, logical_type: &str) -> ColumnEntry {
-        ColumnEntry {
-            name: name.into(),
-            ordinal_position: 1,
-            remarks: None,
+    fn column(name: &str, logical_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            column_name: name.into(),
+            ordinal_position: Some(1),
             xdbc_type_name: Some(public_snowflake_type_name(logical_type)),
             xdbc_column_size: Some(38),
             xdbc_decimal_digits: Some(0),
             xdbc_num_prec_radix: Some(10),
             xdbc_nullable: Some(1),
-            column_default: None,
-            xdbc_char_octet_length: None,
             xdbc_is_nullable: Some("YES".into()),
+            ..ColumnInfo::default()
         }
     }
 
@@ -1333,14 +1301,14 @@ mod tests {
             .unwrap()
             .tables;
         let mut amount = column("amount", "FIXED");
-        amount.ordinal_position = 2;
+        amount.ordinal_position = Some(2);
         amount.remarks = Some("a numeric value".into());
-        amount.column_default = Some("0".into());
+        amount.xdbc_column_def = Some("0".into());
         amount.xdbc_char_octet_length = Some(16);
         amount.xdbc_nullable = Some(0);
         amount.xdbc_is_nullable = Some("NO".into());
         let mut label = column("label", "TEXT");
-        label.ordinal_position = 4;
+        label.ordinal_position = Some(4);
         tables.insert(
             "wanted_view".into(),
             TableEntry {
@@ -1443,7 +1411,7 @@ mod tests {
             .enumerate()
             .map(|(index, name)| {
                 let mut entry = column(name, "FIXED");
-                entry.ordinal_position = i32::try_from(index + 1).unwrap();
+                entry.ordinal_position = Some(i32::try_from(index + 1).unwrap());
                 entry
             })
             .collect();
@@ -1466,7 +1434,7 @@ mod tests {
         retain_matching(&mut objects, None, None, None, Some("th_rd"), like_matches);
         let table = &objects.catalogs["database"].schemas["public"].tables["ORDINAL_TABLE"];
         assert_eq!(table.columns.len(), 1);
-        assert_eq!(table.columns[0].ordinal_position, 3);
+        assert_eq!(table.columns[0].ordinal_position, Some(3));
 
         let batch = object_batch(objects, ObjectDepth::Columns);
         let schemas = batch.column(1).as_list::<i32>().values().as_struct();
@@ -1542,11 +1510,11 @@ mod tests {
                 TableEntry {
                     table_type: "TABLE".into(),
                     columns: vec![column("id", "FIXED")],
-                    constraints: vec![ConstraintEntry {
-                        name: Some("PK".into()),
-                        constraint_type: "PRIMARY KEY",
-                        columns: vec!["id".into()],
-                        usage: Vec::new(),
+                    constraints: vec![ConstraintInfo {
+                        constraint_name: Some("PK".into()),
+                        constraint_type: "PRIMARY KEY".into(),
+                        constraint_column_names: vec!["id".into()],
+                        constraint_column_usage: None,
                     }],
                 },
             );
@@ -1745,10 +1713,40 @@ mod tests {
     }
 
     #[test]
+    fn filtered_column_discovery_narrows_second_phase_to_matching_schemas() {
+        let mut objects = ObjectTree::default();
+        let catalog = objects.catalogs.entry("DB_1".into()).or_default();
+        let matching = catalog.schemas.entry("MATCHING".into()).or_default();
+        matching.tables.insert(
+            "T".into(),
+            TableEntry {
+                columns: vec![column("INTS", "FIXED")],
+                ..TableEntry::default()
+            },
+        );
+        matching
+            .tables
+            .insert("NO_COLUMNS".into(), TableEntry::default());
+        catalog
+            .schemas
+            .entry("OTHER".into())
+            .or_default()
+            .tables
+            .insert("NO_MATCH".into(), TableEntry::default());
+
+        assert_eq!(
+            matching_column_scopes(&mut objects),
+            [MetadataScope::Schema("DB_1".into(), "MATCHING".into())]
+        );
+        assert_eq!(objects.catalogs["DB_1"].schemas["MATCHING"].tables.len(), 1);
+        assert!(objects.catalogs["DB_1"].schemas["OTHER"].tables.is_empty());
+    }
+
+    #[test]
     fn exact_filters_treat_wildcards_as_literal_and_preserve_case() {
         assert_eq!(exact_core_filter(r"A_%\B"), r"A\_\%\\B");
-        // Table filters are escaped for sf_core; column filters are applied
-        // locally so SHOW COLUMNS cannot renumber their ordinal positions.
+        // Exact filters are escaped for sf_core's discovery query; the
+        // unfiltered second query preserves the original column ordinals.
         assert_eq!(core_filter("T_%", true).as_deref(), Some(r"T\_\%"));
         assert_eq!(core_filter(r"A\B", false), None);
         let mut objects = parent_tree();
@@ -1761,7 +1759,7 @@ mod tests {
             .unwrap()
             .tables;
         let mut third_column = column("col_%!", "TEXT");
-        third_column.ordinal_position = 3;
+        third_column.ordinal_position = Some(3);
         tables.insert(
             "T_%".into(),
             TableEntry {
@@ -1783,8 +1781,8 @@ mod tests {
         let tables = &objects.catalogs["database"].schemas["public"].tables;
         assert_eq!(tables.len(), 1);
         assert_eq!(tables["T_%"].columns.len(), 1);
-        assert_eq!(tables["T_%"].columns[0].name, "col_%!");
-        assert_eq!(tables["T_%"].columns[0].ordinal_position, 3);
+        assert_eq!(tables["T_%"].columns[0].column_name, "col_%!");
+        assert_eq!(tables["T_%"].columns[0].ordinal_position, Some(3));
 
         let batch = object_batch(objects, ObjectDepth::Columns);
         let schemas = batch.column(1).as_list::<i32>().values().as_struct();
@@ -1839,11 +1837,11 @@ mod tests {
                 TableEntry {
                     table_type: "TABLE".into(),
                     columns: vec![column("A", "TEXT")],
-                    constraints: vec![ConstraintEntry {
-                        name: Some("PK".into()),
-                        constraint_type: "PRIMARY KEY",
-                        columns: vec!["A".into()],
-                        usage: Vec::new(),
+                    constraints: vec![ConstraintInfo {
+                        constraint_name: Some("PK".into()),
+                        constraint_type: "PRIMARY KEY".into(),
+                        constraint_column_names: vec!["A".into()],
+                        constraint_column_usage: None,
                     }],
                 },
             );
@@ -1857,7 +1855,7 @@ mod tests {
         );
         let table = &objects.catalogs["database"].schemas["public"].tables[r"literal\table"];
         assert!(table.columns.is_empty());
-        assert_eq!(table.constraints[0].name.as_deref(), Some("PK"));
+        assert_eq!(table.constraints[0].constraint_name.as_deref(), Some("PK"));
         let batch = object_batch(objects, ObjectDepth::Columns);
         let schemas = batch.column(1).as_list::<i32>().values().as_struct();
         let tables = schemas.column(1).as_list::<i32>().values().as_struct();
@@ -1982,6 +1980,30 @@ mod tests {
         let mut reader = single_batch_reader(fk_batch);
         let rows = collect_constraints(reader.as_mut(), &objects, ConstraintKind::Foreign).unwrap();
         attach_constraint_rows(&mut objects, rows);
+        assert_eq!(
+            objects
+                .get_constraints("database", "public", "child")
+                .unwrap(),
+            vec![ConstraintInfo {
+                constraint_name: Some("FK_CHILD".into()),
+                constraint_type: "FOREIGN KEY".into(),
+                constraint_column_names: vec!["ref1".into(), "ref2".into()],
+                constraint_column_usage: Some(vec![
+                    ConstraintColumnUsage {
+                        fk_catalog: Some("database".into()),
+                        fk_db_schema: Some("public".into()),
+                        fk_table: "parent".into(),
+                        fk_column_name: "id1".into(),
+                    },
+                    ConstraintColumnUsage {
+                        fk_catalog: Some("database".into()),
+                        fk_db_schema: Some("public".into()),
+                        fk_table: "parent".into(),
+                        fk_column_name: "id2".into(),
+                    },
+                ]),
+            }]
+        );
 
         let batch = object_batch(objects, ObjectDepth::All);
         assert_eq!(batch.schema(), schemas::GET_OBJECTS_SCHEMA.clone());
