@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -925,6 +926,11 @@ func extractSRIDFromMeta(metadata string) (int, string) {
 	return 0, meta.Edges
 }
 
+// Match gosnowflake's file-transfer detection. File transfers reuse the
+// context for follow-up requests after gosnowflake has closed the query-ID
+// channel and would cause a crash otherwise.
+var fileTransferPattern = regexp.MustCompile(`(?i)^(?:/\*.*\*/\s*)*\s*(?:put|get)\s+`)
+
 // captureQueryID records the server ID without waiting when the request failed
 // before Snowflake returned a response. gosnowflake sends and closes the channel.
 func (st *statement) captureQueryID(ids <-chan string, err error) {
@@ -942,6 +948,9 @@ func (st *statement) captureQueryID(ids <-chan string, err error) {
 
 func (st *statement) queryArrowStream(ctx context.Context, params ...driver.NamedValue) (gosnowflake.ArrowStreamLoader, error) {
 	st.lastQueryID.Store(nil)
+	if fileTransferPattern.MatchString(st.query) {
+		return st.cnxn.cn.QueryArrowStream(gosnowflake.WithQueryIDChan(ctx, nil), st.query, params...)
+	}
 	ids := make(chan string, 1)
 	loader, err := st.cnxn.cn.QueryArrowStream(gosnowflake.WithQueryIDChan(ctx, ids), st.query, params...)
 	st.captureQueryID(ids, err)
@@ -950,6 +959,9 @@ func (st *statement) queryArrowStream(ctx context.Context, params ...driver.Name
 
 func (st *statement) execSQL(ctx context.Context, params []driver.NamedValue) (driver.Result, error) {
 	st.lastQueryID.Store(nil)
+	if fileTransferPattern.MatchString(st.query) {
+		return st.cnxn.cn.ExecContext(gosnowflake.WithQueryIDChan(ctx, nil), st.query, params)
+	}
 	ids := make(chan string, 1)
 	result, err := st.cnxn.cn.ExecContext(gosnowflake.WithQueryIDChan(ctx, ids), st.query, params)
 	st.captureQueryID(ids, err)
