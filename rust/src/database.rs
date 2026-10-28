@@ -527,8 +527,7 @@ impl Optionable for Database {
                         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("adbc.")) =>
             {
                 let session_value = database_option_as_string(key_str, &value)?;
-                self.session_parameters
-                    .insert(key_str.to_owned(), session_value.to_owned());
+                self.set_session_parameter(key_str.to_owned(), session_value.to_owned());
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -662,7 +661,11 @@ impl Optionable for Database {
             return Ok(if enabled { "enabled" } else { "disabled" }.to_string());
         }
         let param = adbc_db_param(key_str).ok();
-        if let Some(value) = self.session_parameters.get(key_str) {
+        if let Some((_, value)) = self
+            .session_parameters
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(key_str))
+        {
             return Ok(value.clone());
         }
         if let Some(value) = param.and_then(|param| self.duration_options.get(param)) {
@@ -733,6 +736,13 @@ impl Optionable for Database {
 }
 
 impl Database {
+    /// Snowflake parameter names are case-insensitive: the last spelling set wins.
+    fn set_session_parameter(&mut self, key: String, value: String) {
+        self.session_parameters
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+        self.session_parameters.insert(key, value);
+    }
+
     /// Build the single login map. Go normalizes parameter names to uppercase
     /// when sending them; driver-owned result/geo options always take precedence.
     fn login_session_parameters(&self) -> HashMap<String, String> {
@@ -909,8 +919,7 @@ impl Database {
                     {
                         return Err(unrecognized_option(&key));
                     } else {
-                        self.session_parameters
-                            .insert(key.into_owned(), value.into_owned());
+                        self.set_session_parameter(key.into_owned(), value.into_owned());
                     }
                 }
             }
@@ -2523,6 +2532,35 @@ mod tests {
             db.get_option_string(OptionDatabase::Other("query_tag".into()))
                 .unwrap(),
             "hello world"
+        );
+    }
+
+    #[test]
+    fn session_parameter_names_are_case_insensitive_and_last_set_wins() {
+        let mut db = make_db();
+        for (key, value) in [
+            ("MY_SESSION_PARAM", "first"),
+            ("my_session_param", "second"),
+        ] {
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+        }
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("snowflake://myaccount?week_start=1&WEEK_START=3".into()),
+        )
+        .unwrap();
+        let login = db.login_session_parameters();
+        assert_eq!(login["MY_SESSION_PARAM"], "second");
+        assert_eq!(login["WEEK_START"], "3");
+        assert_eq!(db.session_parameters.len(), 2);
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other("My_Session_Param".into()))
+                .unwrap(),
+            "second"
         );
     }
 

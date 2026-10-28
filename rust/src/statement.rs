@@ -1897,6 +1897,19 @@ fn write_json_bind_value(out: &mut String, col: &dyn Array, row: usize, uuid: bo
     Ok(())
 }
 
+/// An `arrow.uuid` parameter (possibly dictionary-encoded), bound as UUID text.
+fn is_arrow_uuid_bind(field: &Field) -> bool {
+    let value_type = match field.data_type() {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        data_type => data_type,
+    };
+    matches!(value_type, DataType::FixedSizeBinary(16))
+        && field
+            .metadata()
+            .get("ARROW:extension:name")
+            .is_some_and(|name| name == "arrow.uuid")
+}
+
 pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<String> {
     let Some(first) = batches.first() else {
         return Ok("{}".to_string());
@@ -1904,13 +1917,19 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
     let schema = first.schema();
     // A bind_stream reader can yield batches that disagree with its first
     // batch; reject them instead of indexing past the end or mislabeling types.
+    // UUID tagging lives in field metadata and changes the encoding, so it must
+    // match as well as the storage type.
     for (index, batch) in batches.iter().enumerate().skip(1) {
         let matches = batch.num_columns() == first.num_columns()
             && batch
-                .columns()
+                .schema()
+                .fields()
                 .iter()
                 .zip(schema.fields())
-                .all(|(column, field)| column.data_type() == field.data_type());
+                .all(|(field, expected)| {
+                    field.data_type() == expected.data_type()
+                        && is_arrow_uuid_bind(field) == is_arrow_uuid_bind(expected)
+                });
         if !matches {
             return Err(SnowflakeError::invalid_data()
                 .format(format_args!(
@@ -1932,11 +1951,7 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
             DataType::Dictionary(_, value_type) => value_type.as_ref(),
             data_type => data_type,
         };
-        let uuid = matches!(value_type, DataType::FixedSizeBinary(16))
-            && field
-                .metadata()
-                .get("ARROW:extension:name")
-                .is_some_and(|name| name == "arrow.uuid");
+        let uuid = is_arrow_uuid_bind(field);
         let snowflake_type = if uuid {
             "TEXT"
         } else {
@@ -3331,6 +3346,30 @@ pub(crate) mod tests {
         );
         assert!(undeclared.next().unwrap().is_ok());
         assert!(undeclared.next().unwrap().is_err());
+    }
+
+    #[test]
+    fn json_bindings_reject_batches_that_change_uuid_tagging() {
+        let batch = |uuid: bool| {
+            let mut field = Field::new("id", DataType::FixedSizeBinary(16), false);
+            if uuid {
+                field = field
+                    .with_metadata([("ARROW:extension:name".into(), "arrow.uuid".into())].into());
+            }
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field])),
+                vec![Arc::new(
+                    arrow_array::FixedSizeBinaryArray::try_from_iter([[7u8; 16]].into_iter())
+                        .unwrap(),
+                )],
+            )
+            .unwrap()
+        };
+        for (first, later) in [(true, false), (false, true)] {
+            let error = arrow_batches_to_json_bindings(&[batch(first), batch(later)]).unwrap_err();
+            assert_eq!(error.status, Status::InvalidData);
+        }
+        assert!(arrow_batches_to_json_bindings(&[batch(true), batch(true)]).is_ok());
     }
 
     #[test]
