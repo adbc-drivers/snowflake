@@ -1510,7 +1510,7 @@ dependencies = [
 [[package]]
 name = "error_trace"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 dependencies = [
  "error_trace_derive",
  "snafu 0.8.9",
@@ -1519,7 +1519,7 @@ dependencies = [
 [[package]]
 name = "error_trace_derive"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -3363,7 +3363,7 @@ dependencies = [
 [[package]]
 name = "proto_generator"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 dependencies = [
  "clap",
  "env_logger",
@@ -3380,7 +3380,7 @@ dependencies = [
 [[package]]
 name = "proto_utils"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 
 [[package]]
 name = "ptr_meta"
@@ -3740,7 +3740,7 @@ dependencies = [
 [[package]]
 name = "rustls-webpki"
 version = "0.103.16"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3924,7 +3924,7 @@ dependencies = [
 [[package]]
 name = "sf_core"
 version = "0.1.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4017,7 +4017,7 @@ dependencies = [
 [[package]]
 name = "sf_params_spec"
 version = "0.0.0"
-source = "git+https://github.com/snowflakedb/universal-driver?rev=fcebbccd845e6b6f8589eb20f84f95a60ba82ea4#fcebbccd845e6b6f8589eb20f84f95a60ba82ea4"
+source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
 
 [[package]]
 name = "sha1"

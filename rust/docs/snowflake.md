@@ -98,10 +98,11 @@ Examples:
 
 Database options use the same keys and values as the Go Snowflake driver, including the `adbc.snowflake.sql.auth_type` values (`auth_snowflake`, `auth_oauth`, `auth_ext_browser`, `auth_okta`, `auth_jwt`, `auth_mfa`, `auth_pat`, `auth_wif`). Durations such as `login_timeout` accept Go duration strings (for example `30s` or `1m30s`) and are rounded up to whole seconds.
 
-Setting an option the driver does not recognize, or one it cannot honor, fails with `NOT_IMPLEMENTED` instead of being ignored. The following Go driver options are rejected for this reason: `adbc.snowflake.sql.region`, `adbc.snowflake.sql.client_option.ocsp_fail_open_mode`, `adbc.snowflake.sql.client_option.jwt_expire_timeout`, `adbc.snowflake.sql.client_option.tracing`, `adbc.snowflake.sql.client_option.config_file`, `adbc.snowflake.sql.client_option.use_high_precision`, `adbc.snowflake.sql.client_option.stream_retry_enabled`, `adbc.rpc.result_queue_size`, and `adbc.snowflake.rpc.prefetch_concurrency`. Invalid values for recognized options fail with `INVALID_ARGUMENT`.
+Unrecognized database option names outside the `adbc.` namespace are string-valued Snowflake session parameters: they are returned by `GetOption` and sent at login with names uppercased (as in Go). URI query keys not recognized as gosnowflake configuration are also session parameters; recognized configuration keys the Rust driver cannot honor fail with `NOT_IMPLEMENTED` rather than being sent to Snowflake. The driver always overrides user-supplied `PYTHON_CONNECTOR_QUERY_RESULT_FORMAT` with `ARROW_FORCE` and `GEOGRAPHY_OUTPUT_FORMAT` / `GEOMETRY_OUTPUT_FORMAT` with their corresponding explicit format options (default `GEOJSON`). Unknown `adbc.` options still fail with `NOT_IMPLEMENTED`, as do unsupported Go driver options including `adbc.snowflake.sql.region`, `adbc.snowflake.sql.client_option.ocsp_fail_open_mode`, `adbc.snowflake.sql.client_option.tracing`, `adbc.snowflake.sql.client_option.config_file`, `adbc.snowflake.sql.client_option.use_high_precision`, and `adbc.snowflake.sql.client_option.stream_retry_enabled`. Invalid values for recognized options and non-string session parameter values fail with `INVALID_ARGUMENT`.
 
 ### Database and Connection Options
 
+- `adbc.snowflake.sql.client_option.jwt_expire_timeout`: lifetime of the key-pair (`auth_jwt`) JWT, as a Go duration or seconds. `0` selects the default of 120 seconds (Go's default is 60 seconds).
 - `adbc.snowflake.sql.client_option.max_timestamp_precision`: `nanoseconds` (default), `nanoseconds_error_on_overflow`, or `microseconds`. Also settable per statement.
 - `adbc.snowflake.sql.client_option.geography_output_format` / `adbc.snowflake.sql.client_option.geometry_output_format`: `GeoJSON` (default) or `EWKB`, case-insensitive. Setting either on a connection applies it to the current session with `ALTER SESSION`. With `EWKB`, GEOGRAPHY and GEOMETRY columns are returned as binary `geoarrow.wkb` extension arrays; with `GeoJSON` they are strings.
 - `adbc.connection.get_objects.match_exactly`: connection-only option, `false` (default) or `true`. When true, GetObjects catalog, schema, table, and column filters match literal names case-sensitively, including `%` and `_`; invalid values fail with `INVALID_ARGUMENT`. Without it, filters retain case-insensitive LIKE wildcard semantics.
@@ -113,6 +114,8 @@ At `columns` and `all` depths, the adapter retains original column ordinal posit
 ### Statement Options
 
 - `adbc.snowflake.statement.query_timeout`: per-statement query timeout in seconds. Accepts a non-negative integer or a string such as `"30"` or `"30s"`. Set it to `0` to clear the override and use the Snowflake session/default timeout.
+- `adbc.snowflake.rpc.prefetch_concurrency`: number of result chunks downloaded and decoded concurrently (positive integer). When unset, the session's `CLIENT_PREFETCH_THREADS` applies (default 4), which `GetOption` reports.
+- `adbc.rpc.result_queue_size`: maximum number of decoded record batches buffered ahead of the reader (positive integer). Unlike Go, which bounds batches per result stream, this bounds the total across chunks; a chunk with more batches than the limit is still admitted on its own. When unset there is no batch limit beyond the prefetch window, and `GetOption` fails with `NOT_FOUND`.
 
 ### Bulk Ingestion Options
 

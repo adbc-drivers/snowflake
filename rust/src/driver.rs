@@ -415,6 +415,7 @@ impl adbc_core::Driver for Driver {
             trace_parent: None,
             traces_exporter: None,
             traces_folder_path: None,
+            session_parameters: Default::default(),
         };
         for (key, value) in opts {
             db.set_option(key, value)?;

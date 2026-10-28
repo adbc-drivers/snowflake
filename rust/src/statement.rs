@@ -29,6 +29,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use driverbase::{bulk_ingest::BulkIngestState, error::ErrorHelper};
 use sf_core::apis::database_driver_v1::{BindingType, ColumnMetadata, DataPtr, Handle};
 use sf_core::apis::operation_ctx::OperationCtx;
+use sf_core::chunks::DEFAULT_PREFETCH_THREADS;
 use sf_core::config::{param_registry::param_names, settings::Setting};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -65,6 +66,29 @@ fn parse_query_timeout(value: &OptionValue) -> Result<Option<u32>> {
     Ok((seconds != 0).then_some(seconds))
 }
 
+/// Go's statement options for result fetching, mapped to sf_core's
+/// per-statement `CLIENT_PREFETCH_THREADS` and `CLIENT_RESULT_QUEUE_SIZE`.
+const PREFETCH_CONCURRENCY_OPTION: &str = "adbc.snowflake.rpc.prefetch_concurrency";
+const RESULT_QUEUE_SIZE_OPTION: &str = "adbc.rpc.result_queue_size";
+
+fn parse_positive_int(key: &str, value: &OptionValue) -> Result<i64> {
+    let number = match value {
+        OptionValue::Int(value) => Some(*value),
+        OptionValue::String(value) => value.trim().parse::<i64>().ok(),
+        _ => {
+            return Err(SnowflakeError::set_invalid_option(&key, value)
+                .message("must be a string or int")
+                .into());
+        }
+    };
+    match number {
+        Some(number) if number > 0 => Ok(number),
+        _ => Err(SnowflakeError::set_invalid_option(&key, value)
+            .message("must be a positive integer")
+            .into()),
+    }
+}
+
 /// Data supplied by bind()/bind_stream(). Empty means nothing is bound.
 pub(crate) enum Bound {
     Empty,
@@ -84,6 +108,8 @@ pub struct Statement {
     pub(crate) ingest_state: BulkIngestState<SnowflakeError>,
     pub(crate) query_tag: Option<String>,
     pub(crate) query_timeout_seconds: Option<u32>,
+    pub(crate) prefetch_concurrency: Option<i64>,
+    pub(crate) result_queue_size: Option<i64>,
     pub(crate) timestamp_precision: TimestampPrecision,
     pub(crate) ingest_options: crate::ingest::IngestOptions,
     pub(crate) bound: Bound,
@@ -196,6 +222,30 @@ impl Optionable for Statement {
                         .into())
                 }
             }
+            OptionStatement::Other(ref k)
+                if k == PREFETCH_CONCURRENCY_OPTION || k == RESULT_QUEUE_SIZE_OPTION =>
+            {
+                let value = parse_positive_int(k, &value)?;
+                let prefetch = k == PREFETCH_CONCURRENCY_OPTION;
+                let param = if prefetch {
+                    param_names::CLIENT_PREFETCH_THREADS
+                } else {
+                    param_names::CLIENT_RESULT_QUEUE_SIZE
+                };
+                self.inner
+                    .block_on(self.inner.sf.statement_set_option(
+                        self.stmt_handle,
+                        param.into(),
+                        Setting::Int(value),
+                    ))
+                    .map_err(crate::error::api_error_to_adbc_error)?;
+                if prefetch {
+                    self.prefetch_concurrency = Some(value);
+                } else {
+                    self.result_queue_size = Some(value);
+                }
+                Ok(())
+            }
             OptionStatement::Other(ref k) if self.ingest_options.set(k, &value)? => Ok(()),
             _ => Err(SnowflakeError::set_unknown_option(&key.as_ref()).into()),
         }
@@ -219,6 +269,11 @@ impl Optionable for Statement {
                         SnowflakeError::not_found().message("no query has been executed yet"),
                     )
                 })
+            }
+            OptionStatement::Other(k)
+                if k == PREFETCH_CONCURRENCY_OPTION || k == RESULT_QUEUE_SIZE_OPTION =>
+            {
+                self.result_tuning_value(k).map(|value| value.to_string())
             }
             OptionStatement::Other(k)
                 if k == "adbc.snowflake.sql.client_option.max_timestamp_precision" =>
@@ -250,6 +305,11 @@ impl Optionable for Statement {
         match &key {
             OptionStatement::Other(k) if k == QUERY_TIMEOUT_OPTION => {
                 Ok(i64::from(self.query_timeout_seconds.unwrap_or(0)))
+            }
+            OptionStatement::Other(k)
+                if k == PREFETCH_CONCURRENCY_OPTION || k == RESULT_QUEUE_SIZE_OPTION =>
+            {
+                self.result_tuning_value(k)
             }
             OptionStatement::Other(k) => self
                 .ingest_options
@@ -336,6 +396,39 @@ impl Statement {
 
     fn execution_timeout_seconds(&self) -> Option<u32> {
         self.query_timeout_seconds
+    }
+
+    /// The value in effect for a result fetch tuning option. An unset prefetch
+    /// concurrency reports the session's value.
+    fn result_tuning_value(&self, key: &str) -> Result<i64> {
+        if key == PREFETCH_CONCURRENCY_OPTION {
+            return match self.prefetch_concurrency {
+                Some(value) => Ok(value),
+                None => self.session_prefetch_threads(),
+            };
+        }
+        self.result_queue_size.ok_or_else(|| {
+            SnowflakeError::not_found()
+                .message("result_queue_size is not set")
+                .into()
+        })
+    }
+
+    fn session_prefetch_threads(&self) -> Result<i64> {
+        let setting = self
+            .inner
+            .block_on(self.inner.sf.connection_get_parameter(
+                self.conn_handle,
+                param_names::CLIENT_PREFETCH_THREADS.into(),
+            ))
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        Ok(match setting {
+            Some(Setting::Int(value)) => value,
+            Some(Setting::String(value)) => {
+                value.parse().unwrap_or(DEFAULT_PREFETCH_THREADS as i64)
+            }
+            _ => DEFAULT_PREFETCH_THREADS as i64,
+        })
     }
 
     fn effective_trace_parent(&self) -> Option<&str> {
@@ -1580,9 +1673,10 @@ fn snowflake_type_name(dt: &DataType) -> Result<&'static str> {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64
-        | DataType::Decimal128(_, _) => Ok("FIXED"),
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => Ok("FIXED"),
         DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok("REAL"),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("TEXT"),
+        DataType::Null | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("TEXT"),
         DataType::Boolean => Ok("BOOLEAN"),
         DataType::Date32 | DataType::Date64 => Ok("DATE"),
         DataType::Binary
@@ -1615,10 +1709,10 @@ fn escape_json_string_to(out: &mut String, s: &str) {
 }
 
 /// Write a non-null bind value directly where its Arrow storage permits it.
-fn write_json_bind_value(out: &mut String, col: &dyn Array, row: usize) -> Result<()> {
+fn write_json_bind_value(out: &mut String, col: &dyn Array, row: usize, uuid: bool) -> Result<()> {
     use arrow_array::*;
     let dt = col.data_type();
-    if col.is_null(row) {
+    if matches!(dt, DataType::Null) || col.is_null(row) {
         out.push_str("null");
         return Ok(());
     }
@@ -1714,6 +1808,19 @@ fn write_json_bind_value(out: &mut String, col: &dyn Array, row: usize) -> Resul
                 .value(row)
         )
         .unwrap(),
+        DataType::FixedSizeBinary(16) if uuid => {
+            let bytes = col
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(row);
+            write!(
+                out,
+                "{}",
+                uuid::Uuid::from_bytes(bytes.try_into().expect("UUID storage is 16 bytes"))
+            )
+            .expect("String write cannot fail");
+        }
         DataType::Binary
         | DataType::LargeBinary
         | DataType::FixedSizeBinary(_)
@@ -1820,11 +1927,26 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
         if col_idx != 0 {
             json.push(',');
         }
+        let field = schema.field(col_idx);
+        let value_type = match field.data_type() {
+            DataType::Dictionary(_, value_type) => value_type.as_ref(),
+            data_type => data_type,
+        };
+        let uuid = matches!(value_type, DataType::FixedSizeBinary(16))
+            && field
+                .metadata()
+                .get("ARROW:extension:name")
+                .is_some_and(|name| name == "arrow.uuid");
+        let snowflake_type = if uuid {
+            "TEXT"
+        } else {
+            snowflake_type_name(value_type)?
+        };
         write!(
             json,
             "\"{}\":{{\"type\":\"{}\",\"value\":",
             col_idx + 1,
-            snowflake_type_name(schema.field(col_idx).data_type())?
+            snowflake_type
         )
         .expect("String write cannot fail");
         if total_rows != 1 {
@@ -1833,11 +1955,23 @@ pub(crate) fn arrow_batches_to_json_bindings(batches: &[RecordBatch]) -> Result<
         let mut emitted = 0;
         for batch in batches {
             let col = batch.column(col_idx);
+            let decoded;
+            let col: &dyn Array = if matches!(col.data_type(), DataType::Dictionary(..)) {
+                decoded = arrow_cast::cast(col.as_ref(), value_type).map_err(|error| {
+                    Error::from(SnowflakeError::invalid_data().format(format_args!(
+                        "cannot decode bound dictionary column {}: {error}",
+                        field.name()
+                    )))
+                })?;
+                decoded.as_ref()
+            } else {
+                col.as_ref()
+            };
             for row in 0..batch.num_rows() {
                 if emitted != 0 {
                     json.push(',');
                 }
-                write_json_bind_value(&mut json, col.as_ref(), row)?;
+                write_json_bind_value(&mut json, col, row, uuid)?;
                 emitted += 1;
             }
         }
@@ -1883,6 +2017,14 @@ fn format_arrow_value(arr: &dyn Array, row: usize, dt: &DataType) -> Result<Opti
                 .unwrap()
                 .value(row);
             Ok(Some(decimal128_to_string(val, *scale)))
+        }
+        DataType::Decimal256(_, scale) => {
+            let val = arr
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .unwrap()
+                .value(row);
+            Ok(Some(decimal256_to_string(val, *scale)))
         }
         DataType::Time32(TimeUnit::Second) => {
             let v = arr
@@ -1979,6 +2121,23 @@ fn decimal128_to_string(value: i128, scale: i8) -> String {
     )
 }
 
+fn decimal256_to_string(value: arrow_buffer::i256, scale: i8) -> String {
+    let mut text = value.to_string();
+    if scale < 0 {
+        text.extend(std::iter::repeat_n('0', scale.unsigned_abs() as usize));
+    } else if scale > 0 {
+        let sign_len = usize::from(value.is_negative());
+        let digits = text.len() - sign_len;
+        let scale = scale as usize;
+        if digits <= scale {
+            text.insert_str(sign_len, &format!("0.{}", "0".repeat(scale - digits)));
+        } else {
+            text.insert(text.len() - scale, '.');
+        }
+    }
+    text
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2023,6 +2182,8 @@ pub(crate) mod tests {
             ingest_state: BulkIngestState::new(),
             query_tag: None,
             query_timeout_seconds: None,
+            prefetch_concurrency: None,
+            result_queue_size: None,
             timestamp_precision: TimestampPrecision::Nanoseconds,
             ingest_options: crate::ingest::IngestOptions::default(),
             bound: Bound::Empty,
@@ -3629,6 +3790,353 @@ pub(crate) mod tests {
             .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             .unwrap();
         assert_eq!(timestamps.value(0), 1_500_000_000);
+    }
+
+    #[test]
+    fn json_bindings_null_and_decimal256() {
+        use arrow_buffer::i256;
+        let large: i256 = "123456789012345678901234567890123456789".parse().unwrap();
+        let decimals =
+            arrow_array::Decimal256Array::from(vec![Some(large), Some(i256::from_i128(-5)), None])
+                .with_precision_and_scale(39, 2)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("null", DataType::Null, true),
+            Field::new("decimal", DataType::Decimal256(39, 2), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::NullArray::new(3)), Arc::new(decimals)],
+        )
+        .unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[batch]).unwrap(),
+            r#"{"1":{"type":"TEXT","value":[null,null,null]},"2":{"type":"FIXED","value":["1234567890123456789012345678901234567.89","-0.05",null]}}"#
+        );
+        let negative_scale =
+            arrow_array::Decimal256Array::from(vec![Some(i256::from_i128(-12)), None])
+                .with_precision_and_scale(10, -2)
+                .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "decimal",
+                DataType::Decimal256(10, -2),
+                true,
+            )])),
+            vec![Arc::new(negative_scale)],
+        )
+        .unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[batch]).unwrap(),
+            r#"{"1":{"type":"FIXED","value":["-1200",null]}}"#
+        );
+    }
+
+    #[test]
+    fn json_bindings_uuid_extension_and_plain_binary() {
+        use arrow_array::FixedSizeBinaryArray;
+        let bytes: &[u8] = &[
+            0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab,
+            0xcd, 0xef,
+        ];
+        let ids = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(bytes), None].into_iter(),
+            16,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("uuid", DataType::FixedSizeBinary(16), true)
+                .with_metadata([("ARROW:extension:name".into(), "arrow.uuid".into())].into()),
+            Field::new("binary", DataType::FixedSizeBinary(16), true),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(ids.clone()), Arc::new(ids)]).unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[batch]).unwrap(),
+            r#"{"1":{"type":"TEXT","value":["12345678-90ab-cdef-1234-567890abcdef",null]},"2":{"type":"BINARY","value":["1234567890abcdef1234567890abcdef",null]}}"#
+        );
+    }
+
+    #[test]
+    fn json_bindings_decode_dictionary_across_batches() {
+        use arrow_array::{DictionaryArray, Int8Array, StringArray, types::Int8Type};
+        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("one"), None, Some("three")]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(vec![Some(2), None]),
+                    values.clone(),
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(vec![Some(0), Some(1)]),
+                    values,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[first.clone(), second]).unwrap(),
+            r#"{"1":{"type":"TEXT","value":["three",null,"one",null]}}"#
+        );
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[first.slice(0, 1)]).unwrap(),
+            r#"{"1":{"type":"TEXT","value":"three"}}"#
+        );
+    }
+
+    #[test]
+    fn json_bindings_decode_dictionary_decimal_uuid_and_null() {
+        use arrow_array::{
+            Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Int8Array, NullArray,
+            types::Int8Type,
+        };
+        use arrow_buffer::i256;
+        let keys = Int8Array::from(vec![Some(0), None]);
+        let decimal = Decimal256Array::from(vec![i256::from_i128(-5)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let uuid = FixedSizeBinaryArray::try_from_iter(
+            [
+                uuid::Uuid::parse_str("12345678-90ab-cdef-1234-567890abcdef")
+                    .unwrap()
+                    .into_bytes(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(keys.clone(), Arc::new(decimal)).unwrap(),
+            ),
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys.clone(), Arc::new(uuid)).unwrap()),
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(keys, Arc::new(NullArray::new(1))).unwrap(),
+            ),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("decimal", columns[0].data_type().clone(), true),
+            Field::new("uuid", columns[1].data_type().clone(), true)
+                .with_metadata([("ARROW:extension:name".into(), "arrow.uuid".into())].into()),
+            Field::new("null", columns[2].data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        assert_eq!(
+            arrow_batches_to_json_bindings(&[batch]).unwrap(),
+            r#"{"1":{"type":"FIXED","value":["-0.05",null]},"2":{"type":"TEXT","value":["12345678-90ab-cdef-1234-567890abcdef",null]},"3":{"type":"TEXT","value":[null,null]}}"#
+        );
+    }
+
+    #[test]
+    fn json_bindings_reject_unsupported_dictionary_values() {
+        use arrow_array::{DictionaryArray, Int8Array, ListArray, types::Int8Type};
+        let values: ArrayRef = Arc::new(ListArray::from_iter_primitive::<
+            arrow_array::types::Int32Type,
+            _,
+            _,
+        >(vec![Some(vec![Some(1)])]));
+        let dict =
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![Some(0)]), values).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "list",
+                dict.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(dict)],
+        )
+        .unwrap();
+        let error = arrow_batches_to_json_bindings(&[batch]).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(error.message.contains("List"));
+    }
+
+    #[test]
+    #[ignore = "requires SNOWFLAKE_URI and a live Snowflake connection"]
+    fn live_json_bind_types() {
+        use adbc_core::{
+            Connection as _, Database as _, Driver as _,
+            options::{OptionDatabase, OptionValue},
+        };
+        use arrow_array::{
+            Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Int8Array, NullArray,
+            RecordBatchIterator, StringArray, cast::AsArray, types::Int8Type,
+        };
+        use arrow_buffer::i256;
+        let uri = std::env::var("SNOWFLAKE_URI").expect("SNOWFLAKE_URI is required");
+        let mut driver = crate::Driver::default();
+        let mut db = driver.new_database().unwrap();
+        db.set_option(OptionDatabase::Uri, OptionValue::String(uri))
+            .unwrap();
+        for (env, option) in [
+            ("SNOWFLAKE_DATABASE", "adbc.snowflake.sql.db"),
+            ("SNOWFLAKE_SCHEMA", "adbc.snowflake.sql.schema"),
+        ] {
+            if let Ok(value) = std::env::var(env) {
+                db.set_option(
+                    OptionDatabase::Other(option.into()),
+                    OptionValue::String(value),
+                )
+                .unwrap();
+            }
+        }
+        let mut conn = db.new_connection().unwrap();
+        let uuid = uuid::Uuid::parse_str("12345678-90ab-cdef-1234-567890abcdef").unwrap();
+        let uuid_field = Field::new("uuid", DataType::FixedSizeBinary(16), true)
+            .with_metadata([("ARROW:extension:name".into(), "arrow.uuid".into())].into());
+        let decimal_field = Field::new("decimal", DataType::Decimal256(20, 2), true);
+        let dict_values: ArrayRef = Arc::new(StringArray::from(vec!["first", "second"]));
+        let dict = |keys: Vec<Option<i8>>| {
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(Int8Array::from(keys), dict_values.clone())
+                    .unwrap(),
+            ) as ArrayRef
+        };
+        let params = Arc::new(Schema::new(vec![
+            Field::new("null", DataType::Null, true),
+            decimal_field.clone(),
+            uuid_field.clone(),
+            Field::new(
+                "dict",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]));
+        let one = RecordBatch::try_new(
+            params.clone(),
+            vec![
+                Arc::new(NullArray::new(1)),
+                Arc::new(
+                    Decimal256Array::from(vec![i256::from_i128(1234)])
+                        .with_precision_and_scale(20, 2)
+                        .unwrap(),
+                ),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter([uuid.as_bytes().as_slice()].into_iter())
+                        .unwrap(),
+                ),
+                dict(vec![Some(0)]),
+            ],
+        )
+        .unwrap();
+        let two = RecordBatch::try_new(
+            params.clone(),
+            vec![
+                Arc::new(NullArray::new(1)),
+                Arc::new(
+                    Decimal256Array::from(vec![None::<i256>])
+                        .with_precision_and_scale(20, 2)
+                        .unwrap(),
+                ),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [None::<&[u8]>].into_iter(),
+                        16,
+                    )
+                    .unwrap(),
+                ),
+                dict(vec![Some(1)]),
+            ],
+        )
+        .unwrap();
+        for (sql, batch, expected) in [
+            ("SELECT ?", one.slice(0, 1), Some("first")),
+            ("SELECT ?", one.slice(0, 1), None),
+        ] {
+            let col = if expected.is_some() { 3 } else { 0 };
+            let mut stmt = conn.new_statement().unwrap();
+            stmt.set_sql_query(sql).unwrap();
+            stmt.bind(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![params.field(col).as_ref().clone()])),
+                    vec![batch.column(col).clone()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let row = stmt.execute().unwrap().next().unwrap().unwrap();
+            if let Some(value) = expected {
+                assert_eq!(row.column(0).as_string::<i32>().value(0), value);
+            } else {
+                assert!(row.column(0).is_null(0));
+            }
+        }
+        let mut decimal = conn.new_statement().unwrap();
+        decimal.set_sql_query("SELECT ?").unwrap();
+        decimal
+            .bind(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![decimal_field])),
+                    vec![one.column(1).clone()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let decimal_row = decimal.execute().unwrap().next().unwrap().unwrap();
+        let text = arrow_cast::cast(decimal_row.column(0), &DataType::Utf8).unwrap();
+        assert_eq!(text.as_string::<i32>().value(0), "12.34");
+        let mut select_uuid = conn.new_statement().unwrap();
+        select_uuid.set_sql_query("SELECT ?::UUID").unwrap();
+        select_uuid
+            .bind(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![uuid_field])),
+                    vec![one.column(2).clone()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let uuid_row = select_uuid.execute().unwrap().next().unwrap().unwrap();
+        assert_eq!(
+            uuid_row.column(0).as_string::<i32>().value(0),
+            "12345678-90ab-cdef-1234-567890abcdef"
+        );
+
+        let table = format!("ADBC_BIND_TYPES_{}", uuid::Uuid::new_v4().simple());
+        let mut create = conn.new_statement().unwrap();
+        create
+            .set_sql_query(format!(
+                "CREATE TEMP TABLE {table} (N VARCHAR, D NUMBER(20,2), U VARCHAR(36), T VARCHAR)"
+            ))
+            .unwrap();
+        create.execute_update().unwrap();
+        let mut insert = conn.new_statement().unwrap();
+        insert
+            .set_sql_query(format!("INSERT INTO {table} VALUES (?, ?, ?, ?)"))
+            .unwrap();
+        insert
+            .bind_stream(Box::new(RecordBatchIterator::new(
+                vec![Ok(one), Ok(two)].into_iter(),
+                params,
+            )))
+            .unwrap();
+        assert_eq!(insert.execute_update().unwrap(), Some(2));
+        let mut check = conn.new_statement().unwrap();
+        check
+            .set_sql_query(format!("SELECT N, D, U, T FROM {table} ORDER BY T"))
+            .unwrap();
+        let rows = check.execute().unwrap().next().unwrap().unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        assert!(rows.column(0).is_null(0) && rows.column(0).is_null(1));
+        assert_eq!(rows.column(2).as_string::<i32>().value(0), uuid.to_string());
+        assert_eq!(rows.column(3).as_string::<i32>().value(0), "first");
+        assert!(rows.column(1).is_null(1) && rows.column(2).is_null(1));
+        assert_eq!(rows.column(3).as_string::<i32>().value(1), "second");
+        let amounts = arrow_cast::cast(rows.column(1), &DataType::Utf8).unwrap();
+        assert_eq!(amounts.as_string::<i32>().value(0), "12.34");
     }
 
     #[test]
