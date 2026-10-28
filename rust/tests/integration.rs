@@ -15,7 +15,7 @@
 // tests/integration.rs
 use adbc_core::{
     Connection as _, Database as _, Driver as _, Optionable, Statement as _,
-    options::{ObjectDepth, OptionConnection, OptionDatabase, OptionValue},
+    options::{ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue},
 };
 use adbc_driver_snowflake::{Database, Driver};
 use arrow_array::Array;
@@ -1234,4 +1234,49 @@ fn test_geo_formats_and_session_timezone_follow_session_state() {
     );
     let schema = conn.get_table_schema(None, None, &table).unwrap();
     assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+}
+
+#[test]
+fn test_result_fetch_tuning_options() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let prefetch = OptionStatement::Other("adbc.snowflake.rpc.prefetch_concurrency".into());
+    let queue = OptionStatement::Other("adbc.rpc.result_queue_size".into());
+    let mut stmt = conn.new_statement().expect("new_statement");
+    assert!(
+        stmt.get_option_int(prefetch.clone())
+            .expect("session prefetch")
+            > 0
+    );
+    assert_eq!(
+        stmt.get_option_int(queue.clone()).unwrap_err().status,
+        adbc_core::error::Status::NotFound
+    );
+    for key in [&prefetch, &queue] {
+        let error = stmt
+            .set_option(key.clone(), OptionValue::Int(0))
+            .unwrap_err();
+        assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    }
+    stmt.set_option(prefetch.clone(), OptionValue::String("1".into()))
+        .expect("set prefetch");
+    stmt.set_option(queue.clone(), OptionValue::Int(1))
+        .expect("set queue");
+    assert_eq!(stmt.get_option_int(prefetch).unwrap(), 1);
+    assert_eq!(stmt.get_option_string(queue).unwrap(), "1");
+
+    // Large enough for several result chunks, each with more than one batch.
+    let rows = 300_000;
+    stmt.set_sql_query(format!(
+        "SELECT SEQ8() AS n, RANDSTR(64, RANDOM()) AS s FROM TABLE(GENERATOR(ROWCOUNT => {rows}))"
+    ))
+    .expect("set_sql_query");
+    let total: usize = stmt
+        .execute()
+        .expect("execute")
+        .map(|batch| batch.expect("batch").num_rows())
+        .sum();
+    assert_eq!(total, rows);
 }

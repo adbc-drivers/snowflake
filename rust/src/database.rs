@@ -26,6 +26,7 @@ use sf_core::apis::database_driver_v1::{
     Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
 };
 use sf_core::config::param_registry::{Wrapper, param_names, registry};
+use sf_core::config::rest_parameters::DEFAULT_JWT_TIMEOUT_SECS;
 use sf_core::config::settings::Setting;
 
 use crate::connection::{Connection, cleanup_connection_handle};
@@ -105,6 +106,15 @@ fn database_option_as_string<'v>(key: &str, value: &'v OptionValue) -> Result<&'
 fn unrecognized_option(key: &str) -> Error {
     SnowflakeError::set_unknown_option(&key)
         .context("set database option")
+        .into()
+}
+
+fn unsupported_uri_config(key: &str) -> Error {
+    SnowflakeError::not_implemented()
+        .context("set URI database option")
+        .format(format_args!(
+            "unsupported Snowflake URI configuration parameter '{key}'"
+        ))
         .into()
 }
 
@@ -271,6 +281,7 @@ fn adbc_db_param(key: &str) -> Result<&'static str> {
         "adbc.snowflake.sql.client_option.login_timeout" => param_names::LOGIN_TIMEOUT,
         "adbc.snowflake.sql.client_option.request_timeout" => param_names::REQUEST_TIMEOUT,
         "adbc.snowflake.sql.client_option.client_timeout" => param_names::RETRY_TIMEOUT,
+        "adbc.snowflake.sql.client_option.jwt_expire_timeout" => param_names::JWT_TIMEOUT,
         MAX_RETRY_COUNT => param_names::RETRY_MAX_ATTEMPTS,
         "adbc.snowflake.sql.client_option.tls_skip_verify" => param_names::TLS_SKIP_VERIFY,
         "adbc.snowflake.sql.client_option.tls_root_cert" => param_names::CUSTOM_ROOT_STORE_PATH,
@@ -330,6 +341,13 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         "adbc.snowflake.sql.client_option.login_timeout"
         | "adbc.snowflake.sql.client_option.request_timeout"
         | "adbc.snowflake.sql.client_option.client_timeout" => duration_setting(key, value)?,
+        // Like gosnowflake, a zero lifetime selects the default.
+        "adbc.snowflake.sql.client_option.jwt_expire_timeout" => {
+            match duration_setting(key, value)? {
+                Setting::Int(0) => Setting::Int(DEFAULT_JWT_TIMEOUT_SECS),
+                setting => setting,
+            }
+        }
         "adbc.snowflake.sql.client_option.tls_skip_verify"
         | "adbc.snowflake.sql.client_option.keep_session_alive"
         | CACHE_MFA_TOKEN
@@ -337,6 +355,20 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         | "adbc.snowflake.sql.client_option.validate_default_parameters" => {
             Setting::Bool(adbc_option_enabled(value)?)
         }
+        "passcodeInPassword"
+        | "oauth_enable_single_use_refresh_tokens"
+        | "workload_identity_aws_use_outbound_token"
+        | "log_query_text"
+        | "log_query_parameters"
+        | "disable_query_context_cache"
+        | "include_retry_reason"
+        | "disable_saml_url_check"
+        | "enable_connection_diag"
+        | "crl_allow_certificates_without_crl_url" => Setting::Bool(adbc_option_enabled(value)?),
+        "crl_enable_memory_caching" | "crl_enable_disk_caching" => {
+            Setting::Bool(adbc_option_enabled(value)?)
+        }
+        "crl_max_download_size" | "crl_http_timeout" => Setting::Int(non_negative_int(key, value)?),
         "adbc.snowflake.sql.client_option.disable_telemetry" => {
             Setting::Bool(!adbc_option_enabled(value)?)
         }
@@ -359,6 +391,8 @@ pub struct Database {
     /// Canonical sf_core settings already stored on the database handle. Used
     /// only for local getters and the bare-connection signal, never re-seeded.
     pub(crate) sf_settings: HashMap<String, Setting>,
+    /// Additional login session parameters; names are stored as supplied for GetOption.
+    pub(crate) session_parameters: HashMap<String, String>,
     pub(crate) auth_type: Option<&'static str>,
     pub(crate) okta_url: Option<String>,
     pub(crate) max_retry_count: Option<i64>,
@@ -484,12 +518,29 @@ impl Optionable for Database {
             self.max_retry_count = Some(retries);
             return Ok(());
         }
-        if let Some((param, setting)) = adbc_db_opt_to_sf(key_str, &value)? {
+        let mapped = match adbc_db_opt_to_sf(key_str, &value) {
+            Ok(mapped) => mapped,
+            Err(error)
+                if error.status == Status::NotImplemented
+                    && !key_str
+                        .get(..5)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("adbc.")) =>
+            {
+                let session_value = database_option_as_string(key_str, &value)?;
+                self.session_parameters
+                    .insert(key_str.to_owned(), session_value.to_owned());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some((param, setting)) = mapped {
             let credential_enabled = match &setting {
                 Setting::Bool(enabled) => Some(*enabled),
                 _ => None,
             };
             self.set_sf_option(param, setting)?;
+            self.session_parameters
+                .retain(|key, _| !key.eq_ignore_ascii_case(param));
             if key_str.eq_ignore_ascii_case(param_names::AUTHENTICATOR.as_str()) {
                 self.auth_type = None;
             }
@@ -519,6 +570,7 @@ impl Optionable for Database {
                     "adbc.snowflake.sql.client_option.login_timeout"
                         | "adbc.snowflake.sql.client_option.request_timeout"
                         | "adbc.snowflake.sql.client_option.client_timeout"
+                        | "adbc.snowflake.sql.client_option.jwt_expire_timeout"
                 )
             {
                 self.duration_options.insert(
@@ -529,7 +581,10 @@ impl Optionable for Database {
                         "adbc.snowflake.sql.client_option.request_timeout" => {
                             param_names::REQUEST_TIMEOUT.as_str()
                         }
-                        _ => param_names::RETRY_TIMEOUT.as_str(),
+                        "adbc.snowflake.sql.client_option.client_timeout" => {
+                            param_names::RETRY_TIMEOUT.as_str()
+                        }
+                        _ => param_names::JWT_TIMEOUT.as_str(),
                     },
                     duration.clone(),
                 );
@@ -607,6 +662,9 @@ impl Optionable for Database {
             return Ok(if enabled { "enabled" } else { "disabled" }.to_string());
         }
         let param = adbc_db_param(key_str).ok();
+        if let Some(value) = self.session_parameters.get(key_str) {
+            return Ok(value.clone());
+        }
         if let Some(value) = param.and_then(|param| self.duration_options.get(param)) {
             return Ok(value.clone());
         }
@@ -675,9 +733,32 @@ impl Optionable for Database {
 }
 
 impl Database {
+    /// Build the single login map. Go normalizes parameter names to uppercase
+    /// when sending them; driver-owned result/geo options always take precedence.
+    fn login_session_parameters(&self) -> HashMap<String, String> {
+        let mut parameters = self
+            .session_parameters
+            .iter()
+            .map(|(key, value)| (key.to_uppercase(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        parameters.insert(
+            "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".into(),
+            "ARROW_FORCE".into(),
+        );
+        parameters.insert(
+            "GEOGRAPHY_OUTPUT_FORMAT".into(),
+            self.geography_output_format.as_str().into(),
+        );
+        parameters.insert(
+            "GEOMETRY_OUTPUT_FORMAT".into(),
+            self.geometry_output_format.as_str().into(),
+        );
+        parameters
+    }
+
     /// Parse a Snowflake URI and apply each component as an individual option.
     /// Format: snowflake://[user[:password]@]host[/database[/schema]][?param=value&...]
-    /// Recognized query params: account, warehouse, role, host, port, protocol, authenticator
+    /// Other query params are Snowflake login session parameters.
     ///
     /// Limitations: passwords containing `@` are not supported; use `set_option` for
     /// Username/Password directly when credentials contain special characters.
@@ -778,30 +859,156 @@ impl Database {
             for pair in q.split('&') {
                 if let Some((key, encoded_value)) = pair.split_once('=') {
                     let key = decode_uri_component(key, "query parameter name")?;
-                    let adbc_key = match key.as_ref() {
-                        "account" => "adbc.snowflake.sql.account",
-                        "warehouse" => "adbc.snowflake.sql.warehouse",
-                        "role" => "adbc.snowflake.sql.role",
-                        "host" => "adbc.snowflake.sql.uri.host",
-                        "port" => "adbc.snowflake.sql.uri.port",
-                        "protocol" => "adbc.snowflake.sql.uri.protocol",
-                        "authenticator" => "authenticator",
-                        "private_key_file" => "adbc.snowflake.sql.client_option.jwt_private_key",
-                        "private_key" => {
-                            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value"
-                        }
-                        _ => continue,
-                    };
                     let value = decode_uri_component(encoded_value, "query parameter")?;
-                    self.set_option(
-                        OptionDatabase::Other(adbc_key.into()),
-                        OptionValue::String(value.into_owned()),
-                    )?;
+                    if let Some(option) = uri_query_option(&key)? {
+                        let value = match key.as_ref() {
+                            // gosnowflake's timeout DSN values are integral seconds.
+                            "loginTimeout"
+                            | "requestTimeout"
+                            | "clientTimeout"
+                            | "jwtTimeout"
+                            | "crlDownloadMaxSize"
+                            | "crlHttpClientTimeout" => OptionValue::Int(
+                                value
+                                    .parse::<i64>()
+                                    .map_err(|_| invalid_option_value(&key, &value))?,
+                            ),
+                            "crlInMemoryCacheDisabled" | "crlOnDiskCacheDisabled" => {
+                                OptionValue::String(
+                                    (!adbc_option_enabled(&OptionValue::String(
+                                        value.into_owned(),
+                                    ))?)
+                                    .to_string(),
+                                )
+                            }
+                            // Go's DSN uses URL-safe base64; sf_core accepts standard base64.
+                            "privateKey" => {
+                                OptionValue::String(value.replace('-', "+").replace('_', "/"))
+                            }
+                            "certRevocationCheckMode"
+                                if !matches!(
+                                    value.to_ascii_lowercase().as_str(),
+                                    "disabled" | "enabled" | "advisory"
+                                ) =>
+                            {
+                                return Err(invalid_option_value(&key, &value));
+                            }
+                            _ => OptionValue::String(value.into_owned()),
+                        };
+                        self.set_option(OptionDatabase::Other(option.into()), value)
+                            .map_err(|error| {
+                                if error.status == Status::NotImplemented {
+                                    unsupported_uri_config(&key)
+                                } else {
+                                    error
+                                }
+                            })?;
+                    } else if key
+                        .get(..5)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("adbc."))
+                    {
+                        return Err(unrecognized_option(&key));
+                    } else {
+                        self.session_parameters
+                            .insert(key.into_owned(), value.into_owned());
+                    }
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Match gosnowflake v2's parseDSNParams config keys. Non-config query keys
+/// (including Snowflake session names) are passed to the login payload instead.
+fn uri_query_option(key: &str) -> Result<Option<&'static str>> {
+    let option = match key {
+        "account" => "adbc.snowflake.sql.account",
+        "warehouse" => "adbc.snowflake.sql.warehouse",
+        "database" => "adbc.snowflake.sql.db",
+        "schema" => "adbc.snowflake.sql.schema",
+        "role" => "adbc.snowflake.sql.role",
+        "host" => "adbc.snowflake.sql.uri.host",
+        "port" => "adbc.snowflake.sql.uri.port",
+        "protocol" => "adbc.snowflake.sql.uri.protocol",
+        "authenticator" => "authenticator",
+        "passcode" => param_names::PASSCODE.as_str(),
+        "passcodeInPassword" => param_names::PASSCODE_IN_PASSWORD.as_str(),
+        "oauthClientId" => param_names::OAUTH_CLIENT_ID.as_str(),
+        "oauthClientSecret" => param_names::OAUTH_CLIENT_SECRET.as_str(),
+        "oauthAuthorizationUrl" => param_names::OAUTH_AUTHORIZATION_URL.as_str(),
+        "oauthTokenRequestUrl" => param_names::OAUTH_TOKEN_REQUEST_URL.as_str(),
+        "oauthRedirectUri" => param_names::OAUTH_REDIRECT_URI.as_str(),
+        "oauthScope" => param_names::OAUTH_SCOPE.as_str(),
+        "enableSingleUseRefreshTokens" => {
+            param_names::OAUTH_ENABLE_SINGLE_USE_REFRESH_TOKENS.as_str()
+        }
+        "loginTimeout" => "adbc.snowflake.sql.client_option.login_timeout",
+        "requestTimeout" => "adbc.snowflake.sql.client_option.request_timeout",
+        "clientTimeout" => "adbc.snowflake.sql.client_option.client_timeout",
+        "jwtTimeout" => "adbc.snowflake.sql.client_option.jwt_expire_timeout",
+        "maxRetryCount" => MAX_RETRY_COUNT,
+        "serverSessionKeepAlive" => "adbc.snowflake.sql.client_option.keep_session_alive",
+        "application" => "adbc.snowflake.sql.client_option.application",
+        "token" => "adbc.snowflake.sql.client_option.auth_token",
+        "tokenFilePath" => param_names::TOKEN_FILE_PATH.as_str(),
+        "privateKey" | "private_key" => {
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value"
+        }
+        "private_key_file" => "adbc.snowflake.sql.client_option.jwt_private_key",
+        "workloadIdentityProvider" => "adbc.snowflake.sql.client_option.identity_provider",
+        "workloadIdentityEntraResource" => param_names::WORKLOAD_IDENTITY_ENTRA_RESOURCE.as_str(),
+        "workloadIdentityImpersonationPath" => {
+            param_names::WORKLOAD_IDENTITY_IMPERSONATION_PATH.as_str()
+        }
+        "workloadIdentityAwsUseOutboundToken" => {
+            param_names::WORKLOAD_IDENTITY_AWS_USE_OUTBOUND_TOKEN.as_str()
+        }
+        "workloadIdentityHost" => param_names::WIF_HOST.as_str(),
+        "validateDefaultParameters" => {
+            "adbc.snowflake.sql.client_option.validate_default_parameters"
+        }
+        "clientStoreTemporaryCredential" => STORE_TEMP_CREDS,
+        "logQueryText" => param_names::LOG_QUERY_TEXT.as_str(),
+        "logQueryParameters" => param_names::LOG_QUERY_PARAMETERS.as_str(),
+        "disableQueryContextCache" => param_names::DISABLE_QUERY_CONTEXT_CACHE.as_str(),
+        "includeRetryReason" => param_names::INCLUDE_RETRY_REASON.as_str(),
+        "disableSamlURLCheck" => param_names::DISABLE_SAML_URL_CHECK.as_str(),
+        "certRevocationCheckMode" => param_names::CRL_CHECK_MODE.as_str(),
+        "crlAllowCertificatesWithoutCrlURL" => {
+            param_names::CRL_ALLOW_CERTIFICATES_WITHOUT_CRL_URL.as_str()
+        }
+        "crlInMemoryCacheDisabled" => param_names::CRL_ENABLE_MEMORY_CACHING.as_str(),
+        "crlOnDiskCacheDisabled" => param_names::CRL_ENABLE_DISK_CACHING.as_str(),
+        "crlDownloadMaxSize" => param_names::CRL_MAX_DOWNLOAD_SIZE.as_str(),
+        "crlHttpClientTimeout" => param_names::CRL_HTTP_TIMEOUT.as_str(),
+        "connectionDiagnosticsEnabled" => param_names::ENABLE_CONNECTION_DIAG.as_str(),
+        "connectionDiagnosticsAllowlistFile" => {
+            param_names::CONNECTION_DIAG_ALLOWLIST_PATH.as_str()
+        }
+        "proxyHost" => "adbc.snowflake.sql.client_option.proxy_host",
+        "proxyPort" => "adbc.snowflake.sql.client_option.proxy_port",
+        "proxyUser" => "adbc.snowflake.sql.client_option.proxy_user",
+        "proxyPassword" => "adbc.snowflake.sql.client_option.proxy_password",
+        "proxyProtocol" => "adbc.snowflake.sql.client_option.proxy_protocol",
+        "noProxy" => param_names::NO_PROXY.as_str(),
+        "singleAuthenticationPrompt"
+        | "region"
+        | "jwtClientTimeout"
+        | "externalBrowserTimeout"
+        | "cloudStorageTimeout"
+        | "cleanupTimeout"
+        | "disableOCSPChecks"
+        | "ocspFailOpen"
+        | "tlsConfigName"
+        | "clientRequestMfaToken"
+        | "tracing"
+        | "tmpDirPath"
+        | "clientConfigFile"
+        | "disableConsoleLogin" => return Err(unsupported_uri_config(key)),
+        _ => return Ok(None),
+    };
+    Ok(Some(option))
 }
 
 /// Decode a DSN component with Go's url.QueryUnescape semantics, rejecting
@@ -978,8 +1185,9 @@ impl adbc_core::Database for Database {
                 let AccumulatedConnectionOptions {
                     mut sf_options,
                     post_connect_options,
-                    no_connection_details,
+                    mut no_connection_details,
                 } = accumulate_connection_options(&self.sf_settings, opts)?;
+                no_connection_details &= self.session_parameters.is_empty();
                 // Snowflake currently gates Arrow result transport on this protocol ID.
                 // Keep the visible application and wrapper telemetry driver-specific.
                 sf_options.insert(
@@ -1043,20 +1251,7 @@ impl adbc_core::Database for Database {
                     self.inner
                         .block_on(self.inner.sf.connection_set_session_parameters(
                             conn_handle,
-                            HashMap::from([
-                                (
-                                    "PYTHON_CONNECTOR_QUERY_RESULT_FORMAT".to_string(),
-                                    "ARROW_FORCE".to_string(),
-                                ),
-                                (
-                                    "GEOGRAPHY_OUTPUT_FORMAT".to_string(),
-                                    self.geography_output_format.as_str().to_string(),
-                                ),
-                                (
-                                    "GEOMETRY_OUTPUT_FORMAT".to_string(),
-                                    self.geometry_output_format.as_str().to_string(),
-                                ),
-                            ]),
+                            self.login_session_parameters(),
                         ))
                         .map_err(crate::error::api_error_to_adbc_error)?;
 
@@ -1107,9 +1302,10 @@ impl adbc_core::Database for Database {
 mod tests {
     use super::*;
     use adbc_core::{
-        Driver as _,
+        Connection as _, Database as _, Driver as _, Statement as _,
         options::{OptionDatabase, OptionValue},
     };
+    use arrow_array::cast::AsArray;
     use sf_core::config::param_registry::param_names;
 
     fn make_db() -> Database {
@@ -1553,18 +1749,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_go_and_unknown_options_are_not_stored() {
+    fn unsupported_go_and_adbc_options_are_not_stored() {
         let mut db = make_db();
         for key in [
             "adbc.snowflake.sql.region",
             "adbc.snowflake.sql.client_option.ocsp_fail_open_mode",
-            "adbc.snowflake.sql.client_option.jwt_expire_timeout",
             "adbc.snowflake.sql.client_option.tracing",
             "adbc.snowflake.sql.client_option.config_file",
             "adbc.snowflake.sql.client_option.use_high_precision",
             "adbc.snowflake.sql.client_option.stream_retry_enabled",
             "adbc.connection.get_objects.match_exactly",
-            "some.unknown.database.option",
+            "adbc.some.unknown.database.option",
+            "ADBC.some.unknown.database.option",
         ] {
             let error = db
                 .set_option(
@@ -1596,6 +1792,95 @@ mod tests {
             }
         }
         assert!(db.sf_settings.is_empty());
+    }
+
+    #[test]
+    fn session_parameters_round_trip_and_reject_non_string_values() {
+        let mut db = make_db();
+        let option = OptionDatabase::Other("WEEK_START".into());
+        assert_eq!(
+            db.get_option_string(option.clone()).unwrap_err().status,
+            Status::NotFound
+        );
+        db.set_option(option.clone(), OptionValue::String("3".into()))
+            .unwrap();
+        assert_eq!(db.get_option_string(option.clone()).unwrap(), "3");
+        assert_eq!(
+            db.session_parameters.get("WEEK_START").map(String::as_str),
+            Some("3")
+        );
+        assert!(db.sf_settings.is_empty());
+        for value in [
+            OptionValue::Int(2),
+            OptionValue::Double(2.0),
+            OptionValue::Bytes(vec![2]),
+        ] {
+            assert_eq!(
+                db.set_option(option.clone(), value).unwrap_err().status,
+                Status::InvalidArguments
+            );
+            assert_eq!(db.get_option_string(option.clone()).unwrap(), "3");
+        }
+        db.set_option(option.clone(), OptionValue::String("1".into()))
+            .unwrap();
+        assert_eq!(db.get_option_string(option).unwrap(), "1");
+    }
+
+    #[test]
+    fn driver_owned_login_parameters_override_user_values_case_insensitively() {
+        let mut db = make_db();
+        for (name, value) in [
+            ("python_connector_query_result_format", "JSON"),
+            ("Geography_Output_Format", "EWKB"),
+            ("geometry_output_format", "EWKB"),
+            ("WEEK_START", "3"),
+        ] {
+            db.set_option(
+                OptionDatabase::Other(name.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+        }
+        db.set_option(
+            OptionDatabase::Other(GEOMETRY_OUTPUT_FORMAT.into()),
+            OptionValue::String("EWKB".into()),
+        )
+        .unwrap();
+
+        let params = db.login_session_parameters();
+        assert_eq!(
+            params["PYTHON_CONNECTOR_QUERY_RESULT_FORMAT"],
+            "ARROW_FORCE"
+        );
+        assert_eq!(params["GEOGRAPHY_OUTPUT_FORMAT"], "GEOJSON");
+        assert_eq!(params["GEOMETRY_OUTPUT_FORMAT"], "EWKB");
+        assert_eq!(params["WEEK_START"], "3");
+        assert_eq!(params.len(), 4);
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other("Geography_Output_Format".into()))
+                .unwrap(),
+            "EWKB"
+        );
+    }
+
+    #[test]
+    fn later_database_option_overrides_same_uri_session_parameter() {
+        let mut db = make_db();
+        let option = OptionDatabase::Other("QUERY_TAG".into());
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("snowflake://myaccount?QUERY_TAG=from-uri".into()),
+        )
+        .unwrap();
+        assert_eq!(db.get_option_string(option.clone()).unwrap(), "from-uri");
+        db.set_option(option.clone(), OptionValue::String("from-option".into()))
+            .unwrap();
+        assert_eq!(db.get_option_string(option).unwrap(), "from-option");
+        assert!(!db.session_parameters.contains_key("QUERY_TAG"));
+        assert_eq!(
+            db.sf_settings.get(param_names::QUERY_TAG.as_str()),
+            Some(&Setting::String("from-option".into()))
+        );
     }
 
     #[test]
@@ -1697,6 +1982,33 @@ mod tests {
                 .get_option_string(OptionDatabase::Other(key.into()))
                 .unwrap_or_else(|e| panic!("get_option_string({key}) failed: {e}"));
             assert_eq!(got, val, "round-trip failed for {key}");
+        }
+    }
+
+    #[test]
+    fn jwt_expire_timeout_sets_whole_seconds_and_zero_selects_default() {
+        let key = "adbc.snowflake.sql.client_option.jwt_expire_timeout";
+        for (value, seconds) in [
+            ("1m30s", 90),
+            ("1500ms", 2),
+            ("0s", DEFAULT_JWT_TIMEOUT_SECS),
+        ] {
+            let mut db = make_db();
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+            assert_eq!(
+                db.sf_settings.get(param_names::JWT_TIMEOUT.as_str()),
+                Some(&Setting::Int(seconds)),
+                "{value}"
+            );
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Other(key.into()))
+                    .unwrap(),
+                value
+            );
         }
     }
 
@@ -2112,5 +2424,265 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn uri_query_splits_go_config_and_session_parameters() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String(
+                "snowflake://myaccount/PATH_DB?database=QUERY_DB&schema=SC&warehouse=WH\
+                 &application=ADBC_APP&loginTimeout=15&requestTimeout=30&maxRetryCount=2&jwtTimeout=45\
+                 &serverSessionKeepAlive=true&validateDefaultParameters=false\
+                 &clientStoreTemporaryCredential=true&proxyHost=proxy.example\
+                 &noProxy=localhost&workloadIdentityProvider=AWS&oauthClientId=client-id\
+                 &passcodeInPassword=true&crlInMemoryCacheDisabled=true\
+                 &certRevocationCheckMode=advisory&TIMEZONE=America%2FLos_Angeles\
+                 &WEEK_START=3&%71uery_tag=hello+world"
+                    .into(),
+            ),
+        )
+        .unwrap();
+        for (key, expected) in [
+            (
+                param_names::DATABASE.as_str(),
+                Setting::String("QUERY_DB".into()),
+            ),
+            (param_names::SCHEMA.as_str(), Setting::String("SC".into())),
+            (
+                param_names::WAREHOUSE.as_str(),
+                Setting::String("WH".into()),
+            ),
+            (
+                param_names::APPLICATION.as_str(),
+                Setting::String("ADBC_APP".into()),
+            ),
+            (param_names::LOGIN_TIMEOUT.as_str(), Setting::Int(15)),
+            (param_names::REQUEST_TIMEOUT.as_str(), Setting::Int(30)),
+            (param_names::JWT_TIMEOUT.as_str(), Setting::Int(45)),
+            (param_names::RETRY_MAX_ATTEMPTS.as_str(), Setting::Int(3)),
+            (
+                param_names::SERVER_SESSION_KEEP_ALIVE.as_str(),
+                Setting::Bool(true),
+            ),
+            (
+                param_names::VALIDATE_DEFAULT_PARAMETERS.as_str(),
+                Setting::Bool(false),
+            ),
+            (
+                param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str(),
+                Setting::Bool(true),
+            ),
+            (
+                param_names::PROXY_HOST.as_str(),
+                Setting::String("proxy.example".into()),
+            ),
+            (
+                param_names::NO_PROXY.as_str(),
+                Setting::String("localhost".into()),
+            ),
+            (
+                param_names::WORKLOAD_IDENTITY_PROVIDER.as_str(),
+                Setting::String("AWS".into()),
+            ),
+            (
+                param_names::OAUTH_CLIENT_ID.as_str(),
+                Setting::String("client-id".into()),
+            ),
+            (
+                param_names::PASSCODE_IN_PASSWORD.as_str(),
+                Setting::Bool(true),
+            ),
+            (
+                param_names::CRL_ENABLE_MEMORY_CACHING.as_str(),
+                Setting::Bool(false),
+            ),
+            (
+                param_names::CRL_CHECK_MODE.as_str(),
+                Setting::String("advisory".into()),
+            ),
+        ] {
+            assert_eq!(db.sf_settings.get(key), Some(&expected), "{key}");
+        }
+        assert_eq!(
+            db.session_parameters,
+            HashMap::from([
+                ("TIMEZONE".into(), "America/Los_Angeles".into()),
+                ("WEEK_START".into(), "3".into()),
+                ("query_tag".into(), "hello world".into()),
+            ])
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other("TIMEZONE".into()))
+                .unwrap(),
+            "America/Los_Angeles"
+        );
+        assert_eq!(db.login_session_parameters()["QUERY_TAG"], "hello world");
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other("query_tag".into()))
+                .unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn uri_rejects_unsupported_go_configuration_without_forwarding_it() {
+        for key in [
+            "region",
+            "singleAuthenticationPrompt",
+            "jwtClientTimeout",
+            "disableOCSPChecks",
+            "ocspFailOpen",
+            "clientRequestMfaToken",
+            "tracing",
+            "clientConfigFile",
+        ] {
+            let mut db = make_db();
+            let error = db
+                .set_option(
+                    OptionDatabase::Uri,
+                    OptionValue::String(format!("snowflake://myaccount?{key}=true")),
+                )
+                .unwrap_err();
+            assert_eq!(error.status, Status::NotImplemented, "{key}: {error:?}");
+            assert!(error.message.contains(key), "{key}: {error:?}");
+            assert!(db.session_parameters.is_empty(), "{key}");
+        }
+        let mut db = make_db();
+        let error = db
+            .set_option(
+                OptionDatabase::Uri,
+                OptionValue::String("snowflake://myaccount?adbc.some.option=value".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(db.session_parameters.is_empty());
+        let error = db
+            .set_option(
+                OptionDatabase::Uri,
+                OptionValue::String("snowflake://myaccount?SOME_PARAM=%GG".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    fn live_db() -> Option<Database> {
+        let uri = std::env::var("SNOWFLAKE_URI")
+            .ok()
+            .filter(|uri| !uri.is_empty())?;
+        let mut db = make_db();
+        db.set_option(OptionDatabase::Uri, OptionValue::String(uri))
+            .unwrap();
+        for (env_key, db_key) in [
+            ("SNOWFLAKE_DATABASE", "adbc.snowflake.sql.db"),
+            ("SNOWFLAKE_SCHEMA", "adbc.snowflake.sql.schema"),
+        ] {
+            if let Some(value) = std::env::var(env_key)
+                .ok()
+                .filter(|value| !value.is_empty())
+            {
+                db.set_option(
+                    OptionDatabase::Other(db_key.into()),
+                    OptionValue::String(value),
+                )
+                .unwrap();
+            }
+        }
+        Some(db)
+    }
+
+    fn show_session_parameter(conn: &mut Connection, name: &str) -> Option<String> {
+        let mut statement = conn.new_statement().unwrap();
+        statement
+            .set_sql_query(format!("SHOW PARAMETERS LIKE '{name}' IN SESSION"))
+            .unwrap();
+        for batch in statement.execute().unwrap() {
+            let batch = batch.unwrap();
+            let keys = batch.column(0).as_string::<i32>();
+            let values = batch.column(1).as_string::<i32>();
+            for index in 0..batch.num_rows() {
+                if keys.value(index) == name {
+                    return Some(values.value(index).into());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn live_database_session_parameters_apply_at_login() {
+        let Some(mut db) = live_db() else {
+            eprintln!("Skipping: SNOWFLAKE_URI not set");
+            return;
+        };
+        for (key, value) in [
+            ("WEEK_START", "3"),
+            ("QUERY_TAG", "adbc-rust-session-test"),
+            ("TIMEZONE", "America/Los_Angeles"),
+        ] {
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+        }
+        let mut conn = db.new_connection().unwrap();
+        assert_eq!(
+            show_session_parameter(&mut conn, "WEEK_START").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            show_session_parameter(&mut conn, "QUERY_TAG").as_deref(),
+            Some("adbc-rust-session-test")
+        );
+        assert_eq!(
+            show_session_parameter(&mut conn, "TIMEZONE").as_deref(),
+            Some("America/Los_Angeles")
+        );
+    }
+
+    #[test]
+    fn live_uri_session_parameter_applies_at_login() {
+        let Some(mut db) = live_db() else {
+            eprintln!("Skipping: SNOWFLAKE_URI not set");
+            return;
+        };
+        let uri = std::env::var("SNOWFLAKE_URI").unwrap();
+        let separator = if uri.contains('?') { '&' } else { '?' };
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String(format!("{uri}{separator}TIMEZONE=America%2FChicago")),
+        )
+        .unwrap();
+        let mut conn = db.new_connection().unwrap();
+        assert_eq!(
+            show_session_parameter(&mut conn, "TIMEZONE").as_deref(),
+            Some("America/Chicago")
+        );
+    }
+
+    #[test]
+    fn live_database_option_set_after_connect_only_affects_future_connections() {
+        let Some(mut db) = live_db() else {
+            eprintln!("Skipping: SNOWFLAKE_URI not set");
+            return;
+        };
+        let mut first = db.new_connection().unwrap();
+        let original = show_session_parameter(&mut first, "DATE_OUTPUT_FORMAT");
+        db.set_option(
+            OptionDatabase::Other("DATE_OUTPUT_FORMAT".into()),
+            OptionValue::String("DD/MM/YYYY".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            show_session_parameter(&mut first, "DATE_OUTPUT_FORMAT"),
+            original
+        );
+        let mut second = db.new_connection().unwrap();
+        assert_eq!(
+            show_session_parameter(&mut second, "DATE_OUTPUT_FORMAT").as_deref(),
+            Some("DD/MM/YYYY")
+        );
     }
 }

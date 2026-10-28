@@ -521,6 +521,8 @@ impl adbc_core::Connection for Connection {
             ingest_state: driverbase::bulk_ingest::BulkIngestState::new(),
             query_tag: None,
             query_timeout_seconds: None,
+            prefetch_concurrency: None,
+            result_queue_size: None,
             timestamp_precision: self.timestamp_precision,
             ingest_options: crate::ingest::IngestOptions::default(),
             bound: crate::statement::Bound::Empty,
