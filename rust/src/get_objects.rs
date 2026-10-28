@@ -347,6 +347,10 @@ struct ScopedRequest<'a> {
 }
 
 /// Run `request` once per scope, concurrently, in scope order.
+///
+/// Account-wide SHOWs omit databases and schemas the role can list but not
+/// use; a scope resolved from such a listing fails with insufficient
+/// privileges instead, so it contributes nothing, matching the Go driver.
 fn fetch_scoped(
     connection: &Connection,
     operation: &sf_core::apis::operation_ctx::OperationCtx,
@@ -356,7 +360,7 @@ fn fetch_scoped(
     run_concurrently(scopes.iter().map(|scope| {
         move || {
             let (catalog, db_schema) = scope.core_filters(request.catalog, request.db_schema);
-            fetch_core_objects(
+            let result = fetch_core_objects(
                 connection,
                 operation,
                 ScopedRequest {
@@ -364,7 +368,16 @@ fn fetch_scoped(
                     db_schema: db_schema.as_deref(),
                     ..request
                 },
-            )
+            );
+            match result {
+                Err(error)
+                    if *scope != MetadataScope::Account
+                        && error.sqlstate.map(|byte| byte as u8) == *b"42501" =>
+                {
+                    Ok(ObjectTree::default())
+                }
+                result => result,
+            }
         }
     }))
 }
