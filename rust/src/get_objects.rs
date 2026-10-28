@@ -235,9 +235,17 @@ pub(crate) fn execute_get_objects(
     Ok(get_objects(objects, *depth, None, None, None, None, None))
 }
 
-/// Most metadata requests issued concurrently for one GetObjects level.
-/// Beyond this, one broader SHOW costs less than many round trips.
-const MAX_METADATA_SCOPES: usize = 8;
+/// Most resolved parents requested one by one at a GetObjects level; beyond
+/// this the next broader SHOW is used. Measured on a live account: a scoped
+/// SHOW adds ~0.1-0.25 s per schema at [`MAX_CONCURRENT_METADATA_REQUESTS`]
+/// in flight (16 matched schemas: 13.9 s total vs 35.5 s for one
+/// `IN DATABASE`), while `IN DATABASE` over a 485-schema database took ~33 s,
+/// so per-schema requests stay cheaper well past 64 parents.
+const MAX_METADATA_SCOPES: usize = 64;
+
+/// Scoped SHOW requests in flight at once. Four was fastest at 16 matched
+/// schemas (13.9 s vs 15.0 s unbounded and 18.8 s sequential).
+const MAX_CONCURRENT_METADATA_REQUESTS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MetadataScope {
@@ -361,25 +369,44 @@ fn fetch_scoped(
     }))
 }
 
-/// Run blocking metadata requests on scoped threads, returning results in
+/// Run blocking metadata requests on at most
+/// [`MAX_CONCURRENT_METADATA_REQUESTS`] scoped threads, returning results in
 /// input order. A lone request runs inline.
-fn run_concurrently<T: Send>(
-    jobs: impl ExactSizeIterator<Item = impl FnOnce() -> AdbcResult<T> + Send>,
+fn run_concurrently<T: Send, J: FnOnce() -> AdbcResult<T> + Send>(
+    jobs: impl IntoIterator<Item = J>,
 ) -> AdbcResult<Vec<T>> {
+    let jobs = jobs.into_iter().collect::<Vec<_>>();
     if jobs.len() <= 1 {
-        return jobs.map(|job| job()).collect();
+        return jobs.into_iter().map(|job| job()).collect();
     }
-    std::thread::scope(|threads| {
-        let handles = jobs.map(|job| threads.spawn(job)).collect::<Vec<_>>();
+    let workers = jobs.len().min(MAX_CONCURRENT_METADATA_REQUESTS);
+    let queue = std::sync::Mutex::new(jobs.into_iter().enumerate());
+    let mut results = std::thread::scope(|threads| {
+        let handles = (0..workers)
+            .map(|_| {
+                threads.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                        let Some((index, job)) = next else {
+                            return done;
+                        };
+                        done.push((index, job()));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|handle| {
+            .flat_map(|handle| {
                 handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
-            .collect()
-    })
+            .collect::<Vec<_>>()
+    });
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn core_filter(value: &str, match_exactly: bool) -> Option<Cow<'_, str>> {
@@ -1659,6 +1686,41 @@ mod tests {
                 .value(0),
             "PK_UPPER"
         );
+    }
+
+    #[test]
+    fn concurrent_requests_are_bounded_and_keep_input_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let results = run_concurrently((0..20).map(|index| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            move || {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(index)
+            }
+        }))
+        .unwrap();
+        assert_eq!(results, (0..20).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_METADATA_REQUESTS);
+
+        // The first failure in input order is reported.
+        let error = run_concurrently((0..6).map(|index| {
+            move || {
+                if index >= 2 {
+                    Err(SnowflakeError::io()
+                        .format(format_args!("job {index}"))
+                        .to_adbc())
+                } else {
+                    Ok(index)
+                }
+            }
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("job 2"), "{}", error.message);
     }
 
     #[test]
