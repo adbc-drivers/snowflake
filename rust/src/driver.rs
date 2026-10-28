@@ -86,6 +86,7 @@ pub(crate) struct Inner {
     pub sf: DatabaseDriverV1,
     pub(crate) dispatch: tracing::Dispatch,
     pub(crate) telemetry: Arc<Telemetry>,
+    tracing_config: std::sync::Mutex<()>,
 }
 
 pub(crate) struct QueryResult {
@@ -159,6 +160,7 @@ impl Inner {
             }),
             dispatch,
             telemetry,
+            tracing_config: std::sync::Mutex::new(()),
         })
     }
 
@@ -167,6 +169,16 @@ impl Inner {
         exporter: Option<Exporter>,
         folder: Option<&str>,
     ) -> Result<()> {
+        // The exporter is process-wide (see SHARED_INNER). A database that
+        // does not choose one must not switch off another database's traces;
+        // decide under one lock so a concurrent connect cannot interleave.
+        let _guard = self
+            .tracing_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if exporter.is_none() && folder.is_none() && self.telemetry.is_enabled() {
+            return Ok(());
+        }
         self.telemetry.configure(exporter, folder)
     }
 

@@ -152,17 +152,20 @@ fn test_adbcfile_trace_parent_and_sf_core_children() {
         })
         .collect();
     let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    // The exporter is process-wide, so concurrently running tests' spans can
+    // land in this folder too; only this test's remote trace counts.
+    let spans: Vec<_> = spans
+        .into_iter()
+        .filter(|span| span["SpanContext"]["TraceID"] == trace_id)
+        .collect();
     let open = spans
         .iter()
         .find(|span| span["Name"] == "databaseImpl.Open")
-        .expect("Open span");
+        .expect("Open span in the remote trace");
     let execute = spans
         .iter()
         .find(|span| span["Name"] == "statement.ExecuteQuery")
-        .expect("ExecuteQuery span");
-    for span in [open, execute] {
-        assert_eq!(span["SpanContext"]["TraceID"], trace_id);
-    }
+        .expect("ExecuteQuery span in the remote trace");
     assert!(
         spans.iter().any(|span| {
             let name = span["Name"].as_str().unwrap_or_default();
