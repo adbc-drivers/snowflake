@@ -595,6 +595,8 @@ impl adbc_core::Statement for Statement {
         inner.traced("statement.ExecuteQuery", parent.as_deref(), |span| {
             let mut returned_rows = -1;
             let result = (|| {
+                // Like Go, each execution starts without an ID; ingest reports none.
+                self.last_query_id = None;
                 if self.ingest_state.is_set() {
                     // Ingest via execute() — run the ingest and return an empty reader.
                     let result = crate::ingest::execute_ingest(self);
@@ -645,6 +647,7 @@ impl adbc_core::Statement for Statement {
         let parent = self.trace_parent_for_span();
         inner.traced("statement.ExecuteUpdate", parent.as_deref(), |span| {
             let result = (|| {
+                self.last_query_id = None;
                 if self.ingest_state.is_set() {
                     let result = crate::ingest::execute_ingest(self);
                     self.bound = Bound::Empty;
