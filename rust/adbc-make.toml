@@ -14,5 +14,15 @@
 
 driver = "snowflake"
 
+# System libraries used by sf_core's dirs (known folders) and webbrowser
+# (external browser authentication, via AppKit on macOS) dependencies.
+[additional-runtime-dependencies]
+macos = [
+  "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
+  "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+  "/usr/lib/libobjc.A.dylib",
+]
+windows = ["OLE32.DLL", "SHELL32.DLL", "SHLWAPI.DLL"]
+
 [lang]
 lang = "rust"
