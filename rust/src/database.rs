@@ -452,7 +452,7 @@ impl Optionable for Database {
         }
         if key_str == TRACES_EXPORTER {
             let exporter = database_option_as_string(key_str, &value)?;
-            self.traces_exporter = Some(Exporter::parse(exporter)?);
+            self.traces_exporter = Exporter::parse_option(exporter)?;
             return Ok(());
         }
         if key_str == TRACES_FOLDER_PATH {
@@ -1364,6 +1364,11 @@ mod tests {
                 "adbcfile"
             );
         }
+        // A blank exporter unsets the option so OTEL_TRACES_EXPORTER applies.
+        db.set_option(exporter_key.clone(), OptionValue::String("  ".into()))
+            .unwrap();
+        assert_eq!(db.traces_exporter, None);
+        assert_eq!(db.get_option_string(exporter_key.clone()).unwrap(), "");
 
         db.set_option(
             folder_key.clone(),
