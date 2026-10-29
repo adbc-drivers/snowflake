@@ -12,34 +12,342 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Builds AdbcDrivers.Snowflake from the commit supplied by Release Please.
-# Uploads to its draft release, then publishes it. Publishing only runs after
-# approval on the nuget-release environment and authenticates to nuget.org via
-# short-lived OIDC-issued trusted publishing, never a stored API key.
-name: Csharp Publish Release
+# Maintains one release PR with downloadable previews, then stages and publishes
+# the selected Snowflake packages after approval on the nuget-release environment.
+name: CSharp Release
+run-name: CSharp Release - ${{ inputs.release_tag || github.ref_name }}
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'csharp/src/AdbcDrivers.Snowflake/**'
+      - 'csharp/Directory.Build.props'
+      - 'csharp/arrow-adbc'
+      - '.gitmodules'
+      - 'release-please-config.json'
+      - '.github/workflows/csharp_release.yaml'
+      - '.github/actions/release-pr-progress/**'
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag name of the existing draft release, e.g. csharp/v1.0.1'
-        required: true
+        description: 'Existing draft to rebuild from its selected source (supply SHA too)'
         type: string
       release_sha:
-        description: 'Full commit SHA to pack, supplied by Release Please'
-        required: true
+        description: 'Exact source SHA of the existing draft'
         type: string
-
-concurrency:
-  group: release-${{ inputs.release_tag }}
-  cancel-in-progress: false
+      preview_pr:
+        description: 'Existing release PR to build without changing release state (optional)'
+        type: number
+      trigger_pr:
+        description: 'Merged code PR number for a manual preview test (optional)'
+        type: number
+      publish:
+        description: 'Publish final package after approval; disable for staging tests'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
-  pack:
+  plan:
+    name: Prepare release
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-plan-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      candidate: ${{ steps.final.outputs.candidate }}
+      release_tag: ${{ steps.final.outputs.release_tag }}
+      release_sha: ${{ steps.final.outputs.release_sha }}
+      release_pr: ${{ steps.final.outputs.release_pr }}
+      version: ${{ steps.final.outputs.version }}
+      preview_sha: ${{ steps.preview.outputs.source_sha }}
+      preview_version: ${{ steps.preview.outputs.version }}
+      preview_pr: ${{ steps.preview.outputs.release_pr }}
+      trigger_pr: ${{ steps.preview.outputs.trigger_pr }}
+      trigger_sha: ${{ steps.preview.outputs.trigger_sha }}
+    steps:
+      - name: Validate manual release inputs
+        run: |
+          if [[ -n "$RELEASE_TAG" || -n "$RELEASE_SHA" ]]; then
+            [[ "$RELEASE_TAG" =~ ^csharp/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$PREVIEW_PR" = 0
+          fi
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PREVIEW_PR: ${{ inputs.preview_pr || 0 }}
+
+      - name: Create draft release from merged release PR
+        id: release
+        if: ${{ github.ref_name == 'main' && inputs.release_tag == '' && !inputs.preview_pr }}
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Select release stage
+        id: final
+        run: |
+          tag=${SELECTED_TAG:-$NEW_TAG}
+          source_sha=${SELECTED_SHA:-$NEW_SHA}
+          if [[ -n "$tag" ]]; then
+            info=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish,body)
+            test "$(jq -r .isDraft <<< "$info")" = true
+            test "$(jq -r .targetCommitish <<< "$info")" = "$source_sha"
+            if grep -Fq '<!-- publication-started -->' <<< "$(jq -r .body <<< "$info")"; then
+              echo '::error::Publication has started. Resume the original publication run.'
+              exit 1
+            fi
+            if [[ -n "$NEW_TAG" ]]; then
+              jq -r '.body + "\n\n<!-- release-pr-candidate -->"' <<< "$info" > release-notes.md
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
+            fi
+            echo 'candidate=true' >> "$GITHUB_OUTPUT"
+            echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "version=${tag#csharp/v}" >> "$GITHUB_OUTPUT"
+            echo "release_sha=$source_sha" >> "$GITHUB_OUTPUT"
+            release_pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$source_sha/pulls" \
+              --jq '[.[] | select(.merged_at != null and (.head.ref | startswith("release-please--")))][0].number // empty')
+            echo "release_pr=$release_pr" >> "$GITHUB_OUTPUT"
+            echo 'maintain_pr=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'candidate=false' >> "$GITHUB_OUTPUT"
+          # Hold the selected release stable until it is published. In particular,
+          # do not rediscover the same commits while its GitHub release is a draft.
+          if [[ "$GITHUB_REF_NAME" == main && "$PREVIEW_PR" == 0 ]]; then
+            version=$(gh api "repos/$GITHUB_REPOSITORY/contents/.release-please-manifest.json?ref=$GITHUB_SHA" \
+              --jq .content | base64 --decode | jq -er '."csharp/src/AdbcDrivers.Snowflake"')
+            releases=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            if jq -e --arg tag "csharp/v$version" \
+              'any(.[][]; .tag_name == $tag and .draft and (.body | contains("<!-- release-pr-candidate -->")))' \
+              <<< "$releases" > /dev/null; then
+              echo 'maintain_pr=false' >> "$GITHUB_OUTPUT"
+              echo 'The selected final release is awaiting publication. New code will enter the next release PR after publication.' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          echo 'maintain_pr=true' >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          SELECTED_TAG: ${{ inputs.release_tag }}
+          SELECTED_SHA: ${{ inputs.release_sha }}
+          PREVIEW_PR: ${{ inputs.preview_pr || 0 }}
+          NEW_TAG: ${{ steps.release.outputs['csharp/src/AdbcDrivers.Snowflake--tag_name'] }}
+          NEW_SHA: ${{ steps.release.outputs['csharp/src/AdbcDrivers.Snowflake--sha'] }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: ${{ steps.final.outputs.release_pr != '' }}
+        with:
+          persist-credentials: false
+
+      - name: Update release PR build status
+        if: ${{ steps.final.outputs.release_pr != '' }}
+        uses: ./.github/actions/release-pr-progress
+        with:
+          token: ${{ github.token }}
+          pr: ${{ steps.final.outputs.release_pr }}
+          stage: building
+          version: ${{ steps.final.outputs.version }}
+          source-sha: ${{ steps.final.outputs.release_sha }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Update release PR
+        id: release_pr
+        if: ${{ steps.final.outputs.maintain_pr == 'true' && !inputs.preview_pr }}
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Select preview source and version
+        id: preview
+        if: ${{ steps.final.outputs.maintain_pr == 'true' }}
+        run: |
+          release_pr=$PREVIEW_PR
+          if [[ "$release_pr" == 0 && -n "$UPDATED_PR" ]]; then
+            release_pr=$(jq -er .number <<< "$UPDATED_PR")
+          fi
+          if [[ "$release_pr" == 0 ]]; then
+            # REST avoids the search-index delay immediately after PR creation.
+            prs=$(gh api --method GET --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls" \
+              -f state=open -f base="$GITHUB_REF_NAME" -f per_page=100)
+            prs=$(jq '[.[][] | select((.head.ref | startswith("release-please--"))
+              and any(.labels[]; .name == "autorelease: pending"))]' <<< "$prs")
+            test "$(jq length <<< "$prs")" -le 1
+            release_pr=$(jq -r '.[0].number // 0' <<< "$prs")
+          fi
+          if [[ "$release_pr" == 0 ]]; then
+            echo 'No releasable changes; no preview required.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          pr=$(gh pr view "$release_pr" --repo "$GITHUB_REPOSITORY" --json state,headRefOid,headRefName,isCrossRepository)
+          test "$(jq -r .state <<< "$pr")" = OPEN
+          test "$(jq -r .isCrossRepository <<< "$pr")" = false
+          [[ "$(jq -r .headRefName <<< "$pr")" == release-please--* ]]
+          source_sha=$(jq -r .headRefOid <<< "$pr")
+          version=$(gh api "repos/$GITHUB_REPOSITORY/contents/.release-please-manifest.json?ref=$source_sha" \
+            --jq .content | base64 --decode | jq -er '."csharp/src/AdbcDrivers.Snowflake"')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          trigger_pr=$TRIGGER_PR
+          if [[ "$trigger_pr" == 0 ]]; then
+            associated_prs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls")
+            trigger_pr=$(jq -r --arg sha "$GITHUB_SHA" \
+              '[.[] | select(.merged_at != null and .merge_commit_sha == $sha)][0].number // 0' <<< "$associated_prs")
+          fi
+          trigger_sha=$GITHUB_SHA
+          if [[ "$trigger_pr" == 0 ]]; then
+            [[ "$trigger_sha" =~ ^[0-9a-f]{40}$ ]]
+            suffix=${trigger_sha:0:7}
+            # A numeric prerelease identifier cannot have leading zeroes.
+            if [[ "$suffix" =~ ^0[0-9]+$ ]]; then suffix=$trigger_sha; fi
+          else
+            [[ "$trigger_pr" =~ ^[1-9][0-9]*$ ]]
+            trigger=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$trigger_pr")
+            test "$(jq -r .merged <<< "$trigger")" = true
+            trigger_sha=$(jq -er .merge_commit_sha <<< "$trigger")
+            suffix=$trigger_pr
+          fi
+          echo "version=$version-preview.$suffix" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "release_pr=$release_pr" >> "$GITHUB_OUTPUT"
+          echo "trigger_pr=$trigger_pr" >> "$GITHUB_OUTPUT"
+          echo "trigger_sha=$trigger_sha" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PREVIEW_PR: ${{ inputs.preview_pr || 0 }}
+          TRIGGER_PR: ${{ inputs.trigger_pr || 0 }}
+          UPDATED_PR: ${{ steps.release_pr.outputs.pr }}
+
+  preview:
+    name: Build preview package
+    needs: plan
+    if: ${{ needs.plan.outputs.preview_sha != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+      retention_days: ${{ steps.settings.outputs.retention_days }}
+    steps:
+      - name: Validate preview retention
+        id: settings
+        run: |
+          [[ "$RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]
+          test "$RETENTION_DAYS" -le 90
+          echo "retention_days=$RETENTION_DAYS" >> "$GITHUB_OUTPUT"
+        env:
+          RETENTION_DAYS: ${{ vars.PREVIEW_RETENTION_DAYS || 28 }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.preview_sha }}
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build preview package and record source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(dotnet msbuild csharp/src/AdbcDrivers.Snowflake/AdbcDrivers.Snowflake.csproj -getProperty:VersionPrefix)" = "${PREVIEW_VERSION%-preview.*}"
+          dotnet pack csharp/src/AdbcDrivers.Snowflake/AdbcDrivers.Snowflake.csproj -c Release -o artifacts \
+            -p:SnowflakePreviewVersion="$PREVIEW_VERSION" -p:VersionSuffix=
+          jq -n --arg version "$PREVIEW_VERSION" --arg sha "$SOURCE_SHA" \
+            --argjson release_pr "$RELEASE_PR" --argjson trigger_pr "$TRIGGER_PR" --arg trigger_sha "$TRIGGER_SHA" \
+            '{version:$version,source_sha:$sha,release_pr:$release_pr,trigger_pr:(if $trigger_pr == 0 then null else $trigger_pr end),trigger_sha:$trigger_sha}' > artifacts/preview-source.json
+        env:
+          PREVIEW_VERSION: ${{ needs.plan.outputs.preview_version }}
+          SOURCE_SHA: ${{ needs.plan.outputs.preview_sha }}
+          RELEASE_PR: ${{ needs.plan.outputs.preview_pr }}
+          TRIGGER_PR: ${{ needs.plan.outputs.trigger_pr }}
+          TRIGGER_SHA: ${{ needs.plan.outputs.trigger_sha }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: upload
+        with:
+          name: preview-${{ needs.plan.outputs.preview_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: ${{ steps.settings.outputs.retention_days }}
+      - name: Show preview package download
+        run: |
+          {
+            printf '[Download %s](%s) — retained for %s days.\n\nSource: `%s`; release PR: #%s.\n' \
+              "$PREVIEW_VERSION" "$ARTIFACT_URL" "$RETENTION_DAYS" "$SOURCE_SHA" "$RELEASE_PR"
+            if [[ "$TRIGGER_PR" == 0 ]]; then
+              printf 'Triggered by commit: `%s`.\n' "$TRIGGER_SHA"
+            else
+              printf 'Triggered by PR #%s (merge commit `%s`).\n' "$TRIGGER_PR" "$TRIGGER_SHA"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          PREVIEW_VERSION: ${{ needs.plan.outputs.preview_version }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          RETENTION_DAYS: ${{ steps.settings.outputs.retention_days }}
+          SOURCE_SHA: ${{ needs.plan.outputs.preview_sha }}
+          TRIGGER_PR: ${{ needs.plan.outputs.trigger_pr }}
+          TRIGGER_SHA: ${{ needs.plan.outputs.trigger_sha }}
+          RELEASE_PR: ${{ needs.plan.outputs.preview_pr }}
+
+  preview_link:
+    name: Update preview details
+    needs: [plan, preview]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: preview-link-${{ github.repository }}-${{ needs.plan.outputs.preview_pr }}
+      cancel-in-progress: false
+    permissions:
+      statuses: write
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Update preview details on release PR
+        uses: ./.github/actions/release-pr-progress
+        with:
+          token: ${{ github.token }}
+          pr: ${{ needs.plan.outputs.preview_pr }}
+          stage: preview
+          version: ${{ needs.plan.outputs.preview_version }}
+          source-sha: ${{ needs.plan.outputs.preview_sha }}
+          artifact-url: ${{ needs.preview.outputs.artifact_url }}
+          retention-days: ${{ needs.preview.outputs.retention_days }}
+          trigger-pr: ${{ needs.plan.outputs.trigger_pr }}
+          trigger-sha: ${{ needs.plan.outputs.trigger_sha }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Link preview package from commit status
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_SHA" \
+            -f state=success -f context='Release preview package' \
+            -f description="$PREVIEW_VERSION available for testing" -f target_url="$ARTIFACT_URL"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.plan.outputs.preview_sha }}
+          PREVIEW_VERSION: ${{ needs.plan.outputs.preview_version }}
+          ARTIFACT_URL: ${{ needs.preview.outputs.artifact_url }}
+
+  pack:
+    name: Build release packages
+    needs: plan
+    if: ${{ needs.plan.outputs.candidate == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.package.outputs.source_sha }}
+      artifact_url: ${{ steps.final_artifact.outputs.artifact-url }}
     permissions:
       contents: read
     steps:
@@ -48,12 +356,12 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^csharp/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
         env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.release_sha }}
+          ref: ${{ needs.plan.outputs.release_sha }}
           submodules: true
           persist-credentials: false
 
@@ -61,44 +369,335 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Pack matching release version
+      - name: Build release packages for selected version
+        id: package
         run: |
+          source_sha=$(git rev-parse HEAD)
+          test "$source_sha" = "$RELEASE_SHA"
           version=$(dotnet msbuild csharp/src/AdbcDrivers.Snowflake/AdbcDrivers.Snowflake.csproj -getProperty:VersionPrefix)
           test "$version" = "${RELEASE_TAG#csharp/v}"
           dotnet pack csharp/src/AdbcDrivers.Snowflake/AdbcDrivers.Snowflake.csproj -c Release -o artifacts -p:VersionSuffix=
+          packages=(artifacts/*.nupkg)
+          symbols=(artifacts/*.snupkg)
+          test "${#packages[@]}" -eq 1
+          test "${#symbols[@]}" -eq 1
+          test -f "${packages[0]}"
+          test -f "${symbols[0]}"
+          test "${symbols[0]}" = "${packages[0]%.nupkg}.snupkg"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
         env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: final_artifact
         with:
           name: nuget-package
-          path: artifacts/*.nupkg
+          path: artifacts/*nupkg
+          if-no-files-found: error
 
-  publish:
-    needs: pack
+  prepare_candidate:
+    name: Prepare draft release
+    concurrency:
+      group: candidate-${{ github.repository }}-${{ needs.plan.outputs.release_tag }}
+      cancel-in-progress: false
+    needs: [plan, pack]
     runs-on: ubuntu-latest
-    environment: nuget-release
+    outputs:
+      package_name: ${{ steps.candidate.outputs.package_name }}
+      package_sha256: ${{ steps.candidate.outputs.package_sha256 }}
+      symbol_name: ${{ steps.candidate.outputs.symbol_name }}
+      symbol_sha256: ${{ steps.candidate.outputs.symbol_sha256 }}
+      ready: ${{ steps.fresh.outputs.ready }}
     permissions:
-      id-token: write
       contents: write
+      id-token: write
       attestations: write
+      pull-requests: write
     steps:
-      # Draft releases require push access to see; keep this in the write-enabled job.
-      - name: Verify draft release
+      - name: Update draft release notes
         run: |
-          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          info=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,body)
+          test "$(jq -r .isDraft <<< "$info")" = true
+          if grep -Fq '<!-- publication-started -->' <<< "$(jq -r .body <<< "$info")"; then
+            echo '::error::Publication has started; resume its original run instead of replacing this candidate.'
+            exit 1
+          fi
+          previous_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft \
+            --jq '[.[] | select((.isDraft | not) and (.tagName | startswith("csharp/v")))][0].tagName // empty')
+          notes_args=(-f tag_name="$RELEASE_TAG" -f target_commitish="$RELEASE_SHA")
+          if [[ -n "$previous_tag" ]]; then notes_args+=(-f previous_tag_name="$previous_tag"); fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${notes_args[@]}" \
+            --jq .body > release-notes.md
+          printf '\n\n<!-- release-pr-candidate -->\n' >> release-notes.md
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_SHA"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
+          test "$BUILT_SHA" = "$RELEASE_SHA"
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+      - name: Verify release tag
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          if tag_refs=$(git ls-remote --exit-code --tags \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$tag_ref" "$tag_ref^{}"); then
+            # Prefer the peeled commit for annotated tags; lightweight tags point directly at it.
+            tag_sha=$(awk -v ref="$tag_ref" '
+              $2 == ref { direct = $1 }
+              $2 == ref "^{}" { peeled = $1 }
+              END { print peeled ? peeled : direct }
+            ' <<< "$tag_refs")
+            if [[ "$tag_sha" != "$BUILT_SHA" ]]; then
+              echo "::error::The existing release tag does not point to the package build commit."
+              exit 1
+            fi
+          else
+            status=$?
+            # Exit 2 means no matching ref. Authentication/network errors must fail closed.
+            if [[ "$status" -ne 2 ]]; then
+              echo "::error::Could not verify the release tag."
+              exit "$status"
+            fi
+          fi
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        id: final_artifact
         with:
           name: nuget-package
           path: artifacts
 
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      # Use the same predicate generator and signer as attest-build-provenance v2.
+      # Its default dependency describes the workflow commit, not the checked-out source.
+      - uses: actions/attest-build-provenance/predicate@1176ef556905f349f669722abf30bce1a6e16e01 # predicate@1.1.5
+        id: workflow_provenance
+
+      - name: Record release package source in provenance
+        run: |
+          test "$BUILT_SHA" = "$RELEASE_SHA"
+          jq --arg source_sha "$BUILT_SHA" \
+            --arg source_uri "git+$GITHUB_SERVER_URL/$GITHUB_REPOSITORY@$BUILT_SHA" \
+            --arg release_tag "$RELEASE_TAG" '
+              .buildDefinition.externalParameters.release = {
+                tag: $release_tag,
+                source: {uri: $source_uri, digest: {gitCommit: $source_sha}}
+              }
+              | .buildDefinition.resolvedDependencies |= map(. + {name: "workflow"})
+              | .buildDefinition.resolvedDependencies += [{
+                  name: "release-source", uri: $source_uri, digest: {gitCommit: $source_sha}
+                }]
+            ' <<< "$WORKFLOW_PREDICATE" > artifacts/release-provenance.json
+        env:
+          WORKFLOW_PREDICATE: ${{ steps.workflow_provenance.outputs.predicate }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+
+      - uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2.4.0
+        id: release_provenance
         with:
-          subject-path: 'artifacts/*.nupkg'
+          subject-path: 'artifacts/*nupkg'
+          predicate-type: 'https://slsa.dev/provenance/v1'
+          predicate-path: 'artifacts/release-provenance.json'
+
+      - name: Verify release package provenance
+        run: |
+          jq -r '.dsseEnvelope.payload' "$BUNDLE_PATH" | base64 --decode \
+            | jq -e --arg sha "$BUILT_SHA" \
+                --arg uri "git+$GITHUB_SERVER_URL/$GITHUB_REPOSITORY@$BUILT_SHA" '
+                .predicateType == "https://slsa.dev/provenance/v1"
+                and .predicate.buildDefinition.externalParameters.release.source.digest.gitCommit == $sha
+                and any(.predicate.buildDefinition.resolvedDependencies[];
+                  .name == "release-source" and .uri == $uri and .digest.gitCommit == $sha)
+              ' > /dev/null
+        env:
+          BUNDLE_PATH: ${{ steps.release_provenance.outputs.bundle-path }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+
+      - name: Attach release packages and provenance
+        id: candidate
+        run: |
+          packages=(artifacts/*.nupkg)
+          test "${#packages[@]}" -eq 1
+          test -f "${packages[0]}"
+          package_name=${packages[0]##*/}
+          package_sha256=$(sha256sum "${packages[0]}" | cut -d ' ' -f 1)
+          symbol_name=${package_name%.nupkg}.snupkg
+          test -f "artifacts/$symbol_name"
+          symbol_sha256=$(sha256sum "artifacts/$symbol_name" | cut -d ' ' -f 1)
+          cp "$BUNDLE_PATH" artifacts/release-attestation.sigstore.json
+          gh release upload "$RELEASE_TAG" "${packages[0]}" "artifacts/$symbol_name" \
+            artifacts/release-attestation.sigstore.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "package_sha256=$package_sha256" >> "$GITHUB_OUTPUT"
+          echo "symbol_name=$symbol_name" >> "$GITHUB_OUTPUT"
+          echo "symbol_sha256=$symbol_sha256" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BUNDLE_PATH: ${{ steps.release_provenance.outputs.bundle-path }}
+
+      - name: Verify release packages and show review details
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$PACKAGE_NAME" --pattern "$SYMBOL_NAME" --pattern release-attestation.sigstore.json --dir staged
+          printf '%s  %s\n' "$PACKAGE_SHA256" "staged/$PACKAGE_NAME" \
+            "$SYMBOL_SHA256" "staged/$SYMBOL_NAME" | sha256sum --check
+          for package in "$PACKAGE_NAME" "$SYMBOL_NAME"; do
+            gh attestation verify "staged/$package" --repo "$GITHUB_REPOSITORY" \
+              --bundle staged/release-attestation.sigstore.json \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/csharp_release.yaml"
+          done
+          release_url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          {
+            printf '### Release candidate ready\n\n'
+            printf '[Download and test the draft candidate](%s) before approving NuGet publication.\n\n' "$release_url"
+            printf -- '- Package: `%s`\n- Source commit: `%s`\n- SHA-256: `%s`\n' "$PACKAGE_NAME" "$BUILT_SHA" "$PACKAGE_SHA256"
+            printf -- '- Symbols: `%s`\n- Symbols SHA-256: `%s`\n' "$SYMBOL_NAME" "$SYMBOL_SHA256"
+            printf '\nThe publishing job downloads these same assets and checks both digests.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+          PACKAGE_NAME: ${{ steps.candidate.outputs.package_name }}
+          PACKAGE_SHA256: ${{ steps.candidate.outputs.package_sha256 }}
+          SYMBOL_NAME: ${{ steps.candidate.outputs.symbol_name }}
+          SYMBOL_SHA256: ${{ steps.candidate.outputs.symbol_sha256 }}
+
+      - name: Verify selected release source
+        id: fresh
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_SHA"
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: ${{ needs.plan.outputs.release_pr != '' }}
+        with:
+          persist-credentials: false
+      - name: Update release PR approval instructions
+        if: ${{ needs.plan.outputs.release_pr != '' }}
+        uses: ./.github/actions/release-pr-progress
+        with:
+          token: ${{ github.token }}
+          pr: ${{ needs.plan.outputs.release_pr }}
+          stage: ${{ (github.event_name != 'workflow_dispatch' || inputs.publish) && 'ready' || 'staged' }}
+          version: ${{ needs.plan.outputs.version }}
+          source-sha: ${{ needs.plan.outputs.release_sha }}
+          artifact-url: ${{ needs.pack.outputs.artifact_url }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  publish_nuget:
+    name: Approve and publish NuGet packages
+    concurrency:
+      group: candidate-${{ github.repository }}-${{ needs.plan.outputs.release_tag }}
+      cancel-in-progress: false
+    if: ${{ needs.prepare_candidate.outputs.ready == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+    needs: [plan, pack, prepare_candidate]
+    runs-on: ubuntu-latest
+    environment: nuget-release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      # Draft releases require push access to see; keep this in the write-enabled job.
+      - name: Verify draft release and package source
+        run: |
+          release_info=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv')
+          IFS=$'\t' read -r is_draft target_commit <<< "$release_info"
+          if [[ "$is_draft" != true ]]; then
+            echo "::error::The GitHub release must still be a draft."
+            exit 1
+          fi
+          if [[ "$target_commit" != "$RELEASE_SHA" ]]; then
+            echo "::error::The draft release targetCommitish does not match release_sha."
+            exit 1
+          fi
+          if [[ "$BUILT_SHA" != "$RELEASE_SHA" ]]; then
+            echo "::error::The package build commit does not match release_sha."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+
+      - name: Verify release tag
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          if tag_refs=$(git ls-remote --exit-code --tags \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$tag_ref" "$tag_ref^{}"); then
+            # Prefer the peeled commit for annotated tags; lightweight tags point directly at it.
+            tag_sha=$(awk -v ref="$tag_ref" '
+              $2 == ref { direct = $1 }
+              $2 == ref "^{}" { peeled = $1 }
+              END { print peeled ? peeled : direct }
+            ' <<< "$tag_refs")
+            if [[ "$tag_sha" != "$BUILT_SHA" ]]; then
+              echo "::error::The existing release tag does not point to the package build commit."
+              exit 1
+            fi
+          else
+            status=$?
+            # Exit 2 means no matching ref. Authentication/network errors must fail closed.
+            if [[ "$status" -ne 2 ]]; then
+              echo "::error::Could not verify the release tag."
+              exit "$status"
+            fi
+          fi
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+
+      - name: Download and verify approved release packages
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$PACKAGE_NAME" --pattern "$SYMBOL_NAME" --pattern release-attestation.sigstore.json --dir artifacts
+          printf '%s  %s\n' "$PACKAGE_SHA256" "artifacts/$PACKAGE_NAME" \
+            "$SYMBOL_SHA256" "artifacts/$SYMBOL_NAME" | sha256sum --check
+          for package in "$PACKAGE_NAME" "$SYMBOL_NAME"; do
+            gh attestation verify "artifacts/$package" --repo "$GITHUB_REPOSITORY" \
+              --bundle artifacts/release-attestation.sigstore.json \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/csharp_release.yaml"
+          done
+          jq -r '.dsseEnvelope.payload' artifacts/release-attestation.sigstore.json | base64 --decode \
+            | jq -e --arg sha "$BUILT_SHA" \
+                --arg uri "git+$GITHUB_SERVER_URL/$GITHUB_REPOSITORY@$BUILT_SHA" '
+                .predicateType == "https://slsa.dev/provenance/v1"
+                and any(.predicate.buildDefinition.resolvedDependencies[];
+                  .name == "release-source" and .uri == $uri and .digest.gitCommit == $sha)
+              ' > /dev/null
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
+          PACKAGE_NAME: ${{ needs.prepare_candidate.outputs.package_name }}
+          PACKAGE_SHA256: ${{ needs.prepare_candidate.outputs.package_sha256 }}
+          SYMBOL_NAME: ${{ needs.prepare_candidate.outputs.symbol_name }}
+          SYMBOL_SHA256: ${{ needs.prepare_candidate.outputs.symbol_sha256 }}
+
+      - name: Freeze approved release packages
+        run: |
+          body=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          if ! grep -Fq '<!-- publication-started -->' <<< "$body"; then
+            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_SHA"
+            printf '%s\n\n<!-- publication-started -->\n' "$body" > publication-notes.md
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file publication-notes.md
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
 
       - uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
         id: nuget-login
@@ -107,19 +706,105 @@ jobs:
           # Package ownership is selected separately in that policy.
           user: ${{ vars.NUGET_USER }}
 
-      - run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
+      - name: Publish NuGet package and symbols
+        run: |
+          # Explicit pushes ensure a retry still publishes symbols if the main
+          # package succeeded in a previous attempt.
+          dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json --skip-duplicate --no-symbols
+          dotnet nuget push "artifacts/*.snupkg" --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json --skip-duplicate
         env:
           NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
 
-      # The release stays editable until every package asset is attached.
-      - name: Attach package to draft release
-        run: gh release upload "$RELEASE_TAG" artifacts/*.nupkg --repo "$GITHUB_REPOSITORY"
+  publish_release:
+    name: Publish GitHub release
+    needs: [plan, publish_nuget, pack]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Verify release tag
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          if tag_refs=$(git ls-remote --exit-code --tags \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$tag_ref" "$tag_ref^{}"); then
+            # Prefer the peeled commit for annotated tags; lightweight tags point directly at it.
+            tag_sha=$(awk -v ref="$tag_ref" '
+              $2 == ref { direct = $1 }
+              $2 == ref "^{}" { peeled = $1 }
+              END { print peeled ? peeled : direct }
+            ' <<< "$tag_refs")
+            if [[ "$tag_sha" != "$BUILT_SHA" ]]; then
+              echo "::error::The existing release tag does not point to the package build commit."
+              exit 1
+            fi
+          else
+            status=$?
+            # Exit 2 means no matching ref. Authentication/network errors must fail closed.
+            if [[ "$status" -ne 2 ]]; then
+              echo "::error::Could not verify the release tag."
+              exit "$status"
+            fi
+          fi
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          BUILT_SHA: ${{ needs.pack.outputs.source_sha }}
 
-      - name: Publish immutable release
+      - name: Publish GitHub release
         run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+
+      - name: Start next release preparation
+        if: ${{ github.ref_name == 'main' }}
+        run: gh workflow run csharp_release.yaml --repo "$GITHUB_REPOSITORY" --ref main -f publish=false
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  release_progress:
+    name: Update release PR status
+    if: ${{ always() && needs.plan.outputs.candidate == 'true' && needs.plan.outputs.release_pr != '' }}
+    needs: [plan, pack, prepare_candidate, publish_nuget, publish_release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check publication result
+        id: outcome
+        run: |
+          is_draft=true
+          if [[ "$NUGET_RESULT" == success ]]; then
+            # Published releases are readable here. A still-private draft (or
+            # an API failure) must never be reported as a completed release.
+            is_draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo true)
+          fi
+          if [[ "$is_draft" == false ]]; then
+            echo 'stage=published' >> "$GITHUB_OUTPUT"
+          elif [[ "$STAGING_RESULT" == success && "$PUBLISH_ENABLED" == false ]]; then
+            echo 'stage=staged' >> "$GITHUB_OUTPUT"
+          else
+            echo 'stage=attention' >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          STAGING_RESULT: ${{ needs.prepare_candidate.result }}
+          NUGET_RESULT: ${{ needs.publish_nuget.result }}
+          PUBLISH_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+      - name: Update release PR status
+        uses: ./.github/actions/release-pr-progress
+        with:
+          token: ${{ github.token }}
+          pr: ${{ needs.plan.outputs.release_pr }}
+          stage: ${{ steps.outcome.outputs.stage }}
+          version: ${{ needs.plan.outputs.version }}
+          source-sha: ${{ needs.plan.outputs.release_sha }}
+          artifact-url: ${{ needs.pack.outputs.artifact_url }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -3,6 +3,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <VersionPrefix>1.0.0</VersionPrefix> <!-- x-release-please-version -->
     <PackageId>AdbcDrivers.Snowflake</PackageId>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <!-- Scope preview versioning to this package, preserving Arrow's own version. -->
+    <Version Condition="'$(SnowflakePreviewVersion)' != ''">$(SnowflakePreviewVersion)</Version>
+    <PackageVersion Condition="'$(SnowflakePreviewVersion)' != ''">$(SnowflakePreviewVersion)</PackageVersion>
     <PackageReadmeFile>readme.md</PackageReadmeFile>
     <Description>C# Snowflake driver for Apache Arrow ADBC</Description>
   </PropertyGroup>

@@ -1,0 +1,132 @@
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Update release PR progress
+description: Keep one actionable progress panel above Release Please's generated notes.
+inputs:
+  token:
+    required: true
+    description: Token with pull requests write permission
+  pr:
+    default: ''
+    description: Release PR number
+  stage:
+    required: true
+    description: preview, building, ready, staged, published, or attention
+  version:
+    required: true
+    description: Package version
+  source-sha:
+    default: ''
+    description: Exact package source commit
+  artifact-url:
+    default: ''
+    description: Downloadable workflow artifact
+  run-url:
+    required: true
+    description: Workflow run containing the publication approval
+  retention-days:
+    default: '28'
+    description: Preview artifact retention
+  trigger-pr:
+    default: ''
+    description: Merged code PR that triggered the preview
+  trigger-sha:
+    default: ''
+    description: Commit that triggered the preview
+  dry-run:
+    default: 'false'
+    description: Render the panel without reading or changing a PR
+outputs:
+  panel:
+    description: Rendered Markdown panel
+    value: ${{ steps.update.outputs.panel }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      id: update
+      env:
+        PROGRESS_PR: ${{ inputs.pr }}
+        PROGRESS_STAGE: ${{ inputs.stage }}
+        PROGRESS_VERSION: ${{ inputs.version }}
+        PROGRESS_SHA: ${{ inputs.source-sha }}
+        PROGRESS_ARTIFACT: ${{ inputs.artifact-url }}
+        PROGRESS_RUN: ${{ inputs.run-url }}
+        PROGRESS_DAYS: ${{ inputs.retention-days }}
+        PROGRESS_TRIGGER: ${{ inputs.trigger-pr }}
+        PROGRESS_TRIGGER_SHA: ${{ inputs.trigger-sha }}
+        PROGRESS_DRY_RUN: ${{ inputs.dry-run }}
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const e = process.env;
+          const stage = e.PROGRESS_STAGE;
+          const version = e.PROGRESS_VERSION;
+          const repo = `${e.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}`;
+          const run = `[Open release workflow](${e.PROGRESS_RUN})`;
+          const download = e.PROGRESS_ARTIFACT ? `**[Download ${stage === 'preview' ? 'preview' : 'final'} package](${e.PROGRESS_ARTIFACT})**` : '';
+          const headings = {
+            preview: 'Preview ready', building: 'Building final package',
+            ready: 'Publication approval required', staged: 'Final package staged for testing',
+            published: 'Published', attention: 'Release needs attention'
+          };
+          if (!headings[stage]) throw new Error(`Unknown release progress stage: ${stage}`);
+          const lines = ['<!-- release-preview:start -->', `### Release progress: ${headings[stage]}`, '', `**Version:** \`${version}\``, ''];
+          if (stage === 'preview') {
+            lines.push(download, '', `Extract the ZIP to use the \`.nupkg\`. Available for ${e.PROGRESS_DAYS} days from upload.`, '',
+              '**Next:** Test the preview, then review and merge this release PR when ready. Merging builds the final package; a separate publication approval follows.', '',
+              e.PROGRESS_TRIGGER && e.PROGRESS_TRIGGER !== '0'
+                ? `Triggered by #${e.PROGRESS_TRIGGER}.`
+                : `Triggered by commit [${(e.PROGRESS_TRIGGER_SHA || '').slice(0, 7)}](${repo}/commit/${e.PROGRESS_TRIGGER_SHA}).`);
+          } else if (stage === 'building') {
+            lines.push('This release PR has been merged. The final package is being built and verified.', '',
+              `**Next:** ${run}. Wait for the package to be staged and publication approval to become available.`);
+          } else if (stage === 'ready' || stage === 'staged') {
+            lines.push(download, '', `[Open draft releases](${repo}/releases) and select \`csharp/v${version}\` to inspect the final package and provenance.`, '');
+            if (stage === 'ready') {
+              lines.push(`**Next:** ${run}, click **Review deployments**, select **nuget-release**, then **Approve and deploy**.`, '',
+                'That approval publishes this same final package to NuGet and publishes the GitHub release. Nothing has been published yet.');
+            } else {
+              lines.push(`**Next:** ${run} to review this manual staging test. Publication was disabled; no approval is requested.`);
+            }
+          } else if (stage === 'published') {
+            lines.push(`**[Open release and final package](${repo}/releases/tag/csharp/v${version})**`, '',
+              `[Open NuGet package](https://www.nuget.org/packages/AdbcDrivers.Snowflake/${version})`, '',
+              '**Next:** None. NuGet and GitHub release publication are complete.', '', run);
+          } else {
+            lines.push(`**Next:** ${run}, inspect the failed or cancelled job, and rerun failed jobs after resolving the issue.`, '',
+              'If NuGet publication already succeeded, resume the original publication run rather than creating another candidate.');
+          }
+          if (e.PROGRESS_SHA) lines.push('', `**Source commit:** \`${e.PROGRESS_SHA}\`.`);
+          lines.push('<!-- release-preview:end -->');
+          const panel = lines.join('\n');
+          core.setOutput('panel', panel);
+          if (e.PROGRESS_DRY_RUN === 'true') {
+            core.info(panel);
+            return;
+          }
+          const pull_number = Number(e.PROGRESS_PR);
+          if (!Number.isInteger(pull_number) || pull_number < 1) throw new Error('A release PR number is required');
+          const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number});
+          const matches = stage === 'preview'
+            ? pr.state === 'open' && pr.head.sha === e.PROGRESS_SHA
+            : pr.merged && pr.merge_commit_sha === e.PROGRESS_SHA;
+          if (!matches) {
+            core.info('Release PR state/source changed; leave its current progress unchanged.');
+            return;
+          }
+          const notes = (pr.body || '').replace(/<!-- release-preview:start -->[\s\S]*?<!-- release-preview:end -->\s*/g, '');
+          const body = `${panel}\n\n${notes}`;
+          if (body !== pr.body) await github.rest.pulls.update({...context.repo, pull_number, body});
