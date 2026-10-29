@@ -797,7 +797,7 @@ fn fetch_constraints(
             }
         })
         .collect::<Vec<_>>();
-    for rows in run_concurrently(jobs.into_iter())? {
+    for rows in run_concurrently(jobs)? {
         attach_constraint_rows(objects, rows);
     }
     Ok(())
