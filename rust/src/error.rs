@@ -86,6 +86,17 @@ fn query_failure_error(
     error.vendor_code(vendor_code).sqlstate(sqlstate)
 }
 
+/// The ID of a failed query, when the server reported one.
+pub(crate) fn failed_query_id(err: &ApiError) -> Option<String> {
+    if let ApiError::Query { source, .. } = err
+        && let RestError::QueryFailed { ids, .. } = source.as_ref()
+    {
+        ids.query_id.clone().filter(|id| !id.is_empty())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
     // QueryFailed carries the server's diagnostics directly; keep the full
     // cause chain as well as its SQLSTATE, vendor code, and query ID.

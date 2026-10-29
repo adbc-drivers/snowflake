@@ -1280,3 +1280,164 @@ fn test_result_fetch_tuning_options() {
         .sum();
     assert_eq!(total, rows);
 }
+
+fn count_rows(conn: &mut adbc_driver_snowflake::Connection, table: &str) -> i64 {
+    let mut stmt = conn.new_statement().expect("new_statement");
+    stmt.set_sql_query(format!("SELECT COUNT(*) FROM {table}"))
+        .expect("set_sql_query");
+    let batch = stmt.execute().expect("execute").next().unwrap().unwrap();
+    let column = arrow_cast::cast(batch.column(0), &DataType::Int64).unwrap();
+    column
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// Manual transactions without Go's explicit BEGIN: Snowflake starts one
+/// implicitly, and re-enabling autocommit commits it.
+#[test]
+fn test_manual_transactions() {
+    let Some(mut observer) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let table = format!("TXN_TEST_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    let mut setup = observer.new_statement().unwrap();
+    setup
+        .set_sql_query(format!("CREATE TABLE {table} (v INT)"))
+        .unwrap();
+    setup.execute_update().unwrap();
+
+    let mut conn = make_connection().unwrap();
+    let insert = |conn: &mut adbc_driver_snowflake::Connection, value: i32| {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query(format!("INSERT INTO {table} VALUES ({value})"))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    };
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("false".into()),
+    )
+    .unwrap();
+    insert(&mut conn, 1);
+    assert_eq!(count_rows(&mut observer, &table), 0, "uncommitted insert");
+    conn.rollback().unwrap();
+    insert(&mut conn, 2);
+    conn.commit().unwrap();
+    assert_eq!(count_rows(&mut observer, &table), 1, "rollback then commit");
+    insert(&mut conn, 3);
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("true".into()),
+    )
+    .unwrap();
+    assert_eq!(count_rows(&mut observer, &table), 2, "re-enabling commits");
+    assert_eq!(
+        conn.commit().unwrap_err().status,
+        adbc_core::error::Status::InvalidState
+    );
+    insert(&mut conn, 4);
+    assert_eq!(count_rows(&mut observer, &table), 3, "autocommit");
+
+    setup.set_sql_query(format!("DROP TABLE {table}")).unwrap();
+    setup.execute_update().unwrap();
+}
+
+const LAST_QUERY_ID: &str = "snowflake.query.last_query_id";
+const QUERY_ID_METADATA: &str = "SNOWFLAKE:query_id";
+
+fn last_query_id(stmt: &adbc_driver_snowflake::Statement) -> String {
+    stmt.get_option_string(OptionStatement::Other(LAST_QUERY_ID.into()))
+        .expect("last query id")
+}
+
+/// Mirrors the Go driver's TestQueryID contract.
+#[test]
+fn test_query_id() {
+    use arrow_array::RecordBatchReader;
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut stmt = conn.new_statement().unwrap();
+    assert_eq!(last_query_id(&stmt), "");
+    assert_eq!(
+        stmt.set_option(
+            OptionStatement::Other(LAST_QUERY_ID.into()),
+            OptionValue::String("x".into())
+        )
+        .unwrap_err()
+        .status,
+        adbc_core::error::Status::InvalidArguments
+    );
+    let mut previous = String::new();
+    for query in [
+        "SELECT 1",
+        "SELECT 1 WHERE FALSE",
+        "SHOW PARAMETERS LIKE 'TIMEZONE' IN SESSION",
+    ] {
+        stmt.set_sql_query(query).unwrap();
+        let reader = stmt.execute().unwrap();
+        let id = last_query_id(&stmt);
+        assert!(!id.is_empty() && id != previous, "{query}");
+        let schema = reader.schema();
+        assert_eq!(schema.metadata().get(QUERY_ID_METADATA), Some(&id));
+        for batch in reader {
+            assert_eq!(batch.unwrap().schema().metadata(), schema.metadata());
+        }
+        previous = id;
+    }
+    stmt.set_sql_query("SELECT 1").unwrap();
+    let schema = stmt.execute_schema().unwrap();
+    assert!(!schema.metadata().contains_key(QUERY_ID_METADATA));
+    assert_eq!(last_query_id(&stmt), previous);
+
+    stmt.set_sql_query("SELECT * FROM table_that_does_not_exist_for_query_id")
+        .unwrap();
+    assert!(stmt.execute().is_err());
+    let failed = last_query_id(&stmt);
+    assert!(
+        !failed.is_empty() && failed != previous,
+        "failed query's ID"
+    );
+}
+
+/// Mirrors the Go driver's TestQueryIDBound contract.
+#[test]
+fn test_query_id_bound() {
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchReader};
+    use std::sync::Arc;
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut stmt = conn.new_statement().unwrap();
+    stmt.set_sql_query("SELECT ?").unwrap();
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "v",
+        DataType::Int64,
+        false,
+    )]));
+    stmt.bind(RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap())
+        .unwrap();
+    let reader = stmt.execute().unwrap();
+    let first = reader
+        .schema()
+        .metadata()
+        .get(QUERY_ID_METADATA)
+        .cloned()
+        .expect("query id metadata");
+    let mut count = 0;
+    for batch in reader {
+        assert_eq!(
+            batch.unwrap().schema().metadata().get(QUERY_ID_METADATA),
+            Some(&first)
+        );
+        count += 1;
+    }
+    assert_eq!(count, 2);
+    let last = last_query_id(&stmt);
+    assert!(!last.is_empty() && last != first);
+}

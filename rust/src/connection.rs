@@ -40,6 +40,9 @@ use crate::driver::{Inner, OperationCancelHandle, TimestampPrecision};
 use crate::error::SnowflakeError;
 use crate::statement::{Statement, adjust_schema};
 
+/// driverbase-go's value for versions the driver cannot determine.
+const UNKNOWN_VERSION: &str = "(unknown or development build)";
+
 fn info_registry(vendor_version: &str) -> InfoRegistry {
     let mut registry = InfoRegistry::new();
     registry.add_string(InfoCode::VendorName, "Snowflake");
@@ -53,6 +56,8 @@ fn info_registry(vendor_version: &str) -> InfoRegistry {
     );
     registry.add_string(InfoCode::VendorVersion, vendor_version);
     registry.add_string(InfoCode::DriverArrowVersion, ARROW_VERSION);
+    // Snowflake does not report its Arrow version; use Go's placeholder.
+    registry.add_string(InfoCode::VendorArrowVersion, UNKNOWN_VERSION);
     registry
 }
 
@@ -791,6 +796,7 @@ mod tests {
             (InfoCode::DriverVersion, env!("CARGO_PKG_VERSION")),
             (InfoCode::VendorVersion, "10.1.2"),
             (InfoCode::DriverArrowVersion, ARROW_VERSION),
+            (InfoCode::VendorArrowVersion, UNKNOWN_VERSION),
         ] {
             let mut reader = registry.get_info(Some(HashSet::from([code]))).build();
             let batch = reader.next().unwrap().unwrap();
@@ -881,7 +887,7 @@ mod tests {
         use arrow_array::UInt32Array;
 
         let registry = info_registry("10.1.2");
-        let unsupported = InfoCode::VendorArrowVersion;
+        let unsupported = InfoCode::VendorSubstraitMinVersion;
         let mut reader = registry
             .get_info(Some(HashSet::from([unsupported])))
             .build();

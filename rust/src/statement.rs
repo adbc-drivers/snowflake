@@ -66,6 +66,49 @@ fn parse_query_timeout(value: &OptionValue) -> Result<Option<u32>> {
     Ok((seconds != 0).then_some(seconds))
 }
 
+/// The latest query's ID (read-only), and the result schema metadata key that
+/// carries the ID of the query producing a stream; both named as in Go.
+const LAST_QUERY_ID_OPTION: &str = "snowflake.query.last_query_id";
+const QUERY_ID_METADATA_KEY: &str = "SNOWFLAKE:query_id";
+
+/// Label a result's schema, and each batch's, with the producing query's ID.
+fn with_query_id(
+    reader: Box<dyn RecordBatchReader + Send + 'static>,
+    query_id: &str,
+) -> Box<dyn RecordBatchReader + Send + 'static> {
+    if query_id.is_empty() {
+        return reader;
+    }
+    let schema = reader.schema();
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(QUERY_ID_METADATA_KEY.into(), query_id.into());
+    let schema = Arc::new(schema.as_ref().clone().with_metadata(metadata));
+    Box::new(QueryIdReader {
+        inner: reader,
+        schema,
+    })
+}
+
+struct QueryIdReader {
+    inner: Box<dyn RecordBatchReader + Send + 'static>,
+    schema: Arc<Schema>,
+}
+
+impl Iterator for QueryIdReader {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.inner.next()?;
+        Some(batch.and_then(|batch| batch.with_schema(Arc::clone(&self.schema))))
+    }
+}
+
+impl RecordBatchReader for QueryIdReader {
+    fn schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+}
+
 /// Go's statement options for result fetching, mapped to sf_core's
 /// per-statement `CLIENT_PREFETCH_THREADS` and `CLIENT_RESULT_QUEUE_SIZE`.
 const PREFETCH_CONCURRENCY_OPTION: &str = "adbc.snowflake.rpc.prefetch_concurrency";
@@ -246,6 +289,11 @@ impl Optionable for Statement {
                 }
                 Ok(())
             }
+            OptionStatement::Other(ref k) if k == LAST_QUERY_ID_OPTION => {
+                Err(SnowflakeError::set_invalid_option(k, &value)
+                    .message("statement option is read-only")
+                    .into())
+            }
             OptionStatement::Other(ref k) if self.ingest_options.set(k, &value)? => Ok(()),
             _ => Err(SnowflakeError::set_unknown_option(&key.as_ref()).into()),
         }
@@ -263,12 +311,8 @@ impl Optionable for Statement {
             OptionStatement::Other(k) if k == "adbc.snowflake.statement.query_tag" => {
                 Ok(self.query_tag.clone().unwrap_or_default())
             }
-            OptionStatement::Other(k) if k == "adbc.snowflake.sql.query_id" => {
-                self.last_query_id.clone().ok_or_else(|| {
-                    Error::from(
-                        SnowflakeError::not_found().message("no query has been executed yet"),
-                    )
-                })
+            OptionStatement::Other(k) if k == LAST_QUERY_ID_OPTION => {
+                Ok(self.last_query_id.clone().unwrap_or_default())
             }
             OptionStatement::Other(k)
                 if k == PREFETCH_CONCURRENCY_OPTION || k == RESULT_QUEUE_SIZE_OPTION =>
@@ -453,20 +497,23 @@ impl Statement {
         operation
     }
 
-    /// Route every user-statement execution through the statement timeout.
-    /// The binding owner must remain alive until this synchronous call returns.
+    /// Route every user-statement execution through the statement timeout and
+    /// record its query ID. The binding owner must remain alive until this
+    /// synchronous call returns.
     pub(crate) fn execute_query<'a>(
-        &self,
+        &mut self,
         operation: &OperationCtx,
         query: String,
         bindings: Option<BindingType<'a>>,
     ) -> Result<QueryResult> {
-        self.inner.execute_query_with_timeout(
+        let timeout_seconds = self.execution_timeout_seconds();
+        self.inner.execute_query_recording_id(
             Some(operation),
             self.stmt_handle,
             query,
             bindings,
-            self.execution_timeout_seconds(),
+            timeout_seconds,
+            &mut self.last_query_id,
         )
     }
 
@@ -496,15 +543,17 @@ impl Statement {
         let timeout_seconds = self.execution_timeout_seconds();
         let timestamp_precision = self.timestamp_precision;
         let mut last_query_id = self.last_query_id.clone();
+        let mut first_query_id = None;
         let result = execute_bound_rows(&batches, Arc::new(Schema::empty()), |row| {
             let json_bytes = arrow_batches_to_json_bindings(&[row])?;
             let data_ptr = DataPtr::new(json_bytes.as_ptr(), json_bytes.len() as i64);
-            let result = inner.execute_query_with_timeout(
+            let result = inner.execute_query_recording_id(
                 Some(&operation),
                 stmt_handle,
                 query.clone(),
                 Some(BindingType::Json(data_ptr)),
                 timeout_seconds,
+                &mut last_query_id,
             )?;
             if *returned_rows >= 0 {
                 *returned_rows = result
@@ -513,7 +562,7 @@ impl Statement {
                     .and_then(|rows| returned_rows.checked_add(rows))
                     .unwrap_or(-1);
             }
-            last_query_id = Some(result.descriptor.query_id.clone());
+            first_query_id.get_or_insert_with(|| result.descriptor.query_id.clone());
             let timezone = inner.session_timezone(conn_handle)?;
             Ok(Box::new(ConvertingReader::new(
                 result.reader,
@@ -522,9 +571,9 @@ impl Statement {
                 timezone,
             )))
         });
-        // On a later-row failure, retain the ID of the last successful execution.
         self.last_query_id = last_query_id;
-        result
+        // Like Go, the combined result is labelled with the first execution.
+        result.map(|reader| with_query_id(reader, first_query_id.as_deref().unwrap_or_default()))
     }
 }
 
@@ -570,14 +619,14 @@ impl adbc_core::Statement for Statement {
                 let result = self.execute_query(&operation, query, None)?;
                 returned_rows = result.descriptor.row_count.unwrap_or(-1);
 
-                self.last_query_id = Some(result.descriptor.query_id.clone());
-                let reader = result.reader;
-                Ok(Box::new(ConvertingReader::new(
-                    reader,
+                let query_id = result.descriptor.query_id.clone();
+                let reader = ConvertingReader::new(
+                    result.reader,
                     self.timestamp_precision.time_unit(),
                     self.timestamp_precision,
                     self.inner.session_timezone(self.conn_handle)?,
-                )))
+                );
+                Ok(with_query_id(Box::new(reader), &query_id))
             })();
             span.record("db.response.returned_rows", returned_rows);
             if result.is_ok()
@@ -624,14 +673,11 @@ impl adbc_core::Statement for Statement {
                     let operation = self.begin_operation();
                     let result = self.execute_query(&operation, query, Some(binding))?;
 
-                    self.last_query_id = Some(result.descriptor.query_id.clone());
                     return Ok(result.descriptor.rows_affected);
                 }
 
                 let operation = self.begin_operation();
                 let result = self.execute_query(&operation, query, None)?;
-
-                self.last_query_id = Some(result.descriptor.query_id.clone());
 
                 Ok(result.descriptor.rows_affected)
             })();
@@ -654,20 +700,20 @@ impl adbc_core::Statement for Statement {
         let inner = Arc::clone(&self.inner);
         let parent = self.trace_parent_for_span();
         inner.traced("statement.ExecuteSchema", parent.as_deref(), |span| {
+            // Like Go, describing leaves the last executed query's ID alone;
+            // only the span records the describe request's ID.
             let result = (|| {
                 self.invalidate_described();
                 let operation = self.begin_operation();
                 let described = self.describe(&operation)?;
-                self.last_query_id = Some(described.query_id.clone());
-                Ok(described.result.clone())
+                Ok((described.result.clone(), described.query_id.clone()))
             })();
-            if result.is_ok()
-                && self.inner.telemetry.is_enabled()
-                && let Some(id) = self.last_query_id.as_deref().filter(|id| !id.is_empty())
-            {
-                span.set_attribute("snowflake.query.id", id.to_owned());
-            }
-            result
+            result.map(|(schema, query_id)| {
+                if self.inner.telemetry.is_enabled() && !query_id.is_empty() {
+                    span.set_attribute("snowflake.query.id", query_id);
+                }
+                schema
+            })
         })
     }
 
