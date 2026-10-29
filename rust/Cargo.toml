@@ -26,7 +26,7 @@ adbc_core = "0.25"
 adbc_ffi = "0.25"
 # Integration branch: driverbase-rs #44 and #46 (both merged) plus the
 # unmerged #45 telemetry feature. Move the rev to main after #45 merges.
-driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "e55332b13b2864278e52a8da904c193eb2c97a38", features = ["telemetry"] }
+driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "63df11eab9c6c75492827c1d9f280c63ba6c0c83", features = ["telemetry"] }
 # sf_core integration branch: snowflakedb/drivers main plus the JWT lifetime
 # and per-statement prefetch tuning changes. Move back to upstream (and update
 # rustls-webpki below) after those PRs merge.
