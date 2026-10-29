@@ -46,7 +46,7 @@ def compare_ingest_tables(
 class SnowflakeQuirks(model.DriverQuirks):
     name = "snowflake"
     driver = "adbc_driver_snowflake"
-    driver_name = "ADBC Snowflake Driver (Rust)"
+    driver_name = "ADBC Driver Foundry Driver for Snowflake"
     vendor_name = "Snowflake"
     vendor_version = re.compile(r"\d+\.[0-9]+\.[0-9]+")
     short_version = "10"

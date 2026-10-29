@@ -48,7 +48,12 @@ fn info_registry(vendor_version: &str) -> InfoRegistry {
     registry.add_string(InfoCode::VendorName, "Snowflake");
     registry.add_bool(InfoCode::VendorSql, true);
     registry.add_bool(InfoCode::VendorSubstrait, false);
-    registry.add_string(InfoCode::DriverName, "ADBC Snowflake Driver (Rust)");
+    // Go's product name; sf_core's wrapper identity and the default
+    // application stay Rust-specific so Snowflake can tell them apart.
+    registry.add_string(
+        InfoCode::DriverName,
+        "ADBC Driver Foundry Driver for Snowflake",
+    );
     registry.add_string(InfoCode::DriverVersion, env!("CARGO_PKG_VERSION"));
     registry.add_int64(
         InfoCode::DriverAdbcVersion,
@@ -792,7 +797,10 @@ mod tests {
         let registry = info_registry("10.1.2");
         for (code, expected) in [
             (InfoCode::VendorName, "Snowflake"),
-            (InfoCode::DriverName, "ADBC Snowflake Driver (Rust)"),
+            (
+                InfoCode::DriverName,
+                "ADBC Driver Foundry Driver for Snowflake",
+            ),
             (InfoCode::DriverVersion, env!("CARGO_PKG_VERSION")),
             (InfoCode::VendorVersion, "10.1.2"),
             (InfoCode::DriverArrowVersion, ARROW_VERSION),
