@@ -286,6 +286,35 @@ impl Inner {
         self.acquire_execute_result(result)
     }
 
+    /// Like [`Self::execute_query_with_timeout`], also recording the query ID:
+    /// the result's on success and, as in Go, the failed query's when the
+    /// server reports one.
+    pub(crate) fn execute_query_recording_id<'a>(
+        &self,
+        operation_ctx: Option<&OperationCtx>,
+        statement: Handle,
+        query: String,
+        bindings: Option<BindingType<'a>>,
+        timeout_seconds: Option<u32>,
+        last_query_id: &mut Option<String>,
+    ) -> Result<QueryResult> {
+        let result = self
+            .execute_query_raw_with_timeout(
+                operation_ctx,
+                statement,
+                query,
+                bindings,
+                timeout_seconds,
+            )
+            .map_err(|error| {
+                *last_query_id = crate::error::failed_query_id(&error);
+                crate::error::api_error_to_adbc_error(error)
+            })?;
+        let result = self.acquire_execute_result(result)?;
+        *last_query_id = Some(result.descriptor.query_id.clone());
+        Ok(result)
+    }
+
     /// Execute through sf_core without erasing its typed error. Callers must
     /// pass successful results to [`Self::acquire_execute_result`] so result
     /// handles are released on every stream-acquisition path.
