@@ -42,7 +42,10 @@ services:
       - ${SOURCE_ROOT:-.}:/source:rw
 
   manylinux-rust:
-    # LOCAL MODIFICATIONS: do not reuse upstream's Rust image without the Perl modules.
+    # LOCAL MODIFICATIONS: do not reuse upstream's Rust image without the Perl
+    # modules. The suffixed image is never published, so CI always builds it;
+    # build only DOCKER_DEFAULT_PLATFORM (the runner's own architecture), since
+    # the runners' default docker driver cannot build multi-platform images.
     image: ghcr.io/adbc-drivers/dev:${MANYLINUX}-rust${RUST}-snowflake2
     build:
       context: ./compose/manylinux-rust
@@ -50,8 +53,5 @@ services:
         LIBCLANG: ${LIBCLANG}
         RUST: ${RUST}
         MANYLINUX: ${MANYLINUX}
-      platforms:
-        - linux/amd64
-        - linux/arm64
     volumes:
       - ${SOURCE_ROOT:-.}:/source:rw
