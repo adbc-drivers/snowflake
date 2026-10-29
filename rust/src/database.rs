@@ -25,7 +25,9 @@ use driverbase::error::ErrorHelper;
 use sf_core::apis::database_driver_v1::{
     Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
 };
-use sf_core::config::param_registry::{Wrapper, param_names, registry};
+use sf_core::config::param_registry::{
+    DEFAULT_LOGIN_TIMEOUT_SECS, DEFAULT_RETRY_TIMEOUT_SECS, Wrapper, param_names, registry,
+};
 use sf_core::config::rest_parameters::DEFAULT_JWT_TIMEOUT_SECS;
 use sf_core::config::settings::Setting;
 
@@ -338,13 +340,23 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
             }
             Setting::Int(port)
         }
+        // Like gosnowflake, zero selects the default where Go has one; sf_core
+        // would otherwise read 0 as "no timeout". Go's request_timeout default
+        // is no timeout, so 0 passes through.
+        "adbc.snowflake.sql.client_option.request_timeout" => duration_setting(key, value)?,
         "adbc.snowflake.sql.client_option.login_timeout"
-        | "adbc.snowflake.sql.client_option.request_timeout"
-        | "adbc.snowflake.sql.client_option.client_timeout" => duration_setting(key, value)?,
-        // Like gosnowflake, a zero lifetime selects the default.
-        "adbc.snowflake.sql.client_option.jwt_expire_timeout" => {
+        | "adbc.snowflake.sql.client_option.client_timeout"
+        | "adbc.snowflake.sql.client_option.jwt_expire_timeout" => {
             match duration_setting(key, value)? {
-                Setting::Int(0) => Setting::Int(DEFAULT_JWT_TIMEOUT_SECS),
+                Setting::Int(0) => Setting::Int(match key {
+                    "adbc.snowflake.sql.client_option.login_timeout" => {
+                        DEFAULT_LOGIN_TIMEOUT_SECS as i64
+                    }
+                    "adbc.snowflake.sql.client_option.client_timeout" => {
+                        DEFAULT_RETRY_TIMEOUT_SECS as i64
+                    }
+                    _ => DEFAULT_JWT_TIMEOUT_SECS,
+                }),
                 setting => setting,
             }
         }
@@ -2000,12 +2012,35 @@ mod tests {
     }
 
     #[test]
-    fn jwt_expire_timeout_sets_whole_seconds_and_zero_selects_default() {
-        let key = "adbc.snowflake.sql.client_option.jwt_expire_timeout";
-        for (value, seconds) in [
-            ("1m30s", 90),
-            ("1500ms", 2),
-            ("0s", DEFAULT_JWT_TIMEOUT_SECS),
+    fn durations_round_up_and_zero_matches_go_defaults() {
+        let jwt = "adbc.snowflake.sql.client_option.jwt_expire_timeout";
+        let login = "adbc.snowflake.sql.client_option.login_timeout";
+        let client = "adbc.snowflake.sql.client_option.client_timeout";
+        let request = "adbc.snowflake.sql.client_option.request_timeout";
+        for (key, param, value, seconds) in [
+            (jwt, param_names::JWT_TIMEOUT, "1m30s", 90),
+            (jwt, param_names::JWT_TIMEOUT, "1500ms", 2),
+            (
+                jwt,
+                param_names::JWT_TIMEOUT,
+                "0s",
+                DEFAULT_JWT_TIMEOUT_SECS,
+            ),
+            (
+                login,
+                param_names::LOGIN_TIMEOUT,
+                "0s",
+                DEFAULT_LOGIN_TIMEOUT_SECS as i64,
+            ),
+            (login, param_names::LOGIN_TIMEOUT, "500ms", 1),
+            (
+                client,
+                param_names::RETRY_TIMEOUT,
+                "0",
+                DEFAULT_RETRY_TIMEOUT_SECS as i64,
+            ),
+            // Go's request_timeout default is no timeout, which sf_core spells 0.
+            (request, param_names::REQUEST_TIMEOUT, "0s", 0),
         ] {
             let mut db = make_db();
             db.set_option(
@@ -2014,9 +2049,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                db.sf_settings.get(param_names::JWT_TIMEOUT.as_str()),
+                db.sf_settings.get(param.as_str()),
                 Some(&Setting::Int(seconds)),
-                "{value}"
+                "{key}={value}"
             );
             assert_eq!(
                 db.get_option_string(OptionDatabase::Other(key.into()))
