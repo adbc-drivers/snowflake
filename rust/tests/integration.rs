@@ -1402,6 +1402,30 @@ fn test_query_id() {
         !failed.is_empty() && failed != previous,
         "failed query's ID"
     );
+
+    // Reusing the statement for bulk ingestion clears the ID, as in Go.
+    use arrow_array::{Int64Array, RecordBatch};
+    use std::sync::Arc;
+    let table = format!("QUERY_ID_INGEST_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    stmt.set_option(
+        OptionStatement::TargetTable,
+        OptionValue::String(table.clone()),
+    )
+    .unwrap();
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "ID",
+        DataType::Int64,
+        false,
+    )]));
+    stmt.bind(RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap())
+        .unwrap();
+    assert_eq!(stmt.execute_update().unwrap(), Some(1));
+    assert_eq!(last_query_id(&stmt), "", "ingest reports no query ID");
+    let mut cleanup = conn.new_statement().unwrap();
+    cleanup
+        .set_sql_query(format!("DROP TABLE {table}"))
+        .unwrap();
+    cleanup.execute_update().unwrap();
 }
 
 /// Mirrors the Go driver's TestQueryIDBound contract.
