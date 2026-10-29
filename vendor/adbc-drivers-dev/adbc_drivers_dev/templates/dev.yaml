@@ -1,0 +1,81 @@
+<% if private %>
+# Copyright (c) 2025-2026 Columnar Technologies Inc.  All rights reserved.
+<% else %>
+# Copyright (c) 2025-2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+<% endif %>
+
+# This is a common workflow for performing basic PR checks like running
+# pre-commit.
+
+name: Dev
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: "lint & pre-commit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+<% if lang.get("go") %>
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          cache-dependency-path: <{go_mod_path}>/go.sum
+          check-latest: true
+          go-version-file: <{go_mod_path}>/go.mod
+<% endif %>
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          # Stick to 3.14 as some hooks/dependencies are not ready for 3.15
+          python-version: "3.14"
+
+      - name: Install
+        run: pip install pre-commit
+
+      - name: pre-commit (cache)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: pre-commit
+        run: |
+          pre-commit run --all-files --color=always --show-diff-on-failure --verbose
+
+      - name: Analyze workflows with zizmor
+        uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b  # v0.8.0
+        with:
+          advanced-security: false

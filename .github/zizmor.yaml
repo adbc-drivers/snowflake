@@ -12,4 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-rules: {}
+rules:
+  dangerous-triggers:
+    ignore:
+      # "take" handler only assigns the commenter; it checks out no code.
+      - dev_issues.yaml

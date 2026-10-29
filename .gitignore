@@ -43,7 +43,10 @@ go.work.sum
 
 # Editor/IDE
 # .idea/
-# .vscode/
+.vscode/
+
+# Local agent runtime state
+.pi/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -34,5 +34,6 @@ python = ">=3.14.3,<3.15"
 pytest-lazy-fixtures = ">=1.3.2,<2"
 
 [pypi-dependencies]
-adbc-drivers-dev = { git = "https://github.com/adbc-drivers/dev" }
+# LOCAL DEVIATION: Use vendored Snowflake manylinux cache and Rust image fixes.
+adbc-drivers-dev = { path = "../vendor/adbc-drivers-dev", editable = true }
 adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation" }

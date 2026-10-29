@@ -1,0 +1,428 @@
+{
+  "$defs": {
+    "AwsConfig": {
+      "additionalProperties": false,
+      "description": "AWS authentication configuration.",
+      "properties": {
+        "region": {
+          "description": "AWS region to use for authentication (e.g., us-west-2, us-east-1)",
+          "title": "Region",
+          "type": "string"
+        }
+      },
+      "required": [
+        "region"
+      ],
+      "title": "AwsConfig",
+      "type": "object"
+    },
+    "LangBuildConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "additional-make-args": {
+          "description": "A list of additional arguments to pass to adbc-make.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Additional-Make-Args",
+          "type": "array"
+        },
+        "go-mod-path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path containing the go.mod file for Go drivers. Used to cache dependencies in CI. Defaults to the language subdir.",
+          "title": "Go-Mod-Path"
+        },
+        "lang-tools": {
+          "description": "Install tools for these languages to use in the build.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Lang-Tools",
+          "type": "array"
+        },
+        "environment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of a GitHub Actions Environment to activate",
+          "title": "Environment"
+        }
+      },
+      "title": "LangBuildConfig",
+      "type": "object"
+    },
+    "LangConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/LangBuildConfig",
+          "description": "Configuration for building the driver."
+        },
+        "exclude-platforms": {
+          "description": "Platforms to exclude from build/test.",
+          "items": {
+            "enum": [
+              "linux_amd64",
+              "linux_arm64",
+              "macos_arm64",
+              "windows_amd64"
+            ],
+            "type": "string"
+          },
+          "title": "Exclude-Platforms",
+          "type": "array"
+        },
+        "github-stack-behavior": {
+          "default": "all",
+          "description": "Which PRs in a stack run language_test.yaml: 'all', 'bottom' (lowest unmerged), and 'top'.",
+          "enum": [
+            "all",
+            "bottom",
+            "top"
+          ],
+          "title": "Github-Stack-Behavior",
+          "type": "string"
+        },
+        "subdir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Override the default subdirectory for this language. Use '.' to place files at the repository root.",
+          "title": "Subdir"
+        },
+        "test": {
+          "$ref": "#/$defs/LangTestConfig",
+          "description": "Configuration for the driver test suite."
+        },
+        "test-packages": {
+          "$ref": "#/$defs/LangTestPackagesConfig",
+          "description": "Configuration for the Test Packages step."
+        },
+        "validation": {
+          "$ref": "#/$defs/LangValidationConfig",
+          "description": "Configuration for the driver validation suite."
+        }
+      },
+      "title": "LangConfig",
+      "type": "object"
+    },
+    "LangTestConfig": {
+      "additionalProperties": false,
+      "description": "Options for test suite.",
+      "properties": {
+        "skip": {
+          "default": false,
+          "description": "Whether to skip tests in CI (this should only be used temporarily while setting up a driver or for build-only drivers)",
+          "title": "Skip",
+          "type": "boolean"
+        },
+        "timeout-minutes": {
+          "default": 15,
+          "description": "Timeout in minutes for Go and Rust test commands in CI. Must be a positive integer.",
+          "exclusiveMinimum": 0,
+          "title": "Timeout-Minutes",
+          "type": "integer"
+        },
+        "service-name": {
+          "default": "test-service",
+          "description": "docker-compose service to start for tests",
+          "title": "Service-Name",
+          "type": "string"
+        },
+        "environment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of a GitHub Actions Environment to activate",
+          "title": "Environment"
+        },
+        "aws": {
+          "default": false,
+          "description": "Log in to AWS in this config. Expects AWS_ROLE, AWS_ROLE_SESSION_NAME secrets",
+          "title": "Aws",
+          "type": "boolean"
+        },
+        "azure": {
+          "default": false,
+          "description": "Log in to Azure in this config. Expects AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET secrets",
+          "title": "Azure",
+          "type": "boolean"
+        },
+        "gcloud": {
+          "default": false,
+          "description": "Log in to Google Cloud in this config. Expects GCLOUD_SERVICE_ACCOUNT, GCLOUD_WORKLOAD_IDENTITY_PROVIDER secrets",
+          "title": "Gcloud",
+          "type": "boolean"
+        }
+      },
+      "title": "LangTestConfig",
+      "type": "object"
+    },
+    "LangTestPackagesConfig": {
+      "description": "Options for the Test Packages step.",
+      "properties": {
+        "environment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of a GitHub Actions Environment to activate",
+          "title": "Environment"
+        }
+      },
+      "title": "LangTestPackagesConfig",
+      "type": "object"
+    },
+    "LangValidateSpec": {
+      "additionalProperties": false,
+      "description": "A single config to validate.",
+      "properties": {
+        "service-name": {
+          "default": "test-service",
+          "description": "docker-compose service to start",
+          "title": "Service-Name",
+          "type": "string"
+        },
+        "vendor-version": {
+          "default": "latest",
+          "description": "version to pass to the validation suite",
+          "title": "Vendor-Version",
+          "type": "string"
+        },
+        "environment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of a GitHub Actions Environment to activate",
+          "title": "Environment"
+        },
+        "aws": {
+          "default": false,
+          "description": "Log in to AWS in this config. Expects AWS_ROLE, AWS_ROLE_SESSION_NAME secrets",
+          "title": "Aws",
+          "type": "boolean"
+        },
+        "azure": {
+          "default": false,
+          "description": "Log in to Azure in this config. Expects AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET secrets",
+          "title": "Azure",
+          "type": "boolean"
+        },
+        "gcloud": {
+          "default": false,
+          "description": "Log in to Google Cloud in this config. Expects GCLOUD_SERVICE_ACCOUNT, GCLOUD_WORKLOAD_IDENTITY_PROVIDER secrets",
+          "title": "Gcloud",
+          "type": "boolean"
+        }
+      },
+      "title": "LangValidateSpec",
+      "type": "object"
+    },
+    "LangValidationConfig": {
+      "additionalProperties": false,
+      "description": "Options for validation suite.",
+      "properties": {
+        "skip": {
+          "default": false,
+          "description": "Whether to skip the validation suite in CI (this should only be used temporarily while setting up a driver)",
+          "title": "Skip",
+          "type": "boolean"
+        },
+        "configs": {
+          "description": "A list of configurations to run the validation suite with. Each configuration will be run in a separate job",
+          "items": {
+            "$ref": "#/$defs/LangValidateSpec"
+          },
+          "title": "Configs",
+          "type": "array"
+        }
+      },
+      "title": "LangValidationConfig",
+      "type": "object"
+    },
+    "SecretConfigDict": {
+      "additionalProperties": false,
+      "description": "Secret configuration with explicit secret name and contexts.",
+      "properties": {
+        "secret": {
+          "description": "The name of the GitHub secret to use for this secret variable",
+          "title": "Secret",
+          "type": "string"
+        },
+        "contexts": {
+          "description": "Workflow contexts where this secret should be available",
+          "items": {
+            "enum": [
+              "build:test",
+              "build:release",
+              "test",
+              "validate"
+            ],
+            "type": "string"
+          },
+          "title": "Contexts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "secret"
+      ],
+      "title": "SecretConfigDict",
+      "type": "object"
+    },
+    "ValidationConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for validation workflows.",
+      "properties": {
+        "extra-dependencies": {
+          "additionalProperties": true,
+          "description": "Additional dependencies to install for validation workflows. Specify as key-value pairs. Example:\n\n[validation.extra-dependencies]\npytest = \">=7,<8\"\nblack = \"*\"",
+          "title": "Extra-Dependencies",
+          "type": "object"
+        },
+        "extra-pypi-dependencies": {
+          "additionalProperties": true,
+          "description": "Additional dependencies to install for validation workflows. Specify as key-value pairs. Example:\n\n[validation.extra-pypi-dependencies]\npytest = \">=7,<8\"\nblack = \"*\"",
+          "title": "Extra-Pypi-Dependencies",
+          "type": "object"
+        }
+      },
+      "title": "ValidationConfig",
+      "type": "object"
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "You can validate your generate.toml against this schema with tools like tombi (https://tombi-toml.github.io/tombi/docs/linter). Requires placing a `#:schema` directive at the top of your generate.toml file.",
+  "properties": {
+    "repository": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "GitHub repository name (if different from driver name)",
+      "title": "Repository"
+    },
+    "driver": {
+      "default": "(unknown)",
+      "description": "Driver name. Should be lowercase (e.g., postgresql, sqlite)",
+      "title": "Driver",
+      "type": "string"
+    },
+    "private": {
+      "default": false,
+      "description": "Whether the driver is private. Most drivers will be not be private so you can omit this.",
+      "title": "Private",
+      "type": "boolean"
+    },
+    "concurrency-key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Concurrency group for GitHub Actions. If specified, it effectively blocks test and release pipelines from running concurrently.",
+      "title": "Concurrency-Key"
+    },
+    "lang": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/LangConfig"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "description": "Programming language(s) to enable workflows for. Only go and rust are supported. Keys should be lowercase. Set to true to enable with default config, or false (the default) to disable. Example:\n\n[lang]\ngo = true\n\n[lang.rust.build]\nadditional-make-args = [\"example\"]",
+      "title": "Lang",
+      "type": "object"
+    },
+    "secrets": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/$defs/SecretConfigDict"
+          }
+        ]
+      },
+      "description": "Secrets to enable in workflows. By default, no secrets are available in your generated workflows unless you specify them here.\n\nTo make a secret available in all workflows, use the simple syntax:\n\n[secrets]\nMY_TOKEN = \"GITHUB_SECRET_NAME\"\n\nIf you want more fine-grained control, you can restrict secrets to specific workflows. To do this, specify contexts contexts ('build:release', 'test', 'validate') like this:\n\n[secrets.DB_PASSWORD]\nsecret = \"TEST_DB_SECRET\"\ncontexts = [\"test\", \"validate\"]",
+      "title": "Secrets",
+      "type": "object"
+    },
+    "aws": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AwsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Enables AWS authentication in workflows. Automatically adds AWS_ROLE and AWS_ROLE_SESSION_NAME secrets, and sets id_token permissions. Example:\n\n[aws]\nregion = \"us-west-2\""
+    },
+    "gcloud": {
+      "default": false,
+      "description": "Enables Google Cloud authentication in workflows. Automatically adds GCLOUD_SERVICE_ACCOUNT and GCLOUD_WORKLOAD_IDENTITY_PROVIDER secrets, and sets id_token permissions. Set to true to enable. Example:\n\ngcloud = true",
+      "title": "Gcloud",
+      "type": "boolean"
+    },
+    "validation": {
+      "$ref": "#/$defs/ValidationConfig",
+      "description": "Configuration for validation workflows. Currently supports specifying extra dependencies."
+    }
+  },
+  "title": "Schema for generate.toml",
+  "type": "object"
+}

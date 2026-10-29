@@ -1,0 +1,67 @@
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "adbc-driver-snowflake"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adbc_core = "0.25"
+adbc_ffi = "0.25"
+# Integration branch: driverbase-rs #44 and #46 (both merged) plus the
+# unmerged #45 telemetry feature. Move the rev to main after #45 merges.
+driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "63df11eab9c6c75492827c1d9f280c63ba6c0c83", features = ["telemetry"] }
+# sf_core integration branch: snowflakedb/drivers main plus the JWT lifetime
+# and per-statement prefetch tuning changes. Move back to upstream (and update
+# rustls-webpki below) after those PRs merge.
+sf_core = { git = "https://github.com/zeroshade/universal-driver", rev = "d255a731c32a54626cd153bf673cc951f9c94137" }
+arrow-array = { version = ">=58.3,<59", default-features = false, features = [
+  "ffi",
+  "chrono-tz",
+] }
+arrow-buffer = { version = ">=58.3,<59", default-features = false }
+arrow-schema = { version = ">=58.3,<59", default-features = false, features = ["canonical_extension_types"] }
+arrow-cast = { version = ">=58.3,<59", default-features = false }
+parquet = { version = ">=58.3,<59", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "snap", "flate2-zlib-rs", "brotli", "zstd", "lz4"] }
+serde_json = "1"
+uuid = "1"
+log = "0.4.22"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-opentelemetry = "0.31"
+opentelemetry = "0.30"
+opentelemetry_sdk = "0.30"
+
+# Force vendored (static) OpenSSL on Linux for manylinux compatibility.
+# This crate doesn't call openssl APIs directly; it exists to ensure
+# Linux transitive deps link statically. Bump manually on OpenSSL CVEs.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10.76", features = ["vendored"] }
+
+[dev-dependencies]
+bytes = "1"
+chrono = "0.4"
+
+# sf_core pins rustls-webpki =0.103.16 but caps aws-lc-rs <1.18, while
+# crates.io rustls-webpki 0.103.14+ requires aws-lc-rs ^1.18. Upstream resolves
+# this with a workspace patch to its vendored copy; [patch] does not propagate
+# to git dependents, so mirror it here. Keep the rev in sync with sf_core.
+[patch.crates-io]
+rustls-webpki = { git = "https://github.com/zeroshade/universal-driver", rev = "d255a731c32a54626cd153bf673cc951f9c94137" }
