@@ -4,6 +4,7 @@
   "packages": {
     "csharp/src/AdbcDrivers.Snowflake": {
       "release-type": "simple",
+      "draft": true,
       "component": "csharp",
       "tag-separator": "/",
       "extra-files": [
