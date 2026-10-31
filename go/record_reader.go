@@ -132,50 +132,57 @@ func validGeoTypeCode(t uint32) bool {
 	return false
 }
 
-// stripEWKBSRID converts an EWKB geometry that carries an SRID prefix into
-// plain ISO/OGC WKB by clearing the SRID flag and removing the four SRID
-// bytes. Bytes that do not have the SRID flag set are returned unchanged.
-func stripEWKBSRID(b []byte) []byte {
+// appendStrippedEWKBSRID appends b to dst as plain ISO/OGC WKB: if b is an
+// EWKB geometry with the SRID flag set, the flag is cleared and the four SRID
+// bytes are dropped. Bytes that do not have the SRID flag set are appended
+// unchanged.
+func appendStrippedEWKBSRID(dst, b []byte) []byte {
 	if len(b) < 9 {
-		return b
+		return append(dst, b...)
 	}
-	var bo binary.ByteOrder
+	var bo interface {
+		binary.ByteOrder
+		binary.AppendByteOrder
+	}
 	switch b[0] {
 	case 0x00:
 		bo = binary.BigEndian
 	case 0x01:
 		bo = binary.LittleEndian
 	default:
-		return b
+		return append(dst, b...)
 	}
 	typeWord := bo.Uint32(b[1:5])
 	if typeWord&ewkbSRIDFlag == 0 {
-		return b
+		return append(dst, b...)
 	}
-	out := make([]byte, len(b)-4)
-	out[0] = b[0]
-	bo.PutUint32(out[1:5], typeWord&^ewkbSRIDFlag)
-	copy(out[5:], b[9:])
-	return out
+	dst = append(dst, b[0])
+	dst = bo.AppendUint32(dst, typeWord&^ewkbSRIDFlag)
+	return append(dst, b[9:]...)
 }
 
 // stripEWKBSRIDColumn returns a column transformer that rewrites every
-// non-null value through stripEWKBSRID, producing standard WKB on the wire.
-func stripEWKBSRIDColumn(_ context.Context, a arrow.Array) (arrow.Array, error) {
+// non-null value through appendStrippedEWKBSRID, producing standard WKB on the
+// wire.
+func stripEWKBSRIDColumn(ctx context.Context, a arrow.Array) (arrow.Array, error) {
 	ba, ok := a.(*array.Binary)
 	if !ok {
 		a.Retain()
 		return a, nil
 	}
-	bldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	bldr := array.NewBinaryBuilder(compute.GetAllocator(ctx), arrow.BinaryTypes.Binary)
 	defer bldr.Release()
 	bldr.Reserve(ba.Len())
+	// Stripping only ever shrinks values, so the input size is an upper bound.
+	bldr.ReserveData(len(ba.ValueBytes()))
+	var scratch []byte
 	for i := range ba.Len() {
 		if ba.IsNull(i) {
 			bldr.AppendNull()
 			continue
 		}
-		bldr.Append(stripEWKBSRID(ba.Value(i)))
+		scratch = appendStrippedEWKBSRID(scratch[:0], ba.Value(i))
+		bldr.Append(scratch)
 	}
 	return bldr.NewArray(), nil
 }
