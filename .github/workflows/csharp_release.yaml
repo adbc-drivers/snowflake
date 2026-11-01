@@ -152,7 +152,7 @@ jobs:
 
       - name: Update release PR build status
         if: ${{ steps.final.outputs.release_pr != '' }}
-        uses: ./.github/actions/release-pr-progress
+        uses: $/.github/actions/release-pr-progress
         with:
           token: ${{ github.token }}
           pr: ${{ steps.final.outputs.release_pr }}
@@ -316,7 +316,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Update preview details on release PR
-        uses: ./.github/actions/release-pr-progress
+        uses: $/.github/actions/release-pr-progress
         with:
           token: ${{ github.token }}
           pr: ${{ needs.plan.outputs.preview_pr }}
@@ -585,7 +585,7 @@ jobs:
           persist-credentials: false
       - name: Update release PR approval instructions
         if: ${{ needs.plan.outputs.release_pr != '' }}
-        uses: ./.github/actions/release-pr-progress
+        uses: $/.github/actions/release-pr-progress
         with:
           token: ${{ github.token }}
           pr: ${{ needs.plan.outputs.release_pr }}
@@ -799,7 +799,7 @@ jobs:
           NUGET_RESULT: ${{ needs.publish_nuget.result }}
           PUBLISH_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
       - name: Update release PR status
-        uses: ./.github/actions/release-pr-progress
+        uses: $/.github/actions/release-pr-progress
         with:
           token: ${{ github.token }}
           pr: ${{ needs.plan.outputs.release_pr }}
