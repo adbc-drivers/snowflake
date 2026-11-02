@@ -22,6 +22,16 @@ github-stack-behavior = "top"
 environment = "Snowflake CI"
 timeout-minutes = 40
 
+[lang.rust]
+
+[lang.rust.test]
+environment = "Snowflake CI"
+
+[lang.rust.build]
+environment = "Snowflake CI"
+
+[[lang.rust.validation.configs]]
+environment = "Snowflake CI"
 [[lang.go.validation.configs]]
 environment = "Snowflake CI"
 

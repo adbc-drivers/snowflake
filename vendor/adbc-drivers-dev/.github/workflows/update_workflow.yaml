@@ -1,0 +1,103 @@
+# Copyright (c) 2025 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Update versions in workflow templates.
+
+name: Update Workflow Template Actions
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/update_workflow.yaml"
+      - "adbc_drivers_dev/workflow.py"
+  schedule:
+    - cron: 14 23 * * *
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync_workflows:
+    name: Sync Workflows
+    runs-on: ubuntu-slim
+    if: github.repository_owner == 'adbc-drivers'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: true # for git operations below
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          python-version: "3.14"
+
+      - name: Update workflow template actions
+        run: |
+          uv run adbc-gen-workflow update-actions
+
+      - name: Create PR if there are any changes
+        if: github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$(git status --porcelain | { grep -v '^?? ' || test $? = 1; })" ]; then
+            PR_TITLE="chore: update workflow template action versions"
+            BRANCH="chore/workflows_$(date +%Y-%m-%d)"
+
+            # Skip if branch already exists on remote
+            if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+              echo "Branch $BRANCH already exists on remote. Skipping creating a new PR."
+              exit 0
+            fi
+
+            # Skip if PR exists
+            EXISTING_PRS=$(gh pr list --json 'author,title' --jq '.[] | select(.author.login == "app/github-actions") | .title | select(contains("chore: update workflow template action"))')
+            if [[ -n "$EXISTING_PRS" ]]; then
+              echo "Existing PRs already exist. Skipping creating a new PR."
+              exit 0
+            fi
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -b "$BRANCH"
+            # Only add workflow files
+            git add adbc_drivers_dev/templates
+            git commit -m "$PR_TITLE"
+            git push origin "$BRANCH"
+
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "$PR_TITLE" \
+              --body "" || {
+                echo "ERROR: Failed to create pull request"
+                exit 1
+              }
+          else
+            echo "No changes to commit. Skipping creating a PR."
+          fi

@@ -13,6 +13,9 @@
 # limitations under the License.
 
 .github/workflows/dev_issues.yaml
+vendor/adbc-drivers-dev/adbc_drivers_dev/title_check.py
+vendor/adbc-drivers-dev/tests/make/rustdummy/Cargo.toml
+vendor/adbc-drivers-dev/tests/make/rustdummy/src/lib.rs
 
 csharp/Directory.Build.props
 csharp/src/AdbcDrivers.Snowflake.Interop/Build-SnowflakeDriver.ps1

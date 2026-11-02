@@ -13,9 +13,12 @@
 # limitations under the License.
 
 .github/pull_request_template.md
+vendor/adbc-drivers-dev/.github/pull_request_template.md
+vendor/adbc-drivers-dev/schema/generate-schema.json
 .gitmodules
 */go.sum
 */pixi.lock
+*/Cargo.lock
 */*.csproj
 */*.sln
 go/license.tpl
@@ -25,3 +28,8 @@ csharp/test/AdbcDrivers.Snowflake.Interop.Tests/Resources/snowflakeconfig.json
 csharp/src/AdbcDrivers.Snowflake/CHANGELOG.md
 .release-please-manifest.json
 release-please-config.json
+rust/license.tpl
+rust/validation/queries/*/*.json
+rust/validation/queries/*/*.sql
+rust/validation/queries/*/*/*.json
+rust/validation/queries/*/*/*.sql
