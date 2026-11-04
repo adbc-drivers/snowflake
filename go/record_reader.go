@@ -1107,29 +1107,25 @@ func streamBatchToChannel(
 }
 
 // decodeJSONChunkRows decodes the first len(rows) rows of a JSON result chunk
-// into rows, reusing each row's backing array. A chunk is not a JSON document
-// by itself but the comma-separated elements of one (each element a JSON list
-// of strings or nulls), so it is decoded as if wrapped in [ and ], the same
-// way gosnowflake reads JSON chunks. Invalid UTF-8 is replaced with U+FFFD, as
-// encoding/json does.
-func decodeJSONChunkRows(data []byte, rows [][]*string) error {
+// into rows, each of which must have numCols values. A chunk is not a JSON
+// document by itself but the comma-separated elements of one (each element a
+// JSON list of strings or nulls), so it is decoded as if wrapped in [ and ],
+// the same way gosnowflake reads JSON chunks. Invalid UTF-8 is replaced with
+// U+FFFD, as encoding/json does.
+func decodeJSONChunkRows(data []byte, numCols int, rows [][]*string) error {
 	dec := jsontext.NewDecoder(io.MultiReader(strings.NewReader("["), bytes.NewReader(data), strings.NewReader("]")),
 		jsontext.AllowInvalidUTF8(true))
 	if _, err := dec.ReadToken(); err != nil {
 		return fmt.Errorf("JSON decode failed: %w", err)
 	}
-	// Values are stored in one slice per chunk, sized from the first row, so
-	// each value needs no allocation of its own besides its string.
-	var vals []string
+	vals := make([]string, len(rows)*numCols)
+	ptrs := make([]*string, len(rows)*numCols)
 	for i := range rows {
-		row, err := decodeJSONChunkRow(dec, rows[i][:0], &vals)
-		if err != nil {
+		lo, hi := i*numCols, (i+1)*numCols
+		if err := decodeJSONChunkRow(dec, ptrs[lo:hi], vals[lo:hi]); err != nil {
 			return fmt.Errorf("row[%d]: JSON decode failed: %w", i, err)
 		}
-		rows[i] = row
-		if i == 0 {
-			vals = make([]string, 0, (len(rows)-1)*len(row))
-		}
+		rows[i] = ptrs[lo:hi:hi]
 	}
 	// A truncated final row could otherwise be completed by the synthetic
 	// closing bracket.
@@ -1139,38 +1135,40 @@ func decodeJSONChunkRows(data []byte, rows [][]*string) error {
 	return nil
 }
 
-// decodeJSONChunkRow reads one row, a JSON list of strings or nulls, and
-// appends its values to row, storing strings in vals.
-func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals *[]string) ([]*string, error) {
+// decodeJSONChunkRow reads one row, a JSON list of len(row) strings or nulls,
+// into row, storing strings in vals.
+func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals []string) error {
 	tok, err := dec.ReadToken()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if tok.Kind() != '[' {
-		return nil, fmt.Errorf("expected a list, got %v", tok.Kind())
+		return fmt.Errorf("expected a list, got %v", tok.Kind())
 	}
-	for dec.PeekKind() != ']' {
+	n := 0
+	for ; dec.PeekKind() != ']'; n++ {
+		if n == len(row) {
+			return fmt.Errorf("expected %d values, got more", len(row))
+		}
 		tok, err := dec.ReadToken()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		switch tok.Kind() {
 		case 'n':
-			row = append(row, nil)
+			row[n] = nil
 		case '"':
-			if len(*vals) == cap(*vals) {
-				*vals = make([]string, 0, max(cap(*vals), 16))
-			}
-			*vals = append(*vals, tok.String())
-			row = append(row, &(*vals)[len(*vals)-1])
+			vals[n] = tok.String()
+			row[n] = &vals[n]
 		default:
-			return nil, fmt.Errorf("expected a string or null, got %v", tok.Kind())
+			return fmt.Errorf("expected a string or null, got %v", tok.Kind())
 		}
 	}
-	if _, err := dec.ReadToken(); err != nil {
-		return nil, err
+	if n != len(row) {
+		return fmt.Errorf("expected %d values, got %d", len(row), n)
 	}
-	return row, nil
+	_, err = dec.ReadToken()
+	return err
 }
 
 // readJSONBatches handles the case where GetBatches() returned downloadable
@@ -1244,7 +1242,7 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		bldr.Reserve(int(b.NumRows()))
 
-		if err = decodeJSONChunkRows(data, rawData); err != nil {
+		if err = decodeJSONChunkRows(data, bldr.Schema().NumFields(), rawData); err != nil {
 			return nil, adbc.Error{
 				Msg:  fmt.Sprintf("batch[%d] %s", batchIdx, err.Error()),
 				Code: adbc.StatusInternal,
@@ -1335,7 +1333,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			}
 			bldr.Reserve(int(b.NumRows()))
 
-			if err = decodeJSONChunkRows(data, rawData); err != nil {
+			if err = decodeJSONChunkRows(data, bldr.Schema().NumFields(), rawData); err != nil {
 				return nil, adbc.Error{
 					Msg:  err.Error(),
 					Code: adbc.StatusInternal,

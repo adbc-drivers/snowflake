@@ -1101,42 +1101,29 @@ func TestDecodeJSONChunkRows(t *testing.T) {
 		"escapes and unicode":      {`["a\"b\\c","é\n\u00e9"],["[,]","{\"k\":1}"]`, [][]*string{jsonRow(`a"b\c`, "é\né"), jsonRow("[,]", `{"k":1}`)}},
 		"invalid UTF-8":            {"[\"a\xffb\",\"\\ud800\"]", [][]*string{jsonRow("a\uFFFDb", "\uFFFD")}},
 		"whitespace between rows":  {"[\"1\"],\n[\"2\"],\t [\"3\"]", [][]*string{jsonRow("1"), jsonRow("2"), jsonRow("3")}},
-		"empty row":                {`[],["x"]`, [][]*string{jsonRow(), jsonRow("x")}},
-		"rows of different widths": {`["1"],["2","3","4"],["5","6"]`, [][]*string{jsonRow("1"), jsonRow("2", "3", "4"), jsonRow("5", "6")}},
 		"fewer rows than in chunk": {`["1"],["2"],["3"]`, [][]*string{jsonRow("1"), jsonRow("2")}},
 	}
 	for name, tc := range chunks {
 		t.Run(name, func(t *testing.T) {
 			got := make([][]*string, len(tc.want))
-			require.NoError(t, decodeJSONChunkRows([]byte(tc.data), got))
-			require.Len(t, got, len(tc.want))
-			for i := range tc.want {
-				assert.Equal(t, len(tc.want[i]), len(got[i]), "row %d", i)
-				for j := range min(len(tc.want[i]), len(got[i])) {
-					assert.Equal(t, tc.want[i][j], got[i][j], "row %d col %d", i, j)
-				}
-			}
+			require.NoError(t, decodeJSONChunkRows([]byte(tc.data), len(tc.want[0]), got))
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }
 
-func TestDecodeJSONChunkRowsReusesRows(t *testing.T) {
-	rows := make([][]*string, 2)
-	require.NoError(t, decodeJSONChunkRows([]byte(`["a","b","c"],["d"]`), rows))
-	require.NoError(t, decodeJSONChunkRows([]byte(`["x"],[null,"y"]`), rows))
-	assert.Equal(t, [][]*string{jsonRow("x"), jsonRow("<null>", "y")}, rows)
-}
-
 func TestDecodeJSONChunkRowsErrors(t *testing.T) {
 	for name, data := range map[string]string{
-		"too few rows":         `["1"]`,
+		"too few rows":         `["1","2"]`,
 		"not a list":           `{"a":"1"}`,
-		"number value":         `["1"],[2]`,
-		"truncated":            `["1"],["2"`,
-		"truncated mid-string": `["1"],["2`,
+		"number value":         `["1","2"],["3",4]`,
+		"too few values":       `["1","2"],["3"]`,
+		"too many values":      `["1","2"],["3","4","5"]`,
+		"truncated":            `["1","2"],["3","4"`,
+		"truncated mid-string": `["1","2"],["3","4`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := decodeJSONChunkRows([]byte(data), make([][]*string, 2))
+			err := decodeJSONChunkRows([]byte(data), 2, make([][]*string, 2))
 			assert.ErrorContains(t, err, "JSON decode failed")
 		})
 	}
@@ -1167,7 +1154,7 @@ func BenchmarkDecodeJSONChunkRows(b *testing.B) {
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := decodeJSONChunkRows(data, dst); err != nil {
+		if err := decodeJSONChunkRows(data, cols, dst); err != nil {
 			b.Fatal(err)
 		}
 	}
