@@ -27,7 +27,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -1106,6 +1106,71 @@ func streamBatchToChannel(
 	)
 }
 
+// decodeJSONChunkRows decodes the first len(rows) rows of a JSON result chunk
+// into rows, each of which must have numCols values. A chunk is not a JSON
+// document by itself but the comma-separated elements of one (each element a
+// JSON list of strings or nulls), so it is decoded as if wrapped in [ and ],
+// the same way gosnowflake reads JSON chunks. Invalid UTF-8 is replaced with
+// U+FFFD, as encoding/json does.
+func decodeJSONChunkRows(data []byte, numCols int, rows [][]*string) error {
+	dec := jsontext.NewDecoder(io.MultiReader(strings.NewReader("["), bytes.NewReader(data), strings.NewReader("]")),
+		jsontext.AllowInvalidUTF8(true))
+	if _, err := dec.ReadToken(); err != nil {
+		return fmt.Errorf("JSON decode failed: %w", err)
+	}
+	vals := make([]string, len(rows)*numCols)
+	ptrs := make([]*string, len(rows)*numCols)
+	for i := range rows {
+		lo, hi := i*numCols, (i+1)*numCols
+		if err := decodeJSONChunkRow(dec, ptrs[lo:hi], vals[lo:hi]); err != nil {
+			return fmt.Errorf("row[%d]: JSON decode failed: %w", i, err)
+		}
+		rows[i] = ptrs[lo:hi:hi]
+	}
+	// A truncated final row could otherwise be completed by the synthetic
+	// closing bracket.
+	if dec.InputOffset() > int64(len(data))+1 {
+		return fmt.Errorf("row[%d]: JSON decode failed: %w", len(rows)-1, io.ErrUnexpectedEOF)
+	}
+	return nil
+}
+
+// decodeJSONChunkRow reads one row, a JSON list of len(row) strings or nulls,
+// into row, storing strings in vals.
+func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals []string) error {
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	if tok.Kind() != '[' {
+		return fmt.Errorf("expected a list, got %v", tok.Kind())
+	}
+	n := 0
+	for ; dec.PeekKind() != ']'; n++ {
+		if n == len(row) {
+			return fmt.Errorf("expected %d values, got more", len(row))
+		}
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		switch tok.Kind() {
+		case 'n':
+			row[n] = nil
+		case '"':
+			vals[n] = tok.String()
+			row[n] = &vals[n]
+		default:
+			return fmt.Errorf("expected a string or null, got %v", tok.Kind())
+		}
+	}
+	if n != len(row) {
+		return fmt.Errorf("expected %d values, got %d", len(row), n)
+	}
+	_, err = dec.ReadToken()
+	return err
+}
+
 // readJSONBatches handles the case where GetBatches() returned downloadable
 // chunks that contain JSON data instead of Arrow IPC. This happens with some
 // Snowflake stored procedures that return JSON-format results even when Arrow
@@ -1177,22 +1242,10 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		bldr.Reserve(int(b.NumRows()))
 
-		offset, buf := int64(0), bytes.NewReader(data)
-		for i := range b.NumRows() {
-			dec := json.NewDecoder(buf)
-			if err = dec.Decode(&rawData[i]); err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d] row[%d]: JSON decode failed: %s", batchIdx, i, err.Error()),
-					Code: adbc.StatusInternal,
-				}
-			}
-
-			offset += dec.InputOffset() + 1
-			if _, err = buf.Seek(offset, 0); err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d] row[%d]: seek failed: %s", batchIdx, i, err.Error()),
-					Code: adbc.StatusInternal,
-				}
+		if err = decodeJSONChunkRows(data, bldr.Schema().NumFields(), rawData); err != nil {
+			return nil, adbc.Error{
+				Msg:  fmt.Sprintf("batch[%d] %s", batchIdx, err.Error()),
+				Code: adbc.StatusInternal,
 			}
 		}
 
@@ -1280,29 +1333,10 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			}
 			bldr.Reserve(int(b.NumRows()))
 
-			// we grab the entire JSON message and create a bytes reader
-			offset, buf := int64(0), bytes.NewReader(data)
-			for i := range b.NumRows() {
-				// we construct a decoder from the bytes.Reader to read the next JSON list
-				// of columns (one row) from the input
-				dec := json.NewDecoder(buf)
-				if err = dec.Decode(&rawData[i]); err != nil {
-					return nil, adbc.Error{
-						Msg:  err.Error(),
-						Code: adbc.StatusInternal,
-					}
-				}
-
-				// dec.InputOffset() now represents the index of the ',' so we skip the comma
-				offset += dec.InputOffset() + 1
-				// then seek the buffer to that spot. we have to seek based on the start
-				// because json.Decoder can read from the buffer more than is necessary to
-				// process the JSON data.
-				if _, err = buf.Seek(offset, 0); err != nil {
-					return nil, adbc.Error{
-						Msg:  err.Error(),
-						Code: adbc.StatusInternal,
-					}
+			if err = decodeJSONChunkRows(data, bldr.Schema().NumFields(), rawData); err != nil {
+				return nil, adbc.Error{
+					Msg:  err.Error(),
+					Code: adbc.StatusInternal,
 				}
 			}
 
