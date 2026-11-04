@@ -27,6 +27,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
@@ -983,5 +984,98 @@ func TestStreamRetryEnabled_RecoversFromShortReadMidFrameError(t *testing.T) {
 			assert.EqualValues(t, 4, recs[0].NumRows())
 			assert.Equal(t, 2, batch.call, "retry should have been invoked")
 		})
+	}
+}
+
+// POINT(1 2) with SRID 4326, as EWKB and as the expected plain WKB.
+var (
+	ewkbPointLE = []byte{
+		0x01, 0x01, 0x00, 0x00, 0x20, // little endian, Point | SRID flag
+		0xE6, 0x10, 0x00, 0x00, // SRID 4326
+		0, 0, 0, 0, 0, 0, 0xF0, 0x3F, // x = 1
+		0, 0, 0, 0, 0, 0, 0x00, 0x40, // y = 2
+	}
+	wkbPointLE = []byte{
+		0x01, 0x01, 0x00, 0x00, 0x00,
+		0, 0, 0, 0, 0, 0, 0xF0, 0x3F,
+		0, 0, 0, 0, 0, 0, 0x00, 0x40,
+	}
+	ewkbPointBE = []byte{
+		0x00, 0x20, 0x00, 0x00, 0x01, // big endian, SRID flag | Point
+		0x00, 0x00, 0x10, 0xE6,
+		0x3F, 0xF0, 0, 0, 0, 0, 0, 0,
+		0x40, 0x00, 0, 0, 0, 0, 0, 0,
+	}
+	wkbPointBE = []byte{
+		0x00, 0x00, 0x00, 0x00, 0x01,
+		0x3F, 0xF0, 0, 0, 0, 0, 0, 0,
+		0x40, 0x00, 0, 0, 0, 0, 0, 0,
+	}
+)
+
+func TestAppendStrippedEWKBSRID(t *testing.T) {
+	tests := []struct {
+		name    string
+		in, out []byte
+	}{
+		{"little endian with SRID", ewkbPointLE, wkbPointLE},
+		{"big endian with SRID", ewkbPointBE, wkbPointBE},
+		{"plain WKB is unchanged", wkbPointLE, wkbPointLE},
+		{"short input is unchanged", []byte{0x01, 0x02}, []byte{0x01, 0x02}},
+		{"unknown byte order is unchanged", append([]byte{0x07}, ewkbPointLE[1:]...), append([]byte{0x07}, ewkbPointLE[1:]...)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.out, appendStrippedEWKBSRID(nil, tt.in))
+			// Appends after existing content rather than overwriting it.
+			assert.Equal(t, append([]byte("x"), tt.out...), appendStrippedEWKBSRID([]byte("x"), tt.in))
+		})
+	}
+}
+
+func TestStripEWKBSRIDColumnUsesContextAllocator(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+
+	bldr := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+	bldr.Append(ewkbPointLE)
+	bldr.AppendNull()
+	bldr.Append(ewkbPointBE)
+	bldr.Append(wkbPointLE)
+	in := bldr.NewArray()
+	bldr.Release()
+	defer in.Release()
+	inBytes := mem.CurrentAlloc()
+
+	out, err := stripEWKBSRIDColumn(compute.WithAllocator(context.Background(), mem), in)
+	require.NoError(t, err)
+	assert.Greater(t, mem.CurrentAlloc(), inBytes, "output was not allocated from the context allocator")
+
+	got := out.(*array.Binary)
+	require.Equal(t, 4, got.Len())
+	assert.Equal(t, wkbPointLE, got.Value(0))
+	assert.True(t, got.IsNull(1))
+	assert.Equal(t, wkbPointBE, got.Value(2))
+	assert.Equal(t, wkbPointLE, got.Value(3))
+	out.Release()
+}
+
+func BenchmarkStripEWKBSRIDColumn(b *testing.B) {
+	bldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	for range 1 << 16 {
+		bldr.Append(ewkbPointLE)
+	}
+	in := bldr.NewArray()
+	bldr.Release()
+	defer in.Release()
+
+	ctx := compute.WithAllocator(context.Background(), memory.DefaultAllocator)
+	b.ReportAllocs()
+	for b.Loop() {
+		out, err := stripEWKBSRIDColumn(ctx, in)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out.Release()
 	}
 }
