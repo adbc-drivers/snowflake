@@ -251,6 +251,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.plan.outputs.preview_sha }}
+          # A rebuild can select a source from before the arrow-adbc submodule was removed;
+          # this is a no-op for sources without submodules.
+          submodules: true
           persist-credentials: false
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
@@ -359,6 +362,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.plan.outputs.release_sha }}
+          # A rebuild can select a source from before the arrow-adbc submodule was removed;
+          # this is a no-op for sources without submodules.
+          submodules: true
           persist-credentials: false
 
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4

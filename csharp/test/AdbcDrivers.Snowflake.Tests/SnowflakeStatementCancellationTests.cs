@@ -33,6 +33,7 @@ namespace AdbcDrivers.Snowflake.Tests;
 /// Tests for the <see cref="CancellationToken"/> overloads of ExecuteQueryAsync/ExecuteUpdateAsync
 /// that Apache.Arrow.Adbc 1.0 added to <see cref="Apache.Arrow.Adbc.AdbcStatement"/>.
 /// </summary>
+[Trait("Category", "Unit")]
 public class SnowflakeStatementCancellationTests
 {
     private readonly IQueryExecutor _executor = Substitute.For<IQueryExecutor>();
@@ -90,7 +91,30 @@ public class SnowflakeStatementCancellationTests
 
         var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => execute);
         Assert.Equal(cts.Token, ex.CancellationToken);
-        await _executor.Received(1).CancelQueryAsync(request.RequestId!, _authToken, Arg.Any<CancellationToken>());
+        // The fire-and-forget abort gets its own bounded token, not the (cancelled) caller's.
+        await _executor.Received(1).CancelQueryAsync(request.RequestId!, _authToken,
+            Arg.Is<CancellationToken>(t => t.CanBeCanceled && !t.IsCancellationRequested));
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_TokenCancelledAfterResultBuilt_DiscardsResultAndThrows()
+    {
+        // The executor returns Success, but the caller cancels after the result stream was built
+        // (and linked to the execution token) and before ExecuteQueryAsync returns. That stream's
+        // prefetch is already cancelled, so handing it out would truncate the result.
+        var stream = Substitute.For<Ipc.IArrowArrayStream>();
+        using var cts = new CancellationTokenSource();
+        _executor.ExecuteQueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                cts.Cancel();
+                return Task.FromResult(new Services.Query.QueryResult { Status = QueryStatus.Success, ResultStream = stream });
+            });
+        using var statement = CreateStatement();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => statement.ExecuteQueryAsync(cts.Token).AsTask());
+
+        stream.Received(1).Dispose();
     }
 
     [Fact]

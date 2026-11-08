@@ -293,9 +293,28 @@ public sealed class SnowflakeStatement : AdbcStatement
             return await _queryExecutor.ExecuteQueryAsync(request).ConfigureAwait(false);
 
         using var scope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        using var abort = cancellationToken.Register(() => _ = AbortOnServerAsync(requestId, authToken));
-        return await _queryExecutor.ExecuteQueryAsync(request, scope.Token).ConfigureAwait(false);
+        Services.Query.QueryResult result;
+        using (cancellationToken.Register(() => _ = AbortOnServerAsync(requestId, authToken)))
+        {
+            result = await _queryExecutor.ExecuteQueryAsync(request, scope.Token).ConfigureAwait(false);
+        }
+
+        // Unlink from the caller's token before deciding: once disposed (which waits out an
+        // in-flight link callback), the scope can no longer become cancelled. A cancellation
+        // that landed after the executor built the result stream, but before this point, has
+        // already cancelled that stream's prefetch, so the result must not be handed out.
+        scope.Dispose();
+        if (scope.IsCancellationRequested)
+        {
+            result.ResultStream?.Dispose();
+            throw new OperationCanceledException(cancellationToken);
+        }
+        return result;
     }
+
+    // Long enough for a healthy abort round trip; bounds the request so a stalled response
+    // can't keep the task and its connection alive indefinitely.
+    internal static readonly TimeSpan AbortTimeout = TimeSpan.FromSeconds(30);
 
     // Fire-and-forget from a cancellation callback: never block the cancelling thread, and never
     // let a failed abort surface as an unobserved exception.
@@ -303,7 +322,8 @@ public sealed class SnowflakeStatement : AdbcStatement
     {
         try
         {
-            await _queryExecutor.CancelQueryAsync(requestId, authToken).ConfigureAwait(false);
+            using var timeout = new CancellationTokenSource(AbortTimeout);
+            await _queryExecutor.CancelQueryAsync(requestId, authToken, timeout.Token).ConfigureAwait(false);
         }
         catch (Exception)
         {
