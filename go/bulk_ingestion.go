@@ -36,7 +36,6 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -55,7 +54,6 @@ const (
 	bindStageName            = "ADBC$BIND"
 	createTemporaryStageTmpl = "CREATE OR REPLACE TEMPORARY STAGE " + bindStageName + " FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE BINARY_AS_TEXT = FALSE %s REPLACE_INVALID_CHARACTERS = TRUE)"
 	vectorizedScannerOption  = "USE_VECTORIZED_SCANNER=TRUE"
-	putQueryTmpl             = "PUT 'file:///tmp/placeholder/%s' @" + bindStageName + " OVERWRITE = TRUE"
 	copyQuery                = "COPY INTO IDENTIFIER(?) FROM @" + bindStageName + " MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE"
 	countQuery               = "SELECT COUNT(*) FROM IDENTIFIER(?)"
 	megabyte                 = 1024 * 1024
@@ -513,15 +511,12 @@ func runParallelParquetWriters(
 }
 
 func uploadStream(ctx context.Context, cn snowflakeConn, r io.Reader, name string) error {
-	putQuery := fmt.Sprintf(putQueryTmpl, name)
-	putQuery = strings.ReplaceAll(putQuery, "\\", "\\\\") // Windows compatibility
-
-	_, err := cn.ExecContext(gosnowflake.WithFilePutStream(ctx, r), putQuery, nil)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	// Parquet is already compressed. Gzip would also append .gz to the name,
+	// which must match the filename tracked by the COPY tasks.
+	return cn.UploadStreamWithConfig(ctx, "@"+bindStageName, name, r, gosnowflake.UploadStreamConfig{
+		Compression: gosnowflake.CompressionNone,
+		Overwrite:   gosnowflake.ConfigBoolTrue,
+	})
 }
 
 func uploadAllStreams(

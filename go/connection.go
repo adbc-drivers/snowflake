@@ -71,6 +71,7 @@ type snowflakeConn interface {
 	driver.QueryerContext
 	driver.Pinger
 	QueryArrowStream(context.Context, string, ...driver.NamedValue) (gosnowflake.ArrowStreamLoader, error)
+	UploadStreamWithConfig(context.Context, string, string, io.Reader, gosnowflake.UploadStreamConfig) error
 }
 
 type connectionImpl struct {
