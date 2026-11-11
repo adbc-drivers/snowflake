@@ -60,6 +60,6 @@
     </Content>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\arrow-adbc\csharp\src\Apache.Arrow.Adbc\Apache.Arrow.Adbc.csproj" />
+    <PackageReference Include="Apache.Arrow.Adbc" Version="1.0.0" />
   </ItemGroup>
 </Project>
