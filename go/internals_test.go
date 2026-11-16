@@ -77,3 +77,14 @@ func TestConnectorConfigKeepsExplicitParams(t *testing.T) {
 	assert.Equal(t, "GEOJSON", *cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"])
 	assert.Len(t, db.cfg.Params, 1)
 }
+
+func TestSetOptionInternal_AuthTypeOAuthAuthorizationCode(t *testing.T) {
+	db := &databaseImpl{cfg: &gosnowflake.Config{}}
+
+	require.NoError(t, db.SetOptionInternal(OptionAuthType, OptionValueAuthOAuthAuthorizationCode, nil))
+	require.Equal(t, gosnowflake.AuthTypeOAuthAuthorizationCode, db.cfg.Authenticator)
+
+	v, err := db.GetOption(context.Background(), OptionAuthType)
+	require.NoError(t, err)
+	require.Equal(t, "OAUTH_AUTHORIZATION_CODE", v)
+}

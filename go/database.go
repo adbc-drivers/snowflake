@@ -52,14 +52,15 @@ const clientTelemetryEnabledParam = "CLIENT_TELEMETRY_ENABLED"
 var (
 	drv         = gosnowflake.SnowflakeDriver{}
 	authTypeMap = map[string]gosnowflake.AuthType{
-		OptionValueAuthSnowflake:       gosnowflake.AuthTypeSnowflake,
-		OptionValueAuthOAuth:           gosnowflake.AuthTypeOAuth,
-		OptionValueAuthExternalBrowser: gosnowflake.AuthTypeExternalBrowser,
-		OptionValueAuthOkta:            gosnowflake.AuthTypeOkta,
-		OptionValueAuthJwt:             gosnowflake.AuthTypeJwt,
-		OptionValueAuthUserPassMFA:     gosnowflake.AuthTypeUsernamePasswordMFA,
-		OptionValueAuthPat:             gosnowflake.AuthTypePat,
-		OptionValueAuthWIF:             gosnowflake.AuthTypeWorkloadIdentityFederation,
+		OptionValueAuthSnowflake:              gosnowflake.AuthTypeSnowflake,
+		OptionValueAuthOAuth:                  gosnowflake.AuthTypeOAuth,
+		OptionValueAuthOAuthAuthorizationCode: gosnowflake.AuthTypeOAuthAuthorizationCode,
+		OptionValueAuthExternalBrowser:        gosnowflake.AuthTypeExternalBrowser,
+		OptionValueAuthOkta:                   gosnowflake.AuthTypeOkta,
+		OptionValueAuthJwt:                    gosnowflake.AuthTypeJwt,
+		OptionValueAuthUserPassMFA:            gosnowflake.AuthTypeUsernamePasswordMFA,
+		OptionValueAuthPat:                    gosnowflake.AuthTypePat,
+		OptionValueAuthWIF:                    gosnowflake.AuthTypeWorkloadIdentityFederation,
 	}
 )
 
@@ -143,6 +144,10 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 		return strconv.FormatUint(uint64(d.cfg.OCSPFailOpen), 10), nil
 	case OptionAuthToken:
 		return d.cfg.Token, nil
+	case OptionOAuthClientID:
+		return d.cfg.OauthClientID, nil
+	case OptionOAuthClientSecret:
+		return d.cfg.OauthClientSecret, nil
 	case OptionAuthOktaUrl:
 		return d.cfg.OktaURL.String(), nil
 	case OptionKeepSessionAlive:
@@ -398,6 +403,10 @@ func (d *databaseImpl) SetOptionInternal(k string, v string, cnOptions *map[stri
 		}
 	case OptionAuthToken:
 		d.cfg.Token = v
+	case OptionOAuthClientID:
+		d.cfg.OauthClientID = v
+	case OptionOAuthClientSecret:
+		d.cfg.OauthClientSecret = v
 	case OptionAuthOktaUrl:
 		d.cfg.OktaURL, err = url.Parse(v)
 		if err != nil {

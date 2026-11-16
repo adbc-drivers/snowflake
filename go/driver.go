@@ -128,6 +128,19 @@ const (
 	OptionOCSPFailOpenMode = "adbc.snowflake.sql.client_option.ocsp_fail_open_mode"
 	// specify the token to use for OAuth or other forms of authentication
 	OptionAuthToken = "adbc.snowflake.sql.client_option.auth_token"
+	// specify the OAuth client id and secret, used by
+	// OptionValueAuthOAuthAuthorizationCode.
+	//
+	// NOTE: gosnowflake rejects an empty client id or secret for the
+	// authorization code flow when validating the config (error 260017), even
+	// though it has a built-in fallback to Snowflake's LOCAL_APPLICATION client
+	// that is only applied later, when the flow runs. To use Snowflake's
+	// built-in "OAuth for local applications" client, callers must therefore
+	// set both options to "LOCAL_APPLICATION" themselves. This can be dropped
+	// once gosnowflake allows the empty values.
+	// https://github.com/snowflakedb/gosnowflake/issues/1867
+	OptionOAuthClientID     = "adbc.snowflake.sql.client_option.oauth_client_id"
+	OptionOAuthClientSecret = "adbc.snowflake.sql.client_option.oauth_client_secret"
 	// specify the OKTAUrl to use for OKTA Authentication
 	OptionAuthOktaUrl = "adbc.snowflake.sql.client_option.okta_url"
 	// enable the session to persist even after the connection is closed
@@ -178,6 +191,10 @@ const (
 	OptionValueAuthSnowflake = "auth_snowflake"
 	// use OAuth authentication for snowflake connection
 	OptionValueAuthOAuth = "auth_oauth"
+	// use the browser-based OAuth authorization code flow. Requires
+	// OptionOAuthClientID and OptionOAuthClientSecret; set both to
+	// "LOCAL_APPLICATION" to use Snowflake's built-in client.
+	OptionValueAuthOAuthAuthorizationCode = "auth_oauth_authorization_code"
 	// use an external browser to access a FED and perform SSO auth
 	OptionValueAuthExternalBrowser = "auth_ext_browser"
 	// use a native OKTA URL to perform SSO authentication on Okta
