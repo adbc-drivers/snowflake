@@ -12,14 +12,18 @@ dependencies = [
  "arrow-buffer",
  "arrow-cast",
  "arrow-schema",
+ "aws-lc-rs",
+ "base64",
  "bytes",
  "chrono",
  "driverbase",
+ "libc",
  "log",
  "openssl",
  "opentelemetry",
  "opentelemetry_sdk",
  "parquet",
+ "pkcs8",
  "serde_json",
  "sf_core",
  "tokio",
@@ -27,6 +31,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3204,6 +3209,7 @@ dependencies = [
  "des",
  "pbkdf2",
  "scrypt",
+ "sha1",
  "sha2",
  "spki",
 ]

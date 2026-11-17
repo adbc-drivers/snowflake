@@ -21,6 +21,8 @@ use adbc_core::{
     error::{Error, Result, Status},
     options::{OptionConnection, OptionDatabase, OptionValue},
 };
+use aws_lc_rs::{encoding::AsDer, signature::RsaKeyPair};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use driverbase::error::ErrorHelper;
 use sf_core::apis::database_driver_v1::{
     Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
@@ -30,6 +32,8 @@ use sf_core::config::param_registry::{
 };
 use sf_core::config::rest_parameters::DEFAULT_JWT_TIMEOUT_SECS;
 use sf_core::config::settings::Setting;
+use sf_core::sensitive::{Sensitive, SensitiveString};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::connection::{Connection, cleanup_connection_handle};
 use crate::driver::{Inner, TimestampPrecision};
@@ -45,6 +49,9 @@ const CACHE_MFA_TOKEN: &str = "adbc.snowflake.sql.client_option.cache_mfa_token"
 const STORE_TEMP_CREDS: &str = "adbc.snowflake.sql.client_option.store_temp_creds";
 const TLS_SKIP_VERIFY: &str = "adbc.snowflake.sql.client_option.tls_skip_verify";
 const LOG_TRACING: &str = "adbc.snowflake.sql.client_option.tracing";
+const CLIENT_CONFIG_FILE: &str = "adbc.snowflake.sql.client_option.config_file";
+const PRIVATE_KEY_PASSWORD: &str =
+    "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password";
 const DEFAULT_APPLICATION: &str = "ADBC Snowflake Driver (Rust)";
 const MAX_TIMESTAMP_PRECISION: &str = "adbc.snowflake.sql.client_option.max_timestamp_precision";
 pub(crate) const GEOGRAPHY_OUTPUT_FORMAT: &str =
@@ -67,10 +74,9 @@ impl GeoOutputFormat {
         } else if value.eq_ignore_ascii_case("GEOJSON") {
             Ok(Self::GeoJson)
         } else {
-            Err(SnowflakeError::invalid_argument()
-                .context("set database option")
+            Err(crate::error::SnowflakeErrorLowercase::invalid_argument()
                 .format(format_args!(
-                    "option '{key}': invalid value '{value}' (must be 'EWKB' or 'GeoJSON')"
+                    "invalid value for database option '{key}': '{value}' (must be 'EWKB' or 'GeoJSON')"
                 ))
                 .into())
         }
@@ -106,6 +112,13 @@ fn invalid_option_value(key: &str, value: impl std::fmt::Display) -> Error {
 fn database_option_as_string<'v>(key: &str, value: &'v OptionValue) -> Result<&'v str> {
     SnowflakeError::option_as_string(&key, value)
         .map_err(|error| error.context("set database option").into())
+}
+
+fn secret_option_as_string<'v>(key: &str, value: &'v OptionValue) -> Result<&'v str> {
+    match value {
+        OptionValue::String(value) => Ok(value),
+        _ => Err(invalid_option_value(key, "(unsupported option type)")),
+    }
 }
 
 fn unrecognized_option(key: &str) -> Error {
@@ -406,6 +419,24 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         return Ok(None);
     }
     let param = adbc_db_param(key)?;
+    if [
+        param_names::PASSWORD,
+        param_names::PROXY_PASSWORD,
+        param_names::PRIVATE_KEY_PASSWORD,
+        param_names::PASSCODE,
+        param_names::OAUTH_CLIENT_SECRET,
+    ]
+    .iter()
+    .any(|secret| secret.as_str() == param)
+    {
+        secret_option_as_string(key, value)?;
+    }
+    if (param == param_names::PRIVATE_KEY.as_str()
+        || param == param_names::PRIVATE_KEY_FILE.as_str())
+        && !matches!(value, OptionValue::String(_) | OptionValue::Bytes(_))
+    {
+        return Err(invalid_option_value(key, "(unsupported option type)"));
+    }
     let setting = match key {
         "adbc.snowflake.sql.uri.port" | "adbc.snowflake.sql.client_option.proxy_port" => {
             let port = non_negative_int(key, value)?;
@@ -468,11 +499,243 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
     Ok(Some((param, setting)))
 }
 
+fn private_key_error(message: impl std::fmt::Display) -> Error {
+    SnowflakeError::invalid_argument()
+        .format(format_args!("{message}"))
+        .into()
+}
+
+fn encode_pem(label: &str, der: &[u8]) -> String {
+    let mut pem = String::with_capacity(der.len().div_ceil(48) * 65 + label.len() * 2 + 34);
+    pem.push_str("-----BEGIN ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    for chunk in der.chunks(48) {
+        STANDARD.encode_string(chunk, &mut pem);
+        pem.push('\n');
+    }
+    pem.push_str("-----END ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    pem
+}
+
+fn encode_private_key_pem(der: &[u8]) -> String {
+    encode_pem("PRIVATE KEY", der)
+}
+
+/// Like encoding/pem.Decode, accept the first valid block and ignore surrounding text.
+fn decode_private_key_pem(value: &str) -> Option<(&str, Sensitive<Vec<u8>>)> {
+    let mut remaining = value;
+    while let Some(start) = remaining.find("-----BEGIN ") {
+        let candidate = &remaining[start..];
+        let at_line_start = start == 0 || remaining.as_bytes()[start - 1] == b'\n';
+        remaining = &candidate["-----BEGIN ".len()..];
+        if !at_line_start {
+            continue;
+        }
+        let Some((header, body)) = remaining.split_once('\n') else {
+            continue;
+        };
+        let Some(label) = header.trim_end().strip_suffix("-----") else {
+            continue;
+        };
+        let end = format!("-----END {label}-----");
+        let mut encoded = Zeroizing::new(String::with_capacity(body.len()));
+        let mut in_headers = true;
+        for line in body.lines() {
+            if line.trim_end() == end {
+                if let Ok(bytes) = STANDARD.decode(encoded.as_bytes()) {
+                    return Some((label, bytes.into()));
+                }
+                break;
+            }
+            if in_headers && line.contains(':') {
+                continue;
+            }
+            in_headers = false;
+            encoded.extend(line.chars().filter(|c| !matches!(c, ' ' | '\t' | '\r')));
+        }
+    }
+    None
+}
+
+fn decrypt_private_key(
+    der: &[u8],
+    password: &str,
+) -> std::result::Result<pkcs8::SecretDocument, String> {
+    use pkcs8::der::{
+        Decode,
+        asn1::{AnyRef, OctetStringRef},
+    };
+    use pkcs8::pkcs5::pbes2;
+    use pkcs8::{AlgorithmIdentifierRef, ObjectIdentifier};
+
+    let (algorithm, ciphertext) = AnyRef::from_der(der)
+        .and_then(|value| {
+            value.sequence(|reader| {
+                Ok((
+                    AlgorithmIdentifierRef::decode(reader)?,
+                    OctetStringRef::decode(reader)?,
+                ))
+            })
+        })
+        .map_err(|_| "pkcs8: only PKCS #5 v2.0 supported".to_owned())?;
+    if algorithm.oid != pbes2::PBES2_OID {
+        return Err("pkcs8: only PBES2 supported".into());
+    }
+    let (kdf, mut cipher) = algorithm
+        .parameters
+        .ok_or("pkcs8: invalid PBES2 parameters")?
+        .sequence(|reader| {
+            Ok((
+                AlgorithmIdentifierRef::decode(reader)?,
+                AlgorithmIdentifierRef::decode(reader)?,
+            ))
+        })
+        .map_err(|_| "pkcs8: invalid PBES2 parameters".to_owned())?;
+    // youmark/pkcs8 labels these as GCM but actually uses CBC with a 16-byte IV.
+    // Interpret its output as it does; this does not claim support for real GCM.
+    cipher.oid = match cipher.oid {
+        oid if oid == ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6") => {
+            pbes2::AES_128_CBC_OID
+        }
+        oid if oid == ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.26") => {
+            pbes2::AES_192_CBC_OID
+        }
+        oid if oid == ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46") => {
+            pbes2::AES_256_CBC_OID
+        }
+        oid => oid,
+    };
+    let encryption = pbes2::EncryptionScheme::try_from(cipher).map_err(|error| {
+        format!("pkcs8: unsupported cipher or invalid cipher parameters: {error}")
+    })?;
+    let kdf = pbes2::Kdf::try_from(kdf)
+        .map_err(|error| format!("pkcs8: unsupported KDF or invalid KDF parameters: {error}"))?;
+    if let pbes2::Kdf::Pbkdf2(params) = &kdf
+        && !matches!(
+            params.prf,
+            pbes2::Pbkdf2Prf::HmacWithSha1 | pbes2::Pbkdf2Prf::HmacWithSha256
+        )
+    {
+        return Err("pkcs8: unsupported hash function".into());
+    }
+    pkcs8::EncryptedPrivateKeyInfo {
+        encryption_algorithm: pbes2::Parameters { kdf, encryption }.into(),
+        encrypted_data: ciphertext.as_bytes(),
+    }
+    .decrypt(password.as_bytes())
+    .map_err(|_| "pkcs8: incorrect password".into())
+}
+
+fn parsed_private_key_pem(key: RsaKeyPair) -> Result<String> {
+    let der = key.as_der().map_err(|error| {
+        private_key_error(format_args!("failed encoding PKCS8 private key: {error}"))
+    })?;
+    Ok(encode_private_key_pem(der.as_ref()))
+}
+
+fn parse_private_key_file(path: &str) -> Result<String> {
+    let contents: Sensitive<Vec<u8>> = std::fs::read(path)
+        .map_err(|error| {
+            private_key_error(format_args!("could not read private key file: {error}"))
+        })?
+        .into();
+    let parse_error = |error: &dyn std::fmt::Display| {
+        private_key_error(format_args!("failed parsing private key file: {error}"))
+    };
+    let decoded;
+    let der = if contents
+        .reveal()
+        .windows(11)
+        .any(|bytes| bytes == b"PRIVATE KEY")
+    {
+        decoded = std::str::from_utf8(contents.reveal())
+            .ok()
+            .and_then(decode_private_key_pem)
+            .ok_or_else(|| parse_error(&"Failed to parse PEM block containing the private key"))?;
+        decoded.1.reveal().as_slice()
+    } else {
+        contents.reveal().as_slice()
+    };
+    let key = RsaKeyPair::from_der(der)
+        .or_else(|_| RsaKeyPair::from_pkcs8(der))
+        .map_err(|error| {
+            use pkcs8::der::Decode;
+            if pkcs8::PrivateKeyInfo::from_der(der).is_ok_and(|key| {
+                key.algorithm.oid != pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1")
+            }) {
+                parse_error(&"file does not contain an RSA private key")
+            } else {
+                parse_error(&error)
+            }
+        })?;
+    parsed_private_key_pem(key)
+}
+
+fn parse_private_key_value(value: &str, password: Option<&str>) -> Result<String> {
+    let (label, der) = decode_private_key_pem(value)
+        .ok_or_else(|| private_key_error("Failed to parse PEM block containing the private key"))?;
+    let decrypted;
+    let bytes = match label {
+        "PRIVATE KEY" => der.reveal().as_slice(),
+        "ENCRYPTED PRIVATE KEY" => {
+            let password = password.ok_or_else(|| {
+                private_key_error(format_args!("{PRIVATE_KEY_PASSWORD} is not configured"))
+            })?;
+            // youmark/pkcs8 treats an empty password as an unencrypted PKCS#8 key.
+            if password.is_empty() {
+                der.reveal().as_slice()
+            } else {
+                decrypted = decrypt_private_key(der.reveal(), password).map_err(|error| {
+                    private_key_error(format_args!("failed parsing PKCS8 private key: {error}"))
+                })?;
+                decrypted.as_bytes()
+            }
+        }
+        "RSA PRIVATE KEY" => return Err(private_key_error("RSA PRIVATE KEY is not supported")),
+        _ => return Err(private_key_error("unsupported private key PEM label")),
+    };
+    let key = RsaKeyPair::from_pkcs8(bytes).map_err(|error| {
+        private_key_error(format_args!("failed parsing PKCS8 private key: {error}"))
+    })?;
+    parsed_private_key_pem(key)
+}
+
+fn parse_private_key_bytes(value: &[u8], password: Option<&str>) -> Result<String> {
+    if let Ok(pem) = std::str::from_utf8(value) {
+        return parse_private_key_value(pem, password);
+    }
+    let key = RsaKeyPair::from_pkcs8(value).or_else(|error| {
+        let Some(password) = password.filter(|password| !password.is_empty()) else {
+            return Err(private_key_error(format_args!(
+                "failed parsing PKCS8 private key: {error}"
+            )));
+        };
+        let decrypted = decrypt_private_key(value, password).map_err(|error| {
+            private_key_error(format_args!("failed parsing PKCS8 private key: {error}"))
+        })?;
+        RsaKeyPair::from_pkcs8(decrypted.as_bytes()).map_err(|error| {
+            private_key_error(format_args!("failed parsing PKCS8 private key: {error}"))
+        })
+    })?;
+    parsed_private_key_pem(key)
+}
+
+fn zeroize_private_key_setting(setting: &mut Setting) {
+    match setting {
+        Setting::String(value) => value.zeroize(),
+        Setting::Bytes(value) => value.zeroize(),
+        _ => {}
+    }
+}
+
 pub struct Database {
     pub(crate) inner: Arc<Inner>,
     pub(crate) db_handle: Handle,
-    /// Canonical sf_core settings already stored on the database handle. Used
-    /// only for local getters and the bare-connection signal, never re-seeded.
+    /// Canonical settings mirrored from the database handle, except private-key
+    /// sources, which are attached to each connection after last-source selection.
     pub(crate) sf_settings: HashMap<String, Setting>,
     /// Additional login session parameters; names are stored as supplied for GetOption.
     pub(crate) session_parameters: HashMap<String, String>,
@@ -483,6 +746,8 @@ pub struct Database {
     pub(crate) credential_options: HashMap<&'static str, bool>,
     pub(crate) tls_skip_verify: bool,
     pub(crate) tracing_level: Option<String>,
+    pub(crate) client_config_file: String,
+    pub(crate) private_key_password: Option<SensitiveString>,
     /// Database-level warning messages already surfaced to the application logger.
     pub(crate) surfaced_warnings: HashSet<String>,
     /// Arrow time unit used for TIMESTAMP columns.
@@ -496,6 +761,7 @@ pub struct Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        self.clear_private_key_settings();
         let _ = self.inner.sf.database_release(self.db_handle);
         // The batch exporter owns its own thread, so this does not enter the
         // Tokio runtime even when a database is dropped on a runtime worker.
@@ -504,6 +770,34 @@ impl Drop for Database {
 }
 
 impl Database {
+    pub(crate) fn set_initial_options(
+        &mut self,
+        opts: impl IntoIterator<Item = (OptionDatabase, OptionValue)>,
+    ) -> Result<()> {
+        // Go looks up the password in the whole initialization map, not in the
+        // options visited so far. Preserve input order for key source replacement.
+        let opts = opts.into_iter().collect::<Vec<_>>();
+        let is_password = |key: &OptionDatabase| {
+            adbc_db_param(key.as_ref()).ok() == Some(param_names::PRIVATE_KEY_PASSWORD.as_str())
+        };
+        if let Some((key, value)) = opts.iter().rev().find(|(key, _)| is_password(key)) {
+            self.private_key_password = Some(secret_option_as_string(key.as_ref(), value)?.into());
+        }
+        let mut explicit_tracing = None;
+        for (key, value) in opts {
+            if key.as_ref() == LOG_TRACING {
+                self.set_option(key, value)?;
+                explicit_tracing = self.tracing_level.take();
+            } else if !is_password(&key) {
+                self.set_option(key, value)?;
+            }
+        }
+        // Go sets cfg.Tracing = "fatal" after parsing the initialization URI,
+        // then applies only an explicitly supplied tracing database option.
+        self.tracing_level = explicit_tracing;
+        Ok(())
+    }
+
     fn set_sf_options(&mut self, options: HashMap<String, Setting>) -> Result<()> {
         let warnings = self
             .inner
@@ -511,13 +805,23 @@ impl Database {
             .map_err(crate::error::api_error_to_adbc_error)?;
         for warning in warnings {
             let rendered = warning.to_string();
-            if self.surfaced_warnings.insert(rendered.clone()) {
-                tracing::dispatcher::with_default(&self.inner.dispatch, || {
+            tracing::dispatcher::with_default(&self.inner.dispatch, || {
+                if tracing::enabled!(tracing::Level::WARN)
+                    && self.surfaced_warnings.insert(rendered.clone())
+                {
                     tracing::warn!("Snowflake database option warning: {rendered}");
-                });
-            }
+                }
+            });
         }
         Ok(())
+    }
+
+    fn clear_private_key_settings(&mut self) {
+        for param in [param_names::PRIVATE_KEY, param_names::PRIVATE_KEY_FILE] {
+            if let Some(mut setting) = self.sf_settings.remove(param.as_str()) {
+                zeroize_private_key_setting(&mut setting);
+            }
+        }
     }
 
     fn set_sf_option(&mut self, param: &'static str, setting: Setting) -> Result<()> {
@@ -549,9 +853,11 @@ impl Optionable for Database {
         }
         if key_str == LOG_TRACING {
             let level = database_option_as_string(key_str, &value)?;
-            crate::telemetry::log_level_filter(level)
-                .ok_or_else(|| invalid_option_value(key_str, level))?;
             self.tracing_level = Some(level.to_owned());
+            return Ok(());
+        }
+        if key_str == CLIENT_CONFIG_FILE || key_str.eq_ignore_ascii_case("client_config_file") {
+            self.client_config_file = database_option_as_string(key_str, &value)?.to_owned();
             return Ok(());
         }
         if key_str == CACHE_MFA_TOKEN || key_str == STORE_TEMP_CREDS {
@@ -629,6 +935,49 @@ impl Optionable for Database {
             self.max_retry_count = Some(retries);
             return Ok(());
         }
+        if let Ok(param) = adbc_db_param(key_str) {
+            if param == param_names::PRIVATE_KEY_PASSWORD.as_str() {
+                self.private_key_password = Some(secret_option_as_string(key_str, &value)?.into());
+                return Ok(());
+            }
+            if param == param_names::PRIVATE_KEY_FILE.as_str()
+                || param == param_names::PRIVATE_KEY.as_str()
+            {
+                let password = self
+                    .private_key_password
+                    .as_ref()
+                    .map(|value| value.reveal().as_str());
+                let (param, setting) = match value {
+                    OptionValue::Bytes(bytes) => {
+                        let bytes = Zeroizing::new(bytes);
+                        (
+                            param_names::PRIVATE_KEY.as_str(),
+                            Setting::String(parse_private_key_bytes(&bytes, password)?),
+                        )
+                    }
+                    OptionValue::String(value) => match key_str {
+                        "adbc.snowflake.sql.client_option.jwt_private_key" => (
+                            param_names::PRIVATE_KEY.as_str(),
+                            Setting::String(parse_private_key_file(&value)?),
+                        ),
+                        "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value" => {
+                            let value = Zeroizing::new(value);
+                            (
+                                param_names::PRIVATE_KEY.as_str(),
+                                Setting::String(parse_private_key_value(&value, password)?),
+                            )
+                        }
+                        // Preserve sf_core's extended raw-string key formats and file checks.
+                        _ => (param, Setting::String(value)),
+                    },
+                    _ => return Err(invalid_option_value(key_str, "(unsupported option type)")),
+                };
+                // sf_core merges options, so attach only the last key source at connection time.
+                self.clear_private_key_settings();
+                self.sf_settings.insert(param.to_owned(), setting);
+                return Ok(());
+            }
+        }
         let mapped = match adbc_db_opt_to_sf(key_str, &value) {
             Ok(mapped) => mapped,
             Err(error)
@@ -693,6 +1042,9 @@ impl Optionable for Database {
         }
         if key_str == LOG_TRACING {
             return Ok(self.tracing_level.as_deref().unwrap_or("fatal").to_owned());
+        }
+        if key_str == CLIENT_CONFIG_FILE || key_str.eq_ignore_ascii_case("client_config_file") {
+            return Ok(self.client_config_file.clone());
         }
         if key_str == TLS_SKIP_VERIFY {
             return Ok(self.tls_skip_verify.to_string());
@@ -1070,9 +1422,24 @@ impl Database {
                                     .to_string(),
                                 )
                             }
-                            // Go's DSN uses URL-safe base64; sf_core accepts standard base64.
+                            // Go's DSN accepts URL-safe base64 of an unencrypted PKCS#8 key.
                             "privateKey" => {
-                                OptionValue::String(value.replace('-', "+").replace('_', "/"))
+                                let der: Sensitive<Vec<u8>> =
+                                    base64::engine::general_purpose::URL_SAFE
+                                        .decode(value.as_bytes())
+                                        .map_err(|error| {
+                                            private_key_error(format_args!(
+                                                "failed parsing PKCS8 private key: {error}"
+                                            ))
+                                        })?
+                                        .into();
+                                let key =
+                                    RsaKeyPair::from_pkcs8(der.reveal()).map_err(|error| {
+                                        private_key_error(format_args!(
+                                            "failed parsing PKCS8 private key: {error}"
+                                        ))
+                                    })?;
+                                OptionValue::String(parsed_private_key_pem(key)?)
                             }
                             "certRevocationCheckMode"
                                 if !matches!(
@@ -1143,10 +1510,9 @@ fn uri_query_option(key: &str) -> Result<Option<&'static str>> {
         "application" => "adbc.snowflake.sql.client_option.application",
         "token" => "adbc.snowflake.sql.client_option.auth_token",
         "tokenFilePath" => param_names::TOKEN_FILE_PATH.as_str(),
-        "privateKey" | "private_key" => {
-            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value"
-        }
+        "privateKey" | "private_key" => param_names::PRIVATE_KEY.as_str(),
         "private_key_file" => "adbc.snowflake.sql.client_option.jwt_private_key",
+        "clientConfigFile" | "client_config_file" => CLIENT_CONFIG_FILE,
         "workloadIdentityProvider" => "adbc.snowflake.sql.client_option.identity_provider",
         "workloadIdentityEntraResource" => param_names::WORKLOAD_IDENTITY_ENTRA_RESOURCE.as_str(),
         "workloadIdentityImpersonationPath" => {
@@ -1192,7 +1558,6 @@ fn uri_query_option(key: &str) -> Result<Option<&'static str>> {
         | "ocspFailOpen"
         | "tlsConfigName"
         | "tmpDirPath"
-        | "clientConfigFile"
         | "disableConsoleLogin" => return Err(unsupported_uri_config(key)),
         _ => return Ok(None),
     };
@@ -1296,6 +1661,11 @@ fn accumulate_connection_options(
                     if param == param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL.as_str() {
                         credential_options.clear();
                     }
+                    if param == param_names::PRIVATE_KEY.as_str() {
+                        sf_options.remove(param_names::PRIVATE_KEY_FILE.as_str());
+                    } else if param == param_names::PRIVATE_KEY_FILE.as_str() {
+                        sf_options.remove(param_names::PRIVATE_KEY.as_str());
+                    }
                     sf_options.insert(param.to_string(), setting);
                 }
                 Ok(None)
@@ -1391,6 +1761,7 @@ impl adbc_core::Database for Database {
             self.traces_exporter,
             self.traces_folder_path.as_deref(),
             self.tracing_level.as_deref(),
+            &self.client_config_file,
         )?;
         self.inner
             .traced("databaseImpl.Open", self.trace_parent.as_deref(), |_| {
@@ -1407,6 +1778,28 @@ impl adbc_core::Database for Database {
                     &credential_options,
                     no_connection_details,
                 );
+                let key_sources = [param_names::PRIVATE_KEY, param_names::PRIVATE_KEY_FILE];
+                if !key_sources
+                    .iter()
+                    .any(|key| sf_options.contains_key(key.as_str()))
+                {
+                    for key in key_sources {
+                        if let Some(value) = self.sf_settings.get(key.as_str()) {
+                            sf_options.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                if key_sources
+                    .iter()
+                    .any(|key| sf_options.contains_key(key.as_str()))
+                    && !sf_options.contains_key(param_names::PRIVATE_KEY_PASSWORD.as_str())
+                    && let Some(password) = &self.private_key_password
+                {
+                    sf_options.insert(
+                        param_names::PRIVATE_KEY_PASSWORD.to_string(),
+                        Setting::String(password.reveal().clone()),
+                    );
+                }
                 // Snowflake currently gates Arrow result transport on this protocol ID.
                 // Keep the visible application and wrapper telemetry driver-specific.
                 sf_options.insert(
@@ -1530,6 +1923,581 @@ mod tests {
     fn make_db() -> Database {
         let mut driver = crate::driver::Driver::default();
         driver.new_database().unwrap()
+    }
+
+    fn key_option(name: &str) -> OptionDatabase {
+        OptionDatabase::Other(format!("adbc.snowflake.sql.client_option.{name}"))
+    }
+
+    fn test_key_der() -> &'static [u8] {
+        static KEY: std::sync::LazyLock<aws_lc_rs::encoding::Pkcs8V1Der<'static>> =
+            std::sync::LazyLock::new(|| {
+                use aws_lc_rs::encoding::AsDer;
+                aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+                    .unwrap()
+                    .as_der()
+                    .unwrap()
+            });
+        KEY.as_ref()
+    }
+
+    fn test_key_pem() -> String {
+        encode_private_key_pem(test_key_der())
+    }
+
+    fn encrypted_test_key() -> String {
+        use pkcs8::der::Decode;
+        let params =
+            pkcs8::pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(100, b"test salt", &[42; 16])
+                .unwrap();
+        let encrypted = pkcs8::PrivateKeyInfo::from_der(test_key_der())
+            .unwrap()
+            .encrypt_with_params(params, b"test password")
+            .unwrap();
+        encode_pem("ENCRYPTED PRIVATE KEY", encrypted.as_bytes())
+    }
+
+    #[test]
+    fn encrypted_private_key_matches_go_cipher_and_kdf_coverage() {
+        use pkcs8::der::Decode;
+        use pkcs8::pkcs5::pbes2::{
+            EncryptionScheme, Kdf, Parameters, Pbkdf2Params, Pbkdf2Prf, ScryptParams,
+        };
+        let key = pkcs8::PrivateKeyInfo::from_der(test_key_der()).unwrap();
+        let kdfs = [
+            Kdf::Pbkdf2(Pbkdf2Params {
+                salt: b"test salt",
+                iteration_count: 100,
+                key_length: None,
+                prf: Pbkdf2Prf::HmacWithSha1,
+            }),
+            Kdf::Pbkdf2(Pbkdf2Params {
+                salt: b"test salt",
+                iteration_count: 100,
+                key_length: None,
+                prf: Pbkdf2Prf::HmacWithSha256,
+            }),
+            Kdf::Scrypt(ScryptParams {
+                salt: b"test salt",
+                cost_parameter: 16,
+                block_size: 8,
+                parallelization: 1,
+                key_length: None,
+            }),
+        ];
+        for kdf in kdfs {
+            for encryption in [
+                EncryptionScheme::Aes128Cbc { iv: &[1; 16] },
+                EncryptionScheme::Aes192Cbc { iv: &[2; 16] },
+                EncryptionScheme::Aes256Cbc { iv: &[3; 16] },
+                EncryptionScheme::DesEde3Cbc { iv: &[4; 8] },
+            ] {
+                let encrypted = key
+                    .encrypt_with_params(
+                        Parameters {
+                            kdf: kdf.clone(),
+                            encryption,
+                        },
+                        b"password",
+                    )
+                    .unwrap();
+                let parsed = parse_private_key_value(
+                    &encode_pem("ENCRYPTED PRIVATE KEY", encrypted.as_bytes()),
+                    Some("password"),
+                )
+                .unwrap();
+                assert_eq!(parsed, test_key_pem());
+                // The Go library writes CBC ciphertext even for its GCM OIDs.
+                if let Some(final_oid_byte) = match encryption {
+                    EncryptionScheme::Aes128Cbc { .. } => Some(2),
+                    EncryptionScheme::Aes192Cbc { .. } => Some(22),
+                    EncryptionScheme::Aes256Cbc { .. } => Some(42),
+                    _ => None,
+                } {
+                    let oid = [
+                        0x06,
+                        0x09,
+                        0x60,
+                        0x86,
+                        0x48,
+                        0x01,
+                        0x65,
+                        0x03,
+                        0x04,
+                        0x01,
+                        final_oid_byte,
+                    ];
+                    let mut go_gcm = encrypted.as_bytes().to_vec();
+                    let offset = go_gcm
+                        .windows(oid.len())
+                        .position(|window| window == oid)
+                        .unwrap();
+                    go_gcm[offset + oid.len() - 1] += 4;
+                    assert_eq!(
+                        parse_private_key_value(
+                            &encode_pem("ENCRYPTED PRIVATE KEY", &go_gcm),
+                            Some("password"),
+                        )
+                        .unwrap(),
+                        test_key_pem(),
+                    );
+                }
+            }
+        }
+        let unsupported_prf = Parameters {
+            kdf: Kdf::Pbkdf2(Pbkdf2Params {
+                salt: b"test salt",
+                iteration_count: 100,
+                key_length: None,
+                prf: Pbkdf2Prf::HmacWithSha512,
+            }),
+            encryption: EncryptionScheme::Aes256Cbc { iv: &[3; 16] },
+        };
+        let encrypted = key
+            .encrypt_with_params(unsupported_prf, b"password")
+            .unwrap();
+        assert!(
+            parse_private_key_value(
+                &encode_pem("ENCRYPTED PRIVATE KEY", encrypted.as_bytes()),
+                Some("password"),
+            )
+            .unwrap_err()
+            .message
+            .contains("unsupported hash function")
+        );
+    }
+
+    #[test]
+    fn private_key_options_accept_pem_and_pkcs8_bytes() {
+        let encrypted = encrypted_test_key();
+        let (_, encrypted_der) = decode_private_key_pem(&encrypted).unwrap();
+        for option in [
+            key_option("jwt_private_key"),
+            key_option("jwt_private_key_pkcs8_value"),
+            OptionDatabase::Other("private_key".into()),
+            OptionDatabase::Other("private_key_file".into()),
+        ] {
+            for (bytes, password) in [
+                (test_key_pem().into_bytes(), None),
+                (test_key_der().to_vec(), None),
+                (test_key_der().to_vec(), Some("test password")),
+                (encrypted.as_bytes().to_vec(), Some("test password")),
+                (encrypted_der.reveal().clone(), Some("test password")),
+            ] {
+                let mut db = make_db();
+                if let Some(password) = password {
+                    db.set_option(
+                        key_option("jwt_private_key_pkcs8_password"),
+                        OptionValue::String(password.into()),
+                    )
+                    .unwrap();
+                }
+                db.set_option(option.clone(), OptionValue::Bytes(bytes))
+                    .unwrap();
+                assert_eq!(
+                    db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+                    Some(&Setting::String(test_key_pem())),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn secret_options_reject_non_string_values_without_echoing_them() {
+        let mut db = make_db();
+        for name in [
+            "adbc.snowflake.sql.client_option.jwt_private_key",
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value",
+            PRIVATE_KEY_PASSWORD,
+            "private_key",
+            "private_key_file",
+            "private_key_password",
+            "password",
+            "proxy_password",
+            "adbc.snowflake.sql.client_option.proxy_password",
+            "passcode",
+            "oauth_client_secret",
+        ] {
+            for value in [OptionValue::Int(987654321), OptionValue::Double(987654.321)] {
+                let secret = format!("{value:?}");
+                let error = db
+                    .set_option(OptionDatabase::Other(name.into()), value)
+                    .unwrap_err();
+                assert_eq!(error.status, Status::InvalidArguments);
+                assert!(error.message.contains("(unsupported option type)"));
+                assert!(!error.message.contains("987654"));
+                assert!(!error.message.contains(&secret));
+            }
+        }
+        for name in [
+            PRIVATE_KEY_PASSWORD,
+            "private_key_password",
+            "password",
+            "proxy_password",
+            "adbc.snowflake.sql.client_option.proxy_password",
+            "passcode",
+            "oauth_client_secret",
+        ] {
+            let bytes = b"password bytes must stay secret".to_vec();
+            let debug = format!("{bytes:?}");
+            let error = db
+                .set_option(
+                    OptionDatabase::Other(name.into()),
+                    OptionValue::Bytes(bytes),
+                )
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(!error.message.contains(&debug));
+            assert!(!error.message.contains("password bytes must stay secret"));
+        }
+        for name in [PRIVATE_KEY_PASSWORD, "private_key_password"] {
+            let error = db
+                .set_initial_options([(
+                    OptionDatabase::Other(name.into()),
+                    OptionValue::Bytes(b"initial secret".to_vec()),
+                )])
+                .unwrap_err();
+            assert!(error.message.contains("(unsupported option type)"));
+            assert!(!error.message.contains("105, 110, 105"));
+        }
+    }
+
+    #[test]
+    fn private_key_pem_errors_do_not_echo_arbitrary_labels() {
+        let error =
+            parse_private_key_value(&encode_pem("secret-label-do-not-echo", b"not a key"), None)
+                .unwrap_err();
+        assert!(!error.message.contains("secret-label-do-not-echo"));
+    }
+
+    #[test]
+    fn clearing_private_keys_zeroizes_payloads_and_preserves_other_settings() {
+        for mut setting in [
+            Setting::String("private key".into()),
+            Setting::Bytes(b"private key".to_vec()),
+        ] {
+            zeroize_private_key_setting(&mut setting);
+            assert!(
+                matches!(&setting, Setting::String(value) if value.is_empty())
+                    || matches!(&setting, Setting::Bytes(value) if value.is_empty())
+            );
+        }
+        let mut db = make_db();
+        db.sf_settings
+            .insert("private_key".into(), Setting::String(test_key_pem()));
+        db.sf_settings
+            .insert("private_key_file".into(), Setting::String("key.pem".into()));
+        db.sf_settings
+            .insert("account".into(), Setting::String("account".into()));
+        db.clear_private_key_settings();
+        assert_eq!(db.sf_settings.len(), 1);
+        assert!(db.sf_settings.contains_key("account"));
+    }
+
+    #[test]
+    fn private_key_file_errors_are_reported_at_set_option() {
+        let mut db = make_db();
+        let path = std::env::temp_dir().join(format!("missing-key-{}", uuid::Uuid::new_v4()));
+        let error = db
+            .set_option(
+                key_option("jwt_private_key"),
+                OptionValue::String(path.to_str().unwrap().into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("could not read private key file:"));
+        assert!(!error.message.contains(path.to_str().unwrap()));
+
+        std::fs::write(&path, b"invalid key").unwrap();
+        let error = db
+            .set_option(
+                key_option("jwt_private_key"),
+                OptionValue::String(path.to_str().unwrap().into()),
+            )
+            .unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("failed parsing private key file:"));
+        assert!(!error.message.contains(path.to_str().unwrap()));
+        assert!(db.sf_settings.is_empty());
+    }
+
+    #[test]
+    fn private_key_value_errors_are_reported_at_set_option() {
+        let mut db = make_db();
+        for (value, expected) in [
+            ("not PEM".to_owned(), "Failed to parse PEM block"),
+            (
+                encode_pem("PRIVATE KEY", b"not a key"),
+                "failed parsing PKCS8 private key:",
+            ),
+            (
+                encode_pem("RSA PRIVATE KEY", b"not a key"),
+                "RSA PRIVATE KEY is not supported",
+            ),
+        ] {
+            let error = db
+                .set_option(
+                    key_option("jwt_private_key_pkcs8_value"),
+                    OptionValue::String(value),
+                )
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.contains(expected), "{error:?}");
+        }
+        assert!(db.sf_settings.is_empty());
+    }
+
+    #[test]
+    fn encrypted_private_key_requires_password_before_post_init_value() {
+        let mut db = make_db();
+        let encrypted = encrypted_test_key();
+        let value_option = key_option("jwt_private_key_pkcs8_value");
+        let password_option = key_option("jwt_private_key_pkcs8_password");
+        let error = db
+            .set_option(value_option.clone(), OptionValue::String(encrypted.clone()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error
+                .message
+                .contains("jwt_private_key_pkcs8_password is not configured")
+        );
+
+        db.set_option(password_option.clone(), OptionValue::String("wrong".into()))
+            .unwrap();
+        let error = db
+            .set_option(value_option.clone(), OptionValue::String(encrypted.clone()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("failed parsing PKCS8 private key:"));
+        assert!(db.sf_settings.is_empty());
+
+        db.set_option(
+            password_option.clone(),
+            OptionValue::String("test password".into()),
+        )
+        .unwrap();
+        db.set_option(value_option.clone(), OptionValue::String(encrypted))
+            .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+            Some(&Setting::String(test_key_pem())),
+        );
+        for option in [value_option, password_option, key_option("jwt_private_key")] {
+            assert_eq!(
+                db.get_option_string(option).unwrap_err().status,
+                Status::NotFound
+            );
+        }
+        // A later password change cannot re-encrypt or invalidate the parsed key.
+        db.set_option(
+            key_option("jwt_private_key_pkcs8_password"),
+            OptionValue::String("different password".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+            Some(&Setting::String(test_key_pem())),
+        );
+        assert!(
+            !db.sf_settings
+                .contains_key(param_names::PRIVATE_KEY_PASSWORD.as_str())
+        );
+    }
+
+    #[test]
+    fn initial_private_key_password_lookup_is_independent_of_option_order() {
+        for password_first in [false, true] {
+            let mut driver = crate::driver::Driver::default();
+            let mut options = vec![
+                (
+                    key_option("jwt_private_key_pkcs8_value"),
+                    OptionValue::String(encrypted_test_key()),
+                ),
+                (
+                    key_option("jwt_private_key_pkcs8_password"),
+                    OptionValue::String("test password".into()),
+                ),
+            ];
+            if password_first {
+                options.reverse();
+            }
+            let db = driver.new_database_with_opts(options).unwrap();
+            assert_eq!(
+                db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+                Some(&Setting::String(test_key_pem())),
+            );
+        }
+    }
+
+    #[test]
+    fn private_key_file_accepts_pkcs1_and_pkcs8_der_and_pem_but_not_encryption() {
+        use pkcs8::der::Decode;
+        let mut db = make_db();
+        let path = std::env::temp_dir().join(format!("key-format-{}", uuid::Uuid::new_v4()));
+        let pkcs1 = pkcs8::PrivateKeyInfo::from_der(test_key_der())
+            .unwrap()
+            .private_key;
+        for contents in [
+            test_key_der().to_vec(),
+            test_key_pem().into_bytes(),
+            pkcs1.to_vec(),
+            encode_pem("RSA PRIVATE KEY", pkcs1).into_bytes(),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            db.set_option(
+                key_option("jwt_private_key"),
+                OptionValue::String(path.to_str().unwrap().into()),
+            )
+            .unwrap();
+            assert_eq!(
+                db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+                Some(&Setting::String(test_key_pem())),
+            );
+        }
+        std::fs::write(&path, encrypted_test_key()).unwrap();
+        let error = db
+            .set_option(
+                key_option("jwt_private_key"),
+                OptionValue::String(path.to_str().unwrap().into()),
+            )
+            .unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("failed parsing private key file"));
+    }
+
+    #[test]
+    fn private_key_file_and_value_share_one_last_set_key() {
+        use aws_lc_rs::encoding::AsDer;
+        let mut db = make_db();
+        let other = aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+            .unwrap()
+            .as_der()
+            .unwrap();
+        let other_pem = encode_private_key_pem(other.as_ref());
+        let path = std::env::temp_dir().join(format!("last-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, test_key_pem()).unwrap();
+
+        db.set_option(
+            key_option("jwt_private_key"),
+            OptionValue::String(path.to_str().unwrap().into()),
+        )
+        .unwrap();
+        db.set_option(
+            key_option("jwt_private_key_pkcs8_value"),
+            OptionValue::String(other_pem.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+            Some(&Setting::String(other_pem)),
+        );
+        db.set_option(
+            key_option("jwt_private_key"),
+            OptionValue::String(path.to_str().unwrap().into()),
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+            Some(&Setting::String(test_key_pem())),
+        );
+        assert!(
+            !db.sf_settings
+                .contains_key(param_names::PRIVATE_KEY_FILE.as_str())
+        );
+
+        // A rejected replacement does not discard the last successfully parsed key.
+        db.set_option(
+            key_option("jwt_private_key_pkcs8_value"),
+            OptionValue::String("invalid PEM".into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+            Some(&Setting::String(test_key_pem())),
+        );
+    }
+
+    #[test]
+    fn raw_key_overrides_and_connection_options_keep_only_one_source() {
+        let mut db = make_db();
+        db.set_option(
+            OptionDatabase::Other("private_key_file".into()),
+            OptionValue::String("raw-key-file.pem".into()),
+        )
+        .unwrap();
+        db.set_option(
+            key_option("jwt_private_key_pkcs8_value"),
+            OptionValue::String(test_key_pem()),
+        )
+        .unwrap();
+        assert!(
+            !db.sf_settings
+                .contains_key(param_names::PRIVATE_KEY_FILE.as_str())
+        );
+        db.set_option(
+            OptionDatabase::Other("private_key_file".into()),
+            OptionValue::String("another-raw-key-file.pem".into()),
+        )
+        .unwrap();
+        assert!(
+            !db.sf_settings
+                .contains_key(param_names::PRIVATE_KEY.as_str())
+        );
+        for file_last in [false, true] {
+            let mut options = vec![
+                (
+                    OptionConnection::Other("private_key_file".into()),
+                    OptionValue::String("connection-key.pem".into()),
+                ),
+                (
+                    OptionConnection::Other("private_key".into()),
+                    OptionValue::Bytes(test_key_der().to_vec()),
+                ),
+            ];
+            if file_last {
+                options.reverse();
+            }
+            let accumulated = accumulate_connection_options(&db.sf_settings, options).unwrap();
+            assert_eq!(
+                accumulated
+                    .sf_options
+                    .contains_key(param_names::PRIVATE_KEY_FILE.as_str()),
+                file_last,
+            );
+            assert_eq!(
+                accumulated
+                    .sf_options
+                    .contains_key(param_names::PRIVATE_KEY.as_str()),
+                !file_last,
+            );
+        }
+    }
+
+    #[test]
+    fn uri_private_key_is_parsed_as_url_safe_pkcs8_der_at_set() {
+        let mut db = make_db();
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode(test_key_der());
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String(format!("snowflake://account?privateKey={encoded}")),
+        )
+        .unwrap();
+        assert_eq!(
+            db.sf_settings.get(param_names::PRIVATE_KEY.as_str()),
+            Some(&Setting::String(test_key_pem())),
+        );
+        let error = db
+            .set_option(
+                OptionDatabase::Uri,
+                OptionValue::String("snowflake://account?privateKey=bm90LWEta2V5".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("failed parsing PKCS8 private key"));
     }
 
     #[test]
@@ -1820,7 +2788,7 @@ mod tests {
             for value in [OptionValue::String("WKT".into()), OptionValue::Int(1)] {
                 let expected = match &value {
                     OptionValue::String(value) => format!(
-                        "[Snowflake] could not set database option: option '{key}': invalid value '{value}' (must be 'EWKB' or 'GeoJSON')"
+                        "[snowflake] invalid value for database option '{key}': '{value}' (must be 'EWKB' or 'GeoJSON')"
                     ),
                     other => format!(
                         "[Snowflake] could not set database option: could not invalid option \"{key}\"={other:?}: must be a string"
@@ -2369,31 +3337,155 @@ mod tests {
     }
 
     #[test]
-    fn tracing_option_accepts_gosnowflake_v2_levels_and_preserves_value_on_error() {
+    fn tracing_option_stores_strings_and_defers_level_validation_to_connect() {
         let mut db = make_db();
-        let key = OptionDatabase::Other("adbc.snowflake.sql.client_option.tracing".into());
+        let key = OptionDatabase::Other(LOG_TRACING.into());
         assert_eq!(db.get_option_string(key.clone()).unwrap(), "fatal");
-        for level in ["trace", "DEBUG", "Info", "warn", "error", "fatal", "off"] {
+        for level in [
+            "trace", "DEBUG", "Info", "warn", "error", "fatal", "off", "warning", "panic",
+            "invalid", " info ", "",
+        ] {
             db.set_option(key.clone(), OptionValue::String(level.into()))
                 .unwrap();
             assert_eq!(db.get_option_string(key.clone()).unwrap(), level);
         }
-        for value in [
-            OptionValue::String("warning".into()),
-            OptionValue::String("panic".into()),
-            OptionValue::String("invalid".into()),
-            OptionValue::String(" info ".into()),
-            OptionValue::String(String::new()),
-            OptionValue::Int(1),
-        ] {
-            assert_eq!(
-                db.set_option(key.clone(), value).unwrap_err().status,
-                Status::InvalidArguments,
-            );
-            assert_eq!(db.get_option_string(key.clone()).unwrap(), "off");
-        }
+        assert_eq!(
+            db.set_option(key.clone(), OptionValue::Int(1))
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments,
+        );
+        assert_eq!(db.get_option_string(key).unwrap(), "");
         assert!(db.sf_settings.is_empty());
         assert!(db.session_parameters.is_empty());
+    }
+
+    #[test]
+    fn initial_uri_tracing_is_overridden_by_go_database_default_or_explicit_option() {
+        for explicit in [None, Some("INFO"), Some("")] {
+            for uri_first in [false, true] {
+                let mut options = vec![(
+                    OptionDatabase::Uri,
+                    OptionValue::String("snowflake://account?tracing=DEBUG".into()),
+                )];
+                if let Some(level) = explicit {
+                    options.push((
+                        OptionDatabase::Other(LOG_TRACING.into()),
+                        OptionValue::String(level.into()),
+                    ));
+                }
+                if !uri_first {
+                    options.reverse();
+                }
+                let mut driver = crate::driver::Driver::default();
+                let db = driver.new_database_with_opts(options).unwrap();
+                assert_eq!(
+                    db.get_option_string(OptionDatabase::Other(LOG_TRACING.into()))
+                        .unwrap(),
+                    explicit.unwrap_or("fatal"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tracing_validation_happens_on_every_connection_and_is_process_global() {
+        const CHILD: &str = "ADBC_SNOWFLAKE_LOG_TIMING_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("adbc-log-home-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "database::tests::tracing_validation_happens_on_every_connection_and_is_process_global", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env_remove("SF_CLIENT_CONFIG_FILE")
+                .output().unwrap();
+            std::fs::remove_dir_all(home).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let logs = String::from_utf8(output.stderr).unwrap();
+            assert!(!logs.contains("set alone does not change logging"));
+            assert!(logs.contains("connected debug level is global"));
+            assert!(!logs.contains("second connection resets fatal"));
+            assert!(logs.contains("first connection reapplies debug"));
+            return;
+        }
+        let mut first = make_db();
+        let mut second = make_db();
+        for db in [&mut first, &mut second] {
+            db.set_option(
+                OptionDatabase::Username,
+                OptionValue::String("unused".into()),
+            )
+            .unwrap();
+            db.set_option(
+                OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                OptionValue::String("unused".into()),
+            )
+            .unwrap();
+            db.set_option(
+                OptionDatabase::Other(AUTH_TYPE.into()),
+                OptionValue::String("auth_jwt".into()),
+            )
+            .unwrap();
+        }
+        let emit = |message: &str| {
+            tracing::dispatcher::with_default(&second.inner.dispatch, || {
+                tracing::debug!(target: "sf_core", "{message}");
+            });
+        };
+        first
+            .set_option(
+                OptionDatabase::Other(LOG_TRACING.into()),
+                OptionValue::String("DEBUG".into()),
+            )
+            .unwrap();
+        emit("set alone does not change logging");
+        // Missing JWT key prevents any network request; logging is applied at connect.
+        assert!(first.new_connection().is_err());
+        emit("connected debug level is global");
+        assert!(second.new_connection().is_err());
+        emit("second connection resets fatal");
+        assert!(first.new_connection().is_err());
+        emit("first connection reapplies debug");
+        first
+            .set_option(
+                OptionDatabase::Other(LOG_TRACING.into()),
+                OptionValue::String("warning".into()),
+            )
+            .unwrap();
+        let error = first.new_connection().err().unwrap();
+        assert_eq!(error.status, Status::IO);
+        assert!(error.message.contains("unknown log level: WARNING"));
+    }
+
+    #[test]
+    fn client_config_options_are_stored_without_opening_the_file() {
+        let mut db = make_db();
+        for key in [CLIENT_CONFIG_FILE, "client_config_file"] {
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String("/not/opened/at/set.json".into()),
+            )
+            .unwrap();
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Other(CLIENT_CONFIG_FILE.into()))
+                    .unwrap(),
+                "/not/opened/at/set.json"
+            );
+        }
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("snowflake://account?clientConfigFile=client.json".into()),
+        )
+        .unwrap();
+        assert_eq!(db.client_config_file, "client.json");
+        assert!(!db.sf_settings.contains_key("client_config_file"));
+        assert!(!db.session_parameters.contains_key("clientConfigFile"));
     }
 
     #[test]
@@ -2467,7 +3559,6 @@ mod tests {
         for key in [
             "adbc.snowflake.sql.region",
             "adbc.snowflake.sql.client_option.ocsp_fail_open_mode",
-            "adbc.snowflake.sql.client_option.config_file",
             "adbc.snowflake.sql.client_option.use_high_precision",
             "adbc.snowflake.sql.client_option.stream_retry_enabled",
             "adbc.connection.get_objects.match_exactly",
@@ -3297,7 +4388,6 @@ mod tests {
             "singleAuthenticationPrompt",
             "jwtClientTimeout",
             "ocspFailOpen",
-            "clientConfigFile",
         ] {
             let mut db = make_db();
             let error = db

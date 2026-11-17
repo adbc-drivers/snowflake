@@ -14,11 +14,12 @@
 
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, TrySendError},
     },
     time::Duration,
@@ -60,6 +61,7 @@ type BatchIter = Box<dyn Iterator<Item = std::result::Result<RecordBatch, ArrowE
 
 #[derive(Clone, Debug)]
 pub(crate) struct IngestOptions {
+    pub(crate) temporary: bool,
     writer_concurrency: usize,
     upload_concurrency: usize,
     copy_concurrency: usize,
@@ -74,6 +76,7 @@ pub(crate) struct IngestOptions {
 impl Default for IngestOptions {
     fn default() -> Self {
         Self {
+            temporary: false,
             writer_concurrency: std::thread::available_parallelism().map_or(1, usize::from),
             upload_concurrency: 8,
             copy_concurrency: 4,
@@ -333,6 +336,117 @@ impl IngestFailure {
     }
 }
 
+/// Preserve the ingest failure even if counting the partially loaded table fails.
+/// Replace-mode rows stay in staging until SWAP succeeds, not in the target.
+fn with_rows_loaded(
+    mut error: Error,
+    initial_rows: i64,
+    target_unchanged: bool,
+    recount: impl FnOnce() -> Result<i64>,
+) -> Error {
+    let rows = if target_unchanged {
+        0
+    } else {
+        let Ok(total) = recount() else {
+            return error;
+        };
+        total.saturating_sub(initial_rows).max(0)
+    };
+    if target_unchanged {
+        error.message.push_str(
+            "; 0 rows were loaded into the target before the failure; target table was not replaced",
+        );
+    } else {
+        write!(
+            error.message,
+            "; {rows} rows were loaded before the failure"
+        )
+        .unwrap();
+    }
+    error.details.get_or_insert_with(Vec::new).push((
+        "adbc.snowflake.ingest.rows_loaded".into(),
+        rows.to_string().into_bytes(),
+    ));
+    error
+}
+
+fn count_target_rows(stmt: &Statement, op: &OperationCtx, qname: &str) -> Result<i64> {
+    let inner = &stmt.inner;
+    let handle = inner
+        .sf
+        .statement_new(stmt.conn_handle)
+        .map_err(crate::error::api_error_to_adbc_error)?;
+    let response = inner.execute_query_with_timeout_tagged(
+        Some(op),
+        handle,
+        format!("SELECT COUNT(*) FROM {qname}"),
+        stmt.query_timeout_seconds,
+        stmt.query_tag.as_deref(),
+    );
+    let release = inner.sf.statement_release(handle);
+    let mut result = response?;
+    release.map_err(crate::error::api_error_to_adbc_error)?;
+    let missing_count = || {
+        SnowflakeError::invalid_data()
+            .message("target row count query did not return a count")
+            .to_adbc()
+    };
+    let batch = result
+        .reader
+        .next()
+        .ok_or_else(missing_count)?
+        .map_err(SnowflakeError::from_arrow)?;
+    if batch.num_rows() != 1 || batch.num_columns() != 1 || batch.column(0).is_null(0) {
+        return Err(missing_count());
+    }
+    array_value_to_string(batch.column(0), 0)
+        .map_err(SnowflakeError::from_arrow)?
+        .parse::<i64>()
+        .map_err(|error| {
+            SnowflakeError::invalid_data()
+                .format(format_args!("invalid target row count: {error}"))
+                .into()
+        })
+}
+
+fn temporary_table_exists(stmt: &Statement, op: &OperationCtx, table: &str) -> Result<bool> {
+    // SHOW TERSE TABLES can report only the permanent table when a temporary
+    // table shadows it. Information schema exposes both, including IS_TEMPORARY.
+    // Equality avoids LIKE wildcard matching for names containing '%' or '_'.
+    let mut sql = String::from(
+        "SELECT 1 FROM INFORMATION_SCHEMA.TABLES \
+         WHERE TABLE_SCHEMA = CURRENT_SCHEMA() AND IS_TEMPORARY = 'YES' AND TABLE_NAME = '",
+    );
+    for ch in table.chars() {
+        if matches!(ch, '\'' | '\\') {
+            sql.push(ch);
+        }
+        sql.push(ch);
+    }
+    sql.push('\'');
+    let inner = &stmt.inner;
+    let handle = inner
+        .sf
+        .statement_new(stmt.conn_handle)
+        .map_err(crate::error::api_error_to_adbc_error)?;
+    let response = inner.execute_query_with_timeout_tagged(
+        Some(op),
+        handle,
+        sql,
+        stmt.query_timeout_seconds,
+        stmt.query_tag.as_deref(),
+    );
+    let release = inner.sf.statement_release(handle);
+    let result = response?;
+    release.map_err(crate::error::api_error_to_adbc_error)?;
+    for batch in result.reader {
+        if batch.map_err(SnowflakeError::from_arrow)?.num_rows() != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn send_batch(
     sender: &mpsc::SyncSender<RecordBatch>,
     mut batch: RecordBatch,
@@ -418,6 +532,15 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
         let table = stmt.ingest_state.table.as_deref().ok_or_else(|| {
             Error::from(SnowflakeError::invalid_state().message("target_table not set"))
         })?;
+        if stmt.ingest_options.temporary
+            && (stmt.ingest_state.catalog.is_some() || stmt.ingest_state.schema.is_some())
+        {
+            return Err(SnowflakeError::invalid_argument()
+                .message(
+                    "temporary ingestion cannot be combined with target_catalog or target_db_schema",
+                )
+                .into());
+        }
         let qname = qualified_table_identifier(
             stmt.ingest_state.catalog.as_deref(),
             stmt.ingest_state.schema.as_deref(),
@@ -450,6 +573,14 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
         // settings before any DDL, so a failed create-mode ingest leaves no table.
         let normalized = normalize_schema(&schema)?;
         let props = stmt.ingest_options.writer_properties()?;
+        if stmt.ingest_options.temporary
+            && stmt.ingest_state.mode == IngestMode::Append
+            && !temporary_table_exists(stmt, &operation, table)?
+        {
+            return Err(SnowflakeError::not_found()
+                .format(format_args!("temporary target table {qname} does not exist"))
+                .into());
+        }
         initialize_target(
             stmt,
             &operation,
@@ -458,6 +589,13 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
             &schema,
             &copy_plan.overrides,
         )?;
+        let initial_rows = match stmt.ingest_state.mode {
+            IngestMode::Append | IngestMode::CreateAppend => {
+                count_target_rows(stmt, &operation, &qname)?
+            }
+            IngestMode::Create | IngestMode::Replace => 0,
+        };
+        let copy_started = Arc::new(AtomicBool::new(false));
 
         let load = stmt
             .inner
@@ -476,6 +614,7 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
                         op: operation.clone(),
                         stage: stage.clone(),
                         copy_sql: copy_plan.sql,
+                        copy_started: Arc::clone(&copy_started),
                         timeout: stmt.query_timeout_seconds,
                         query_tag: stmt.query_tag.as_deref().map(Arc::from),
                         options: stmt.ingest_options.clone(),
@@ -497,6 +636,18 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
                 stmt.query_tag.as_deref(),
             )
         };
+        let report_failure = |error, target_unchanged| {
+            if target_unchanged || copy_started.load(Ordering::Relaxed) {
+                with_rows_loaded(error, initial_rows, target_unchanged, || {
+                    // Do not publish this context: a second cancel must not
+                    // interrupt the recount after the workers have stopped.
+                    let recount = OperationCtx::with_own_token();
+                    count_target_rows(stmt, &recount, &qname)
+                })
+            } else {
+                error
+            }
+        };
         let stage_cleanup = cleanup(format!("DROP STAGE IF EXISTS {stage}"));
         let rows = match load {
             Ok(rows) => rows,
@@ -504,7 +655,7 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
                 if replace {
                     let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
                 }
-                return Err(err);
+                return Err(report_failure(err, replace));
             }
         };
         if replace {
@@ -517,11 +668,12 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
                 stmt.query_tag.as_deref(),
             ) {
                 let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
-                return Err(err);
+                return Err(report_failure(err, true));
             }
-            cleanup(format!("DROP TABLE IF EXISTS {load_table}"))?;
+            cleanup(format!("DROP TABLE IF EXISTS {load_table}"))
+                .map_err(|error| report_failure(error, false))?;
         }
-        stage_cleanup?;
+        stage_cleanup.map_err(|error| report_failure(error, false))?;
         Ok(Some(rows))
     })
 }
@@ -701,6 +853,7 @@ fn initialize_target(
     overrides: &[Option<String>],
 ) -> Result<()> {
     let mode = stmt.ingest_state.mode;
+    let temporary = stmt.ingest_options.temporary;
     let execute = |sql: String| {
         stmt.inner.execute_temporary_statement_tagged(
             Some(op),
@@ -711,19 +864,24 @@ fn initialize_target(
         )
     };
     match mode {
+        // CREATE TEMPORARY (including IF NOT EXISTS) checks the session's
+        // temporary namespace and shadows a same-named permanent table.
         IngestMode::Create => execute(build_create_sql(
             qname,
             schema,
             overrides,
             CreateMode::Create,
+            temporary,
         )?),
         IngestMode::Replace => {
             // Build both statements before running either, so unsupported
             // input fails without touching any table.
             let ensure_target =
-                build_create_sql(qname, schema, overrides, CreateMode::IfNotExists)?;
+                build_create_sql(qname, schema, overrides, CreateMode::IfNotExists, temporary)?;
+            // Snowflake allows swapping two temporary tables, but not a
+            // temporary table with a permanent or transient table.
             let create_staging =
-                build_create_sql(load_table, schema, overrides, CreateMode::Create)?;
+                build_create_sql(load_table, schema, overrides, CreateMode::Create, temporary)?;
             execute(ensure_target)?;
             execute(create_staging)
         }
@@ -731,7 +889,7 @@ fn initialize_target(
             stmt.inner.execute_temporary_statement_tagged(
                 Some(op),
                 stmt.conn_handle,
-                build_create_sql(qname, schema, overrides, CreateMode::IfNotExists)?,
+                build_create_sql(qname, schema, overrides, CreateMode::IfNotExists, temporary)?,
                 stmt.query_timeout_seconds,
                 stmt.query_tag.as_deref(),
             )?;
@@ -752,6 +910,7 @@ fn build_create_sql(
     schema: &Schema,
     overrides: &[Option<String>],
     mode: CreateMode,
+    temporary: bool,
 ) -> Result<String> {
     let mut columns = Vec::with_capacity(schema.fields().len());
     for (field, override_type) in schema.fields().iter().zip(overrides) {
@@ -762,11 +921,15 @@ fn build_create_sql(
         let not_null = if field.is_nullable() { "" } else { " NOT NULL" };
         columns.push(format!("{} {ty}{not_null}", quote_identifier(field.name())));
     }
-    let create = match mode {
-        CreateMode::Create => "CREATE TABLE",
-        CreateMode::IfNotExists => "CREATE TABLE IF NOT EXISTS",
+    let temporary = if temporary { " TEMPORARY" } else { "" };
+    let if_not_exists = match mode {
+        CreateMode::Create => "",
+        CreateMode::IfNotExists => " IF NOT EXISTS",
     };
-    Ok(format!("{create} {qname} ({})", columns.join(", ")))
+    Ok(format!(
+        "CREATE{temporary} TABLE{if_not_exists} {qname} ({})",
+        columns.join(", ")
+    ))
 }
 
 fn to_sf_ddl(ty: &DataType) -> Result<String> {
@@ -868,6 +1031,8 @@ fn validate_target_schema(
                 ))
                 .map_err(crate::error::api_error_to_adbc_error)?;
         }
+        // Resolve through this session, where a temporary table shadows a
+        // permanent table of the same name, rather than catalog metadata.
         inner.prepare_statement(Some(op), handle, format!("SELECT * FROM {qname}"))
     })();
     let released = inner.sf.statement_release(handle);
@@ -1068,6 +1233,7 @@ struct IngestJob {
     op: Arc<OperationCtx>,
     stage: String,
     copy_sql: String,
+    copy_started: Arc<AtomicBool>,
     timeout: Option<u32>,
     query_tag: Option<Arc<str>>,
     options: IngestOptions,
@@ -1102,6 +1268,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         op,
         stage,
         copy_sql,
+        copy_started,
         timeout,
         query_tag,
         options,
@@ -1132,6 +1299,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         let op = Arc::clone(&op);
         let failure = Arc::clone(&failure);
         let copy_sql = Arc::clone(&copy_sql);
+        let copy_started = Arc::clone(&copy_started);
         let query_tag = query_tag.clone();
         let copy_span = span.clone();
         let copy_dispatch = dispatch.clone();
@@ -1178,6 +1346,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                             let failure = Arc::clone(&failure);
                             let outstanding = Arc::clone(&outstanding);
                             let copy_sql = Arc::clone(&copy_sql);
+                            let copy_started = Arc::clone(&copy_started);
                             let query_tag = query_tag.clone();
                             let task_span = copy_span.clone();
                             let task_dispatch = copy_dispatch.clone();
@@ -1188,6 +1357,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                                 if op.token().is_cancelled() {
                                     return None;
                                 }
+                                copy_started.store(true, Ordering::Relaxed);
                                 match execute_copy(
                                     &inner,
                                     conn,
@@ -1408,6 +1578,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         if attempt != 0 {
             std::thread::sleep(Duration::from_millis(100 * (1 << (attempt - 1))));
         }
+        copy_started.store(true, Ordering::Relaxed);
         let n = execute_copy(
             &inner,
             conn,
@@ -1568,6 +1739,110 @@ mod tests {
     }
 
     #[test]
+    fn failed_ingest_reports_only_new_rows_and_preserves_diagnostics() {
+        let mut original = SnowflakeError::io()
+            .message("COPY failed")
+            .vendor_code(123)
+            .sqlstate([b'X' as _, b'X' as _, b'0' as _, b'0' as _, b'0' as _])
+            .to_adbc();
+        original.details = Some(vec![("existing".into(), b"detail".to_vec())]);
+        let error = with_rows_loaded(original.clone(), 10, false, || Ok(13));
+        assert_eq!(error.status, original.status);
+        assert_eq!(error.vendor_code, original.vendor_code);
+        assert_eq!(error.sqlstate, original.sqlstate);
+        assert_eq!(
+            error.message,
+            "[Snowflake] COPY failed; 3 rows were loaded before the failure"
+        );
+        assert_eq!(
+            error.details.unwrap(),
+            vec![
+                ("existing".into(), b"detail".to_vec()),
+                ("adbc.snowflake.ingest.rows_loaded".into(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelled_ingest_keeps_cancelled_status_when_reporting_rows() {
+        let error = with_rows_loaded(cancelled(), 0, false, || Ok(7));
+        assert_eq!(error.status, Status::Cancelled);
+        assert!(error.message.contains("7 rows were loaded"));
+        assert_eq!(
+            error.details.unwrap(),
+            vec![("adbc.snowflake.ingest.rows_loaded".into(), b"7".to_vec())]
+        );
+    }
+
+    #[test]
+    fn failed_recount_does_not_mask_ingest_failure() {
+        let original = SnowflakeError::io().message("COPY failed").to_adbc();
+        let error = with_rows_loaded(original.clone(), 3, false, || {
+            Err(SnowflakeError::io().message("recount failed").into())
+        });
+        assert_eq!(error, original);
+    }
+
+    #[test]
+    fn failed_replace_reports_unchanged_target_not_staging_rows() {
+        let error = with_rows_loaded(cancelled(), 0, true, || {
+            panic!("an unswapped target cannot contain newly loaded rows")
+        });
+        assert_eq!(error.status, Status::Cancelled);
+        assert!(error.message.contains("0 rows were loaded into the target"));
+        assert!(error.message.contains("target table was not replaced"));
+        assert_eq!(
+            error.details.unwrap(),
+            vec![("adbc.snowflake.ingest.rows_loaded".into(), b"0".to_vec())]
+        );
+    }
+
+    #[test]
+    fn temporary_create_sql_preserves_columns_and_create_mode() {
+        let schema = Schema::new(vec![Field::new("ID", DataType::Int64, false)]);
+        for (mode, expected) in [
+            (
+                CreateMode::Create,
+                "CREATE TEMPORARY TABLE \"target\" (\"ID\" integer NOT NULL)",
+            ),
+            (
+                CreateMode::IfNotExists,
+                "CREATE TEMPORARY TABLE IF NOT EXISTS \"target\" (\"ID\" integer NOT NULL)",
+            ),
+        ] {
+            assert_eq!(
+                build_create_sql("\"target\"", &schema, &[None], mode, true).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_ingest_rejects_explicit_namespace_before_ddl() {
+        for key in [
+            OptionStatement::TargetCatalog,
+            OptionStatement::TargetDbSchema,
+        ] {
+            let mut stmt = crate::statement::tests::make_stmt();
+            stmt.set_option(OptionStatement::Temporary, "true".into())
+                .unwrap();
+            stmt.set_option(OptionStatement::TargetTable, "target".into())
+                .unwrap();
+            stmt.set_option(key, "explicit_namespace".into()).unwrap();
+            stmt.bound = Bound::Batches(vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                Field::new("ID", DataType::Int64, false),
+            ])))]);
+            let error = execute_ingest(&mut stmt).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(
+                error.message.contains("target_catalog")
+                    && error.message.contains("target_db_schema")
+            );
+            assert!(matches!(stmt.bound, Bound::Empty));
+        }
+    }
+
+    #[test]
     fn empty_ingest_pipeline_succeeds_without_upload_or_copy() {
         let stmt = crate::statement::tests::make_stmt();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1579,6 +1854,7 @@ mod tests {
                 writer_concurrency: 2,
                 ..IngestOptions::default()
             };
+            let copy_started = Arc::new(AtomicBool::new(false));
             let job = IngestJob {
                 inner: Arc::clone(&stmt.inner),
                 // Invalid handles ensure any upload or COPY fails this test.
@@ -1586,6 +1862,7 @@ mod tests {
                 op: Arc::new(OperationCtx::with_own_token()),
                 stage: "empty_stage".into(),
                 copy_sql: "COPY INTO empty_target FROM @empty_stage".into(),
+                copy_started: Arc::clone(&copy_started),
                 timeout: None,
                 query_tag: Some(Arc::from("empty-ingest")),
                 options: options.clone(),
@@ -1601,6 +1878,7 @@ mod tests {
                 .unwrap(),
                 0
             );
+            assert!(!copy_started.load(Ordering::Relaxed));
         }
     }
 
@@ -1962,7 +2240,8 @@ mod tests {
                 "\"table\"",
                 &Schema::new(vec![Field::new("odd\"name", DataType::Boolean, false)]),
                 &[None],
-                CreateMode::IfNotExists
+                CreateMode::IfNotExists,
+                false,
             )
             .unwrap(),
             "CREATE TABLE IF NOT EXISTS \"table\" (\"odd\"\"name\" boolean NOT NULL)"

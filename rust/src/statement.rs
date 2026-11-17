@@ -33,7 +33,10 @@ use sf_core::chunks::DEFAULT_PREFETCH_THREADS;
 use sf_core::config::{param_registry::param_names, settings::Setting};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::driver::{Inner, OperationCancelHandle, QueryResult, TimestampPrecision};
+use crate::driver::{
+    Inner, OperationCancelHandle, QueryResult, StatementOperation, StatementOperationState,
+    TimestampPrecision,
+};
 use crate::error::SnowflakeError;
 
 /// Per-statement Snowflake query timeout, in seconds. A value of zero clears
@@ -161,10 +164,8 @@ pub struct Statement {
     /// the describe runs on first need and is cached in `described`.
     pub(crate) prepared: bool,
     pub(crate) described: Mutex<Option<Arc<DescribedSchemas>>>,
-    /// The most recently started sf_core operation. A retained cancellation
-    /// handle can use this slot while an execute borrows the statement.
-    /// Cancelling a finished operation is a no-op.
-    pub(crate) operation: Arc<Mutex<Arc<OperationCtx>>>,
+    /// Shared execution context, active through execution and returned stream consumption.
+    pub(crate) operation: Arc<Mutex<StatementOperationState>>,
 }
 
 impl Drop for Statement {
@@ -224,20 +225,27 @@ impl Optionable for Statement {
                 self.invalidate_described();
                 Ok(())
             }
-            OptionStatement::Temporary => match value {
-                OptionValue::String(value) => match value.as_str() {
-                    "false" | "0" | "disabled" => Ok(()),
-                    "true" | "1" | "enabled" => Err(SnowflakeError::not_implemented()
-                        .message("temporary ingestion is not supported")
-                        .into()),
-                    _ => Err(SnowflakeError::invalid_argument()
-                        .message("temporary ingestion must be enabled or disabled")
-                        .into()),
-                },
-                _ => Err(SnowflakeError::invalid_argument()
-                    .message("temporary ingestion must be a string")
-                    .into()),
-            },
+            OptionStatement::Temporary => {
+                let temporary = match value {
+                    OptionValue::String(value) => match value.as_str() {
+                        "false" | "0" | "disabled" => false,
+                        "true" | "1" | "enabled" => true,
+                        _ => {
+                            return Err(SnowflakeError::invalid_argument()
+                                .message("temporary ingestion must be enabled or disabled")
+                                .into());
+                        }
+                    },
+                    _ => {
+                        return Err(SnowflakeError::invalid_argument()
+                            .message("temporary ingestion must be a string")
+                            .into());
+                    }
+                };
+                self.ingest_options.temporary = temporary;
+                self.invalidate_described();
+                Ok(())
+            }
             OptionStatement::Other(k) if k == driverbase::telemetry::TRACE_PARENT => {
                 let parent = SnowflakeError::option_as_string(&k, &value)?;
                 self.trace_parent = driverbase::telemetry::validate_trace_parent(parent)?;
@@ -302,6 +310,7 @@ impl Optionable for Statement {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let key_str = key.as_ref();
         match &key {
+            OptionStatement::Temporary => Ok(self.ingest_options.temporary.to_string()),
             OptionStatement::Other(k) if k == driverbase::telemetry::TRACE_PARENT => {
                 Ok(self.effective_trace_parent().unwrap_or_default().to_owned())
             }
@@ -415,6 +424,7 @@ impl Statement {
                 self.timestamp_precision.time_unit(),
                 &timezone,
                 None,
+                Some(&prepared.columns),
             )
             .as_ref()
             .clone(),
@@ -489,12 +499,15 @@ impl Statement {
         }
     }
 
-    /// Start a cancellable sf_core operation and publish it for the cancel handle.
-    /// Each operation needs a fresh context because cancellation is one-shot.
+    /// Share the active execution's context with query and ingest work.
     pub(crate) fn begin_operation(&self) -> Arc<OperationCtx> {
-        let operation = Arc::new(OperationCtx::with_own_token());
-        *self.operation.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&operation);
-        operation
+        Arc::clone(
+            &self
+                .operation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .context,
+        )
     }
 
     /// Route every user-statement execution through the statement timeout and
@@ -569,6 +582,7 @@ impl Statement {
                 timestamp_precision.time_unit(),
                 timestamp_precision,
                 timezone,
+                (!result.has_arrow_metadata).then_some(result.descriptor.columns.as_slice()),
             )))
         });
         self.last_query_id = last_query_id;
@@ -590,6 +604,7 @@ impl adbc_core::Statement for Statement {
 
     #[allow(refining_impl_trait)]
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let operation = StatementOperation::start(&self.operation);
         let inner = Arc::clone(&self.inner);
         let parent = self.trace_parent_for_span();
         inner.traced("statement.ExecuteQuery", parent.as_deref(), |span| {
@@ -627,6 +642,7 @@ impl adbc_core::Statement for Statement {
                     self.timestamp_precision.time_unit(),
                     self.timestamp_precision,
                     self.inner.session_timezone(self.conn_handle)?,
+                    (!result.has_arrow_metadata).then_some(result.descriptor.columns.as_slice()),
                 );
                 Ok(with_query_id(Box::new(reader), &query_id))
             })();
@@ -638,11 +654,12 @@ impl adbc_core::Statement for Statement {
             {
                 span.set_attribute("snowflake.query.id", id.to_owned());
             }
-            result
+            result.map(|reader| operation.wrap_reader(reader))
         })
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
+        let _operation = StatementOperation::start(&self.operation);
         let inner = Arc::clone(&self.inner);
         let parent = self.trace_parent_for_span();
         inner.traced("statement.ExecuteUpdate", parent.as_deref(), |span| {
@@ -700,6 +717,7 @@ impl adbc_core::Statement for Statement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
+        let _operation = StatementOperation::start(&self.operation);
         let inner = Arc::clone(&self.inner);
         let parent = self.trace_parent_for_span();
         inner.traced("statement.ExecuteSchema", parent.as_deref(), |span| {
@@ -732,7 +750,7 @@ impl adbc_core::Statement for Statement {
                 .message("parameter metadata is unavailable; prepare the statement first")
                 .into());
         }
-        let operation = self.begin_operation();
+        let operation = OperationCtx::with_own_token();
         self.describe(&operation)?
             .parameters
             .clone()
@@ -768,9 +786,9 @@ impl adbc_core::Statement for Statement {
     }
 
     fn get_cancel_handle(&self) -> Box<dyn adbc_core::CancelHandle> {
-        Box::new(OperationCancelHandle {
-            operation: Arc::clone(&self.operation),
-        })
+        Box::new(OperationCancelHandle::Statement(Arc::clone(
+            &self.operation,
+        )))
     }
 }
 
@@ -922,7 +940,7 @@ fn parameter_schema_from_prepare(
         })
         .collect::<Vec<_>>();
     Some(
-        adjust_schema(&Schema::new(fields), ts_unit, timezone, None)
+        adjust_schema(&Schema::new(fields), ts_unit, timezone, None, None)
             .as_ref()
             .clone(),
     )
@@ -957,37 +975,44 @@ fn time_unit_rank(unit: TimeUnit) -> u32 {
     }
 }
 
-/// Map Snowflake's physical encodings to Arrow types without losing field
-/// metadata. ARRAY and GeoArrow fields replace their source metadata, as in Go.
+/// Convert physical types while retaining IPC server metadata. JSON results and
+/// describe-only schemas instead use Go's rowType metadata; ARRAY and binary geo
+/// extensions replace metadata, while UUID augments it.
 pub(crate) fn adjust_schema(
     schema: &Schema,
     ts_unit: TimeUnit,
     timezone: &str,
     geo_srids: Option<&[Option<u32>]>,
+    row_types: Option<&[ColumnMetadata]>,
 ) -> Arc<Schema> {
-    use arrow_schema::extension::{Json, Uuid};
+    use std::collections::HashMap;
+
     let adjusted_fields: Vec<Field> = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(index, field)| {
-            let mut adjusted = field
-                .as_ref()
-                .clone()
-                .with_data_type(compute_target_type(field, ts_unit, timezone));
-            if is_uuid_field(field) && matches!(field.data_type(), DataType::Utf8) {
-                return adjusted
-                    .with_data_type(DataType::FixedSizeBinary(16))
-                    .with_extension_type(Uuid);
-            }
-            if field.metadata().get("logicalType").is_some_and(|s| s == "ARRAY")
-                && matches!(adjusted.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+            let row_type = row_types.map(|columns| &columns[index]);
+            let target_type = compute_target_type(field, ts_unit, timezone);
+            let logical_type = row_type
+                .map(|column| column.r#type.as_str())
+                .or_else(|| field.metadata().get("logicalType").map(String::as_str))
+                .unwrap_or("");
+            if logical_type.eq_ignore_ascii_case("ARRAY")
+                && matches!(target_type, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
             {
-                return Field::new(field.name(), adjusted.data_type().clone(), field.is_nullable())
-                    .with_extension_type(Json::default());
+                // Go emits only the extension name; arrow-rs requires the
+                // (empty) extension metadata to recognize arrow.json.
+                return Field::new(field.name(), target_type, field.is_nullable()).with_metadata(
+                    HashMap::from([
+                        ("ARROW:extension:name".into(), "arrow.json".into()),
+                        ("ARROW:extension:metadata".into(), String::new()),
+                    ]),
+                );
             }
-            if let Some(geo_type) = geo_type(field)
-                && matches!(adjusted.data_type(), DataType::Binary)
+            if row_types.is_none()
+                && let Some(geo_type) = geo_type(field)
+                && matches!(target_type, DataType::Binary)
             {
                 let srid = geo_srids
                     .and_then(|srids| srids.get(index))
@@ -997,27 +1022,47 @@ pub(crate) fn adjust_schema(
                     (Some(_), Some(srid), _) if srid != 0 => Some(format!(
                         "{{\"crs\":\"EPSG:{srid}\",\"crs_type\":\"authority_code\"}}"
                     )),
+                    // Only GetTableSchema knows GEOGRAPHY has spherical edges.
                     (None, _, "GEOGRAPHY") => Some(
                         "{\"crs\":\"EPSG:4326\",\"crs_type\":\"authority_code\",\"edges\":\"spherical\"}".to_owned()
                     ),
                     _ => None,
                 };
-                let mut extension = std::collections::HashMap::from([(
-                    "ARROW:extension:name".to_owned(),
-                    "geoarrow.wkb".to_owned(),
-                )]);
+                let mut extension =
+                    HashMap::from([("ARROW:extension:name".into(), "geoarrow.wkb".into())]);
                 if let Some(metadata) = metadata {
-                    extension.insert("ARROW:extension:metadata".to_owned(), metadata);
+                    extension.insert("ARROW:extension:metadata".into(), metadata);
                 }
-                adjusted = adjusted.with_metadata(extension);
+                return Field::new(field.name(), target_type, field.is_nullable())
+                    .with_metadata(extension);
+            }
+            let mut adjusted = if let Some(row_type) = row_type {
+                Field::new(field.name(), target_type, field.is_nullable()).with_metadata(
+                    HashMap::from([("SNOWFLAKE_TYPE".into(), row_type.r#type.clone())]),
+                )
+            } else {
+                field.as_ref().clone().with_data_type(target_type)
+            };
+            let is_uuid = row_type.map_or_else(
+                || is_uuid_field(field),
+                |column| column.r#type.eq_ignore_ascii_case("text") && column.length == Some(0),
+            );
+            if is_uuid && matches!(field.data_type(), DataType::Utf8) {
+                adjusted = adjusted.with_data_type(DataType::FixedSizeBinary(16));
+                // Go's C exporter also writes an empty ARROW:extension:metadata;
+                // arrow-rs rejects that for arrow.uuid, so the key is omitted.
+                adjusted
+                    .metadata_mut()
+                    .insert("ARROW:extension:name".into(), "arrow.uuid".into());
             }
             adjusted
         })
         .collect();
-    Arc::new(Schema::new_with_metadata(
-        adjusted_fields,
-        schema.metadata().clone(),
-    ))
+    Arc::new(if row_types.is_some() {
+        Schema::new(adjusted_fields)
+    } else {
+        Schema::new_with_metadata(adjusted_fields, schema.metadata().clone())
+    })
 }
 
 fn is_uuid_field(field: &Field) -> bool {
@@ -1098,37 +1143,23 @@ fn geo_column_srid(column: &arrow_array::BinaryArray) -> Option<u32> {
     if inconsistent { None } else { observed }
 }
 
-/// Rewrite EWKB values as ISO WKB. `declared` is the SRID the field's CRS
-/// metadata was built from; a value carrying any other SRID cannot be
-/// described by that single column CRS, so it is rejected rather than having
-/// its SRID silently dropped.
-fn strip_geo_srid(
-    column: &ArrayRef,
-    field_name: &str,
-    declared: Option<u32>,
-) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+/// Strip every complete EWKB SRID prefix, independently of the first batch's
+/// column CRS. Like Go, leave short values and unknown byte orders unchanged.
+fn strip_geo_srid(column: &ArrayRef) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
     use std::io::Write as _;
-    let binary = column
-        .as_any()
-        .downcast_ref::<arrow_array::BinaryArray>()
-        .ok_or_else(|| arrow_schema::ArrowError::CastError("expected binary EWKB column".into()))?;
-    let mut has_srid = false;
-    for srid in binary
-        .iter()
-        .flatten()
-        .filter_map(|value| ewkb_srid(value).flatten())
-    {
-        if declared != Some(srid) {
-            return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
-                "geo column '{field_name}' contains SRID {srid}, but its CRS metadata was \
-                 inferred from the first batch as {}; set the geography/geometry output \
-                 format to GeoJSON to read mixed-SRID results",
-                declared.map_or_else(|| "unknown".to_owned(), |srid| format!("EPSG:{srid}")),
-            )));
-        }
-        has_srid = true;
-    }
-    if !has_srid {
+    let Some(binary) = column.as_any().downcast_ref::<arrow_array::BinaryArray>() else {
+        return Ok(column.clone());
+    };
+    // Stripping, unlike CRS inference, does not validate the geometry type.
+    let has_srid = |value: &[u8]| {
+        value.len() >= 9
+            && match value[0] {
+                0 => value[1] & 0x20 != 0,
+                1 => value[4] & 0x20 != 0,
+                _ => false,
+            }
+    };
+    if !binary.iter().flatten().any(has_srid) {
         return Ok(column.clone());
     }
     let mut builder =
@@ -1138,20 +1169,16 @@ fn strip_geo_srid(
             builder.append_null();
             continue;
         };
-        if ewkb_srid(value).is_some_and(|srid| srid.is_some()) {
-            let header: [u8; 4] = value[1..5].try_into().expect("validated EWKB header");
-            let type_word = if value[0] == 0 {
-                u32::from_be_bytes(header) & !0x2000_0000
-            } else {
-                u32::from_le_bytes(header) & !0x2000_0000
-            };
-            builder.write_all(&value[..1]).expect("in-memory write");
+        if has_srid(value) {
+            let flag_byte = if value[0] == 0 { 1 } else { 4 };
             builder
-                .write_all(&if value[0] == 0 {
-                    type_word.to_be_bytes()
-                } else {
-                    type_word.to_le_bytes()
-                })
+                .write_all(&value[..flag_byte])
+                .expect("in-memory write");
+            builder
+                .write_all(&[value[flag_byte] & !0x20])
+                .expect("in-memory write");
+            builder
+                .write_all(&value[flag_byte + 1..5])
                 .expect("in-memory write");
             builder.append_value(&value[9..]);
         } else {
@@ -1241,9 +1268,6 @@ pub(crate) struct ConvertingReader<R: RecordBatchReader> {
     original_schema: Arc<Schema>,
     schema: Arc<Schema>,
     pending: Option<std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
-    /// Per-column SRID the GeoArrow CRS metadata was built from (empty when
-    /// the result has no EWKB geo columns or no batches).
-    geo_srids: Vec<Option<u32>>,
     timezone: Arc<str>,
     ts_unit: TimeUnit,
     check_overflow: bool,
@@ -1255,43 +1279,50 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
         ts_unit: TimeUnit,
         ts_precision: TimestampPrecision,
         timezone: Arc<str>,
+        row_types: Option<&[ColumnMetadata]>,
     ) -> Self {
         let original_schema = inner.schema();
-        // GeoArrow CRS metadata comes from the first batch's EWKB SRID. Only
-        // geo result sets need an eager read; all others remain lazy.
-        let has_geo = original_schema.fields().iter().any(|field| {
-            geo_type(field).is_some() && matches!(field.data_type(), DataType::Binary)
-        });
+        let has_geo = row_types.is_none()
+            && original_schema.fields().iter().any(|field| {
+                geo_type(field).is_some() && matches!(field.data_type(), DataType::Binary)
+            });
+        // Only IPC geo columns need a first-batch peek for CRS inference.
         let pending = has_geo.then(|| inner.next()).flatten();
-        let srids = pending.as_ref().and_then(|result| {
-            result.as_ref().ok().map(|batch| {
-                original_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, field)| match geo_type(field) {
-                        Some(geo) => batch
-                            .column(i)
-                            .as_any()
-                            .downcast_ref::<arrow_array::BinaryArray>()
-                            .and_then(geo_column_srid)
-                            // GEOGRAPHY is always EPSG:4326, even when the
-                            // first batch has no SRID to observe.
-                            .or((geo == "GEOGRAPHY").then_some(4326)),
-                        None => None,
-                    })
-                    .collect::<Vec<_>>()
+        let srids = if has_geo {
+            pending.as_ref().and_then(|result| {
+                result.as_ref().ok().map(|batch| {
+                    original_schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, field)| {
+                            geo_type(field).and_then(|_| {
+                                batch
+                                    .column(i)
+                                    .as_any()
+                                    .downcast_ref::<arrow_array::BinaryArray>()
+                                    .and_then(geo_column_srid)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
             })
-        });
-        let schema = adjust_schema(&original_schema, ts_unit, &timezone, srids.as_deref());
-        let geo_srids = srids.unwrap_or_default();
+        } else {
+            None
+        };
+        let schema = adjust_schema(
+            &original_schema,
+            ts_unit,
+            &timezone,
+            Some(srids.as_deref().unwrap_or(&[])),
+            row_types,
+        );
 
         Self {
             inner,
             original_schema,
             schema,
             pending,
-            geo_srids,
             timezone,
             ts_unit,
             check_overflow: ts_precision == TimestampPrecision::NanosecondsErrorOnOverflow,
@@ -1301,17 +1332,23 @@ impl<R: RecordBatchReader> ConvertingReader<R> {
     fn convert_column(
         col: &ArrayRef,
         source_field: &Field,
-        target_type: &DataType,
+        target_field: &Field,
         ts_unit: TimeUnit,
         check_overflow: bool,
         timezone: &Arc<str>,
-        geo_srid: Option<u32>,
     ) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
-        if is_uuid_field(source_field) && matches!(target_type, DataType::FixedSizeBinary(16)) {
+        let target_type = target_field.data_type();
+        if matches!(source_field.data_type(), DataType::Utf8)
+            && matches!(target_type, DataType::FixedSizeBinary(16))
+        {
             return uuid_strings_to_bytes(col);
         }
-        if geo_type(source_field).is_some() && matches!(target_type, DataType::Binary) {
-            return strip_geo_srid(col, source_field.name(), geo_srid);
+        if target_field
+            .metadata()
+            .get("ARROW:extension:name")
+            .is_some_and(|name| name == "geoarrow.wkb")
+        {
+            return strip_geo_srid(col);
         }
         let logical_type = source_field
             .metadata()
@@ -1685,11 +1722,10 @@ impl<R: RecordBatchReader> Iterator for ConvertingReader<R> {
                 Self::convert_column(
                     col,
                     self.original_schema.field(i),
-                    self.schema.field(i).data_type(),
+                    self.schema.field(i),
                     self.ts_unit,
                     self.check_overflow,
                     &self.timezone,
-                    self.geo_srids.get(i).copied().flatten(),
                 )
             })
             .collect();
@@ -1921,13 +1957,20 @@ fn write_json_bind_value(out: &mut String, col: &dyn Array, row: usize, uuid: bo
                     .value(row),
                 _ => unreachable!(),
             };
-            if !value.is_finite() {
-                out.pop();
-                out.push_str("null");
-                return Ok(());
-            }
-            // Float16 and Float32 use f32 Debug formatting, as in format_arrow_value.
-            if matches!(dt, DataType::Float64) {
+            // Non-finite values are sent as Snowflake's FLOAT literals, not JSON
+            // null. gosnowflake sends Go's "+Inf"/"-Inf", and Snowflake rejects both
+            // those and "inf"/"-inf" (error 2086); it accepts "Infinity"/"-Infinity".
+            if value.is_nan() {
+                out.push_str("NaN");
+            } else if value == f64::INFINITY {
+                out.push_str("Infinity");
+            } else if value == f64::NEG_INFINITY {
+                out.push_str("-Infinity");
+            } else if value == 0.0 {
+                out.push_str(if value.is_sign_negative() { "-0" } else { "0" });
+            } else if matches!(dt, DataType::Float64) {
+                // Keep full f64 precision; gosnowflake v2.4's scalar converter uses
+                // FormatFloat with bitSize=32 even for float64/sql.NullFloat64.
                 write!(out, "{value:?}").unwrap();
             } else {
                 write!(out, "{:?}", value as f32).unwrap();
@@ -2254,7 +2297,7 @@ pub(crate) mod tests {
             last_query_id: None,
             prepared: false,
             described: Mutex::new(None),
-            operation: Arc::new(Mutex::new(Arc::new(OperationCtx::with_own_token()))),
+            operation: Arc::new(Mutex::new(StatementOperationState::default())),
         }
     }
 
@@ -2425,14 +2468,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cancel_without_inflight_query_succeeds_on_valid_core_statement() {
+    fn cancel_without_inflight_query_returns_invalid_state() {
         let mut stmt = make_stmt();
         let inner = stmt.inner.clone();
         let conn_handle = inner.sf.connection_new();
         stmt.conn_handle = conn_handle;
         stmt.stmt_handle = inner.sf.statement_new(conn_handle).unwrap();
 
-        stmt.get_cancel_handle().try_cancel().unwrap();
+        let error = stmt.get_cancel_handle().try_cancel().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert_eq!(
+            error.message,
+            "AdbcStatementCancel: no active query to cancel"
+        );
 
         drop(stmt);
         // Statement::drop released the statement; release the core connection.
@@ -2443,8 +2491,11 @@ pub(crate) mod tests {
     fn statement_cancel_handle_tracks_current_operation() {
         let stmt = make_stmt();
         let handle = stmt.get_cancel_handle();
-        handle.try_cancel().unwrap();
-        let old = stmt.begin_operation();
+        assert_eq!(
+            handle.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+        let old = crate::driver::StatementOperation::start(&stmt.operation);
         let (started, waiting) = std::sync::mpsc::channel();
         let mut started = Some(started);
         let cancelled = std::thread::scope(|scope| {
@@ -2471,7 +2522,12 @@ pub(crate) mod tests {
             crate::error::api_error_to_adbc_error(cancelled.unwrap_err()).status,
             Status::Cancelled
         );
-        let next = stmt.begin_operation();
+        drop(old);
+        assert_eq!(
+            handle.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+        let next = crate::driver::StatementOperation::start(&stmt.operation);
         assert!(!next.token().is_cancelled());
         assert!(
             stmt.inner
@@ -2483,6 +2539,137 @@ pub(crate) mod tests {
         );
         handle.try_cancel().unwrap();
         assert!(next.token().is_cancelled());
+        drop(next);
+        assert_eq!(
+            handle.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+    }
+
+    #[test]
+    fn failed_execution_clears_active_operation() {
+        let mut stmt = make_stmt();
+        let cancel = stmt.get_cancel_handle();
+        assert!(stmt.execute().is_err());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+        stmt.set_sql_query("SELECT 1").unwrap();
+        assert!(stmt.execute_update().is_err());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+        assert!(stmt.execute_schema().is_err());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+        stmt.set_option(OptionStatement::TargetTable, "cancel_ingest".into())
+            .unwrap();
+        assert!(stmt.execute_update().is_err());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+    }
+
+    #[test]
+    fn statement_stream_cancel_and_completion_clear_active_operation() {
+        let stmt = make_stmt();
+        let cancel = stmt.get_cancel_handle();
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let operation = crate::driver::StatementOperation::start(&stmt.operation);
+        let mut reader =
+            operation.wrap_reader(crate::connection::single_batch_reader(batch.clone()));
+        cancel.try_cancel().unwrap();
+        let error = reader.next().unwrap().unwrap_err();
+        let arrow_schema::ArrowError::ExternalError(error) = error else {
+            panic!("expected an ADBC cancellation error");
+        };
+        assert_eq!(
+            error.downcast_ref::<Error>().unwrap().status,
+            Status::Cancelled
+        );
+        assert!(reader.next().is_none());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+
+        let operation = crate::driver::StatementOperation::start(&stmt.operation);
+        let mut reader =
+            operation.wrap_reader(crate::connection::single_batch_reader(batch.clone()));
+        assert!(reader.next().unwrap().is_ok());
+        assert!(reader.next().is_none());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+
+        let operation = crate::driver::StatementOperation::start(&stmt.operation);
+        let reader = operation.wrap_reader(crate::connection::single_batch_reader(batch));
+        drop(reader);
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+    }
+
+    #[test]
+    fn failed_stream_clears_active_operation() {
+        let stmt = make_stmt();
+        let cancel = stmt.get_cancel_handle();
+        let operation = crate::driver::StatementOperation::start(&stmt.operation);
+        let source = arrow_array::RecordBatchIterator::new(
+            vec![Err(arrow_schema::ArrowError::ComputeError(
+                "stream failed".into(),
+            ))],
+            Arc::new(Schema::empty()),
+        );
+        let mut reader = operation.wrap_reader(Box::new(source));
+        assert!(matches!(
+            reader.next().unwrap(),
+            Err(arrow_schema::ArrowError::ComputeError(_))
+        ));
+        assert!(reader.next().is_none());
+        assert_eq!(
+            cancel.try_cancel().unwrap_err().status,
+            Status::InvalidState
+        );
+    }
+
+    #[test]
+    fn finishing_previous_operation_does_not_clear_new_operation() {
+        let stmt = make_stmt();
+        let cancel = stmt.get_cancel_handle();
+        let previous = crate::driver::StatementOperation::start(&stmt.operation);
+        let current = crate::driver::StatementOperation::start(&stmt.operation);
+        assert!(previous.token().is_cancelled());
+        drop(previous);
+        cancel.try_cancel().unwrap();
+        assert!(current.token().is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_can_race_with_operation_completion() {
+        let stmt = make_stmt();
+        let cancel = stmt.get_cancel_handle();
+        for _ in 0..32 {
+            let operation = crate::driver::StatementOperation::start(&stmt.operation);
+            std::thread::scope(|scope| {
+                let cancellation = scope.spawn(|| cancel.try_cancel());
+                drop(operation);
+                if let Err(error) = cancellation.join().unwrap() {
+                    assert_eq!(error.status, Status::InvalidState);
+                }
+            });
+            assert_eq!(
+                cancel.try_cancel().unwrap_err().status,
+                Status::InvalidState
+            );
+        }
     }
 
     #[test]
@@ -2884,24 +3071,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn temporary_ingestion_rejects_enabled_values() {
+    fn temporary_ingestion_accepts_enabled_values() {
         for value in ["true", "1", "enabled"] {
             let mut stmt = make_stmt();
+            assert_eq!(
+                stmt.get_option_string(OptionStatement::Temporary).unwrap(),
+                "false"
+            );
             stmt.set_option(
                 OptionStatement::TargetTable,
                 OptionValue::String("table".into()),
             )
             .unwrap();
-            let error = stmt
-                .set_option(
-                    OptionStatement::Temporary,
-                    OptionValue::String(value.into()),
-                )
-                .unwrap_err();
-            assert_eq!(error.status, Status::NotImplemented, "value {value}");
+            stmt.set_option(
+                OptionStatement::Temporary,
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
             assert_eq!(
-                error.message,
-                "[Snowflake] temporary ingestion is not supported"
+                stmt.get_option_string(OptionStatement::Temporary).unwrap(),
+                "true",
+                "value {value}"
             );
             assert_eq!(stmt.ingest_state.table.as_deref(), Some("table"));
         }
@@ -2918,9 +3108,19 @@ pub(crate) mod tests {
             .unwrap();
             stmt.set_option(
                 OptionStatement::Temporary,
+                OptionValue::String("true".into()),
+            )
+            .unwrap();
+            stmt.set_option(
+                OptionStatement::Temporary,
                 OptionValue::String(value.into()),
             )
             .unwrap();
+            assert_eq!(
+                stmt.get_option_string(OptionStatement::Temporary).unwrap(),
+                "false",
+                "value {value}"
+            );
             assert_eq!(stmt.ingest_state.table.as_deref(), Some("table"));
         }
     }
@@ -3072,7 +3272,7 @@ pub(crate) mod tests {
         let field = make_field_with_precision("d", DataType::Int16, "FIXED", "2", "15");
         let schema = Arc::new(Schema::new(vec![field]));
         assert_eq!(
-            adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None)
+            adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None, None)
                 .field(0)
                 .data_type(),
             &DataType::Decimal128(15, 2)
@@ -3094,6 +3294,7 @@ pub(crate) mod tests {
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
             Arc::from("UTC"),
+            None,
         );
         let out = reader.next().unwrap().unwrap();
         let values = arrow_cast::cast(out.column(0), &DataType::Utf8).unwrap();
@@ -3136,6 +3337,7 @@ pub(crate) mod tests {
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
             Arc::from("UTC"),
+            None,
         );
         let out = cr.next().unwrap().unwrap();
 
@@ -3167,27 +3369,223 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn schema_preserves_metadata_and_marks_only_array_json() {
-        let array = make_field_with_meta("items", DataType::Utf8, "ARRAY", "0");
-        let object = make_field_with_meta("object", DataType::Utf8, "OBJECT", "0");
-        let time = make_field_with_meta("time", DataType::Int64, "TIME", "9");
-        let schema = Schema::new(vec![array, object.clone(), time.clone()]);
-        let adjusted = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
-        assert_eq!(
-            adjusted
-                .field(0)
-                .metadata()
-                .get("ARROW:extension:name")
-                .map(String::as_str),
-            Some("arrow.json")
+    fn arrow_schema_preserves_server_metadata_except_array_and_geo() {
+        use std::collections::HashMap;
+
+        let fields = [
+            ("FIXED", DataType::Int64),
+            ("REAL", DataType::Float64),
+            ("TEXT", DataType::Utf8),
+            ("BINARY", DataType::Binary),
+            ("BOOLEAN", DataType::Boolean),
+            ("DATE", DataType::Date32),
+            ("TIME", DataType::Int64),
+            ("TIMESTAMP_NTZ", DataType::Int64),
+            ("TIMESTAMP_LTZ", DataType::Int64),
+            ("TIMESTAMP_TZ", DataType::Int64),
+            ("OBJECT", DataType::Utf8),
+            ("VARIANT", DataType::Utf8),
+            ("ARRAY", DataType::Utf8),
+        ]
+        .into_iter()
+        .map(|(logical_type, data_type)| {
+            let mut field = make_field_with_meta(logical_type, data_type, logical_type, "9");
+            field
+                .metadata_mut()
+                .insert("server_specific".into(), "preserved".into());
+            field
+                .metadata_mut()
+                .insert("nullable".into(), "true".into());
+            field
+        })
+        .collect::<Vec<_>>();
+        let schema = Schema::new_with_metadata(
+            fields,
+            HashMap::from([("server_schema_key".into(), "preserved".into())]),
         );
-        assert!(adjusted.field(0).try_canonical_extension_type().is_ok());
-        assert_eq!(adjusted.field(1).metadata(), object.metadata());
-        assert_eq!(adjusted.field(2).metadata(), time.metadata());
-        assert_eq!(
-            adjusted.field(2).data_type(),
-            &DataType::Time64(TimeUnit::Nanosecond)
+        let adjusted = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None, None);
+        assert_eq!(adjusted.metadata(), schema.metadata());
+        for (source, target) in schema.fields().iter().zip(adjusted.fields()) {
+            if source.name() == "ARRAY" {
+                assert_eq!(
+                    target.metadata(),
+                    &HashMap::from([
+                        ("ARROW:extension:name".into(), "arrow.json".into()),
+                        ("ARROW:extension:metadata".into(), String::new()),
+                    ])
+                );
+                assert!(target.try_canonical_extension_type().is_ok());
+            } else {
+                assert_eq!(target.metadata(), source.metadata(), "{}", source.name());
+                assert!(!target.metadata().contains_key("SNOWFLAKE_TYPE"));
+            }
+        }
+    }
+
+    #[test]
+    fn row_type_schemas_replace_core_metadata_with_snowflake_type() {
+        use std::collections::HashMap;
+
+        for (wire_type, logical_type, data_type, extension) in [
+            ("fixed", "FIXED", DataType::Int64, None),
+            ("real", "REAL", DataType::Float64, None),
+            ("text", "TEXT", DataType::Utf8, None),
+            ("boolean", "BOOLEAN", DataType::Boolean, None),
+            ("date", "DATE", DataType::Date32, None),
+            ("time", "TIME", DataType::Int64, None),
+            ("timestamp_ntz", "TIMESTAMP_NTZ", DataType::Int64, None),
+            ("timestamp_ltz", "TIMESTAMP_LTZ", DataType::Int64, None),
+            ("timestamp_tz", "TIMESTAMP_TZ", DataType::Int64, None),
+            ("binary", "BINARY", DataType::Binary, None),
+            ("array", "ARRAY", DataType::Utf8, Some("arrow.json")),
+            ("variant", "VARIANT", DataType::Utf8, None),
+            ("object", "OBJECT", DataType::Utf8, None),
+            ("binary", "BINARY", DataType::Binary, Some("GEOGRAPHY")),
+            ("object", "TEXT", DataType::Utf8, Some("GEOMETRY")),
+            ("text", "TEXT", DataType::Utf8, Some("arrow.uuid")),
+        ] {
+            let mut field = make_field_with_meta("value", data_type, logical_type, "9");
+            field
+                .metadata_mut()
+                .insert("nullable".into(), "true".into());
+            let mut row_type = bind_metadata("value", wire_type, None, Some(9));
+            row_type.length = Some(20);
+            if extension == Some("arrow.uuid") {
+                row_type.length = Some(0);
+                // Go's JSON/describe path uses length alone, unlike IPC's NULL check.
+                field.metadata_mut().insert("charLength".into(), "0".into());
+                field.metadata_mut().insert("byteLength".into(), "0".into());
+            } else if let Some(geo @ ("GEOGRAPHY" | "GEOMETRY")) = extension {
+                field
+                    .metadata_mut()
+                    .insert("extTypeName".into(), geo.into());
+            }
+            let source = Schema::new_with_metadata(
+                vec![field],
+                HashMap::from([("core_only".into(), "discarded".into())]),
+            );
+            let adjusted = adjust_schema(
+                &source,
+                TimeUnit::Nanosecond,
+                "UTC",
+                None,
+                Some(&[row_type]),
+            );
+            let expected = match extension {
+                Some("arrow.json") => HashMap::from([
+                    ("ARROW:extension:name".into(), "arrow.json".into()),
+                    ("ARROW:extension:metadata".into(), String::new()),
+                ]),
+                Some("arrow.uuid") => HashMap::from([
+                    ("SNOWFLAKE_TYPE".into(), "text".into()),
+                    ("ARROW:extension:name".into(), "arrow.uuid".into()),
+                ]),
+                _ => HashMap::from([("SNOWFLAKE_TYPE".into(), wire_type.into())]),
+            };
+            assert_eq!(
+                adjusted.field(0).metadata(),
+                &expected,
+                "{wire_type} {extension:?}"
+            );
+            assert!(adjusted.metadata().is_empty());
+        }
+    }
+
+    #[test]
+    fn json_and_schema_only_readers_keep_conversion_metadata_private() {
+        use std::collections::HashMap;
+
+        let number = make_field_with_precision("N", DataType::Int16, "FIXED", "2", "10");
+        let geo = Field::new("G", DataType::Binary, true).with_metadata(HashMap::from([
+            ("logicalType".into(), "BINARY".into()),
+            ("extTypeName".into(), "GEOGRAPHY".into()),
+        ]));
+        let schema = Arc::new(Schema::new(vec![number, geo]));
+        let row_types = [
+            bind_metadata("N", "fixed", Some(10), Some(2)),
+            bind_metadata("G", "binary", None, None),
+        ];
+        let ewkb = [1, 1, 0, 0, 0x20, 0xe6, 0x10, 0, 0];
+        for empty in [false, true] {
+            let batch = if empty {
+                // sf_core emits an empty synthetic batch for schema-only results.
+                RecordBatch::new_empty(schema.clone())
+            } else {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(arrow_array::Int16Array::from(vec![1234])),
+                        Arc::new(arrow_array::BinaryArray::from(vec![ewkb.as_slice()])),
+                    ],
+                )
+                .unwrap()
+            };
+            let mut reader = ConvertingReader::new(
+                ConcatReader {
+                    batches: vec![batch].into_iter(),
+                    schema: schema.clone(),
+                },
+                TimeUnit::Nanosecond,
+                TimestampPrecision::Nanoseconds,
+                Arc::from("UTC"),
+                Some(&row_types),
+            );
+            let output_schema = reader.schema();
+            assert_eq!(
+                output_schema.field(0).metadata(),
+                &HashMap::from([("SNOWFLAKE_TYPE".into(), "fixed".into())]),
+            );
+            assert_eq!(
+                output_schema.field(1).metadata(),
+                &HashMap::from([("SNOWFLAKE_TYPE".into(), "binary".into())]),
+            );
+            let batch = reader.next().unwrap().unwrap();
+            assert_eq!(batch.schema(), output_schema);
+            assert_eq!(batch.num_rows(), usize::from(!empty));
+            if !empty {
+                let number = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Decimal128Array>()
+                    .unwrap();
+                assert_eq!(number.value(0), 1234);
+                assert_eq!(number.data_type(), &DataType::Decimal128(10, 2));
+                let geo = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .unwrap();
+                // Go never adds GeoArrow or strips EWKB on the JSON path.
+                assert_eq!(geo.value(0), ewkb);
+            }
+            assert!(reader.next().is_none());
+        }
+    }
+
+    #[test]
+    fn ordinary_binary_is_not_classified_as_geo_from_its_contents() {
+        let field = make_field_with_meta("B", DataType::Binary, "BINARY", "0");
+        let schema = Arc::new(Schema::new(vec![field]));
+        let ewkb = [1, 1, 0, 0, 0x20, 0xe6, 0x10, 0, 0];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::BinaryArray::from(vec![
+                ewkb.as_slice(),
+            ]))],
+        )
+        .unwrap();
+        let mut reader = ConvertingReader::new(
+            ConcatReader {
+                batches: vec![batch.clone()].into_iter(),
+                schema: schema.clone(),
+            },
+            TimeUnit::Nanosecond,
+            TimestampPrecision::Nanoseconds,
+            Arc::from("UTC"),
+            None,
         );
+        assert_eq!(reader.schema(), schema);
+        assert_eq!(reader.next().unwrap().unwrap(), batch);
     }
 
     #[test]
@@ -3226,6 +3624,7 @@ pub(crate) mod tests {
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
             Arc::from("UTC"),
+            None,
         );
         assert_eq!(
             reader.schema().field(0).data_type(),
@@ -3237,6 +3636,15 @@ pub(crate) mod tests {
                 .field(0)
                 .try_canonical_extension_type()
                 .is_ok()
+        );
+        assert_eq!(
+            reader.schema().field(0).metadata(),
+            &std::collections::HashMap::from([
+                ("logicalType".into(), "TEXT".into()),
+                ("charLength".into(), "0".into()),
+                ("byteLength".into(), "16".into()),
+                ("ARROW:extension:name".into(), "arrow.uuid".into()),
+            ]),
         );
         assert_eq!(reader.schema().field(1).data_type(), &DataType::Utf8);
         let converted = reader.next().unwrap().unwrap();
@@ -3265,6 +3673,7 @@ pub(crate) mod tests {
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
             Arc::from("UTC"),
+            None,
         );
         assert!(
             invalid
@@ -3286,7 +3695,7 @@ pub(crate) mod tests {
             .into(),
         );
         let schema = Arc::new(Schema::new(vec![field]));
-        let described = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
+        let described = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None, None);
         assert_eq!(
             described
                 .field(0)
@@ -3313,6 +3722,7 @@ pub(crate) mod tests {
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
             Arc::from("UTC"),
+            None,
         );
         assert_eq!(
             reader
@@ -3336,65 +3746,168 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn geometry_srid_not_matching_first_batch_crs_is_rejected() {
-        let field = Field::new("geom", DataType::Binary, true).with_metadata(
-            [
-                ("logicalType".to_owned(), "BINARY".to_owned()),
-                ("extTypeName".to_owned(), "GEOMETRY".to_owned()),
-            ]
-            .into(),
-        );
-        let schema = Arc::new(Schema::new(vec![field]));
-        let point = |srid: u32| {
-            let mut ewkb = vec![1, 1, 0, 0, 0x20];
-            ewkb.extend_from_slice(&srid.to_le_bytes());
-            ewkb.extend_from_slice(&[0; 16]);
-            ewkb
-        };
-        let batch = |value: Option<Vec<u8>>| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(arrow_array::BinaryArray::from(vec![
-                    value.as_deref(),
-                ]))],
-            )
-            .unwrap()
-        };
-        let reader = |batches: Vec<RecordBatch>| {
-            ConvertingReader::new(
-                ConcatReader {
-                    batches: batches.into_iter(),
-                    schema: schema.clone(),
-                },
-                TimeUnit::Nanosecond,
-                TimestampPrecision::Nanoseconds,
-                Arc::from("UTC"),
-            )
-        };
+    fn geo_srid_metadata_uses_only_the_first_batch_and_never_rejects_later_srids() {
+        for geo_type in ["GEOMETRY", "GEOGRAPHY"] {
+            let field = Field::new("geo", DataType::Binary, true).with_metadata(
+                [
+                    ("logicalType".to_owned(), "BINARY".to_owned()),
+                    ("extTypeName".to_owned(), geo_type.to_owned()),
+                ]
+                .into(),
+            );
+            let schema = Arc::new(Schema::new(vec![field]));
+            let point = |srid: u32| {
+                let mut ewkb = vec![1, 1, 0, 0, 0x20];
+                ewkb.extend_from_slice(&srid.to_le_bytes());
+                ewkb.extend_from_slice(&[0; 16]);
+                ewkb
+            };
+            let batch = |values: Vec<Option<Vec<u8>>>| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(arrow_array::BinaryArray::from_iter(
+                        values.iter().map(|value| value.as_deref()),
+                    ))],
+                )
+                .unwrap()
+            };
+            let mut plain = vec![1, 1, 0, 0, 0];
+            plain.extend_from_slice(&[0; 16]);
+            for (first, expected_crs) in [
+                (vec![Some(point(3857))], Some("EPSG:3857")),
+                (vec![Some(point(3857)), Some(point(4326))], None),
+                (vec![Some(plain.clone())], None),
+                (vec![None], None),
+                (vec![], None),
+            ] {
+                let first_rows = first.len();
+                let first_null = first_rows == 1 && first[0].is_none();
+                let mut reader = ConvertingReader::new(
+                    ConcatReader {
+                        batches: vec![batch(first), batch(vec![Some(point(4326))])].into_iter(),
+                        schema: schema.clone(),
+                    },
+                    TimeUnit::Nanosecond,
+                    TimestampPrecision::Nanoseconds,
+                    Arc::from("UTC"),
+                    None,
+                );
+                let output_schema = reader.schema();
+                let expected_metadata = match expected_crs {
+                    Some(crs) => std::collections::HashMap::from([
+                        ("ARROW:extension:name".into(), "geoarrow.wkb".into()),
+                        (
+                            "ARROW:extension:metadata".into(),
+                            format!("{{\"crs\":\"{crs}\",\"crs_type\":\"authority_code\"}}"),
+                        ),
+                    ]),
+                    None => std::collections::HashMap::from([(
+                        "ARROW:extension:name".into(),
+                        "geoarrow.wkb".into(),
+                    )]),
+                };
+                assert_eq!(output_schema.field(0).metadata(), &expected_metadata);
+                let mut batch_count = 0;
+                for (index, batch) in reader.by_ref().enumerate() {
+                    let batch = batch.unwrap();
+                    batch_count += 1;
+                    assert_eq!(batch.schema(), output_schema);
+                    assert_eq!(batch.num_rows(), if index == 0 { first_rows } else { 1 });
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::BinaryArray>()
+                        .unwrap();
+                    if index == 0 && first_null {
+                        assert!(column.is_null(0));
+                    }
+                    for value in column.iter().flatten() {
+                        assert_eq!(value, plain);
+                    }
+                }
+                assert_eq!(batch_count, 2);
+            }
+        }
+    }
 
-        // A later batch with the same SRID as the declared CRS is stripped.
-        let mut same = reader(vec![batch(Some(point(3857))), batch(Some(point(3857)))]);
-        assert!(same.next().unwrap().is_ok());
-        assert!(same.next().unwrap().is_ok());
+    #[test]
+    fn stripping_srid_matches_go_for_malformed_and_nonstandard_headers() {
+        let cases = [
+            (vec![], vec![]),
+            (vec![1, 1, 0, 0], vec![1, 1, 0, 0]),
+            (
+                vec![2, 1, 0, 0, 0x20, 0xe6, 0x10, 0, 0],
+                vec![2, 1, 0, 0, 0x20, 0xe6, 0x10, 0, 0],
+            ),
+            (
+                vec![1, 1, 0, 0, 0x20, 0xe6, 0x10, 0],
+                vec![1, 1, 0, 0, 0x20, 0xe6, 0x10, 0],
+            ),
+            (
+                vec![1, 1, 0, 0, 0, 0, 0, 0, 0],
+                vec![1, 1, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                vec![1, 99, 0, 0, 0x20, 0xe6, 0x10, 0, 0, 7],
+                vec![1, 99, 0, 0, 0, 7],
+            ),
+            (
+                vec![0, 0xe0, 0, 0, 1, 0, 0, 0x10, 0xe6, 7],
+                vec![0, 0xc0, 0, 0, 1, 7],
+            ),
+        ];
+        let input: ArrayRef = Arc::new(arrow_array::BinaryArray::from_iter(
+            cases
+                .iter()
+                .map(|(input, _)| Some(input.as_slice()))
+                .chain(std::iter::once(None)),
+        ));
+        let stripped = strip_geo_srid(&input).unwrap();
+        let stripped = stripped
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        for (index, (_, expected)) in cases.iter().enumerate() {
+            assert_eq!(stripped.value(index), expected);
+        }
+        assert!(stripped.is_null(cases.len()));
+    }
 
-        // A later batch with a different SRID would be mislabeled.
-        let mut different = reader(vec![batch(Some(point(3857))), batch(Some(point(4326)))]);
-        assert!(different.next().unwrap().is_ok());
-        let error = different.next().unwrap().unwrap_err().to_string();
-        assert!(error.contains("SRID 4326"), "{error}");
-
-        // A first batch with no SRID establishes no CRS, so a later SRID is rejected.
-        let mut undeclared = reader(vec![batch(None), batch(Some(point(3857)))]);
-        assert_eq!(
-            undeclared
-                .schema()
-                .field(0)
-                .metadata()
-                .get("ARROW:extension:metadata"),
-            None
-        );
-        assert!(undeclared.next().unwrap().is_ok());
-        assert!(undeclared.next().unwrap().is_err());
+    #[test]
+    fn first_batch_srid_analysis_matches_go_header_rules() {
+        let little = [1, 1, 0, 0, 0x20, 0xe6, 0x10, 0, 0];
+        let big = [0, 0x20, 0, 0, 1, 0, 0, 0x10, 0xe6];
+        let plain = [1, 1, 0, 0, 0];
+        let invalid = [1, 99, 0, 0, 0];
+        for (values, expected) in [
+            (
+                vec![Some(little.as_slice()), Some(big.as_slice())],
+                Some(4326),
+            ),
+            (
+                vec![Some(plain.as_slice()), Some(little.as_slice())],
+                Some(4326),
+            ),
+            (
+                vec![Some(little.as_slice()), Some(plain.as_slice())],
+                Some(4326),
+            ),
+            (
+                vec![Some(little.as_slice()), Some(invalid.as_slice())],
+                None,
+            ),
+            (
+                vec![Some(invalid.as_slice()), Some(little.as_slice())],
+                None,
+            ),
+            (vec![None], None),
+            (vec![], None),
+        ] {
+            assert_eq!(
+                geo_column_srid(&arrow_array::BinaryArray::from(values)),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3509,6 +4022,7 @@ pub(crate) mod tests {
                 TimeUnit::Nanosecond,
                 TimestampPrecision::Nanoseconds,
                 Arc::from("UTC"),
+                None,
             );
             let out = reader.next().unwrap().unwrap();
             let column = out.column(0);
@@ -3532,7 +4046,7 @@ pub(crate) mod tests {
     fn test_adjust_schema_timestamp_ntz_int64_to_timestamp_ns() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None);
+        let result = adjust_schema(&schema, TimeUnit::Nanosecond, "UTC", None, None);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
@@ -3543,7 +4057,13 @@ pub(crate) mod tests {
     fn test_adjust_schema_timestamp_ltz_uses_session_timezone() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_LTZ", "6");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Microsecond, "America/Los_Angeles", None);
+        let result = adjust_schema(
+            &schema,
+            TimeUnit::Microsecond,
+            "America/Los_Angeles",
+            None,
+            None,
+        );
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(
@@ -3572,6 +4092,7 @@ pub(crate) mod tests {
             TimeUnit::Nanosecond,
             TimestampPrecision::Nanoseconds,
             Arc::from("UTC"),
+            None,
         );
         let out = cr.next().unwrap().unwrap();
         assert_eq!(
@@ -3615,6 +4136,7 @@ pub(crate) mod tests {
                     TimeUnit::Nanosecond,
                     TimestampPrecision::Nanoseconds,
                     Arc::from("America/Los_Angeles"),
+                    None,
                 );
                 let out = reader.next().unwrap().unwrap();
                 assert_eq!(
@@ -3717,7 +4239,7 @@ pub(crate) mod tests {
     fn test_adjust_schema_timestamp_ntz_capped_by_ts_unit() {
         let f = make_field_with_meta("ts", DataType::Int64, "TIMESTAMP_NTZ", "9");
         let schema = Schema::new(vec![f]);
-        let result = adjust_schema(&schema, TimeUnit::Microsecond, "UTC", None);
+        let result = adjust_schema(&schema, TimeUnit::Microsecond, "UTC", None, None);
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -4248,28 +4770,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn float16_bindings_promote_finite_values_and_null_nonfinite() {
-        let source = arrow_array::Float32Array::from(vec![
-            Some(1.5),
-            Some(f32::NAN),
-            Some(f32::INFINITY),
-            None,
-        ]);
-        let column = arrow_cast::cast(&source, &DataType::Float16).unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "half",
-            DataType::Float16,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
-        assert_eq!(
-            arrow_batches_to_json_bindings(&[batch.slice(0, 1)]).unwrap(),
-            "{\"1\":{\"type\":\"REAL\",\"value\":\"1.5\"}}"
-        );
-        assert_eq!(
-            arrow_batches_to_json_bindings(&[batch]).unwrap(),
-            "{\"1\":{\"type\":\"REAL\",\"value\":[\"1.5\",null,null,null]}}"
-        );
+    fn float_bindings_preserve_nonfinite_values_signed_zero_and_precision() {
+        for (data_type, precise, expected_precise) in [
+            (DataType::Float16, 1.0009765625, "1.0009766"),
+            (DataType::Float32, 1.2345678, "1.2345678"),
+            (DataType::Float64, 1.2345678901234567, "1.2345678901234567"),
+        ] {
+            let source = arrow_array::Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                Some(-0.0),
+                Some(precise),
+                None,
+            ]);
+            let column = arrow_cast::cast(&source, &data_type).unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("v", data_type, true)]));
+            let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+            let expected_values =
+                format!(r#""NaN","Infinity","-Infinity","-0","{expected_precise}",null"#);
+            assert_eq!(
+                arrow_batches_to_json_bindings(std::slice::from_ref(&batch)).unwrap(),
+                format!(r#"{{"1":{{"type":"REAL","value":[{expected_values}]}}}}"#)
+            );
+            for (row, expected) in expected_values.split(',').enumerate() {
+                assert_eq!(
+                    arrow_batches_to_json_bindings(&[batch.slice(row, 1)]).unwrap(),
+                    format!(r#"{{"1":{{"type":"REAL","value":{expected}}}}}"#)
+                );
+            }
+            assert_eq!(
+                arrow_batches_to_json_bindings(&[batch.slice(0, 2), batch.slice(2, 4)]).unwrap(),
+                format!(r#"{{"1":{{"type":"REAL","value":[{expected_values}]}}}}"#)
+            );
+        }
     }
 
     #[test]

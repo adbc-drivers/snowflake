@@ -1775,6 +1775,7 @@ mod tests {
                 TimeUnit::Nanosecond,
                 "UTC",
                 None,
+                None,
             );
             let values = core_column_values(CoreColumnMetadata {
                 logical_type,

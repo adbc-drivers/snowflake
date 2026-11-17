@@ -18,7 +18,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use adbc_core::{
-    Optionable,
     error::Result,
     options::{OptionDatabase, OptionValue},
 };
@@ -67,17 +66,134 @@ impl TimestampPrecision {
 
 /// Shares the current cancellable operation with a handle that outlives a
 /// borrow of the connection or statement.
-pub(crate) struct OperationCancelHandle {
-    pub(crate) operation: Arc<std::sync::Mutex<Arc<OperationCtx>>>,
+pub(crate) enum OperationCancelHandle {
+    Connection(Arc<std::sync::Mutex<Arc<OperationCtx>>>),
+    Statement(Arc<std::sync::Mutex<StatementOperationState>>),
 }
 
 impl adbc_core::CancelHandle for OperationCancelHandle {
     fn try_cancel(&self) -> Result<()> {
-        self.operation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancel();
+        let operation = match self {
+            Self::Connection(operation) => {
+                Arc::clone(&operation.lock().unwrap_or_else(|e| e.into_inner()))
+            }
+            Self::Statement(state) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.active {
+                    return Err(adbc_core::error::Error {
+                        message: "AdbcStatementCancel: no active query to cancel".into(),
+                        status: adbc_core::error::Status::InvalidState,
+                        vendor_code: 0,
+                        sqlstate: [0; 5],
+                        details: None,
+                    });
+                }
+                Arc::clone(&state.context)
+            }
+        };
+        // Cancellation may wake tasks; never run it while holding the state lock.
+        operation.cancel();
         Ok(())
+    }
+}
+
+pub(crate) struct StatementOperationState {
+    pub(crate) context: Arc<OperationCtx>,
+    active: bool,
+}
+
+impl Default for StatementOperationState {
+    fn default() -> Self {
+        Self {
+            context: Arc::new(OperationCtx::with_own_token()),
+            active: false,
+        }
+    }
+}
+
+/// Keeps execution active through errors, unwinding, and returned stream ownership.
+pub(crate) struct StatementOperation {
+    state: Arc<std::sync::Mutex<StatementOperationState>>,
+    context: Arc<OperationCtx>,
+}
+
+impl StatementOperation {
+    pub(crate) fn start(state: &Arc<std::sync::Mutex<StatementOperationState>>) -> Self {
+        let context = Arc::new(OperationCtx::with_own_token());
+        let previous = {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = true;
+            std::mem::replace(&mut state.context, Arc::clone(&context))
+        };
+        previous.cancel();
+        Self {
+            state: Arc::clone(state),
+            context,
+        }
+    }
+
+    pub(crate) fn wrap_reader(
+        self,
+        reader: Box<dyn RecordBatchReader + Send>,
+    ) -> Box<dyn RecordBatchReader + Send> {
+        Box::new(OperationReader {
+            reader,
+            operation: Some(self),
+        })
+    }
+}
+
+impl std::ops::Deref for StatementOperation {
+    type Target = OperationCtx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl Drop for StatementOperation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::ptr_eq(&state.context, &self.context) {
+            state.active = false;
+        }
+    }
+}
+
+struct OperationReader {
+    reader: Box<dyn RecordBatchReader + Send>,
+    operation: Option<StatementOperation>,
+}
+
+impl Iterator for OperationReader {
+    type Item = std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let operation = self.operation.as_ref()?;
+        let mut result = if operation.token().is_cancelled() {
+            None
+        } else {
+            self.reader.next()
+        };
+        if operation.token().is_cancelled() {
+            let error: adbc_core::error::Error =
+                SnowflakeError::status(adbc_core::error::Status::Cancelled)
+                    .message("query cancelled")
+                    .into();
+            result = Some(Err(arrow_schema::ArrowError::ExternalError(Box::new(
+                error,
+            ))));
+        }
+        if !matches!(result, Some(Ok(_))) {
+            self.operation = None;
+        }
+        result
+    }
+}
+
+impl RecordBatchReader for OperationReader {
+    fn schema(&self) -> Arc<arrow_schema::Schema> {
+        self.reader.schema()
     }
 }
 
@@ -93,11 +209,13 @@ pub(crate) struct Inner {
 pub(crate) struct QueryResult {
     pub reader: Box<dyn RecordBatchReader + Send>,
     pub descriptor: ResultSetDescriptor,
+    pub has_arrow_metadata: bool,
 }
 
 pub(crate) struct PreparedResult {
     pub reader: Box<dyn RecordBatchReader + Send>,
     pub query_id: String,
+    pub columns: Vec<ColumnMetadata>,
     pub number_of_binds: i32,
     pub binds: Vec<ColumnMetadata>,
 }
@@ -172,30 +290,20 @@ impl Inner {
         exporter: Option<Exporter>,
         folder: Option<&str>,
         log_level: Option<&str>,
+        client_config_file: &str,
     ) -> Result<()> {
-        // Logging and exporters share this process-wide dispatcher. An unset
-        // option must not undo another database's explicit configuration.
-        // Reconfigure layers in place: creating another dispatcher can deadlock.
+        // Go reapplies tracing (fatal by default) on each connect, globally.
+        // Exporters remain independent: an unset exporter must not disable one
+        // another database configured. Reuse the dispatcher to avoid teardown races.
         let _guard = self
             .tracing_config
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(level) = log_level {
-            let filter = crate::telemetry::log_level_filter(level).ok_or_else(|| {
-                SnowflakeError::invalid_argument()
-                    .context("configure tracing")
-                    .format(format_args!("invalid log level '{level}'"))
-                    .to_adbc()
-            })?;
-            tracing::dispatcher::with_default(&self.dispatch, || {
-                self.log_level.reload(filter).map_err(|error| {
-                    SnowflakeError::internal_no_location()
-                        .context("configure tracing")
-                        .format(format_args!("could not update stderr log level: {error}"))
-                        .to_adbc()
-                })
-            })?;
-        }
+        // reload rebuilds tracing-core callsite interest using the current
+        // dispatcher; without this guard it can disable sf_core's span pipeline.
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            self.log_level.configure(log_level, client_config_file)
+        })?;
         if exporter.is_none() && folder.is_none() && self.telemetry.is_enabled() {
             return Ok(());
         }
@@ -418,6 +526,7 @@ impl Inner {
         Ok(PreparedResult {
             reader: result.stream,
             query_id: result.query_id,
+            columns: result.columns,
             number_of_binds: result.number_of_binds,
             binds: result.binds,
         })
@@ -425,10 +534,36 @@ impl Inner {
 
     /// Acquire a core result stream and release its handle on every path.
     pub fn acquire_result(&self, result: ResultSetInfo) -> Result<QueryResult> {
-        let stream = self.block_on(self.sf.result_set_get_stream(result.handle));
+        let stream = self.block_on(async {
+            let has_arrow_metadata = match (
+                result.descriptor.query_result_format.as_deref(),
+                result.descriptor.row_count,
+            ) {
+                (Some("arrow"), Some(0)) => {
+                    // This snapshots stored chunk metadata without consuming the
+                    // stream or making a request. Schema-only results have no IPC.
+                    let chunks = self
+                        .sf
+                        .result_set_get_chunks(result.handle)
+                        .await?
+                        .chunk_data;
+                    matches!(
+                        chunks.inline,
+                        sf_core::apis::database_driver_v1::InlineData::ArrowIpc(_)
+                    ) || !chunks.remote_chunks.is_empty()
+                }
+                (Some("arrow"), _) => true,
+                _ => false,
+            };
+            let reader = self
+                .sf
+                .result_set_get_stream_without_nullable_metadata(result.handle)
+                .await?;
+            Ok::<_, ApiError>((reader, has_arrow_metadata))
+        });
         let release = self.sf.result_set_release(result.handle);
 
-        let reader = match stream {
+        let (reader, has_arrow_metadata) = match stream {
             Ok(reader) => {
                 release.map_err(crate::error::api_error_to_adbc_error)?;
                 reader
@@ -443,6 +578,7 @@ impl Inner {
         Ok(QueryResult {
             reader,
             descriptor: result.descriptor,
+            has_arrow_metadata,
         })
     }
 }
@@ -499,14 +635,14 @@ impl adbc_core::Driver for Driver {
             credential_options: Default::default(),
             tls_skip_verify: false,
             tracing_level: None,
+            client_config_file: String::new(),
+            private_key_password: None,
             trace_parent: None,
             traces_exporter: None,
             traces_folder_path: None,
             session_parameters: Default::default(),
         };
-        for (key, value) in opts {
-            db.set_option(key, value)?;
-        }
+        db.set_initial_options(opts)?;
         Ok(db)
     }
 }

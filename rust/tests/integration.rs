@@ -79,6 +79,7 @@ fn test_login_failure_diagnostics() {
         "{error:?}"
     );
     assert_ne!(error.vendor_code, 0, "{error:?}");
+    assert!(error.message.starts_with("[snowflake] "), "{error:?}");
     assert_eq!(error.sqlstate.map(|c| c as u8), *b"08004", "{error:?}");
 }
 
@@ -123,6 +124,113 @@ fn test_select_one() {
     let batch = reader.next().expect("no batch").expect("batch error");
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.num_columns(), 1);
+}
+
+#[test]
+fn test_statement_cancel_during_execution() {
+    use adbc_core::error::Status;
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    conn.get_cancel_handle().try_cancel().unwrap();
+    let mut stmt = conn.new_statement().unwrap();
+    let cancel = stmt.get_cancel_handle();
+    let error = cancel.try_cancel().unwrap_err();
+    assert_eq!(error.status, Status::InvalidState);
+    assert_eq!(
+        error.message,
+        "AdbcStatementCancel: no active query to cancel"
+    );
+    stmt.set_sql_query("SELECT SYSTEM$WAIT(30)").unwrap();
+    std::thread::scope(|scope| {
+        let cancelling = scope.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match cancel.try_cancel() {
+                    Ok(()) => break,
+                    Err(error) => assert_eq!(error.status, Status::InvalidState),
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "execution never became active"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let error = stmt.execute().err().expect("query must be cancelled");
+        cancelling.join().unwrap();
+        assert_eq!(error.status, Status::Cancelled, "{error:?}");
+    });
+    assert_eq!(
+        cancel.try_cancel().unwrap_err().status,
+        Status::InvalidState
+    );
+    stmt.set_sql_query("SELECT 1").unwrap();
+    let mut reader = stmt.execute().unwrap();
+    assert!(reader.next().unwrap().is_ok());
+    assert!(reader.next().is_none());
+    assert_eq!(
+        cancel.try_cancel().unwrap_err().status,
+        Status::InvalidState
+    );
+}
+
+#[test]
+fn test_statement_cancel_during_stream_consumption() {
+    use adbc_core::error::{Error, Status};
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut stmt = conn.new_statement().unwrap();
+    let cancel = stmt.get_cancel_handle();
+    stmt.set_sql_query("SELECT SEQ4() FROM TABLE(GENERATOR(ROWCOUNT => 100000))")
+        .unwrap();
+    let mut reader = stmt.execute().unwrap();
+    assert!(reader.next().unwrap().unwrap().num_rows() > 0);
+    cancel.try_cancel().unwrap();
+    let error = reader.next().unwrap().unwrap_err();
+    let arrow_schema::ArrowError::ExternalError(error) = error else {
+        panic!("expected an ADBC cancellation error");
+    };
+    let error = error.downcast_ref::<Error>().unwrap();
+    assert_eq!(error.status, Status::Cancelled);
+    assert!(error.message.starts_with("[Snowflake] "));
+    assert!(reader.next().is_none());
+    assert_eq!(
+        cancel.try_cancel().unwrap_err().status,
+        Status::InvalidState
+    );
+    drop(reader);
+
+    stmt.set_sql_query("SELECT 1").unwrap();
+    let reader = stmt.execute().unwrap();
+    drop(reader);
+    assert_eq!(
+        cancel.try_cancel().unwrap_err().status,
+        Status::InvalidState
+    );
+}
+
+#[test]
+fn test_server_query_error_uses_lowercase_prefix() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut stmt = conn.new_statement().unwrap();
+    stmt.set_sql_query("SELECT FROM").unwrap();
+    let error = stmt.execute().err().expect("SQL must be rejected");
+    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert!(error.message.starts_with("[snowflake] "), "{error:?}");
+    assert!(error.message.contains("(query ID: "), "{error:?}");
+    assert_eq!(
+        stmt.get_cancel_handle().try_cancel().unwrap_err().status,
+        adbc_core::error::Status::InvalidState
+    );
 }
 
 /// Verify that the database options export the driver and sf_core spans in the
@@ -955,6 +1063,153 @@ fn test_execute_schema() {
 }
 
 #[test]
+fn test_result_field_metadata_matches_go_paths() {
+    use std::collections::HashMap;
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let table = format!(
+        "ADBC_RUST_RESULT_METADATA_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut statement = conn.new_statement().unwrap();
+    statement
+        .set_sql_query(format!(
+            "CREATE TEMPORARY TABLE {table} \
+             (N NUMBER(10,2), S VARCHAR(12), TS TIMESTAMP_NTZ(9), A ARRAY, V VARIANT)"
+        ))
+        .unwrap();
+    // DDL status rows use JSON, not Arrow IPC.
+    let mut created = statement.execute().unwrap();
+    assert_eq!(
+        created.schema().field(0).metadata(),
+        &HashMap::from([("SNOWFLAKE_TYPE".into(), "text".into())]),
+    );
+    assert_eq!(created.next().unwrap().unwrap().num_rows(), 1);
+    drop(created);
+
+    statement
+        .set_sql_query(format!(
+            "INSERT INTO {table} SELECT 12.34, 'hello', \
+             '2020-01-02 03:04:05.123456789'::TIMESTAMP_NTZ(9), \
+             ARRAY_CONSTRUCT(1, 'two'), PARSE_JSON('{{\"k\":1}}')"
+        ))
+        .unwrap();
+    statement.execute_update().unwrap();
+
+    statement
+        .set_sql_query(format!("SELECT * FROM {table}"))
+        .unwrap();
+    let described = statement.execute_schema().unwrap();
+    let expected_row_types = ["fixed", "text", "timestamp_ntz", "array", "variant"];
+    for (field, snowflake_type) in described.fields().iter().zip(expected_row_types) {
+        let expected = if snowflake_type == "array" {
+            HashMap::from([
+                ("ARROW:extension:name".into(), "arrow.json".into()),
+                ("ARROW:extension:metadata".into(), String::new()),
+            ])
+        } else {
+            HashMap::from([("SNOWFLAKE_TYPE".into(), snowflake_type.into())])
+        };
+        assert_eq!(field.metadata(), &expected, "describe {}", field.name());
+    }
+
+    let mut reader = statement.execute().unwrap();
+    let schema = reader.schema();
+    for (field, logical_type) in
+        schema
+            .fields()
+            .iter()
+            .zip(["FIXED", "TEXT", "TIMESTAMP_NTZ", "ARRAY", "VARIANT"])
+    {
+        if logical_type == "ARRAY" {
+            assert_eq!(
+                field.metadata(),
+                &HashMap::from([
+                    ("ARROW:extension:name".into(), "arrow.json".into()),
+                    ("ARROW:extension:metadata".into(), String::new()),
+                ]),
+            );
+        } else {
+            // Go preserves the server's IPC keys, rather than adding the JSON key.
+            assert_eq!(field.metadata()["logicalType"], logical_type);
+            assert!(!field.metadata().contains_key("SNOWFLAKE_TYPE"));
+        }
+    }
+    assert_eq!(schema.field(0).metadata()["precision"], "10");
+    assert_eq!(schema.field(0).metadata()["scale"], "2");
+    assert_eq!(schema.field(2).metadata()["scale"], "9");
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.schema(), schema);
+    assert_eq!(batch.num_rows(), 1);
+    assert!(reader.next().is_none());
+    drop(reader);
+
+    // With no IPC payload, Go builds the schema from rowTypes even for SELECT.
+    statement
+        .set_sql_query(format!("SELECT * FROM {table} WHERE FALSE"))
+        .unwrap();
+    let empty = statement.execute().unwrap();
+    for (field, expected) in empty.schema().fields().iter().zip(described.fields()) {
+        assert_eq!(
+            field.metadata(),
+            expected.metadata(),
+            "empty {}",
+            field.name()
+        );
+    }
+    assert_eq!(
+        empty.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        0
+    );
+}
+
+#[test]
+fn test_mixed_geometry_srids_are_stripped_without_column_crs() {
+    use std::collections::HashMap;
+
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.client_option.geometry_output_format".into()),
+        OptionValue::String("ewkb".into()),
+    )
+    .unwrap();
+    let mut conn = db.new_connection().unwrap();
+    let mut statement = conn.new_statement().unwrap();
+    statement
+        .set_sql_query(
+            "SELECT TO_GEOMETRY(column1) AS GEO FROM VALUES \
+             ('SRID=3857;POINT(1 2)'), ('SRID=4326;POINT(1 2)')",
+        )
+        .unwrap();
+    let reader = statement.execute().unwrap();
+    assert_eq!(
+        reader.schema().field(0).metadata(),
+        &HashMap::from([("ARROW:extension:name".into(), "geoarrow.wkb".into())]),
+    );
+    let mut rows = 0;
+    for batch in reader {
+        let batch = batch.unwrap();
+        let values = batch.column(0).as_binary::<i32>();
+        for value in values.iter().flatten() {
+            assert_eq!(
+                value,
+                &[
+                    1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0x40
+                ]
+            );
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 2);
+}
+
+#[test]
 fn test_prepare_parameter_schema_and_describe_only_execution() {
     let Some(mut conn) = make_connection() else {
         eprintln!("Skipping: SNOWFLAKE_URI not set");
@@ -1056,6 +1311,100 @@ fn test_float64_select_precision() {
         .column(5)
         .as_primitive::<arrow_array::types::Float64Type>();
     assert!(null_arr.is_null(0), "null_val should be null");
+}
+
+#[test]
+fn test_float_bindings_preserve_nonfinite_values() {
+    use arrow_array::{Float64Array, Int64Array, RecordBatch};
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    for data_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
+        let finite = if data_type == DataType::Float64 {
+            1.2345678901234567
+        } else {
+            1.5
+        };
+        let expected = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, finite];
+        let values = arrow_cast::cast(&Float64Array::from(expected.to_vec()), &data_type).unwrap();
+        let value_schema = Arc::new(Schema::new(vec![Field::new("V", data_type.clone(), false)]));
+        let bound_values = RecordBatch::try_new(value_schema, vec![values.clone()]).unwrap();
+        let insert_schema = Arc::new(Schema::new(vec![
+            Field::new("ID", DataType::Int64, false),
+            Field::new("V", data_type, false),
+        ]));
+        let bound_insert = RecordBatch::try_new(
+            insert_schema,
+            vec![Arc::new(Int64Array::from(vec![0, 1, 2, 3])), values],
+        )
+        .unwrap();
+        let assert_values = |batches: Vec<RecordBatch>| {
+            let mut row = 0;
+            for batch in batches {
+                let values = batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Float64Type>();
+                for index in 0..values.len() {
+                    assert!(row < expected.len(), "unexpected extra row");
+                    assert!(!values.is_null(index), "bound float became NULL");
+                    let actual = values.value(index);
+                    let expected = expected[row];
+                    if expected.is_nan() {
+                        assert!(actual.is_nan(), "expected NaN, got {actual}");
+                    } else if expected.is_infinite() {
+                        assert!(actual.is_infinite(), "expected infinity, got {actual}");
+                        assert_eq!(actual.is_sign_negative(), expected.is_sign_negative());
+                    } else {
+                        assert_eq!(actual.to_bits(), expected.to_bits());
+                    }
+                    row += 1;
+                }
+            }
+            assert_eq!(row, expected.len());
+        };
+
+        let table = format!("ADBC_RUST_FLOAT_BIND_{}", uuid::Uuid::new_v4().simple());
+        let mut ddl = conn.new_statement().unwrap();
+        ddl.set_sql_query(format!(
+            "CREATE TEMPORARY TABLE \"{table}\" (ID INTEGER, V FLOAT)"
+        ))
+        .unwrap();
+        ddl.execute_update().expect("create float bind table");
+        let mut insert = conn.new_statement().unwrap();
+        insert
+            .set_sql_query(format!("INSERT INTO \"{table}\" VALUES (?, ?)"))
+            .unwrap();
+        insert.bind(bound_insert).unwrap();
+        assert_eq!(insert.execute_update().expect("array bind floats"), Some(4));
+
+        let mut query = conn.new_statement().unwrap();
+        query
+            .set_sql_query(format!("SELECT V FROM \"{table}\" ORDER BY ID"))
+            .unwrap();
+        assert_values(
+            query
+                .execute()
+                .expect("read array-bound floats")
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        query.set_sql_query("SELECT ?::FLOAT").unwrap();
+        query.bind(bound_values).unwrap();
+        assert_values(
+            query
+                .execute()
+                .expect("query bound floats")
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        ddl.set_sql_query(format!("DROP TABLE \"{table}\""))
+            .unwrap();
+        ddl.execute_update().expect("drop float bind table");
+    }
 }
 
 #[test]
@@ -1596,4 +1945,612 @@ fn test_query_id_bound() {
     assert_eq!(count, 2);
     let last = last_query_id(&stmt);
     assert!(!last.is_empty() && last != first);
+}
+
+fn ingest_temporary_rows(
+    conn: &mut adbc_driver_snowflake::Connection,
+    table: &str,
+    mode: &str,
+    rows: Vec<i64>,
+) -> adbc_core::error::Result<Option<i64>> {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    let mut stmt = conn.new_statement()?;
+    stmt.set_option(OptionStatement::TargetTable, table.into())?;
+    stmt.set_option(
+        OptionStatement::IngestMode,
+        format!("adbc.ingest.mode.{mode}").into(),
+    )?;
+    stmt.set_option(OptionStatement::Temporary, "enabled".into())?;
+    assert_eq!(stmt.get_option_string(OptionStatement::Temporary)?, "true");
+    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
+    stmt.bind(RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(rows))]).unwrap())?;
+    stmt.execute_update()
+}
+
+#[test]
+fn test_temporary_ingest_create_append_and_isolation() {
+    let Some(db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut conn = db.new_connection().unwrap();
+    let mut observer = db.new_connection().unwrap();
+    let table = format!("ADBC_TEMP_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    let quoted = format!("\"{table}\"");
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "create", vec![1, 2]).unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "append", vec![3]).unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "create_append", vec![4]).unwrap(),
+        Some(1)
+    );
+    assert_eq!(count_rows(&mut conn, &quoted), 4);
+    let mut query = observer.new_statement().unwrap();
+    query
+        .set_sql_query(format!("SELECT * FROM {quoted}"))
+        .unwrap();
+    let error = query
+        .execute()
+        .err()
+        .expect("temporary table must be private");
+    assert_eq!(error.status, adbc_core::error::Status::NotFound, "{error}");
+
+    let mut drop_table = conn.new_statement().unwrap();
+    drop_table
+        .set_sql_query(format!("DROP TABLE {quoted}"))
+        .unwrap();
+    drop_table.execute_update().unwrap();
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "create_append", vec![5]).unwrap(),
+        Some(1)
+    );
+    assert_eq!(count_rows(&mut conn, &quoted), 1);
+}
+
+#[test]
+fn test_temporary_ingest_replace_and_shadowed_permanent_table() {
+    use arrow_array::{RecordBatch, RecordBatchIterator};
+    use arrow_schema::{ArrowError, Field, Schema};
+    use std::sync::Arc;
+
+    let Some(db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut conn = db.new_connection().unwrap();
+    let mut observer = db.new_connection().unwrap();
+    let table = format!("ADBC_TEMP_SWAP_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    let quoted = format!("\"{table}\"");
+    let mut ddl = observer.new_statement().unwrap();
+    ddl.set_sql_query(format!(
+        "CREATE TABLE {quoted} AS SELECT 'permanent' AS PERMANENT_VALUE"
+    ))
+    .unwrap();
+    ddl.execute_update().unwrap();
+
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "create", vec![1, 2]).unwrap(),
+        Some(2)
+    );
+    // Preparing SELECT * must see the temporary ID column, not PERMANENT_VALUE.
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "append", vec![3]).unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "create_append", vec![4]).unwrap(),
+        Some(1)
+    );
+    assert_eq!(count_rows(&mut conn, &quoted), 4);
+    assert_eq!(
+        ingest_temporary_rows(&mut conn, &table, "replace", vec![8, 9]).unwrap(),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut conn, &quoted), 2);
+    assert_eq!(count_rows(&mut observer, &quoted), 1);
+
+    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
+    let mut failing = conn.new_statement().unwrap();
+    failing
+        .set_option(OptionStatement::TargetTable, table.clone().into())
+        .unwrap();
+    failing
+        .set_option(OptionStatement::Temporary, "true".into())
+        .unwrap();
+    failing
+        .set_option(
+            OptionStatement::IngestMode,
+            "adbc.ingest.mode.replace".into(),
+        )
+        .unwrap();
+    let failure: Result<RecordBatch, ArrowError> = Err(ArrowError::ParseError(
+        "intentional replacement failure".into(),
+    ));
+    failing
+        .bind_stream(Box::new(RecordBatchIterator::new([failure], schema)))
+        .unwrap();
+    let error = failing.execute_update().unwrap_err();
+    assert!(error.message.contains("intentional replacement failure"));
+    assert!(error.message.contains("target table was not replaced"));
+    assert!(
+        error
+            .details
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|(key, value)| { key == "adbc.snowflake.ingest.rows_loaded" && value == b"0" })
+    );
+    assert_eq!(count_rows(&mut conn, &quoted), 2);
+    assert_eq!(count_rows(&mut observer, &quoted), 1);
+
+    // The second session drops only the permanent table, never the temporary one.
+    ddl.set_sql_query(format!("DROP TABLE {quoted}")).unwrap();
+    ddl.execute_update().unwrap();
+    assert_eq!(count_rows(&mut conn, &quoted), 2);
+}
+
+#[test]
+fn test_temporary_ingest_rejects_explicit_catalog_or_schema() {
+    use arrow_array::RecordBatch;
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let catalog = conn
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .unwrap();
+    let schema_name = conn
+        .get_option_string(OptionConnection::CurrentSchema)
+        .unwrap();
+    let table = format!("ADBC_TEMP_NAMESPACE_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
+    for (key, value) in [
+        (OptionStatement::TargetCatalog, catalog),
+        (OptionStatement::TargetDbSchema, schema_name),
+    ] {
+        for mode in ["create", "append", "create_append", "replace"] {
+            for namespace_first in [false, true] {
+                let mut stmt = conn.new_statement().unwrap();
+                stmt.set_option(OptionStatement::TargetTable, table.clone().into())
+                    .unwrap();
+                stmt.set_option(
+                    OptionStatement::IngestMode,
+                    format!("adbc.ingest.mode.{mode}").into(),
+                )
+                .unwrap();
+                if namespace_first {
+                    stmt.set_option(key.clone(), value.clone().into()).unwrap();
+                }
+                stmt.set_option(OptionStatement::Temporary, "true".into())
+                    .unwrap();
+                if !namespace_first {
+                    stmt.set_option(key.clone(), value.clone().into()).unwrap();
+                }
+                stmt.bind(RecordBatch::new_empty(Arc::clone(&schema)))
+                    .unwrap();
+                let error = stmt.execute_update().unwrap_err();
+                assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+                assert!(error.message.contains("target_catalog"));
+                assert!(error.message.contains("target_db_schema"));
+            }
+        }
+    }
+    let mut query = conn.new_statement().unwrap();
+    query
+        .set_sql_query(format!("SELECT * FROM \"{table}\""))
+        .unwrap();
+    let error = query
+        .execute()
+        .err()
+        .expect("invalid options must not create a table");
+    assert_eq!(error.status, adbc_core::error::Status::NotFound);
+}
+
+#[test]
+fn test_failed_ingest_recounts_partial_rows_with_query_tag() {
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{ArrowError, Field, Schema};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let Some(db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut conn = db.new_connection().unwrap();
+    let mut observer = db.new_connection().unwrap();
+    let table = format!("ADBC_PARTIAL_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    let quoted = format!("\"{table}\"");
+    let tag = format!("adbc-partial-{}", uuid::Uuid::new_v4());
+    let mut ddl = conn.new_statement().unwrap();
+    ddl.set_sql_query(format!("CREATE TABLE {quoted} AS SELECT 0::INTEGER AS ID"))
+        .unwrap();
+    ddl.execute_update().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let observed_table = quoted.clone();
+    let fail_after_copy = std::iter::once_with(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if count_rows(&mut observer, &observed_table) == 4 {
+                return Err(ArrowError::ParseError("intentional stream failure".into()));
+            }
+            if Instant::now() >= deadline {
+                return Err(ArrowError::ParseError(
+                    "COPY did not finish before deadline".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let mut stmt = conn.new_statement().unwrap();
+    stmt.set_option(OptionStatement::TargetTable, table.into())
+        .unwrap();
+    stmt.set_option(
+        OptionStatement::IngestMode,
+        "adbc.ingest.mode.append".into(),
+    )
+    .unwrap();
+    stmt.set_option(
+        OptionStatement::Other("adbc.snowflake.statement.query_tag".into()),
+        tag.clone().into(),
+    )
+    .unwrap();
+    for (name, value) in [
+        ("ingest_target_file_size", 0),
+        ("ingest_writer_concurrency", 1),
+        ("ingest_upload_concurrency", 1),
+        ("ingest_copy_concurrency", 1),
+    ] {
+        stmt.set_option(
+            OptionStatement::Other(format!("adbc.snowflake.statement.{name}")),
+            OptionValue::Int(value),
+        )
+        .unwrap();
+    }
+    stmt.bind_stream(Box::new(RecordBatchIterator::new(
+        std::iter::once(Ok(first)).chain(fail_after_copy),
+        schema,
+    )))
+    .unwrap();
+    // Reading the failure cancels the pipeline token before the recount.
+    let error = stmt.execute_update().unwrap_err();
+    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert!(
+        error.message.contains("intentional stream failure"),
+        "{error}"
+    );
+    assert!(error.message.contains("3 rows were loaded"), "{error}");
+    assert!(
+        error
+            .details
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|(key, value)| { key == "adbc.snowflake.ingest.rows_loaded" && value == b"3" })
+    );
+    assert_eq!(count_rows(&mut conn, &quoted), 4);
+
+    let mut history = conn.new_statement().unwrap();
+    history
+        .set_sql_query(format!(
+            "SELECT QUERY_TEXT FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(RESULT_LIMIT => 1000)) \
+             WHERE QUERY_TAG = '{tag}'"
+        ))
+        .unwrap();
+    let mut counts = 0;
+    let count_sql = format!("SELECT COUNT(*) FROM {quoted}");
+    for batch in history.execute().unwrap() {
+        let batch = batch.unwrap();
+        let texts = batch.column(0).as_string::<i32>();
+        counts += (0..texts.len())
+            .filter(|&row| texts.value(row) == count_sql)
+            .count();
+    }
+    assert_eq!(
+        counts, 2,
+        "initial count and failure recount must carry the tag"
+    );
+    ddl.set_sql_query(format!("DROP TABLE {quoted}")).unwrap();
+    ddl.execute_update().unwrap();
+}
+
+#[test]
+fn test_jwt_key_replacement_uses_last_parsed_key_and_does_not_reopen_file() {
+    use aws_lc_rs::{encoding::AsDer, signature::RsaKeyPair};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, URL_SAFE},
+    };
+    use pkcs8::der::Decode;
+    use std::io::Write as _;
+
+    let Some(uri) = get_env("SNOWFLAKE_URI") else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let decode = |value: &str| {
+        let bytes = value.as_bytes();
+        let mut output = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'%' => {
+                    let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap();
+                    output.push(u8::from_str_radix(hex, 16).unwrap());
+                    index += 3;
+                }
+                b'+' => {
+                    output.push(b' ');
+                    index += 1;
+                }
+                byte => {
+                    output.push(byte);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8(output).unwrap()
+    };
+    let key_source = uri.split_once('?').and_then(|(_, query)| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find_map(|(name, value)| {
+                let name = decode(name);
+                matches!(
+                    name.as_str(),
+                    "privateKey" | "private_key" | "private_key_file"
+                )
+                .then(|| (name, decode(value)))
+            })
+    });
+    let Some((source, value)) = key_source else {
+        eprintln!("Skipping: SNOWFLAKE_URI does not configure a private key");
+        return;
+    };
+    let encoded = if source == "private_key_file" {
+        std::fs::read(value).unwrap()
+    } else if value.contains("-----BEGIN ") {
+        value.into_bytes()
+    } else if source == "privateKey" {
+        URL_SAFE.decode(value).unwrap()
+    } else {
+        STANDARD.decode(value).unwrap()
+    };
+    let der = if encoded.starts_with(b"-----BEGIN ") {
+        let body = std::str::from_utf8(&encoded)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        STANDARD.decode(body).unwrap()
+    } else {
+        encoded
+    };
+    let key = RsaKeyPair::from_pkcs8(&der)
+        .or_else(|_| RsaKeyPair::from_der(&der))
+        .unwrap();
+    let valid_der = key.as_der().unwrap();
+    let pem = |label: &str, bytes: &[u8]| {
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            STANDARD.encode(bytes)
+        )
+    };
+    let valid_pem = pem("PRIVATE KEY", valid_der.as_ref());
+    let other = RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+        .unwrap()
+        .as_der()
+        .unwrap();
+    let other_pem = pem("PRIVATE KEY", other.as_ref());
+    let encrypted = pkcs8::PrivateKeyInfo::from_der(valid_der.as_ref())
+        .unwrap()
+        .encrypt_with_params(
+            pkcs8::pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(
+                100,
+                b"integration test salt",
+                &[9; 16],
+            )
+            .unwrap(),
+            b"integration test password",
+        )
+        .unwrap();
+    let encrypted_pem = pem("ENCRYPTED PRIVATE KEY", encrypted.as_bytes());
+    struct RemoveKeyFile(std::path::PathBuf);
+    impl Drop for RemoveKeyFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    for file_last in [false, true] {
+        let mut db = make_db().unwrap();
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.auth_type".into()),
+            OptionValue::String("auth_jwt".into()),
+        )
+        .unwrap();
+        let path = RemoveKeyFile(
+            std::env::temp_dir().join(format!("adbc-jwt-{}.pem", uuid::Uuid::new_v4())),
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&path.0)
+            .unwrap()
+            .write_all(if file_last {
+                valid_pem.as_bytes()
+            } else {
+                other_pem.as_bytes()
+            })
+            .unwrap();
+        let file_option =
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.jwt_private_key".into());
+        let value_option = OptionDatabase::Other(
+            "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_value".into(),
+        );
+        if file_last {
+            db.set_option(value_option, OptionValue::String(other_pem.clone()))
+                .unwrap();
+            db.set_option(
+                file_option,
+                OptionValue::String(path.0.to_str().unwrap().into()),
+            )
+            .unwrap();
+        } else {
+            db.set_option(
+                file_option,
+                OptionValue::String(path.0.to_str().unwrap().into()),
+            )
+            .unwrap();
+            db.set_option(
+                OptionDatabase::Other(
+                    "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password".into(),
+                ),
+                OptionValue::String("integration test password".into()),
+            )
+            .unwrap();
+            db.set_option(value_option, OptionValue::String(encrypted_pem.clone()))
+                .unwrap();
+        }
+        std::fs::remove_file(&path.0).unwrap();
+        let mut connection = db
+            .new_connection()
+            .expect("last parsed key must authenticate");
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("SELECT 1").unwrap();
+        let rows = statement
+            .execute()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 1);
+    }
+}
+
+fn temporary_ingest_preserves_permanent_table(mode: &str) {
+    use adbc_core::error::Status;
+
+    let Some(db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut conn = db.new_connection().unwrap();
+    let mut observer = db.new_connection().unwrap();
+    // Exercise literal matching, SQL quoting, and case-sensitive identifiers.
+    let table = format!("ADBC_TEMP_{}_mixed_%_'_\\", uuid::Uuid::new_v4().simple());
+    let quoted = format!("\"{table}\"");
+    let execute = |conn: &mut adbc_driver_snowflake::Connection, sql: String| {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query(sql).unwrap();
+        stmt.execute_update().unwrap();
+    };
+    let ids = |conn: &mut adbc_driver_snowflake::Connection| {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_sql_query(format!("SELECT ID FROM {quoted} ORDER BY ID"))
+            .unwrap();
+        stmt.execute()
+            .unwrap()
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        arrow_cast::display::array_value_to_string(batch.column(0), row).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    execute(
+        &mut observer,
+        format!("CREATE TABLE {quoted} AS SELECT 99 AS ID"),
+    );
+    let first = ingest_temporary_rows(&mut conn, &table, mode, vec![1, 2]);
+    let first_permanent_rows = ids(&mut observer);
+    if mode == "append" {
+        // The permanent table has a compatible schema, so schema validation
+        // alone would incorrectly permit COPY into it.
+        execute(
+            &mut conn,
+            format!("CREATE TEMPORARY TABLE {quoted} AS SELECT 0 AS ID"),
+        );
+    }
+    let first_temporary_rows = ids(&mut conn);
+    let second = ingest_temporary_rows(&mut conn, &table, mode, vec![3]);
+    let second_temporary_rows = ids(&mut conn);
+    let second_permanent_rows = ids(&mut observer);
+    // Clean up before asserting so a regression does not leak a permanent table.
+    execute(&mut conn, format!("DROP TABLE {quoted}"));
+    execute(&mut observer, format!("DROP TABLE {quoted}"));
+
+    assert_eq!(first_permanent_rows, ["99"], "{mode}");
+    assert_eq!(second_permanent_rows, ["99"], "{mode}");
+    match mode {
+        "append" => {
+            assert_eq!(first.unwrap_err().status, Status::NotFound);
+            assert_eq!(first_temporary_rows, ["0"]);
+            assert_eq!(second.unwrap(), Some(1));
+            assert_eq!(second_temporary_rows, ["0", "3"]);
+        }
+        "create" => {
+            assert_eq!(first.unwrap(), Some(2));
+            assert_eq!(first_temporary_rows, ["1", "2"]);
+            assert_eq!(second.unwrap_err().status, Status::AlreadyExists);
+            assert_eq!(second_temporary_rows, ["1", "2"]);
+        }
+        "create_append" => {
+            assert_eq!(first.unwrap(), Some(2));
+            assert_eq!(first_temporary_rows, ["1", "2"]);
+            assert_eq!(second.unwrap(), Some(1));
+            assert_eq!(second_temporary_rows, ["1", "2", "3"]);
+        }
+        "replace" => {
+            assert_eq!(first.unwrap(), Some(2));
+            assert_eq!(first_temporary_rows, ["1", "2"]);
+            assert_eq!(second.unwrap(), Some(1));
+            assert_eq!(second_temporary_rows, ["3"]);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn test_temporary_ingest_append_preserves_permanent_table() {
+    temporary_ingest_preserves_permanent_table("append");
+}
+
+#[test]
+fn test_temporary_ingest_create_preserves_permanent_table() {
+    temporary_ingest_preserves_permanent_table("create");
+}
+
+#[test]
+fn test_temporary_ingest_create_append_preserves_permanent_table() {
+    temporary_ingest_preserves_permanent_table("create_append");
+}
+
+#[test]
+fn test_temporary_ingest_replace_preserves_permanent_table() {
+    temporary_ingest_preserves_permanent_table("replace");
 }

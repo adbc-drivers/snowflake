@@ -28,7 +28,7 @@ use adbc_core::{
     schemas,
 };
 use arrow_array::{Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use driverbase::InfoRegistry;
 use driverbase::error::ErrorHelper;
 use driverbase::telemetry::{TRACE_PARENT, validate_trace_parent};
@@ -279,6 +279,15 @@ fn apply_desc_metadata(schema: &Schema, columns: &HashMap<String, DescColumn>) -
             if let Some(comment) = &desc.comment {
                 metadata.insert("COMMENT".to_owned(), comment.clone());
             }
+            if desc.data_type == "UUID" {
+                metadata.insert("ARROW:extension:name".into(), "arrow.uuid".into());
+                return Ok(Field::new(
+                    field.name(),
+                    DataType::FixedSizeBinary(16),
+                    field.is_nullable(),
+                )
+                .with_metadata(metadata));
+            }
             if let Some(extension) = extension {
                 metadata.insert("ARROW:extension:name".to_owned(), extension.to_owned());
                 if let Some(value) = field.metadata().get("ARROW:extension:metadata") {
@@ -288,7 +297,7 @@ fn apply_desc_metadata(schema: &Schema, columns: &HashMap<String, DescColumn>) -
             Ok(field.as_ref().clone().with_metadata(metadata))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+    Ok(Schema::new(fields))
 }
 
 impl Connection {
@@ -547,14 +556,14 @@ impl adbc_core::Connection for Connection {
             last_query_id: None,
             prepared: false,
             described: Mutex::new(None),
-            operation: Arc::new(Mutex::new(Arc::new(OperationCtx::with_own_token()))),
+            operation: Arc::new(Mutex::new(crate::driver::StatementOperationState::default())),
         })
     }
 
     fn get_cancel_handle(&self) -> Box<dyn adbc_core::CancelHandle> {
-        Box::new(OperationCancelHandle {
-            operation: Arc::clone(&self.operation),
-        })
+        Box::new(OperationCancelHandle::Connection(Arc::clone(
+            &self.operation,
+        )))
     }
 
     #[allow(refining_impl_trait)]
@@ -655,6 +664,7 @@ impl adbc_core::Connection for Connection {
                         &schema,
                         self.timestamp_precision.time_unit(),
                         &timezone,
+                        None,
                         None,
                     );
                     let columns = self.with_metadata_reader(
@@ -1236,15 +1246,21 @@ mod tests {
                 "ARROW:extension:name".into(),
                 "arrow.json".into(),
             )])),
-            Field::new("UUID_COL", DataType::FixedSizeBinary(16), true).with_metadata(
-                HashMap::from([("ARROW:extension:name".into(), "arrow.uuid".into())]),
-            ),
+            Field::new("UUID_COL", DataType::Utf8, true).with_metadata(HashMap::from([
+                ("logicalType".into(), "TEXT".into()),
+                ("SNOWFLAKE_TYPE".into(), "text".into()),
+            ])),
             Field::new("LOCATION", DataType::Binary, true).with_metadata(HashMap::from([(
                 "ARROW:extension:name".into(),
                 "geoarrow.wkb".into(),
             )])),
         ];
-        let result = apply_desc_metadata(&Schema::new(fields.to_vec()), &desc).unwrap();
+        let source = Schema::new_with_metadata(
+            fields.to_vec(),
+            HashMap::from([("core_only".into(), "discarded".into())]),
+        );
+        let result = apply_desc_metadata(&source, &desc).unwrap();
+        assert!(result.metadata().is_empty());
         assert_eq!(
             result.field(0).metadata(),
             &HashMap::from([
@@ -1257,29 +1273,15 @@ mod tests {
             result.field(1).metadata(),
             &HashMap::from([("ARROW:extension:name".into(), "arrow.json".into())]),
         );
+        assert_eq!(result.field(2).data_type(), &DataType::FixedSizeBinary(16));
         assert_eq!(
-            result
-                .field(2)
-                .metadata()
-                .get("COMMENT")
-                .map(String::as_str),
-            Some("")
-        );
-        assert_eq!(
-            result
-                .field(2)
-                .metadata()
-                .get("DATA_TYPE")
-                .map(String::as_str),
-            Some("UUID")
-        );
-        assert_eq!(
-            result
-                .field(2)
-                .metadata()
-                .get("ARROW:extension:name")
-                .map(String::as_str),
-            Some("arrow.uuid")
+            result.field(2).metadata(),
+            &HashMap::from([
+                ("DATA_TYPE".into(), "UUID".into()),
+                ("PRIMARY_KEY".into(), "N".into()),
+                ("COMMENT".into(), String::new()),
+                ("ARROW:extension:name".into(), "arrow.uuid".into()),
+            ]),
         );
         assert_eq!(
             result.field(3).metadata(),

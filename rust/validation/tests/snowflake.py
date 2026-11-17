@@ -16,6 +16,7 @@ import functools
 import re
 from pathlib import Path
 
+import adbc_driver_manager.dbapi
 import pyarrow
 from adbc_drivers_validation import compare, model, quirks
 
@@ -63,7 +64,8 @@ class SnowflakeQuirks(model.DriverQuirks):
         statement_bulk_ingest=True,
         statement_bulk_ingest_catalog=True,
         statement_bulk_ingest_schema=True,
-        statement_bulk_ingest_temporary=False,
+        statement_bulk_ingest_temporary=True,
+        quirk_bulk_ingest_temporary_shares_namespace=True,
         statement_execute_schema=True,
         statement_get_parameter_schema=True,
         statement_prepare=True,
@@ -126,6 +128,13 @@ class SnowflakeQuirks(model.DriverQuirks):
     def quote_one_identifier(self, identifier: str) -> str:
         identifier = identifier.replace('"', '""')
         return f'"{identifier}"'
+
+    def qualify_temp_table(
+        self, cursor: adbc_driver_manager.dbapi.Cursor, name: str
+    ) -> str:
+        # Snowflake temporary tables live in the session's current schema and
+        # shadow permanent tables of the same name.
+        return self.quote_identifier(name)
 
     def split_statement(self, statement: str) -> list[str]:
         return quirks.split_statement(statement, dialect=self.name)

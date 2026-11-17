@@ -28,6 +28,14 @@ impl ErrorHelper for SnowflakeError {
     const NAME: &'static str = "Snowflake";
 }
 
+/// Go uses a lowercase prefix for server diagnostics and selected legacy errors.
+#[derive(Clone)]
+pub(crate) struct SnowflakeErrorLowercase;
+
+impl ErrorHelper for SnowflakeErrorLowercase {
+    const NAME: &'static str = "snowflake";
+}
+
 fn sqlstate_to_adbc(sqlstate: &str) -> Option<[c_char; 5]> {
     let bytes: [u8; 5] = sqlstate.as_bytes().try_into().ok()?;
     Some(bytes.map(|byte| byte as c_char))
@@ -84,9 +92,9 @@ fn query_failure_error(
     code: Option<i32>,
     sql_state: Option<&str>,
     query_id: Option<&str>,
-) -> DriverError<SnowflakeError> {
+) -> DriverError<SnowflakeErrorLowercase> {
     let (status, vendor_code, sqlstate) = classify_query_failure(message, code, sql_state);
-    let error = SnowflakeError::status(status).context("execute query");
+    let error = SnowflakeErrorLowercase::status(status);
     let error = match query_id.filter(|id| !id.is_empty()) {
         Some(id) => error.format(format_args!("{message} (query ID: {id})")),
         None => error.message(message),
@@ -105,7 +113,7 @@ pub(crate) fn failed_query_id(err: &ApiError) -> Option<String> {
     }
 }
 
-fn login_failure_error(err: &(dyn std::error::Error + 'static)) -> DriverError<SnowflakeError> {
+fn login_failure_error(err: &(dyn std::error::Error + 'static)) -> Error {
     let mut cause = Some(err);
     while let Some(source) = cause {
         let rest_error = source
@@ -116,16 +124,18 @@ fn login_failure_error(err: &(dyn std::error::Error + 'static)) -> DriverError<S
             // of the more specific authorization SQLSTATE used by sf_core.
             let (status, vendor_code, sqlstate) =
                 classify_server_failure(Some(*code), Some("08004"));
-            return SnowflakeError::status(status)
+            return SnowflakeErrorLowercase::status(status)
                 .format(format_args!("{code:06} (08004): {message}"))
                 .vendor_code(vendor_code)
-                .sqlstate(sqlstate);
+                .sqlstate(sqlstate)
+                .into();
         }
         if matches!(rest_error, Some(RestError::SessionExpired { .. })) {
-            return SnowflakeError::status(Status::Unauthorized)
+            return SnowflakeErrorLowercase::status(Status::Unauthorized)
                 .message(message_with_causes(err))
                 .vendor_code(260008)
-                .sqlstate(sqlstate_to_adbc("08004").unwrap());
+                .sqlstate(sqlstate_to_adbc("08004").unwrap())
+                .into();
         }
         if let Some(sf_core::rest::snowflake::SnowflakeResponseError::ResponseStatus {
             status,
@@ -140,16 +150,19 @@ fn login_failure_error(err: &(dyn std::error::Error + 'static)) -> DriverError<S
             };
             let (status, vendor_code, sqlstate) =
                 classify_server_failure(Some(code), Some(sql_state));
-            return SnowflakeError::status(status)
+            return SnowflakeErrorLowercase::status(status)
                 .message(message_with_causes(err))
                 .vendor_code(vendor_code)
-                .sqlstate(sqlstate);
+                .sqlstate(sqlstate)
+                .into();
         }
         cause = source.source();
     }
     // Transport failures, retry exhaustion, and browser/OAuth errors do not
     // necessarily carry Snowflake diagnostics; never invent a server code.
-    SnowflakeError::status(Status::Unauthenticated).message(message_with_causes(err))
+    SnowflakeError::status(Status::Unauthenticated)
+        .message(message_with_causes(err))
+        .into()
 }
 
 pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
@@ -173,7 +186,7 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         .into();
     }
     if matches!(&err, ApiError::Login { .. }) {
-        return login_failure_error(&err).into();
+        return login_failure_error(&err);
     }
     let status = match &err {
         ApiError::InvalidArgument { .. } => Status::InvalidArguments,
@@ -266,13 +279,13 @@ mod tests {
 
     #[test]
     fn login_rejection_preserves_go_diagnostics_and_server_message() {
-        let error = login_failure_error(&login_rejection(390100)).to_adbc();
+        let error = login_failure_error(&login_rejection(390100));
         assert_eq!(error.status, Status::Unauthorized);
         assert_eq!(error.vendor_code, 390100);
         assert_eq!(error.sqlstate, sqlstate_to_adbc("08004").unwrap());
         assert_eq!(
             error.message,
-            "[Snowflake] 390100 (08004): Incorrect username or password was specified."
+            "[snowflake] 390100 (08004): Incorrect username or password was specified."
         );
         // Go applies vendor-code overrides after the connection SQLSTATE.
         for (code, expected) in [
@@ -281,10 +294,7 @@ mod tests {
             (100383, Status::InvalidArguments),
             (QUERY_CANCELED, Status::Unauthorized),
         ] {
-            assert_eq!(
-                login_failure_error(&login_rejection(code)).to_adbc().status,
-                expected,
-            );
+            assert_eq!(login_failure_error(&login_rejection(code)).status, expected,);
         }
     }
 
@@ -302,7 +312,7 @@ mod tests {
                 Some(&self.0)
             }
         }
-        let error = login_failure_error(&Wrapped(Box::new(login_rejection(390100)))).to_adbc();
+        let error = login_failure_error(&Wrapped(Box::new(login_rejection(390100))));
         assert_eq!(error.status, Status::Unauthorized);
         assert_eq!(error.vendor_code, 390100);
         assert_eq!(error.sqlstate, sqlstate_to_adbc("08004").unwrap());
@@ -314,8 +324,7 @@ mod tests {
         let ApiError::InvalidArgument { location, .. } = ApiError::invalid_argument("test") else {
             unreachable!()
         };
-        let error =
-            login_failure_error(&Box::new(RestError::SessionExpired { location })).to_adbc();
+        let error = login_failure_error(&Box::new(RestError::SessionExpired { location }));
         assert_eq!(error.status, Status::Unauthorized);
         assert_eq!(error.vendor_code, 260008);
         assert_eq!(error.sqlstate, sqlstate_to_adbc("08004").unwrap());
@@ -342,7 +351,7 @@ mod tests {
                 },
                 location,
             };
-            let error = login_failure_error(&source).to_adbc();
+            let error = login_failure_error(&source);
             assert_eq!(error.status, status, "HTTP {http_status}");
             assert_eq!(error.vendor_code, vendor_code, "HTTP {http_status}");
             assert_eq!(error.sqlstate, sqlstate_to_adbc(sqlstate).unwrap());
@@ -361,13 +370,13 @@ mod tests {
             ids: Default::default(),
             location,
         };
-        let error = login_failure_error(&source).to_adbc();
+        let error = login_failure_error(&source);
         assert_eq!(error.status, Status::Unauthenticated);
         assert_eq!(error.vendor_code, 0);
         assert_eq!(error.sqlstate, [0; 5]);
         assert!(error.message.contains("login timed out"));
         let network = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "network failure");
-        let error = login_failure_error(&network).to_adbc();
+        let error = login_failure_error(&network);
         assert_eq!(error.status, Status::Unauthenticated);
         assert_eq!(error.vendor_code, 0);
         assert_eq!(error.sqlstate, [0; 5]);
@@ -464,7 +473,7 @@ mod tests {
         assert_eq!(error.sqlstate, sqlstate_to_adbc("42000").unwrap());
         assert_eq!(
             error.message,
-            "[Snowflake] could not execute query: SQL compilation error: syntax error (query ID: 01abcdef)"
+            "[snowflake] SQL compilation error: syntax error (query ID: 01abcdef)"
         );
         assert_eq!(
             query_failure_error("query canceled", Some(QUERY_CANCELED), Some("57014"), None)
@@ -476,7 +485,7 @@ mod tests {
             query_failure_error("failure", None, None, Some(""))
                 .to_adbc()
                 .message,
-            "[Snowflake] could not execute query: failure"
+            "[snowflake] failure"
         );
         let missing = query_failure_error("missing table", None, Some("42S02"), None).to_adbc();
         assert_eq!(missing.status, Status::NotFound);

@@ -41,6 +41,12 @@ arrow-buffer = { version = ">=58.3,<59", default-features = false }
 arrow-schema = { version = ">=58.3,<59", default-features = false, features = ["canonical_extension_types"] }
 arrow-cast = { version = ">=58.3,<59", default-features = false }
 parquet = { version = ">=58.3,<59", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "snap", "flate2-zlib-rs", "brotli", "zstd", "lz4"] }
+# Reuse sf_core's locked crypto stack for eager Go-compatible key parsing.
+aws-lc-rs = ">=1.16.2, <1.18"
+base64 = "0.22.1"
+pkcs8 = { version = "0.10.2", features = ["3des", "sha1-insecure"] }
+zeroize = "1.8.2"
+chrono = "0.4.44"
 serde_json = "1"
 uuid = "1"
 log = "0.4.22"
@@ -57,9 +63,11 @@ opentelemetry_sdk = "0.30"
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10.76", features = ["vendored"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 bytes = "1"
-chrono = "0.4"
 
 # sf_core pins rustls-webpki =0.103.16 but caps aws-lc-rs <1.18, while
 # crates.io rustls-webpki 0.103.14+ requires aws-lc-rs ^1.18. Upstream resolves
