@@ -1531,7 +1531,7 @@ dependencies = [
 [[package]]
 name = "error_trace"
 version = "0.1.0"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 dependencies = [
  "error_trace_derive",
  "snafu 0.8.9",
@@ -1540,7 +1540,7 @@ dependencies = [
 [[package]]
 name = "error_trace_derive"
 version = "0.1.0"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -1808,9 +1808,9 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "839c0e8a181239723652be9062bb56ca5bf5f64011f73b623f6f4fc59086a228"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3320,7 +3320,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools",
  "log",
  "multimap",
@@ -3384,7 +3384,7 @@ dependencies = [
 [[package]]
 name = "proto_generator"
 version = "0.1.0"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 dependencies = [
  "clap",
  "env_logger",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "proto_utils"
 version = "0.1.0"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 
 [[package]]
 name = "ptr_meta"
@@ -3852,7 +3852,7 @@ dependencies = [
 [[package]]
 name = "rustls-webpki"
 version = "0.103.16"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4036,7 +4036,7 @@ dependencies = [
 [[package]]
 name = "sf_core"
 version = "0.1.0"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4066,6 +4066,7 @@ dependencies = [
  "fs2",
  "futures",
  "glob",
+ "h2",
  "hex",
  "html-escape",
  "http 1.4.0",
@@ -4129,7 +4130,7 @@ dependencies = [
 [[package]]
 name = "sf_params_spec"
 version = "0.0.0"
-source = "git+https://github.com/zeroshade/universal-driver?rev=d255a731c32a54626cd153bf673cc951f9c94137#d255a731c32a54626cd153bf673cc951f9c94137"
+source = "git+https://github.com/zeroshade/universal-driver?rev=85e2a02b218b455924d49b25b4dc9e82c3940717#85e2a02b218b455924d49b25b4dc9e82c3940717"
 
 [[package]]
 name = "sha1"
@@ -4261,7 +4262,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5178,7 +5179,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

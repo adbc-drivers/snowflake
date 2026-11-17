@@ -38,15 +38,11 @@ fn is_snowflake_statement_timeout(message: &str) -> bool {
     message.contains("statement or warehouse timeout") || message.contains("statement timeout")
 }
 
-/// Classify a server-side query failure into an ADBC status plus the vendor
-/// code and SQLSTATE forwarded to the caller.
-fn classify_query_failure(
-    message: &str,
+fn classify_server_failure(
     code: Option<i32>,
     sql_state: Option<&str>,
 ) -> (Status, i32, [c_char; 5]) {
     let sqlstate = sql_state.and_then(sqlstate_to_adbc).unwrap_or([0; 5]);
-    let server_cancel = code == Some(QUERY_CANCELED) || sql_state == Some("57014");
     // Go's SQLSTATE mapping is applied first; vendor codes override it.
     let mut status = match sql_state {
         Some("42S02") => Status::NotFound,
@@ -59,6 +55,18 @@ fn classify_query_failure(
         Some(2003) => Status::NotFound,
         _ => status,
     };
+    (status, code.unwrap_or_default(), sqlstate)
+}
+
+/// Classify a server-side query failure into an ADBC status plus the vendor
+/// code and SQLSTATE forwarded to the caller.
+fn classify_query_failure(
+    message: &str,
+    code: Option<i32>,
+    sql_state: Option<&str>,
+) -> (Status, i32, [c_char; 5]) {
+    let (mut status, vendor_code, sqlstate) = classify_server_failure(code, sql_state);
+    let server_cancel = code == Some(QUERY_CANCELED) || sql_state == Some("57014");
     // Server cancellation and statement timeout are distinguished by the
     // server message, even when another diagnostic code is also present.
     if server_cancel {
@@ -68,7 +76,7 @@ fn classify_query_failure(
             Status::Cancelled
         };
     }
-    (status, code.unwrap_or_default(), sqlstate)
+    (status, vendor_code, sqlstate)
 }
 
 fn query_failure_error(
@@ -97,6 +105,53 @@ pub(crate) fn failed_query_id(err: &ApiError) -> Option<String> {
     }
 }
 
+fn login_failure_error(err: &(dyn std::error::Error + 'static)) -> DriverError<SnowflakeError> {
+    let mut cause = Some(err);
+    while let Some(source) = cause {
+        let rest_error = source
+            .downcast_ref::<RestError>()
+            .or_else(|| source.downcast_ref::<Box<RestError>>().map(Box::as_ref));
+        if let Some(RestError::LoginError { message, code, .. }) = rest_error {
+            // gosnowflake uses 08004 for server login rejections, regardless
+            // of the more specific authorization SQLSTATE used by sf_core.
+            let (status, vendor_code, sqlstate) =
+                classify_server_failure(Some(*code), Some("08004"));
+            return SnowflakeError::status(status)
+                .format(format_args!("{code:06} (08004): {message}"))
+                .vendor_code(vendor_code)
+                .sqlstate(sqlstate);
+        }
+        if matches!(rest_error, Some(RestError::SessionExpired { .. })) {
+            return SnowflakeError::status(Status::Unauthorized)
+                .message(message_with_causes(err))
+                .vendor_code(260008)
+                .sqlstate(sqlstate_to_adbc("08004").unwrap());
+        }
+        if let Some(sf_core::rest::snowflake::SnowflakeResponseError::ResponseStatus {
+            status,
+            ..
+        }) = source.downcast_ref::<sf_core::rest::snowflake::SnowflakeResponseError>()
+        {
+            // Match gosnowflake's postAuth HTTP response classification.
+            let (code, sql_state) = match status.as_u16() {
+                502..=504 => (260007, "08001"),
+                403 => (260008, "08004"),
+                _ => (261004, "08004"),
+            };
+            let (status, vendor_code, sqlstate) =
+                classify_server_failure(Some(code), Some(sql_state));
+            return SnowflakeError::status(status)
+                .message(message_with_causes(err))
+                .vendor_code(vendor_code)
+                .sqlstate(sqlstate);
+        }
+        cause = source.source();
+    }
+    // Transport failures, retry exhaustion, and browser/OAuth errors do not
+    // necessarily carry Snowflake diagnostics; never invent a server code.
+    SnowflakeError::status(Status::Unauthenticated).message(message_with_causes(err))
+}
+
 pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
     // QueryFailed carries the server's diagnostics directly; keep the full
     // cause chain as well as its SQLSTATE, vendor code, and query ID.
@@ -117,6 +172,9 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         )
         .into();
     }
+    if matches!(&err, ApiError::Login { .. }) {
+        return login_failure_error(&err).into();
+    }
     let status = match &err {
         ApiError::InvalidArgument { .. } => Status::InvalidArguments,
         ApiError::Configuration { .. } => Status::InvalidArguments,
@@ -126,7 +184,6 @@ pub(crate) fn api_error_to_adbc_error(err: ApiError) -> Error {
         ApiError::StatementLocking { .. } => Status::InvalidState,
         ApiError::DatabaseLocking { .. } => Status::InvalidState,
         ApiError::InvalidRefreshState { .. } => Status::InvalidState,
-        ApiError::Login { .. } => Status::Unauthenticated,
         ApiError::SessionRefresh { .. } => Status::Unauthenticated,
         ApiError::MasterTokenTerminal { .. } => Status::Unauthenticated,
         ApiError::TlsClientCreation { .. } => Status::IO,
@@ -191,6 +248,130 @@ mod tests {
         assert_eq!(error.vendor_code, 0);
         assert_eq!(error.sqlstate, [0; 5]);
         assert_eq!(error.message, "[Snowflake] Invalid argument: bad handle");
+    }
+
+    fn login_rejection(code: i32) -> RestError {
+        // ApiError variants are non-exhaustive; reuse a public constructor's
+        // location to build the public REST error without a snafu dependency.
+        let ApiError::InvalidArgument { location, .. } = ApiError::invalid_argument("test") else {
+            unreachable!()
+        };
+        RestError::LoginError {
+            message: "Incorrect username or password was specified.".into(),
+            code,
+            reauthentication_required: false,
+            location,
+        }
+    }
+
+    #[test]
+    fn login_rejection_preserves_go_diagnostics_and_server_message() {
+        let error = login_failure_error(&login_rejection(390100)).to_adbc();
+        assert_eq!(error.status, Status::Unauthorized);
+        assert_eq!(error.vendor_code, 390100);
+        assert_eq!(error.sqlstate, sqlstate_to_adbc("08004").unwrap());
+        assert_eq!(
+            error.message,
+            "[Snowflake] 390100 (08004): Incorrect username or password was specified."
+        );
+        // Go applies vendor-code overrides after the connection SQLSTATE.
+        for (code, expected) in [
+            (1003, Status::InvalidArguments),
+            (2003, Status::NotFound),
+            (100383, Status::InvalidArguments),
+            (QUERY_CANCELED, Status::Unauthorized),
+        ] {
+            assert_eq!(
+                login_failure_error(&login_rejection(code)).to_adbc().status,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn login_rejection_diagnostics_survive_nested_sources() {
+        #[derive(Debug)]
+        struct Wrapped(Box<RestError>);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("authentication wrapper")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = login_failure_error(&Wrapped(Box::new(login_rejection(390100)))).to_adbc();
+        assert_eq!(error.status, Status::Unauthorized);
+        assert_eq!(error.vendor_code, 390100);
+        assert_eq!(error.sqlstate, sqlstate_to_adbc("08004").unwrap());
+        assert!(error.message.contains("Incorrect username or password"));
+    }
+
+    #[test]
+    fn login_session_expired_preserves_go_http_401_diagnostics() {
+        let ApiError::InvalidArgument { location, .. } = ApiError::invalid_argument("test") else {
+            unreachable!()
+        };
+        let error =
+            login_failure_error(&Box::new(RestError::SessionExpired { location })).to_adbc();
+        assert_eq!(error.status, Status::Unauthorized);
+        assert_eq!(error.vendor_code, 260008);
+        assert_eq!(error.sqlstate, sqlstate_to_adbc("08004").unwrap());
+    }
+
+    #[test]
+    fn login_http_failures_preserve_go_diagnostics() {
+        for (http_status, vendor_code, sqlstate, status) in [
+            (403_u16, 260008, "08004", Status::Unauthorized),
+            (502, 260007, "08001", Status::IO),
+            (503, 260007, "08001", Status::IO),
+            (504, 260007, "08001", Status::IO),
+            (400, 261004, "08004", Status::Unauthorized),
+        ] {
+            let ApiError::InvalidArgument { location, .. } = ApiError::invalid_argument("test")
+            else {
+                unreachable!()
+            };
+            let source = RestError::InvalidSnowflakeResponse {
+                source: sf_core::rest::snowflake::SnowflakeResponseError::ResponseStatus {
+                    status: http_status.try_into().unwrap(),
+                    message: "login request rejected".into(),
+                    location,
+                },
+                location,
+            };
+            let error = login_failure_error(&source).to_adbc();
+            assert_eq!(error.status, status, "HTTP {http_status}");
+            assert_eq!(error.vendor_code, vendor_code, "HTTP {http_status}");
+            assert_eq!(error.sqlstate, sqlstate_to_adbc(sqlstate).unwrap());
+            assert!(error.message.contains("login request rejected"));
+        }
+    }
+
+    #[test]
+    fn login_without_go_diagnostics_keeps_unauthenticated_fallback() {
+        let ApiError::InvalidArgument { location, .. } = ApiError::invalid_argument("test") else {
+            unreachable!()
+        };
+        let source = RestError::OperationTimeout {
+            operation: "login".into(),
+            budget: std::time::Duration::from_secs(5),
+            ids: Default::default(),
+            location,
+        };
+        let error = login_failure_error(&source).to_adbc();
+        assert_eq!(error.status, Status::Unauthenticated);
+        assert_eq!(error.vendor_code, 0);
+        assert_eq!(error.sqlstate, [0; 5]);
+        assert!(error.message.contains("login timed out"));
+        let network = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "network failure");
+        let error = login_failure_error(&network).to_adbc();
+        assert_eq!(error.status, Status::Unauthenticated);
+        assert_eq!(error.vendor_code, 0);
+        assert_eq!(error.sqlstate, [0; 5]);
+        assert!(error.message.contains("network failure"));
     }
 
     #[test]

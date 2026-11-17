@@ -87,6 +87,7 @@ pub(crate) struct Inner {
     pub(crate) dispatch: tracing::Dispatch,
     pub(crate) telemetry: Arc<Telemetry>,
     tracing_config: std::sync::Mutex<()>,
+    log_level: crate::telemetry::LogLevelHandle,
 }
 
 pub(crate) struct QueryResult {
@@ -108,12 +109,13 @@ impl Inner {
             env!("CARGO_PKG_VERSION"),
             "snowflake",
         ));
+        let (app_sink, log_level) = app_layer(Arc::clone(&telemetry));
         let log_manager = sf_core::logging::LogManager::with_app_sink(
             sf_core::logging::LoggingConfig {
                 enabled: false,
                 ..Default::default()
             },
-            app_layer(Arc::clone(&telemetry)),
+            app_sink,
             Default::default(),
         )
         .map_err(|error| {
@@ -161,6 +163,7 @@ impl Inner {
             dispatch,
             telemetry,
             tracing_config: std::sync::Mutex::new(()),
+            log_level,
         })
     }
 
@@ -168,14 +171,31 @@ impl Inner {
         &self,
         exporter: Option<Exporter>,
         folder: Option<&str>,
+        log_level: Option<&str>,
     ) -> Result<()> {
-        // The exporter is process-wide (see SHARED_INNER). A database that
-        // does not choose one must not switch off another database's traces;
-        // decide under one lock so a concurrent connect cannot interleave.
+        // Logging and exporters share this process-wide dispatcher. An unset
+        // option must not undo another database's explicit configuration.
+        // Reconfigure layers in place: creating another dispatcher can deadlock.
         let _guard = self
             .tracing_config
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if let Some(level) = log_level {
+            let filter = crate::telemetry::log_level_filter(level).ok_or_else(|| {
+                SnowflakeError::invalid_argument()
+                    .context("configure tracing")
+                    .format(format_args!("invalid log level '{level}'"))
+                    .to_adbc()
+            })?;
+            tracing::dispatcher::with_default(&self.dispatch, || {
+                self.log_level.reload(filter).map_err(|error| {
+                    SnowflakeError::internal_no_location()
+                        .context("configure tracing")
+                        .format(format_args!("could not update stderr log level: {error}"))
+                        .to_adbc()
+                })
+            })?;
+        }
         if exporter.is_none() && folder.is_none() && self.telemetry.is_enabled() {
             return Ok(());
         }
@@ -240,16 +260,33 @@ impl Inner {
         query: impl Into<String>,
         timeout_seconds: Option<u32>,
     ) -> Result<()> {
+        self.execute_temporary_statement_tagged(
+            operation_ctx,
+            connection,
+            query,
+            timeout_seconds,
+            None,
+        )
+    }
+
+    pub(crate) fn execute_temporary_statement_tagged(
+        &self,
+        operation_ctx: Option<&OperationCtx>,
+        connection: Handle,
+        query: impl Into<String>,
+        timeout_seconds: Option<u32>,
+        query_tag: Option<&str>,
+    ) -> Result<()> {
         let statement = self
             .sf
             .statement_new(connection)
             .map_err(crate::error::api_error_to_adbc_error)?;
-        let result = self.execute_query_with_timeout(
+        let result = self.execute_query_with_timeout_tagged(
             operation_ctx,
             statement,
             query.into(),
-            None,
             timeout_seconds,
+            query_tag,
         );
         let release = self.sf.statement_release(statement);
         match result {
@@ -284,6 +321,25 @@ impl Inner {
             )
             .map_err(crate::error::api_error_to_adbc_error)?;
         self.acquire_execute_result(result)
+    }
+
+    pub(crate) fn execute_query_with_timeout_tagged(
+        &self,
+        operation_ctx: Option<&OperationCtx>,
+        statement: Handle,
+        query: String,
+        timeout_seconds: Option<u32>,
+        query_tag: Option<&str>,
+    ) -> Result<QueryResult> {
+        if let Some(query_tag) = query_tag {
+            self.block_on(self.sf.statement_set_option(
+                statement,
+                sf_core::config::param_registry::param_names::QUERY_TAG.into(),
+                sf_core::config::settings::Setting::String(query_tag.to_owned()),
+            ))
+            .map_err(crate::error::api_error_to_adbc_error)?;
+        }
+        self.execute_query_with_timeout(operation_ctx, statement, query, None, timeout_seconds)
     }
 
     /// Like [`Self::execute_query_with_timeout`], also recording the query ID:
@@ -441,6 +497,8 @@ impl adbc_core::Driver for Driver {
             max_retry_count: None,
             duration_options: Default::default(),
             credential_options: Default::default(),
+            tls_skip_verify: false,
+            tracing_level: None,
             trace_parent: None,
             traces_exporter: None,
             traces_folder_path: None,

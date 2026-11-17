@@ -27,10 +27,12 @@ adbc_ffi = "0.25"
 # Integration branch: driverbase-rs #44 and #46 (both merged) plus the
 # unmerged #45 telemetry feature. Move the rev to main after #45 merges.
 driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "63df11eab9c6c75492827c1d9f280c63ba6c0c83", features = ["telemetry"] }
-# sf_core integration branch: snowflakedb/drivers main plus the JWT lifetime
-# and per-statement prefetch tuning changes. Move back to upstream (and update
-# rustls-webpki below) after those PRs merge.
-sf_core = { git = "https://github.com/zeroshade/universal-driver", rev = "d255a731c32a54626cd153bf673cc951f9c94137" }
+# sf_core integration branch (zeroshade/universal-driver adbc-integration-v2):
+# snowflakedb/universal-driver main (c9e93d3) plus per-statement prefetch
+# tuning, strict JSON chunk validation, Go-compatible GetObjects missing-scope
+# detection, and query tags on streamed PUT. Move back to upstream (and update
+# rustls-webpki below) after those changes merge.
+sf_core = { git = "https://github.com/zeroshade/universal-driver", rev = "85e2a02b218b455924d49b25b4dc9e82c3940717" }
 arrow-array = { version = ">=58.3,<59", default-features = false, features = [
   "ffi",
   "chrono-tz",
@@ -64,4 +66,4 @@ chrono = "0.4"
 # this with a workspace patch to its vendored copy; [patch] does not propagate
 # to git dependents, so mirror it here. Keep the rev in sync with sf_core.
 [patch.crates-io]
-rustls-webpki = { git = "https://github.com/zeroshade/universal-driver", rev = "d255a731c32a54626cd153bf673cc951f9c94137" }
+rustls-webpki = { git = "https://github.com/zeroshade/universal-driver", rev = "85e2a02b218b455924d49b25b4dc9e82c3940717" }

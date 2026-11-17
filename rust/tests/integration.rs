@@ -55,6 +55,33 @@ fn make_connection() -> Option<adbc_driver_snowflake::Connection> {
     Some(make_db()?.new_connection().expect("new_connection"))
 }
 
+/// A rejected login keeps Snowflake's vendor code and Go's SQLSTATE 08004.
+#[test]
+fn test_login_failure_diagnostics() {
+    let Some(mut db) = make_db() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    db.set_option(
+        OptionDatabase::Other("adbc.snowflake.sql.auth_type".into()),
+        OptionValue::String("auth_snowflake".into()),
+    )
+    .unwrap();
+    db.set_option(
+        OptionDatabase::Password,
+        OptionValue::String(format!("not-the-password-{}", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    let error = db.new_connection().err().expect("login must fail");
+    assert_eq!(
+        error.status,
+        adbc_core::error::Status::Unauthorized,
+        "{error:?}"
+    );
+    assert_ne!(error.vendor_code, 0, "{error:?}");
+    assert_eq!(error.sqlstate.map(|c| c as u8), *b"08004", "{error:?}");
+}
+
 #[test]
 fn test_private_key_simple_query() {
     let Some(mut conn) = make_connection() else {
@@ -779,33 +806,51 @@ fn test_database_options_round_trip() {
         return;
     };
 
-    let cases: &[(&str, &str)] = &[
-        ("adbc.snowflake.sql.client_option.login_timeout", "30s"),
-        ("adbc.snowflake.sql.client_option.request_timeout", "60s"),
-        ("adbc.snowflake.sql.client_option.client_timeout", "120s"),
+    // Boolean options accept enabled/disabled but read back as true/false, as in Go.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "adbc.snowflake.sql.client_option.login_timeout",
+            "30s",
+            "30s",
+        ),
+        (
+            "adbc.snowflake.sql.client_option.request_timeout",
+            "60s",
+            "60s",
+        ),
+        (
+            "adbc.snowflake.sql.client_option.client_timeout",
+            "120s",
+            "120s",
+        ),
         (
             "adbc.snowflake.sql.client_option.keep_session_alive",
             "enabled",
+            "true",
         ),
         (
             "adbc.snowflake.sql.client_option.disable_telemetry",
-            "enabled",
+            "true",
+            "true",
         ),
         (
             "adbc.snowflake.sql.client_option.cache_mfa_token",
             "enabled",
+            "true",
         ),
         (
             "adbc.snowflake.sql.client_option.store_temp_creds",
-            "enabled",
+            "false",
+            "false",
         ),
         (
             "adbc.snowflake.sql.client_option.identity_provider",
             "azure",
+            "azure",
         ),
     ];
 
-    for (key, val) in cases {
+    for (key, val, expected) in cases {
         db.set_option(
             OptionDatabase::Other((*key).into()),
             OptionValue::String((*val).into()),
@@ -816,11 +861,12 @@ fn test_database_options_round_trip() {
             .get_option_string(OptionDatabase::Other((*key).into()))
             .unwrap_or_else(|e| panic!("get_option_string({key}) failed: {e}"));
 
-        assert_eq!(got, *val, "round-trip mismatch for {key}");
+        assert_eq!(got, *expected, "round-trip mismatch for {key}");
     }
 }
 
-/// Verify the canonical tls_skip_verify option round-trips.
+/// tls_skip_verify only disables revocation checks (as in Go; the unit tests
+/// assert it never sets sf_core's TLS_SKIP_VERIFY) and reads back as true/false.
 #[test]
 fn test_tls_skip_verify_option() {
     let Some(mut db) = make_db() else {
@@ -828,36 +874,26 @@ fn test_tls_skip_verify_option() {
         return;
     };
 
-    // enabled → skip verification
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
-        OptionValue::String("enabled".into()),
-    )
-    .expect("set tls_skip_verify enabled");
+    let key = || OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into());
+    assert_eq!(db.get_option_string(key()).unwrap(), "false");
+    db.set_option(key(), OptionValue::String("enabled".into()))
+        .expect("set tls_skip_verify enabled");
+    assert_eq!(db.get_option_string(key()).unwrap(), "true");
+    let mut conn = db.new_connection().expect("connect with tls_skip_verify");
+    let mut stmt = conn.new_statement().unwrap();
+    stmt.set_sql_query("SELECT 1").unwrap();
     assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.tls_skip_verify".into()
-        ))
-        .unwrap(),
-        "enabled"
+        stmt.execute().unwrap().next().unwrap().unwrap().num_rows(),
+        1
     );
 
-    // disabled → restore verification
-    db.set_option(
-        OptionDatabase::Other("adbc.snowflake.sql.client_option.tls_skip_verify".into()),
-        OptionValue::String("disabled".into()),
-    )
-    .expect("set tls_skip_verify disabled");
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            "adbc.snowflake.sql.client_option.tls_skip_verify".into()
-        ))
-        .unwrap(),
-        "disabled"
-    );
+    db.set_option(key(), OptionValue::String("disabled".into()))
+        .expect("set tls_skip_verify disabled");
+    assert_eq!(db.get_option_string(key()).unwrap(), "false");
 }
 
-/// Unsupported Go-only options cannot be silently accepted by sf_core.
+/// Unsupported Go-only options cannot be silently accepted by sf_core; the
+/// getter reports Go's unset value.
 #[test]
 fn test_ocsp_fail_open_mode_is_not_implemented() {
     let Some(mut db) = make_db() else {
@@ -870,10 +906,7 @@ fn test_ocsp_fail_open_mode_is_not_implemented() {
         .set_option(option.clone(), OptionValue::String("enabled".into()))
         .unwrap_err();
     assert_eq!(error.status, adbc_core::error::Status::NotImplemented);
-    assert_eq!(
-        db.get_option_string(option).unwrap_err().status,
-        adbc_core::error::Status::NotFound
-    );
+    assert_eq!(db.get_option_string(option).unwrap(), "0");
 }
 
 #[test]
@@ -1126,6 +1159,105 @@ fn test_ingest_stream_parquet_split_and_append_schema_validation() {
         .unwrap();
     let error = append.execute_update().unwrap_err();
     assert_eq!(error.status, Status::AlreadyExists);
+
+    let mut cleanup = conn.new_statement().unwrap();
+    cleanup
+        .set_sql_query(format!("DROP TABLE IF EXISTS \"{table}\""))
+        .unwrap();
+    cleanup.execute_update().expect("drop ingest test table");
+}
+
+/// Empty ingest streams succeed with zero rows in every mode (as in Go), and
+/// the statement query tag reaches every ingest SQL statement and the PUT.
+#[test]
+fn test_ingest_empty_stream_and_query_tag() {
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let table = format!("ADBC_RUST_EMPTY_INGEST_{}", std::process::id());
+    let tag = format!("adbc-rust-ingest-tag-{}", uuid::Uuid::new_v4());
+    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
+    let ingest = |conn: &mut adbc_driver_snowflake::Connection, mode: &str, rows: Vec<i64>| {
+        let mut stmt = conn.new_statement().unwrap();
+        stmt.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String(table.clone()),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(format!("adbc.ingest.mode.{mode}")),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("adbc.snowflake.statement.query_tag".into()),
+            OptionValue::String(tag.clone()),
+        )
+        .unwrap();
+        let batches = if rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(rows))])
+                    .unwrap(),
+            ]
+        };
+        stmt.bind_stream(Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        )))
+        .unwrap();
+        stmt.execute_update()
+    };
+
+    assert_eq!(
+        ingest(&mut conn, "create", vec![]).expect("empty create"),
+        Some(0)
+    );
+    assert_eq!(count_rows(&mut conn, &format!("\"{table}\"")), 0);
+    assert_eq!(
+        ingest(&mut conn, "append", vec![]).expect("empty append"),
+        Some(0)
+    );
+    assert_eq!(
+        ingest(&mut conn, "create_append", vec![]).expect("empty create_append"),
+        Some(0)
+    );
+    assert_eq!(
+        ingest(&mut conn, "append", vec![1, 2]).expect("append"),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut conn, &format!("\"{table}\"")), 2);
+    assert_eq!(
+        ingest(&mut conn, "replace", vec![]).expect("empty replace"),
+        Some(0)
+    );
+    assert_eq!(count_rows(&mut conn, &format!("\"{table}\"")), 0);
+
+    let mut history = conn.new_statement().unwrap();
+    history
+        .set_sql_query(format!(
+            "SELECT QUERY_TEXT FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(RESULT_LIMIT => 1000)) \
+             WHERE QUERY_TAG = '{tag}'"
+        ))
+        .unwrap();
+    let mut texts = Vec::new();
+    for batch in history.execute().unwrap() {
+        let batch = batch.unwrap();
+        let column = batch.column(0).as_string::<i32>();
+        texts.extend((0..column.len()).map(|i| column.value(i).to_uppercase()));
+    }
+    for expected in ["CREATE TABLE", "PUT ", "COPY INTO", "SWAP WITH"] {
+        assert!(
+            texts.iter().any(|text| text.contains(expected)),
+            "no {expected:?} statement carried the query tag; tagged statements: {texts:#?}"
+        );
+    }
 
     let mut cleanup = conn.new_statement().unwrap();
     cleanup

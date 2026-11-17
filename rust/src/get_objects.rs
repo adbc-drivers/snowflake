@@ -21,7 +21,7 @@ use arrow_array::{
     Array, BooleanArray, Int32Array, Int64Array, LargeListArray, LargeStringArray, RecordBatch,
     RecordBatchReader, StringArray, StructArray,
 };
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType, TimeUnit};
 use driverbase::{
     error::{Error as DriverbaseError, ErrorHelper},
     get_objects::{
@@ -34,6 +34,7 @@ use sf_core::apis::database_driver_v1::{
 };
 
 use crate::connection::{Connection, quote_identifier};
+use crate::database::GeoOutputFormat;
 use crate::error::SnowflakeError;
 
 #[derive(Default)]
@@ -839,14 +840,16 @@ fn fetch_core_objects(
         // renumbers column ordinals in its filtered SHOW COLUMNS output.
         column_name: request.column_name.map(str::to_owned),
     };
-    // sf_core's connection_get_objects does not accept an OperationCtx yet.
-    // Its asynchronous request can still be interrupted at the wrapper boundary.
+    // sf_core runs the SHOWs under this operation, so a connection cancel
+    // aborts in-flight metadata requests server-side.
     let result = connection
         .inner
-        .block_on(operation.run(
-            "connection_get_objects",
-            connection.inner.sf.connection_get_objects(request),
-        ))
+        .block_on(
+            connection
+                .inner
+                .sf
+                .connection_get_objects(Some(operation), request),
+        )
         .map_err(crate::error::api_error_to_adbc_error)?;
     let mut reader = connection.inner.acquire_result(result)?.reader;
     let mut objects = ObjectTree::default();
@@ -859,7 +862,7 @@ fn fetch_core_objects(
         let batch = batch.map_err(|error| SnowflakeError::from_arrow(error).to_adbc())?;
         merge_all(
             &mut objects,
-            parse_core_batch(&batch)
+            parse_core_batch(&batch, connection)
                 .map_err(|error| SnowflakeError::from_arrow(error).to_adbc())?,
         );
     }
@@ -930,7 +933,10 @@ fn merge_all(target: &mut ObjectTree, source: ObjectTree) {
     }
 }
 
-fn parse_core_batch(batch: &RecordBatch) -> Result<ObjectTree, ArrowError> {
+fn parse_core_batch(
+    batch: &RecordBatch,
+    connection: &Connection,
+) -> Result<ObjectTree, ArrowError> {
     if batch.num_columns() != 2 {
         return Err(schema_error(format!(
             "sf_core get_objects returned {} top-level columns; expected 2",
@@ -986,7 +992,11 @@ fn parse_core_batch(batch: &RecordBatch) -> Result<ObjectTree, ArrowError> {
                 {
                     table.columns.reserve(column_range.len());
                     for column_index in column_range {
-                        table.columns.push(column_arrays.column(column_index)?);
+                        table.columns.push(column_arrays.column(
+                            column_index,
+                            connection.geography_output_format,
+                            connection.geometry_output_format,
+                        )?);
                     }
                 }
                 schema.tables.insert(table_name.to_owned(), table);
@@ -1005,7 +1015,6 @@ struct CoreColumnArrays<'a> {
     char_lengths: &'a Int64Array,
     byte_lengths: &'a Int64Array,
     nullables: &'a BooleanArray,
-    defaults: &'a StringArray,
     remarks: &'a StringArray,
 }
 
@@ -1023,14 +1032,68 @@ impl<'a> CoreColumnArrays<'a> {
             char_lengths: expect_array::<Int64Array>(values.column(5), "char_length")?,
             byte_lengths: expect_array::<Int64Array>(values.column(6), "byte_length")?,
             nullables: expect_array::<BooleanArray>(values.column(7), "nullable")?,
-            defaults: expect_array::<StringArray>(values.column(8), "column_def")?,
             remarks: expect_array::<StringArray>(values.column(9), "remarks")?,
         })
     }
 
-    fn column(&self, index: usize) -> Result<ColumnInfo, ArrowError> {
-        let logical_type = optional_string(self.logical_types, index);
+    fn column(
+        &self,
+        index: usize,
+        geography_output_format: GeoOutputFormat,
+        geometry_output_format: GeoOutputFormat,
+    ) -> Result<ColumnInfo, ArrowError> {
+        let type_name = optional_string(self.logical_types, index).map(public_snowflake_type_name);
+        let logical_type = type_name.as_deref();
+        let precision = optional_i32(self.precisions, index);
+        let scale = optional_i32(self.scales, index);
         let nullable = (!self.nullables.is_null(index)).then(|| self.nullables.value(index));
+        let column_size = match logical_type {
+            Some("TEXT") => optional_i64(self.char_lengths, index)
+                .map(|value| checked_i64_to_i32(value, "char_length"))
+                .transpose()?,
+            Some("NUMBER") => precision,
+            Some("BINARY") => optional_i64(self.byte_lengths, index)
+                .map(|value| checked_i64_to_i32(value, "byte_length"))
+                .transpose()?,
+            _ => None,
+        };
+        // SHOW byteLength can retain the old 16 MiB cap for TEXT, and also
+        // describes non-character types. INFORMATION_SCHEMA instead reports
+        // four bytes per character, capped at Snowflake's 128 MiB limit.
+        let char_octet_length = if logical_type == Some("TEXT") {
+            column_size
+                .map(|length| {
+                    checked_i64_to_i32(
+                        (i64::from(length) * 4).min(134_217_728),
+                        "character_octet_length",
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let datetime_sub = if matches!(
+            logical_type,
+            Some("TIME" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ")
+        ) {
+            scale.map(checked_scale_to_i16).transpose()?
+        } else {
+            None
+        };
+        let arrow_type = logical_type.and_then(|logical_type| {
+            column_arrow_type(
+                logical_type,
+                precision,
+                scale,
+                geography_output_format,
+                geometry_output_format,
+            )
+        });
+        let (mut data_type, sql_data_type) = xdbc_type_codes(arrow_type.as_ref());
+        if logical_type == Some("UUID") {
+            // Go's Arrow extension type ID, not its fixed-size-binary storage ID.
+            data_type = Some(31);
+        }
         Ok(ColumnInfo {
             column_name: required_string(self.names, index, "column_name")?.to_owned(),
             ordinal_position: Some(if self.ordinals.is_null(index) {
@@ -1039,30 +1102,20 @@ impl<'a> CoreColumnArrays<'a> {
                 self.ordinals.value(index)
             }),
             remarks: optional_string(self.remarks, index).map(str::to_owned),
-            xdbc_type_name: logical_type.map(public_snowflake_type_name),
-            xdbc_column_size: if !self.char_lengths.is_null(index) {
-                Some(checked_i64_to_i32(
-                    self.char_lengths.value(index),
-                    "char_length",
-                )?)
-            } else {
-                optional_i32(self.precisions, index)
-            },
-            xdbc_decimal_digits: xdbc_decimal_digits(
-                logical_type,
-                optional_i32(self.scales, index),
-            )?,
-            xdbc_num_prec_radix: logical_type.and_then(|logical_type| match logical_type {
-                "FIXED" => Some(10),
-                "REAL" => Some(2),
+            xdbc_data_type: data_type,
+            xdbc_column_size: column_size,
+            xdbc_decimal_digits: xdbc_decimal_digits(logical_type, scale)?,
+            xdbc_num_prec_radix: match logical_type {
+                Some("NUMBER") => Some(10),
                 _ => None,
-            }),
+            },
             xdbc_nullable: nullable.map(|value| if value { 1 } else { 0 }),
-            xdbc_column_def: optional_string(self.defaults, index).map(str::to_owned),
-            xdbc_char_octet_length: optional_i64(self.byte_lengths, index)
-                .map(|value| checked_i64_to_i32(value, "byte_length"))
-                .transpose()?,
+            xdbc_sql_data_type: Some(sql_data_type),
+            xdbc_datetime_sub: datetime_sub,
+            xdbc_char_octet_length: char_octet_length,
             xdbc_is_nullable: nullable.map(|value| if value { "YES" } else { "NO" }.to_owned()),
+            xdbc_type_name: type_name,
+            // Go does not project COLUMN_DEFAULT into GetObjects.
             ..ColumnInfo::default()
         })
     }
@@ -1072,32 +1125,90 @@ fn xdbc_decimal_digits(
     logical_type: Option<&str>,
     scale: Option<i32>,
 ) -> Result<Option<i16>, ArrowError> {
-    if !matches!(logical_type, Some("FIXED" | "REAL")) {
+    if logical_type != Some("NUMBER") {
         return Ok(None);
     }
 
-    scale
-        .map(|value| {
-            i16::try_from(value).map_err(|_| schema_error("sf_core scale does not fit in Int16"))
-        })
-        .transpose()
+    scale.map(checked_scale_to_i16).transpose()
+}
+
+fn checked_scale_to_i16(scale: i32) -> Result<i16, ArrowError> {
+    i16::try_from(scale).map_err(|_| schema_error("sf_core scale does not fit in Int16"))
 }
 
 fn public_snowflake_type_name(logical_type: &str) -> String {
-    match logical_type.to_ascii_uppercase().as_str() {
-        "FIXED" => "NUMBER".to_owned(),
-        "REAL" => "DOUBLE".to_owned(),
-        "TEXT" => "VARCHAR".to_owned(),
-        "BINARY" => "BINARY".to_owned(),
-        "BOOLEAN" => "BOOLEAN".to_owned(),
-        "DATE" => "DATE".to_owned(),
-        "TIME" => "TIME".to_owned(),
-        "TIMESTAMP_NTZ" => "TIMESTAMP_NTZ".to_owned(),
-        "TIMESTAMP_LTZ" => "TIMESTAMP_LTZ".to_owned(),
-        "TIMESTAMP_TZ" => "TIMESTAMP_TZ".to_owned(),
-        "TIMESTAMP" => "TIMESTAMP_NTZ".to_owned(),
-        _ => logical_type.to_owned(),
+    if logical_type.eq_ignore_ascii_case("FIXED") {
+        "NUMBER".to_owned()
+    } else if logical_type.eq_ignore_ascii_case("REAL") {
+        "FLOAT".to_owned()
+    } else if logical_type.eq_ignore_ascii_case("TIMESTAMP") {
+        "TIMESTAMP_NTZ".to_owned()
+    } else {
+        logical_type.to_ascii_uppercase()
     }
+}
+
+// Apply the schema-only mapping used by GetTableSchema and
+// statement::compute_target_type without allocating a Field and its metadata.
+// Timestamp units/time zones do not affect either of the reported type IDs.
+fn column_arrow_type(
+    logical_type: &str,
+    precision: Option<i32>,
+    scale: Option<i32>,
+    geography_output_format: GeoOutputFormat,
+    geometry_output_format: GeoOutputFormat,
+) -> Option<DataType> {
+    Some(match logical_type {
+        "NUMBER" if scale.unwrap_or(0) > 0 => DataType::Decimal128(
+            precision
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or(38)
+                .clamp(1, 38),
+            scale.unwrap_or(0).clamp(0, 38) as i8,
+        ),
+        "NUMBER" => DataType::Int64,
+        "FLOAT" => DataType::Float64,
+        "TEXT" | "VARIANT" | "OBJECT" | "ARRAY" => DataType::Utf8,
+        "UUID" => DataType::FixedSizeBinary(16),
+        "BINARY" => DataType::Binary,
+        "BOOLEAN" => DataType::Boolean,
+        "DATE" => DataType::Date32,
+        "TIME" => match scale.unwrap_or(9) {
+            0 => DataType::Time32(TimeUnit::Second),
+            1..=3 => DataType::Time32(TimeUnit::Millisecond),
+            4..=6 => DataType::Time64(TimeUnit::Microsecond),
+            _ => DataType::Time64(TimeUnit::Nanosecond),
+        },
+        "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        }
+        "GEOGRAPHY" if geography_output_format == GeoOutputFormat::Ewkb => DataType::Binary,
+        "GEOMETRY" if geometry_output_format == GeoOutputFormat::Ewkb => DataType::Binary,
+        "GEOGRAPHY" | "GEOMETRY" => DataType::Utf8,
+        // Like Go, do not invent an Arrow type when SHOW lacks the metadata
+        // needed to reconstruct it (notably a VECTOR's element type/dimension).
+        _ => return None,
+    })
+}
+
+fn xdbc_type_codes(data_type: Option<&DataType>) -> (Option<i16>, i16) {
+    // Go exposes Arrow's type ID in xdbc_data_type, and driverbase-go's
+    // ToXdbcDataType result in xdbc_sql_data_type (FLOAT64 is SQL_FLOAT, 6).
+    let (arrow_id, sql_type) = match data_type {
+        Some(DataType::Boolean) => (1, -7),
+        Some(DataType::Int64) => (9, -5),
+        Some(DataType::Float64) => (12, 6),
+        Some(DataType::Utf8) => (13, 12),
+        Some(DataType::Binary) => (14, -2),
+        Some(DataType::FixedSizeBinary(_)) => (15, -2),
+        Some(DataType::Date32) => (16, 91),
+        Some(DataType::Timestamp(_, _)) => (18, 93),
+        Some(DataType::Time32(_)) => (19, 92),
+        Some(DataType::Time64(_)) => (20, 92),
+        Some(DataType::Decimal128(_, _)) => (23, 3),
+        _ => return (None, 0),
+    };
+    (Some(arrow_id), sql_type)
 }
 
 // No metadata calls are made while driverbase builds batches. Its iterator
@@ -1273,40 +1384,490 @@ mod tests {
     }
 
     fn column(name: &str, logical_type: &str) -> ColumnInfo {
-        ColumnInfo {
-            column_name: name.into(),
-            ordinal_position: Some(1),
-            xdbc_type_name: Some(public_snowflake_type_name(logical_type)),
-            xdbc_column_size: Some(38),
-            xdbc_decimal_digits: Some(0),
-            xdbc_num_prec_radix: Some(10),
-            xdbc_nullable: Some(1),
-            xdbc_is_nullable: Some("YES".into()),
-            ..ColumnInfo::default()
-        }
+        let values = core_column_values(CoreColumnMetadata {
+            logical_type,
+            precision: Some(38),
+            scale: Some(0),
+            char_length: (logical_type == "TEXT").then_some(16_777_216),
+            byte_length: (logical_type == "TEXT").then_some(16_777_216),
+        });
+        let mut column = CoreColumnArrays::try_new(&values)
+            .unwrap()
+            .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+            .unwrap();
+        column.column_name = name.into();
+        column.ordinal_position = Some(1);
+        column.remarks = None;
+        column
     }
 
     #[test]
-    fn public_xdbc_type_names_use_snowflake_sql_names() {
+    fn public_xdbc_type_names_match_information_schema() {
         assert_eq!(public_snowflake_type_name("FIXED"), "NUMBER");
-        assert_eq!(public_snowflake_type_name("TEXT"), "VARCHAR");
-        assert_eq!(public_snowflake_type_name("REAL"), "DOUBLE");
+        assert_eq!(public_snowflake_type_name("TEXT"), "TEXT");
+        assert_eq!(public_snowflake_type_name("REAL"), "FLOAT");
         assert_eq!(public_snowflake_type_name("TIMESTAMP_LTZ"), "TIMESTAMP_LTZ");
     }
 
     #[test]
     fn decimal_digits_only_use_numeric_scales() {
         assert_eq!(
-            xdbc_decimal_digits(Some("FIXED"), Some(2)).unwrap(),
+            xdbc_decimal_digits(Some("NUMBER"), Some(2)).unwrap(),
             Some(2)
         );
-        assert_eq!(xdbc_decimal_digits(Some("REAL"), Some(7)).unwrap(), Some(7));
+        assert_eq!(xdbc_decimal_digits(Some("REAL"), Some(7)).unwrap(), None);
         assert_eq!(xdbc_decimal_digits(Some("TIME"), Some(9)).unwrap(), None);
         assert_eq!(
             xdbc_decimal_digits(Some("TIMESTAMP_NTZ"), Some(9)).unwrap(),
             None
         );
         assert_eq!(xdbc_decimal_digits(Some("TEXT"), Some(0)).unwrap(), None);
+    }
+
+    #[derive(Default)]
+    struct CoreColumnMetadata<'a> {
+        logical_type: &'a str,
+        precision: Option<i32>,
+        scale: Option<i32>,
+        char_length: Option<i64>,
+        byte_length: Option<i64>,
+    }
+
+    fn core_column_values(metadata: CoreColumnMetadata<'_>) -> StructArray {
+        let arrays: Vec<(&str, ArrayRef)> = vec![
+            ("column_name", Arc::new(StringArray::from(vec!["value"]))),
+            ("ordinal_position", Arc::new(Int32Array::from(vec![3]))),
+            (
+                "logical_type",
+                Arc::new(StringArray::from(vec![metadata.logical_type])),
+            ),
+            (
+                "precision",
+                Arc::new(Int32Array::from(vec![metadata.precision])),
+            ),
+            ("scale", Arc::new(Int32Array::from(vec![metadata.scale]))),
+            (
+                "char_length",
+                Arc::new(Int64Array::from(vec![metadata.char_length])),
+            ),
+            (
+                "byte_length",
+                Arc::new(Int64Array::from(vec![metadata.byte_length])),
+            ),
+            ("nullable", Arc::new(BooleanArray::from(vec![true]))),
+            ("column_def", Arc::new(StringArray::from(vec!["42"]))),
+            ("remarks", Arc::new(StringArray::from(vec!["a comment"]))),
+        ];
+        StructArray::from(
+            arrays
+                .into_iter()
+                .map(|(name, array)| {
+                    (
+                        Arc::new(Field::new(name, array.data_type().clone(), true)),
+                        array,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn core_columns_populate_xdbc_metadata_by_type_family() {
+        let cases = [
+            (
+                CoreColumnMetadata {
+                    logical_type: "TEXT",
+                    precision: Some(16_777_216),
+                    scale: Some(0),
+                    char_length: Some(16_777_216),
+                    // Older SHOW responses cap this at 16 MiB, unlike
+                    // INFORMATION_SCHEMA.COLUMNS.CHARACTER_OCTET_LENGTH.
+                    byte_length: Some(16_777_216),
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("TEXT".into()),
+                    xdbc_data_type: Some(13),
+                    xdbc_sql_data_type: Some(12),
+                    xdbc_column_size: Some(16_777_216),
+                    xdbc_char_octet_length: Some(67_108_864),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "FIXED",
+                    precision: Some(38),
+                    scale: Some(0),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("NUMBER".into()),
+                    xdbc_data_type: Some(9),
+                    xdbc_sql_data_type: Some(-5),
+                    xdbc_column_size: Some(38),
+                    xdbc_decimal_digits: Some(0),
+                    xdbc_num_prec_radix: Some(10),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "FIXED",
+                    precision: Some(10),
+                    scale: Some(2),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("NUMBER".into()),
+                    xdbc_data_type: Some(23),
+                    xdbc_sql_data_type: Some(3),
+                    xdbc_column_size: Some(10),
+                    xdbc_decimal_digits: Some(2),
+                    xdbc_num_prec_radix: Some(10),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "REAL",
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("FLOAT".into()),
+                    xdbc_data_type: Some(12),
+                    xdbc_sql_data_type: Some(6),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "BINARY",
+                    byte_length: Some(8_388_608),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("BINARY".into()),
+                    xdbc_data_type: Some(14),
+                    xdbc_sql_data_type: Some(-2),
+                    xdbc_column_size: Some(8_388_608),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "BOOLEAN",
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("BOOLEAN".into()),
+                    xdbc_data_type: Some(1),
+                    xdbc_sql_data_type: Some(-7),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "DATE",
+                    precision: Some(0),
+                    scale: Some(0),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("DATE".into()),
+                    xdbc_data_type: Some(16),
+                    xdbc_sql_data_type: Some(91),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "TIME",
+                    precision: Some(0),
+                    scale: Some(9),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("TIME".into()),
+                    xdbc_data_type: Some(20),
+                    xdbc_sql_data_type: Some(92),
+                    xdbc_datetime_sub: Some(9),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "TIMESTAMP_NTZ",
+                    precision: Some(0),
+                    scale: Some(9),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("TIMESTAMP_NTZ".into()),
+                    xdbc_data_type: Some(18),
+                    xdbc_sql_data_type: Some(93),
+                    xdbc_datetime_sub: Some(9),
+                    ..ColumnInfo::default()
+                },
+            ),
+            (
+                CoreColumnMetadata {
+                    logical_type: "VARIANT",
+                    byte_length: Some(16_777_216),
+                    ..CoreColumnMetadata::default()
+                },
+                ColumnInfo {
+                    xdbc_type_name: Some("VARIANT".into()),
+                    xdbc_data_type: Some(13),
+                    xdbc_sql_data_type: Some(12),
+                    ..ColumnInfo::default()
+                },
+            ),
+        ];
+
+        for (metadata, expected) in cases {
+            let values = core_column_values(metadata);
+            let columns = CoreColumnArrays::try_new(&values).unwrap();
+            let actual = columns
+                .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+                .unwrap();
+            assert_eq!(
+                actual,
+                ColumnInfo {
+                    column_name: "value".into(),
+                    ordinal_position: Some(3),
+                    remarks: Some("a comment".into()),
+                    xdbc_nullable: Some(1),
+                    xdbc_is_nullable: Some("YES".into()),
+                    // Go deliberately leaves xdbc_column_def null even for
+                    // columns with a default expression.
+                    ..expected
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn binary_size_uses_bytes_and_text_octets_respect_the_server_limit() {
+        for (logical_type, char_length, byte_length, size, octets) in [
+            ("BINARY", None, Some(10), Some(10), None),
+            ("TEXT", Some(10), Some(40), Some(10), Some(40)),
+            (
+                "TEXT",
+                Some(134_217_728),
+                Some(134_217_728),
+                Some(134_217_728),
+                Some(134_217_728),
+            ),
+        ] {
+            let values = core_column_values(CoreColumnMetadata {
+                logical_type,
+                char_length,
+                byte_length,
+                ..CoreColumnMetadata::default()
+            });
+            let column = CoreColumnArrays::try_new(&values)
+                .unwrap()
+                .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+                .unwrap();
+            assert_eq!(column.xdbc_column_size, size, "{logical_type}");
+            assert_eq!(column.xdbc_char_octet_length, octets, "{logical_type}");
+        }
+    }
+
+    #[test]
+    fn datetime_type_codes_use_the_rust_schema_mapping() {
+        for (logical_type, scale, arrow_type, sql_type) in [
+            ("TIME", 0, 19, 92),
+            ("TIME", 3, 19, 92),
+            ("TIME", 6, 20, 92),
+            ("TIMESTAMP_NTZ", 9, 18, 93),
+            ("TIMESTAMP_LTZ", 9, 18, 93),
+            ("TIMESTAMP_TZ", 9, 18, 93),
+        ] {
+            let values = core_column_values(CoreColumnMetadata {
+                logical_type,
+                scale: Some(scale),
+                ..CoreColumnMetadata::default()
+            });
+            let column = CoreColumnArrays::try_new(&values)
+                .unwrap()
+                .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+                .unwrap();
+            assert_eq!(column.xdbc_data_type, Some(arrow_type), "{logical_type}");
+            assert_eq!(column.xdbc_sql_data_type, Some(sql_type), "{logical_type}");
+            assert_eq!(
+                column.xdbc_datetime_sub,
+                Some(scale as i16),
+                "{logical_type}"
+            );
+            assert_eq!(column.xdbc_decimal_digits, None, "{logical_type}");
+        }
+    }
+
+    #[test]
+    fn geographic_type_codes_follow_each_output_format() {
+        for (logical_type, geography, geometry, arrow_type, sql_type) in [
+            (
+                "GEOGRAPHY",
+                GeoOutputFormat::GeoJson,
+                GeoOutputFormat::Ewkb,
+                13,
+                12,
+            ),
+            (
+                "GEOMETRY",
+                GeoOutputFormat::GeoJson,
+                GeoOutputFormat::Ewkb,
+                14,
+                -2,
+            ),
+            (
+                "GEOGRAPHY",
+                GeoOutputFormat::Ewkb,
+                GeoOutputFormat::GeoJson,
+                14,
+                -2,
+            ),
+            (
+                "GEOMETRY",
+                GeoOutputFormat::Ewkb,
+                GeoOutputFormat::GeoJson,
+                13,
+                12,
+            ),
+        ] {
+            let values = core_column_values(CoreColumnMetadata {
+                logical_type,
+                ..CoreColumnMetadata::default()
+            });
+            let column = CoreColumnArrays::try_new(&values)
+                .unwrap()
+                .column(0, geography, geometry)
+                .unwrap();
+            assert_eq!(column.xdbc_type_name.as_deref(), Some(logical_type));
+            assert_eq!(column.xdbc_data_type, Some(arrow_type));
+            assert_eq!(column.xdbc_sql_data_type, Some(sql_type));
+        }
+    }
+
+    #[test]
+    fn metadata_type_codes_agree_with_adjusted_table_schemas() {
+        for (logical_type, precision, scale, physical_type) in [
+            ("FIXED", 38, 0, DataType::Int64),
+            ("FIXED", 10, 2, DataType::Int64),
+            ("REAL", 0, 0, DataType::Float64),
+            ("TIME", 0, 0, DataType::Int32),
+            ("TIME", 0, 3, DataType::Int32),
+            ("TIME", 0, 9, DataType::Int64),
+            ("TIMESTAMP_NTZ", 0, 9, DataType::Int64),
+            ("TIMESTAMP_LTZ", 0, 9, DataType::Int64),
+            ("TIMESTAMP_TZ", 0, 9, DataType::Int64),
+        ] {
+            let field = Field::new("value", physical_type, true).with_metadata(
+                std::collections::HashMap::from([
+                    ("logicalType".into(), logical_type.into()),
+                    ("precision".into(), precision.to_string()),
+                    ("scale".into(), scale.to_string()),
+                ]),
+            );
+            let schema = crate::statement::adjust_schema(
+                &arrow_schema::Schema::new(vec![field]),
+                TimeUnit::Nanosecond,
+                "UTC",
+                None,
+            );
+            let values = core_column_values(CoreColumnMetadata {
+                logical_type,
+                precision: Some(precision),
+                scale: Some(scale),
+                ..CoreColumnMetadata::default()
+            });
+            let column = CoreColumnArrays::try_new(&values)
+                .unwrap()
+                .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+                .unwrap();
+            let (arrow_id, sql_type) = xdbc_type_codes(Some(schema.field(0).data_type()));
+            assert_eq!(column.xdbc_data_type, arrow_id, "{logical_type}");
+            assert_eq!(column.xdbc_sql_data_type, Some(sql_type), "{logical_type}");
+        }
+    }
+
+    #[test]
+    fn nullability_and_remarks_preserve_sf_core_values() {
+        for (nullable, remarks, expected_nullable, expected_is_nullable) in [
+            (Some(true), Some("a comment"), Some(1), Some("YES")),
+            (Some(false), None, Some(0), Some("NO")),
+            (None, Some(""), None, None),
+        ] {
+            let values = core_column_values(CoreColumnMetadata {
+                logical_type: "BOOLEAN",
+                ..CoreColumnMetadata::default()
+            });
+            let mut arrays = values.columns().to_vec();
+            arrays[7] = Arc::new(BooleanArray::from(vec![nullable]));
+            arrays[9] = Arc::new(StringArray::from(vec![remarks]));
+            let values = StructArray::new(values.fields().clone(), arrays, None);
+            let column = CoreColumnArrays::try_new(&values)
+                .unwrap()
+                .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+                .unwrap();
+            assert_eq!(column.xdbc_nullable, expected_nullable);
+            assert_eq!(column.xdbc_is_nullable.as_deref(), expected_is_nullable);
+            assert_eq!(column.remarks.as_deref(), remarks);
+            assert_eq!(column.xdbc_column_def, None);
+        }
+    }
+
+    #[test]
+    fn string_extensions_and_unknown_types_match_go_type_codes() {
+        for (logical_type, arrow_id, sql_type) in [
+            ("ARRAY", Some(13), 12),
+            ("OBJECT", Some(13), 12),
+            ("UUID", Some(31), -2),
+            ("VECTOR", None, 0),
+            ("UNKNOWN", None, 0),
+        ] {
+            let values = core_column_values(CoreColumnMetadata {
+                logical_type,
+                ..CoreColumnMetadata::default()
+            });
+            let column = CoreColumnArrays::try_new(&values)
+                .unwrap()
+                .column(0, GeoOutputFormat::GeoJson, GeoOutputFormat::GeoJson)
+                .unwrap();
+            assert_eq!(column.xdbc_type_name.as_deref(), Some(logical_type));
+            assert_eq!(column.xdbc_data_type, arrow_id);
+            assert_eq!(column.xdbc_sql_data_type, Some(sql_type));
+        }
+    }
+
+    #[test]
+    fn invalid_sizes_and_datetime_precision_do_not_wrap() {
+        for metadata in [
+            CoreColumnMetadata {
+                logical_type: "BINARY",
+                byte_length: Some(i64::from(i32::MAX) + 1),
+                ..CoreColumnMetadata::default()
+            },
+            CoreColumnMetadata {
+                logical_type: "TIME",
+                scale: Some(i32::from(i16::MAX) + 1),
+                ..CoreColumnMetadata::default()
+            },
+            CoreColumnMetadata {
+                logical_type: "FIXED",
+                scale: Some(i32::from(i16::MAX) + 1),
+                ..CoreColumnMetadata::default()
+            },
+        ] {
+            let values = core_column_values(metadata);
+            let result = CoreColumnArrays::try_new(&values).unwrap().column(
+                0,
+                GeoOutputFormat::GeoJson,
+                GeoOutputFormat::GeoJson,
+            );
+            assert!(matches!(result, Err(ArrowError::SchemaError(_))));
+        }
     }
 
     #[test]
@@ -1343,8 +1904,6 @@ mod tests {
         let mut amount = column("amount", "FIXED");
         amount.ordinal_position = Some(2);
         amount.remarks = Some("a numeric value".into());
-        amount.xdbc_column_def = Some("0".into());
-        amount.xdbc_char_octet_length = Some(16);
         amount.xdbc_nullable = Some(0);
         amount.xdbc_is_nullable = Some("NO".into());
         let mut label = column("label", "TEXT");
@@ -1393,10 +1952,14 @@ mod tests {
             "a numeric value"
         );
         assert!(column_values.column(2).is_null(1));
-        assert!(column_values.column(3).is_null(0));
+        let data_types = column_values
+            .column(3)
+            .as_primitive::<arrow_array::types::Int16Type>();
+        assert_eq!(data_types.value(0), 9);
+        assert_eq!(data_types.value(1), 13);
         let type_names = column_values.column(4).as_string::<i32>();
         assert_eq!(type_names.value(0), "NUMBER");
-        assert_eq!(type_names.value(1), "VARCHAR");
+        assert_eq!(type_names.value(1), "TEXT");
         assert_eq!(
             column_values
                 .column(5)
@@ -1425,17 +1988,16 @@ mod tests {
                 .value(0),
             0
         );
-        assert_eq!(column_values.column(9).as_string::<i32>().value(0), "0");
+        assert!(column_values.column(9).is_null(0));
         assert!(column_values.column(9).is_null(1));
-        assert_eq!(
-            column_values
-                .column(12)
-                .as_primitive::<arrow_array::types::Int32Type>()
-                .value(0),
-            16
-        );
+        let sql_data_types = column_values
+            .column(10)
+            .as_primitive::<arrow_array::types::Int16Type>();
+        assert_eq!(sql_data_types.value(0), -5);
+        assert_eq!(sql_data_types.value(1), 12);
+        assert!(column_values.column(12).is_null(0));
         assert_eq!(column_values.column(13).as_string::<i32>().value(0), "NO");
-        for field in [10, 11, 14, 15, 16, 17, 18] {
+        for field in [11, 14, 15, 16, 17, 18] {
             assert!(column_values.column(field).is_null(0));
         }
         let constraints = table_values.column(3).as_list::<i32>();

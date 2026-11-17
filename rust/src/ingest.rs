@@ -38,6 +38,7 @@ use parquet::{
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use sf_core::apis::{database_driver_v1::Handle, operation_ctx::OperationCtx};
+use sf_core::config::{param_registry::param_names, settings::Setting};
 use tokio::{
     sync::Semaphore,
     task::{JoinHandle, JoinSet},
@@ -460,11 +461,12 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
 
         let load = stmt
             .inner
-            .execute_temporary_statement(
+            .execute_temporary_statement_tagged(
                 Some(&operation),
                 stmt.conn_handle,
                 create_stage_sql(&stage, stmt.ingest_options.vectorized_scanner),
                 stmt.query_timeout_seconds,
+                stmt.query_tag.as_deref(),
             )
             .and_then(|()| {
                 ingest_batches(
@@ -475,6 +477,7 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
                         stage: stage.clone(),
                         copy_sql: copy_plan.sql,
                         timeout: stmt.query_timeout_seconds,
+                        query_tag: stmt.query_tag.as_deref().map(Arc::from),
                         options: stmt.ingest_options.clone(),
                         normalized,
                         props,
@@ -486,11 +489,12 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
         // Cleanup must work even after cancellation, so it runs without the
         // operation. A temporary stage also dies with the session.
         let cleanup = |sql: String| {
-            stmt.inner.execute_temporary_statement(
+            stmt.inner.execute_temporary_statement_tagged(
                 None,
                 stmt.conn_handle,
                 sql,
                 stmt.query_timeout_seconds,
+                stmt.query_tag.as_deref(),
             )
         };
         let stage_cleanup = cleanup(format!("DROP STAGE IF EXISTS {stage}"));
@@ -505,11 +509,12 @@ pub(crate) fn execute_ingest(stmt: &mut Statement) -> Result<Option<i64>> {
         };
         if replace {
             // SWAP is atomic; afterwards the staging name holds the old data.
-            if let Err(err) = stmt.inner.execute_temporary_statement(
+            if let Err(err) = stmt.inner.execute_temporary_statement_tagged(
                 Some(&operation),
                 stmt.conn_handle,
                 format!("ALTER TABLE {load_table} SWAP WITH {qname}"),
                 stmt.query_timeout_seconds,
+                stmt.query_tag.as_deref(),
             ) {
                 let _ = cleanup(format!("DROP TABLE IF EXISTS {load_table}"));
                 return Err(err);
@@ -697,11 +702,12 @@ fn initialize_target(
 ) -> Result<()> {
     let mode = stmt.ingest_state.mode;
     let execute = |sql: String| {
-        stmt.inner.execute_temporary_statement(
+        stmt.inner.execute_temporary_statement_tagged(
             Some(op),
             stmt.conn_handle,
             sql,
             stmt.query_timeout_seconds,
+            stmt.query_tag.as_deref(),
         )
     };
     match mode {
@@ -722,17 +728,16 @@ fn initialize_target(
             execute(create_staging)
         }
         IngestMode::CreateAppend => {
-            stmt.inner.execute_temporary_statement(
+            stmt.inner.execute_temporary_statement_tagged(
                 Some(op),
                 stmt.conn_handle,
                 build_create_sql(qname, schema, overrides, CreateMode::IfNotExists)?,
                 stmt.query_timeout_seconds,
+                stmt.query_tag.as_deref(),
             )?;
-            validate_target_schema(&stmt.inner, stmt.conn_handle, op, qname, schema)
+            validate_target_schema(stmt, op, qname, schema)
         }
-        IngestMode::Append => {
-            validate_target_schema(&stmt.inner, stmt.conn_handle, op, qname, schema)
-        }
+        IngestMode::Append => validate_target_schema(stmt, op, qname, schema),
     }
 }
 
@@ -843,17 +848,28 @@ fn column_names_equivalent(expected: &Schema, actual: &Schema) -> bool {
 }
 
 fn validate_target_schema(
-    inner: &Inner,
-    conn: Handle,
+    stmt: &Statement,
     op: &OperationCtx,
     qname: &str,
     expected: &Schema,
 ) -> Result<()> {
+    let inner = &stmt.inner;
     let handle = inner
         .sf
-        .statement_new(conn)
+        .statement_new(stmt.conn_handle)
         .map_err(crate::error::api_error_to_adbc_error)?;
-    let prepared = inner.prepare_statement(Some(op), handle, format!("SELECT * FROM {qname}"));
+    let prepared = (|| {
+        if let Some(query_tag) = &stmt.query_tag {
+            inner
+                .block_on(inner.sf.statement_set_option(
+                    handle,
+                    param_names::QUERY_TAG.into(),
+                    Setting::String(query_tag.clone()),
+                ))
+                .map_err(crate::error::api_error_to_adbc_error)?;
+        }
+        inner.prepare_statement(Some(op), handle, format!("SELECT * FROM {qname}"))
+    })();
     let released = inner.sf.statement_release(handle);
     let schema = prepared?.reader.schema();
     released.map_err(crate::error::api_error_to_adbc_error)?;
@@ -1053,6 +1069,7 @@ struct IngestJob {
     stage: String,
     copy_sql: String,
     timeout: Option<u32>,
+    query_tag: Option<Arc<str>>,
     options: IngestOptions,
     /// Parquet schema and writer settings, validated before any DDL runs.
     normalized: SchemaRef,
@@ -1086,6 +1103,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         stage,
         copy_sql,
         timeout,
+        query_tag,
         options,
         normalized,
         props,
@@ -1114,76 +1132,90 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         let op = Arc::clone(&op);
         let failure = Arc::clone(&failure);
         let copy_sql = Arc::clone(&copy_sql);
+        let query_tag = query_tag.clone();
         let copy_span = span.clone();
         let copy_dispatch = dispatch.clone();
-        runtime.spawn(async move {
-            let mut copies = JoinSet::new();
-            let mut loaded = 0i64;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = op.token().cancelled() => break,
-                    result = copies.join_next(), if !copies.is_empty() => {
-                        if let Some(result) = result {
-                            record_copy_completion(result, &mut loaded, &failure);
+        runtime.spawn(
+            async move {
+                let mut copies = JoinSet::new();
+                let mut loaded = 0i64;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = op.token().cancelled() => break,
+                        result = copies.join_next(), if !copies.is_empty() => {
+                            if let Some(result) = result {
+                                record_copy_completion(result, &mut loaded, &failure);
+                            }
                         }
-                    }
-                    notification = copy_notifications.recv() => {
-                        if notification.is_none() || op.token().is_cancelled() {
-                            break;
-                        }
-                        let permit = match &copy_limit {
-                            Some(limit) => {
-                                tokio::select! {
-                                    biased;
-                                    _ = op.token().cancelled() => break,
-                                    permit = Arc::clone(limit).acquire_owned() => {
-                                        match permit {
-                                            Ok(permit) => Some(permit),
-                                            Err(_) => {
-                                                failure.report(cancelled());
-                                                break;
+                        notification = copy_notifications.recv() => {
+                            if notification.is_none() || op.token().is_cancelled() {
+                                break;
+                            }
+                            let permit = match &copy_limit {
+                                Some(limit) => {
+                                    tokio::select! {
+                                        biased;
+                                        _ = op.token().cancelled() => break,
+                                        permit = Arc::clone(limit).acquire_owned() => {
+                                            match permit {
+                                                Ok(permit) => Some(permit),
+                                                Err(_) => {
+                                                    failure.report(cancelled());
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                            None => None,
-                        };
-                        if op.token().is_cancelled() {
-                            break;
-                        }
-                        let inner = Arc::clone(&inner);
-                        let op = Arc::clone(&op);
-                        let failure = Arc::clone(&failure);
-                        let outstanding = Arc::clone(&outstanding);
-                        let copy_sql = Arc::clone(&copy_sql);
-                        let task_span = copy_span.clone();
-                        let task_dispatch = copy_dispatch.clone();
-                        copies.spawn_blocking(move || {
-                            let _default = tracing::dispatcher::set_default(&task_dispatch);
-                            let _entered = task_span.enter();
-                            let _permit = permit;
+                                None => None,
+                            };
                             if op.token().is_cancelled() {
-                                return None;
+                                break;
                             }
-                            match execute_copy(&inner, conn, &op, copy_sql.as_str(), timeout, &outstanding) {
-                                Ok(rows) => Some(rows),
-                                Err(error) => {
-                                    failure.report(error);
-                                    None
+                            let inner = Arc::clone(&inner);
+                            let op = Arc::clone(&op);
+                            let failure = Arc::clone(&failure);
+                            let outstanding = Arc::clone(&outstanding);
+                            let copy_sql = Arc::clone(&copy_sql);
+                            let query_tag = query_tag.clone();
+                            let task_span = copy_span.clone();
+                            let task_dispatch = copy_dispatch.clone();
+                            copies.spawn_blocking(move || {
+                                let _default = tracing::dispatcher::set_default(&task_dispatch);
+                                let _entered = task_span.enter();
+                                let _permit = permit;
+                                if op.token().is_cancelled() {
+                                    return None;
                                 }
-                            }
-                        });
+                                match execute_copy(
+                                    &inner,
+                                    conn,
+                                    &op,
+                                    copy_sql.as_str(),
+                                    timeout,
+                                    query_tag.as_deref(),
+                                    &outstanding,
+                                ) {
+                                    Ok(rows) => Some(rows),
+                                    Err(error) => {
+                                        failure.report(error);
+                                        None
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
+                drop(copy_notifications);
+                while let Some(result) = copies.join_next().await {
+                    record_copy_completion(result, &mut loaded, &failure);
+                }
+                loaded
             }
-            drop(copy_notifications);
-            while let Some(result) = copies.join_next().await {
-                record_copy_completion(result, &mut loaded, &failure);
-            }
-            loaded
-        }.instrument(span.clone()).with_subscriber(dispatch.clone()))
+            .instrument(span.clone())
+            .with_subscriber(dispatch.clone()),
+        )
     };
     let (sender, receiver) = mpsc::sync_channel(options.writer_concurrency);
     let receiver = Arc::new(Mutex::new(receiver));
@@ -1201,6 +1233,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         let inner = Arc::clone(&inner);
         let op = Arc::clone(&op);
         let stage = Arc::clone(&stage);
+        let query_tag = query_tag.clone();
         let worker_runtime = runtime.clone();
         let failure = Arc::clone(&failure);
         let worker_span = span.clone();
@@ -1243,14 +1276,22 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
                     let outstanding = Arc::clone(&outstanding);
                     let copy_ready = copy_ready.clone();
                     let upload_sql = put_sql(&stage, &filename);
+                    let query_tag = query_tag.clone();
                     let spawned = worker_runtime.spawn(
                         async move {
                             let _permit = permit;
                             if op.token().is_cancelled() {
                                 return;
                             }
-                            if let Err(error) =
-                                upload_parquet(&inner, conn, &op, upload_sql, bytes).await
+                            if let Err(error) = upload_parquet(
+                                &inner,
+                                conn,
+                                &op,
+                                upload_sql,
+                                bytes,
+                                query_tag.as_deref(),
+                            )
+                            .await
                             {
                                 failure.report(error);
                                 return;
@@ -1352,9 +1393,7 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         return Err(cancelled());
     }
     if next_file.load(Ordering::Relaxed) == 0 {
-        return Err(SnowflakeError::invalid_argument()
-            .message("no records in stream to write")
-            .into());
+        return Ok(0);
     }
     // A COPY may return before an uploaded file becomes visible in the stage;
     // retry any such files with Go's 100/200/400/800/1600 ms backoff.
@@ -1369,7 +1408,15 @@ fn ingest_batches(job: IngestJob, batches: BatchIter, schema: SchemaRef) -> Resu
         if attempt != 0 {
             std::thread::sleep(Duration::from_millis(100 * (1 << (attempt - 1))));
         }
-        let n = execute_copy(&inner, conn, &op, copy_sql.as_str(), timeout, &outstanding)?;
+        let n = execute_copy(
+            &inner,
+            conn,
+            &op,
+            copy_sql.as_str(),
+            timeout,
+            query_tag.as_deref(),
+            &outstanding,
+        )?;
         loaded = loaded.checked_add(n).ok_or_else(|| {
             Error::from(SnowflakeError::internal_no_location().message("ingest row count overflow"))
         })?;
@@ -1388,12 +1435,17 @@ async fn upload_parquet(
     op: &OperationCtx,
     sql: String,
     bytes: Vec<u8>,
+    query_tag: Option<&str>,
 ) -> Result<()> {
     let sf = &inner.sf;
     let handle = op
         .run(
             "ingest upload begin",
-            sf.connection_upload_stream_begin(conn, sql),
+            sf.connection_upload_stream_begin_with_query_tag(
+                conn,
+                sql,
+                query_tag.map(str::to_owned),
+            ),
         )
         .await
         .map_err(crate::error::api_error_to_adbc_error)?;
@@ -1428,14 +1480,20 @@ fn execute_copy(
     op: &OperationCtx,
     sql: &str,
     timeout: Option<u32>,
+    query_tag: Option<&str>,
     outstanding: &Mutex<HashSet<String>>,
 ) -> Result<i64> {
     let handle = inner
         .sf
         .statement_new(conn)
         .map_err(crate::error::api_error_to_adbc_error)?;
-    let response =
-        inner.execute_query_with_timeout(Some(op), handle, sql.to_owned(), None, timeout);
+    let response = inner.execute_query_with_timeout_tagged(
+        Some(op),
+        handle,
+        sql.to_owned(),
+        timeout,
+        query_tag,
+    );
     let release = inner.sf.statement_release(handle);
     let result = response?;
     release.map_err(crate::error::api_error_to_adbc_error)?;
@@ -1507,6 +1565,43 @@ mod tests {
 
     fn option(name: &str) -> String {
         format!("{INGEST_OPTION_PREFIX}{name}")
+    }
+
+    #[test]
+    fn empty_ingest_pipeline_succeeds_without_upload_or_copy() {
+        let stmt = crate::statement::tests::make_stmt();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        for batches in [
+            Vec::new(),
+            vec![RecordBatch::new_empty(Arc::clone(&schema))],
+        ] {
+            let options = IngestOptions {
+                writer_concurrency: 2,
+                ..IngestOptions::default()
+            };
+            let job = IngestJob {
+                inner: Arc::clone(&stmt.inner),
+                // Invalid handles ensure any upload or COPY fails this test.
+                conn: stmt.conn_handle,
+                op: Arc::new(OperationCtx::with_own_token()),
+                stage: "empty_stage".into(),
+                copy_sql: "COPY INTO empty_target FROM @empty_stage".into(),
+                timeout: None,
+                query_tag: Some(Arc::from("empty-ingest")),
+                options: options.clone(),
+                normalized: Arc::clone(&schema),
+                props: options.writer_properties().unwrap(),
+            };
+            assert_eq!(
+                ingest_batches(
+                    job,
+                    Box::new(batches.into_iter().map(Ok)),
+                    Arc::clone(&schema),
+                )
+                .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

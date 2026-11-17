@@ -114,7 +114,7 @@ pub(crate) fn cleanup_connection_handle(
         move || {
             let _ = close_inner.traced("connectionImpl.Close", close_parent.as_deref(), |_| {
                 close_inner
-                    .block_on(close_inner.sf.connection_close(conn_handle))
+                    .block_on(close_inner.sf.connection_close(None, conn_handle))
                     .map_err(crate::error::api_error_to_adbc_error)
             });
         },
@@ -296,6 +296,14 @@ impl Connection {
         let operation = Arc::new(OperationCtx::with_own_token());
         *self.operation.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&operation);
         operation
+    }
+
+    fn begin_transaction_operation(&self) -> OperationCtx {
+        // Never publish this token to AdbcConnectionCancel: the transaction
+        // outcome must remain known even when the caller gives up. Cancels
+        // still target the previous operation, and begin_operation installs
+        // a fresh token for the next cancellable call.
+        OperationCtx::with_own_token()
     }
 
     pub(crate) fn with_metadata_reader<T>(
@@ -723,7 +731,7 @@ impl adbc_core::Connection for Connection {
                         .message("cannot commit: autocommit is enabled")
                         .into());
                 }
-                let operation = self.begin_operation();
+                let operation = self.begin_transaction_operation();
                 self.inner.execute_temporary_statement(
                     Some(&operation),
                     self.conn_handle,
@@ -745,7 +753,7 @@ impl adbc_core::Connection for Connection {
                         .message("cannot rollback: autocommit is enabled")
                         .into());
                 }
-                let operation = self.begin_operation();
+                let operation = self.begin_transaction_operation();
                 self.inner.execute_temporary_statement(
                     Some(&operation),
                     self.conn_handle,
@@ -1048,6 +1056,58 @@ mod tests {
                 .is_ok()
         );
         handle.try_cancel().unwrap();
+    }
+
+    #[test]
+    fn transaction_operation_ignores_connection_cancel() {
+        use adbc_core::Connection as _;
+        let conn = fake_connection();
+        let handle = conn.get_cancel_handle();
+        handle.try_cancel().unwrap();
+        let transaction = conn.begin_transaction_operation();
+        assert!(!transaction.token().is_cancelled());
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+        let result = std::thread::scope(|scope| {
+            let cancel = &handle;
+            let cancelling = scope.spawn(move || {
+                waiting.recv().unwrap();
+                cancel.try_cancel().unwrap();
+                cancelled.send(()).unwrap();
+            });
+            let result = conn
+                .inner
+                .block_on(transaction.run("transaction_cancel_unit", async {
+                    started.send(()).unwrap();
+                    cancellation.await.unwrap();
+                    Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())
+                }));
+            cancelling.join().unwrap();
+            result
+        });
+        assert!(result.is_ok());
+        assert!(!transaction.token().is_cancelled());
+        let next = conn.begin_operation();
+        assert!(!next.token().is_cancelled());
+        assert!(
+            conn.inner
+                .block_on(next.run(
+                    "connection_after_transaction_unit",
+                    std::future::ready(Ok::<(), sf_core::apis::database_driver_v1::ApiError>(())),
+                ))
+                .is_ok()
+        );
+        handle.try_cancel().unwrap();
+        assert!(next.token().is_cancelled());
+    }
+
+    #[test]
+    fn transaction_completion_still_requires_autocommit_disabled() {
+        use adbc_core::Connection as _;
+        let mut conn = fake_connection();
+        conn.get_cancel_handle().try_cancel().unwrap();
+        assert_eq!(conn.commit().unwrap_err().status, Status::InvalidState);
+        assert_eq!(conn.rollback().unwrap_err().status, Status::InvalidState);
     }
 
     #[test]
