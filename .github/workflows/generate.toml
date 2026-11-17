@@ -13,7 +13,6 @@
 # limitations under the License.
 
 driver = "snowflake"
-environment = "Snowflake CI"
 private = false
 
 [lang.go]
@@ -23,8 +22,16 @@ github-stack-behavior = "top"
 environment = "Snowflake CI"
 timeout-minutes = 40
 
-[lang.rust]
 [[lang.go.validation.configs]]
+environment = "Snowflake CI"
+
+[lang.rust]
+
+[lang.rust.test]
+environment = "Snowflake CI"
+
+[[lang.rust.validation.configs]]
+environment = "Snowflake CI"
 
 [secrets]
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["test", "validate"] }
