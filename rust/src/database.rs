@@ -43,6 +43,10 @@ use driverbase::telemetry::{
 };
 
 const AUTH_TYPE: &str = "adbc.snowflake.sql.auth_type";
+const REGION: &str = "adbc.snowflake.sql.region";
+// Driver-only provenance: an account-form URI synthesizes its host before
+// query parameters are applied. Never forward this key to sf_core.
+const URI_ACCOUNT: &str = "adbc.snowflake.internal.uri_account";
 const OKTA_URL: &str = "adbc.snowflake.sql.client_option.okta_url";
 const MAX_RETRY_COUNT: &str = "adbc.snowflake.sql.client_option.max_retry_count";
 const CACHE_MFA_TOKEN: &str = "adbc.snowflake.sql.client_option.cache_mfa_token";
@@ -475,6 +479,7 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         | "log_query_text"
         | "log_query_parameters"
         | "disable_query_context_cache"
+        | "disable_parallel_user_prompt"
         | "include_retry_reason"
         | "disable_saml_url_check"
         | "enable_connection_diag"
@@ -735,7 +740,7 @@ pub struct Database {
     pub(crate) inner: Arc<Inner>,
     pub(crate) db_handle: Handle,
     /// Canonical settings mirrored from the database handle, except private-key
-    /// sources, which are attached to each connection after last-source selection.
+    /// sources and driver-only REGION/URI_ACCOUNT host-derivation inputs.
     pub(crate) sf_settings: HashMap<String, Setting>,
     /// Additional login session parameters; names are stored as supplied for GetOption.
     pub(crate) session_parameters: HashMap<String, String>,
@@ -783,12 +788,19 @@ impl Database {
         if let Some((key, value)) = opts.iter().rev().find(|(key, _)| is_password(key)) {
             self.private_key_password = Some(secret_option_as_string(key.as_ref(), value)?.into());
         }
+        // ADBC FFI supplies a map: explicit options must override the URI
+        // independently of iteration order, as in Go's SetOptions.
+        for (key, value) in &opts {
+            if key.as_ref() == "uri" {
+                self.apply_uri(database_option_as_string("uri", value)?)?;
+            }
+        }
         let mut explicit_tracing = None;
         for (key, value) in opts {
             if key.as_ref() == LOG_TRACING {
                 self.set_option(key, value)?;
                 explicit_tracing = self.tracing_level.take();
-            } else if !is_password(&key) {
+            } else if !is_password(&key) && key.as_ref() != "uri" {
                 self.set_option(key, value)?;
             }
         }
@@ -836,6 +848,23 @@ impl Optionable for Database {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         let key_str = key.as_ref();
+        if key_str == REGION {
+            let region = database_option_as_string(key_str, &value)?;
+            let trimmed = region.trim_matches(' ');
+            if !trimmed.is_empty()
+                && !trimmed.split('.').all(|label| {
+                    !label.is_empty()
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+            {
+                return Err(invalid_option_value(key_str, region));
+            }
+            self.sf_settings
+                .insert(REGION.into(), Setting::String(region.into()));
+            return Ok(());
+        }
         if key_str == TRACE_PARENT {
             let parent = database_option_as_string(key_str, &value)?;
             self.trace_parent = validate_trace_parent(parent)?;
@@ -994,6 +1023,9 @@ impl Optionable for Database {
         };
         if let Some((param, setting)) = mapped {
             self.set_sf_option(param, setting)?;
+            if param == param_names::ACCOUNT.as_str() {
+                self.sf_settings.remove(URI_ACCOUNT);
+            }
             self.session_parameters
                 .retain(|key, _| !key.eq_ignore_ascii_case(param));
             if key_str.eq_ignore_ascii_case(param_names::AUTHENTICATOR.as_str()) {
@@ -1037,6 +1069,12 @@ impl Optionable for Database {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let key_str = key.as_ref();
+        if key_str == REGION {
+            return Ok(match self.sf_settings.get(REGION) {
+                Some(Setting::String(region)) => region.clone(),
+                _ => String::new(),
+            });
+        }
         if write_only_database_option(key_str) {
             return Err(go_unknown_database_option(key_str));
         }
@@ -1211,6 +1249,106 @@ impl Optionable for Database {
 }
 
 impl Database {
+    fn apply_account_region(&self, options: &mut HashMap<String, Setting>) {
+        let value = |key| match options.get(key).or_else(|| self.sf_settings.get(key)) {
+            Some(Setting::String(value)) => Some(value.as_str()),
+            _ => None,
+        };
+        // Profile and environment hosts must retain sf_core's normal precedence.
+        if self
+            .sf_settings
+            .contains_key(param_names::CONNECTION_NAME.as_str())
+            || options.contains_key(param_names::CONNECTION_NAME.as_str())
+            || value(param_names::SERVER_URL.as_str()).is_some_and(|url| !url.is_empty())
+        {
+            return;
+        }
+        let account = value(param_names::ACCOUNT.as_str()).unwrap_or_default();
+        let explicit_host = value(param_names::HOST.as_str()).filter(|host| !host.is_empty());
+        if account.is_empty() && explicit_host.is_none() {
+            return;
+        }
+        let region = value(REGION).unwrap_or_default().trim_matches(' ');
+        let uri_account = if options.contains_key(param_names::ACCOUNT.as_str()) {
+            None
+        } else {
+            value(URI_ACCOUNT)
+        };
+        let derived_host = if explicit_host.is_none() {
+            let (prefix, domain_region) = if let Some(uri_account) = uri_account {
+                let embedded = uri_account.split_once('.').map_or("", |(_, region)| region);
+                let prefix = if embedded.eq_ignore_ascii_case("us-west-2") {
+                    uri_account.split('.').next().unwrap_or_default()
+                } else {
+                    uri_account
+                };
+                (prefix, embedded)
+            } else {
+                (
+                    account,
+                    if region.is_empty() {
+                        account.split_once('.').map_or("", |(_, region)| region)
+                    } else {
+                        region
+                    },
+                )
+            };
+            let domain = if domain_region
+                .get(..3)
+                .is_some_and(|s| s.eq_ignore_ascii_case("cn-"))
+            {
+                ".snowflakecomputing.cn"
+            } else {
+                ".snowflakecomputing.com"
+            };
+            // ParseDSN only patches a synthesized host if it lacks the region.
+            // Programmatic Config instead appends any separately set region.
+            let append_region =
+                !region.is_empty() && (uri_account.is_none() || !prefix.ends_with(region));
+            if append_region
+                || prefix != account
+                || domain != ".snowflakecomputing.com"
+                || value(param_names::HOST.as_str()) == Some("")
+            {
+                Some(if append_region {
+                    format!("{prefix}.{region}{domain}")
+                } else {
+                    format!("{prefix}{domain}")
+                })
+            } else {
+                // Identical to sf_core's derivation: leave host absent so a
+                // profile or SPCS host can still take precedence.
+                None
+            }
+        } else {
+            None
+        };
+        let host = explicit_host
+            .or(derived_host.as_deref())
+            .unwrap_or_default();
+        let account = if (explicit_host.is_some() || uri_account.is_some())
+            && host
+                .as_bytes()
+                .windows(8)
+                .any(|part| part.eq_ignore_ascii_case(b".global."))
+        {
+            account
+                .rsplit_once('-')
+                .map_or(account, |(account, _)| account)
+        } else {
+            account
+        };
+        let normalized_account = (!account.is_empty()
+            && value(param_names::ACCOUNT.as_str()) != Some(account))
+        .then(|| account.to_owned());
+        if let Some(account) = normalized_account {
+            options.insert(param_names::ACCOUNT.into(), Setting::String(account));
+        }
+        if let Some(host) = derived_host {
+            options.insert(param_names::HOST.into(), Setting::String(host));
+        }
+    }
+
     fn apply_connection_defaults(
         &self,
         options: &mut HashMap<String, Setting>,
@@ -1307,6 +1445,11 @@ impl Database {
         let stripped = uri.strip_prefix("snowflake://").unwrap_or(uri);
         let (user_info, rest) = stripped
             .split_once('@')
+            .filter(|(info, _)| {
+                !info
+                    .split_once('?')
+                    .is_some_and(|(_, query)| query.contains('='))
+            })
             .map_or((None, stripped), |(info, rest)| (Some(info), rest));
 
         if let Some(info) = user_info {
@@ -1347,6 +1490,7 @@ impl Database {
         });
 
         let mut parts = path.splitn(3, '/');
+        let mut uri_account = None;
         if let Some(authority) = parts.next().filter(|s| !s.is_empty()) {
             let authority = decode_uri_component(authority, "account/host")?;
             // The documented form is host[:port], with or without account=.
@@ -1354,11 +1498,10 @@ impl Database {
                 Some((host, port)) => (host.to_owned(), Some(port.to_owned())),
                 None => (authority.into_owned(), None),
             };
-            // Like gosnowflake's ParseDSN: an authority containing the
-            // Snowflake domain is a full hostname whose first label is the
-            // account (unless account= is given); otherwise it is the account.
+            // A Snowflake hostname or an authority with a port is explicit.
+            // Otherwise Go treats the authority as account[.region].
             let is_hostname = host.to_ascii_lowercase().contains(".snowflakecomputing.");
-            if explicit_account || is_hostname {
+            if is_hostname || port.is_some() {
                 if is_hostname && !explicit_account {
                     let account = host.split('.').next().unwrap_or_default();
                     self.set_option(
@@ -1371,10 +1514,18 @@ impl Database {
                     OptionValue::String(host),
                 )?;
             } else {
+                let (account, region) = host.split_once('.').unwrap_or((&host, ""));
+                let region = if region.eq_ignore_ascii_case("us-west-2") {
+                    ""
+                } else {
+                    region
+                };
                 self.set_option(
                     OptionDatabase::Other("adbc.snowflake.sql.account".into()),
-                    OptionValue::String(host),
+                    OptionValue::String(account.to_owned()),
                 )?;
+                self.set_option(OptionDatabase::Other(REGION.into()), region.into())?;
+                uri_account = Some(host);
             }
             if let Some(port) = port {
                 self.set_option(
@@ -1403,6 +1554,31 @@ impl Database {
                     let value = decode_uri_component(encoded_value, "query parameter")?;
                     if let Some(option) = uri_query_option(&key)? {
                         let value = match key.as_ref() {
+                            "singleAuthenticationPrompt" => OptionValue::String(
+                                match value.as_ref() {
+                                    "1" | "t" | "T" | "true" | "TRUE" | "True" => "true",
+                                    "0" | "f" | "F" | "false" | "FALSE" | "False" => "false",
+                                    _ => return Err(invalid_option_value(&key, &value)),
+                                }
+                                .into(),
+                            ),
+                            "externalBrowserTimeout" => {
+                                let seconds = value
+                                    .parse::<i64>()
+                                    .map_err(|_| invalid_option_value(&key, &value))?;
+                                // Go stores time.Duration in signed nanoseconds, including
+                                // its overflow behavior. Nonpositive deadlines expire at once;
+                                // exactly zero selects Go's 120-second default.
+                                let nanos = seconds.wrapping_mul(1_000_000_000);
+                                OptionValue::Int(if nanos == 0 {
+                                    120
+                                } else if nanos < 0 {
+                                    0
+                                } else {
+                                    nanos / 1_000_000_000 + i64::from(nanos % 1_000_000_000 != 0)
+                                })
+                            }
+                            "region" => OptionValue::String(value.trim_matches(' ').into()),
                             // gosnowflake's timeout DSN values are integral seconds.
                             "loginTimeout"
                             | "requestTimeout"
@@ -1470,6 +1646,10 @@ impl Database {
                 }
             }
         }
+        if let Some(account) = uri_account {
+            self.sf_settings
+                .insert(URI_ACCOUNT.into(), Setting::String(account));
+        }
         Ok(())
     }
 }
@@ -1479,6 +1659,9 @@ impl Database {
 fn uri_query_option(key: &str) -> Result<Option<&'static str>> {
     let option = match key {
         "account" => "adbc.snowflake.sql.account",
+        "region" => REGION,
+        "singleAuthenticationPrompt" => param_names::DISABLE_PARALLEL_USER_PROMPT.as_str(),
+        "externalBrowserTimeout" => param_names::AUTHENTICATION_TIMEOUT.as_str(),
         "warehouse" => "adbc.snowflake.sql.warehouse",
         "database" => "adbc.snowflake.sql.db",
         "schema" => "adbc.snowflake.sql.schema",
@@ -1549,10 +1732,7 @@ fn uri_query_option(key: &str) -> Result<Option<&'static str>> {
         "proxyPassword" => "adbc.snowflake.sql.client_option.proxy_password",
         "proxyProtocol" => "adbc.snowflake.sql.client_option.proxy_protocol",
         "noProxy" => param_names::NO_PROXY.as_str(),
-        "singleAuthenticationPrompt"
-        | "region"
-        | "jwtClientTimeout"
-        | "externalBrowserTimeout"
+        "jwtClientTimeout"
         | "cloudStorageTimeout"
         | "cleanupTimeout"
         | "ocspFailOpen"
@@ -1778,6 +1958,7 @@ impl adbc_core::Database for Database {
                     &credential_options,
                     no_connection_details,
                 );
+                self.apply_account_region(&mut sf_options);
                 let key_sources = [param_names::PRIVATE_KEY, param_names::PRIVATE_KEY_FILE];
                 if !key_sources
                     .iter()
@@ -1891,6 +2072,7 @@ impl adbc_core::Database for Database {
                     inner: self.inner.clone(),
                     conn_handle,
                     autocommit: true,
+                    active_transaction: false,
                     trace_parent: self.trace_parent.clone(),
                     match_exactly: false,
                     timestamp_precision: self.timestamp_precision,
@@ -3557,7 +3739,6 @@ mod tests {
     fn unsupported_go_and_adbc_options_are_not_stored() {
         let mut db = make_db();
         for key in [
-            "adbc.snowflake.sql.region",
             "adbc.snowflake.sql.client_option.ocsp_fail_open_mode",
             "adbc.snowflake.sql.client_option.use_high_precision",
             "adbc.snowflake.sql.client_option.stream_retry_enabled",
@@ -4138,7 +4319,7 @@ mod tests {
     }
 
     #[test]
-    fn uri_account_with_port_splits_port_without_explicit_account() {
+    fn uri_authority_with_port_is_an_explicit_host() {
         let mut db = make_db();
         db.set_option(
             OptionDatabase::Uri,
@@ -4146,14 +4327,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            db.sf_settings.get(param_names::ACCOUNT.as_str()).unwrap(),
+            db.sf_settings.get(param_names::HOST.as_str()).unwrap(),
             &Setting::String("myorg-account1".into())
         );
         assert_eq!(
             db.sf_settings.get(param_names::PORT.as_str()).unwrap(),
             &Setting::Int(443)
         );
-        assert!(!db.sf_settings.contains_key(param_names::HOST.as_str()));
+        assert!(!db.sf_settings.contains_key(param_names::ACCOUNT.as_str()));
     }
 
     #[test]
@@ -4383,12 +4564,7 @@ mod tests {
 
     #[test]
     fn uri_rejects_unsupported_go_configuration_without_forwarding_it() {
-        for key in [
-            "region",
-            "singleAuthenticationPrompt",
-            "jwtClientTimeout",
-            "ocspFailOpen",
-        ] {
+        for key in ["jwtClientTimeout", "ocspFailOpen"] {
             let mut db = make_db();
             let error = db
                 .set_option(
@@ -4535,5 +4711,466 @@ mod tests {
             show_session_parameter(&mut second, "DATE_OUTPUT_FORMAT").as_deref(),
             Some("DD/MM/YYYY")
         );
+    }
+
+    #[test]
+    fn uri_single_authentication_prompt_matches_go_parse_bool() {
+        for (value, expected) in [
+            ("1", true),
+            ("t", true),
+            ("T", true),
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("0", false),
+            ("f", false),
+            ("F", false),
+            ("false", false),
+            ("FALSE", false),
+            ("False", false),
+        ] {
+            let mut db = make_db();
+            db.apply_uri(&format!("account?singleAuthenticationPrompt={value}"))
+                .unwrap();
+            assert_eq!(
+                db.sf_settings.get("disable_parallel_user_prompt"),
+                Some(&Setting::Bool(expected)),
+            );
+            assert!(db.session_parameters.is_empty());
+        }
+        for value in ["", "yes", "no", "TrUe", "2", "%20true"] {
+            let error = make_db()
+                .apply_uri(&format!("account?singleAuthenticationPrompt={value}"))
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{value}");
+        }
+        assert!(
+            !make_db()
+                .sf_settings
+                .contains_key("disable_parallel_user_prompt")
+        );
+    }
+
+    #[test]
+    fn uri_external_browser_timeout_uses_go_integer_seconds() {
+        for (value, expected) in [("17", 17), ("%2B17", 17), ("0", 120), ("-1", 0)] {
+            let mut db = make_db();
+            db.apply_uri(&format!("account?externalBrowserTimeout={value}"))
+                .unwrap();
+            assert_eq!(
+                db.sf_settings.get("authentication_timeout"),
+                Some(&Setting::Int(expected)),
+            );
+            assert!(db.session_parameters.is_empty());
+        }
+        for value in ["", "1s", "1.5", "%201", "9223372036854775808"] {
+            let error = make_db()
+                .apply_uri(&format!("account?externalBrowserTimeout={value}"))
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{value}");
+        }
+    }
+
+    fn connection_endpoint(db: &Database) -> (String, String) {
+        let mut options = HashMap::new();
+        db.apply_account_region(&mut options);
+        let mut explicit = sf_core::config::param_store::ParamStore::new();
+        for key in [param_names::ACCOUNT, param_names::HOST] {
+            if let Some(value) = options
+                .get(key.as_str())
+                .or_else(|| db.sf_settings.get(key.as_str()))
+            {
+                explicit.insert(key.to_string(), value.clone());
+            }
+        }
+        let resolved = sf_core::config::resolver::resolve_with_paths(
+            &explicit,
+            &sf_core::config::path_resolver::ConfigPaths {
+                config_file: None,
+                connections_file: None,
+            },
+            false,
+        )
+        .unwrap();
+        (
+            resolved
+                .get_string(param_names::ACCOUNT)
+                .unwrap_or_default(),
+            resolved.get_string(param_names::HOST).unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn region_options_derive_hosts_independently_of_option_order() {
+        // Go ADBC uses FillMissingConfigParameters, not DSN(Config)'s
+        // default-region removal or region-conflict check.
+        for (account, region, host) in [
+            ("account", "", "account.snowflakecomputing.com"),
+            (
+                "account",
+                "eu-faraway",
+                "account.eu-faraway.snowflakecomputing.com",
+            ),
+            (
+                "account",
+                "us-west-2",
+                "account.us-west-2.snowflakecomputing.com",
+            ),
+            (
+                "account",
+                "  cn-region  ",
+                "account.cn-region.snowflakecomputing.cn",
+            ),
+            (
+                "account",
+                "CN-region",
+                "account.CN-region.snowflakecomputing.cn",
+            ),
+            (
+                "account.cn-region",
+                "",
+                "account.cn-region.snowflakecomputing.cn",
+            ),
+            (
+                "account.us-west-2",
+                "",
+                "account.us-west-2.snowflakecomputing.com",
+            ),
+            ("a.b.c", "", "a.b.c.snowflakecomputing.com"),
+            ("a.b.c", "r", "a.b.c.r.snowflakecomputing.com"),
+            (
+                "a-aofnadsf.global",
+                "",
+                "a-aofnadsf.global.snowflakecomputing.com",
+            ),
+            (
+                "a-aofnadsf.somewhere.azure",
+                "",
+                "a-aofnadsf.somewhere.azure.snowflakecomputing.com",
+            ),
+        ] {
+            for reverse in [false, true] {
+                let mut db = make_db();
+                let mut options = [
+                    ("adbc.snowflake.sql.account", account),
+                    ("adbc.snowflake.sql.region", region),
+                ];
+                if reverse {
+                    options.reverse();
+                }
+                for (key, value) in options {
+                    db.set_option(OptionDatabase::Other(key.into()), value.into())
+                        .unwrap();
+                }
+                assert_eq!(connection_endpoint(&db), (account.into(), host.into()));
+                assert_eq!(
+                    db.get_option_string(OptionDatabase::Other("adbc.snowflake.sql.region".into()))
+                        .unwrap(),
+                    region,
+                );
+                assert!(db.session_parameters.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn uri_region_derivation_matches_gosnowflake_vectors() {
+        // gosnowflake internal/config/dsn_test.go TestParseDSN:
+        // China, eu-faraway, global routing, explicit host, and military domain.
+        for (uri, account, region, host) in [
+            (
+                "u:p@/db?account=ac&region=cn-region",
+                "ac",
+                "cn-region",
+                "ac.cn-region.snowflakecomputing.cn",
+            ),
+            (
+                "user:pass@account.cn-region",
+                "account",
+                "cn-region",
+                "account.cn-region.snowflakecomputing.cn",
+            ),
+            (
+                "user:pass@account.eu-faraway",
+                "account",
+                "eu-faraway",
+                "account.eu-faraway.snowflakecomputing.com",
+            ),
+            (
+                "user:pass@account?region=eu-faraway",
+                "account",
+                "eu-faraway",
+                "account.eu-faraway.snowflakecomputing.com",
+            ),
+            (
+                "user:pass@account.us-west-2",
+                "account",
+                "",
+                "account.snowflakecomputing.com",
+            ),
+            (
+                "user:pass@account.US-WEST-2",
+                "account",
+                "",
+                "account.snowflakecomputing.com",
+            ),
+            (
+                "user:pass@account?region=us-west-2",
+                "account",
+                "us-west-2",
+                "account.us-west-2.snowflakecomputing.com",
+            ),
+            (
+                "user:pass@ac-1-laksdnflaf.global/db/schema",
+                "ac-1",
+                "global",
+                "ac-1-laksdnflaf.global.snowflakecomputing.com",
+            ),
+            (
+                "u:p@a.snowflakecomputing.com/db/pa?region=eu-faraway",
+                "a",
+                "eu-faraway",
+                "a.snowflakecomputing.com",
+            ),
+            (
+                "u:p@a.snowflakecomputing.mil/db/pa?account=a",
+                "a",
+                "",
+                "a.snowflakecomputing.mil",
+            ),
+            (
+                "u:p@localhost:443?account=ac&region=eu-faraway",
+                "ac",
+                "eu-faraway",
+                "localhost",
+            ),
+            (
+                "u:p@account.cn-region?region=other",
+                "account",
+                "other",
+                "account.cn-region.other.snowflakecomputing.cn",
+            ),
+            (
+                "u:p@account?region=cn-region",
+                "account",
+                "cn-region",
+                "account.cn-region.snowflakecomputing.com",
+            ),
+        ] {
+            let mut db = make_db();
+            db.apply_uri(uri).unwrap();
+            assert_eq!(
+                connection_endpoint(&db),
+                (account.into(), host.into()),
+                "{uri}"
+            );
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Other("adbc.snowflake.sql.region".into()))
+                    .unwrap(),
+                region,
+                "{uri}",
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_host_wins_over_region_and_account_changes() {
+        for host in [
+            "account.snowflakecomputing.com",
+            "private.example",
+            "account.snowflakecomputing.gov.pl",
+        ] {
+            let mut db = make_db();
+            for (key, value) in [
+                ("adbc.snowflake.sql.uri.host", host),
+                ("adbc.snowflake.sql.region", "cn-region"),
+                ("adbc.snowflake.sql.account", "account"),
+            ] {
+                db.set_option(OptionDatabase::Other(key.into()), value.into())
+                    .unwrap();
+            }
+            assert_eq!(connection_endpoint(&db), ("account".into(), host.into()));
+        }
+    }
+
+    #[test]
+    fn qualified_account_and_separate_region_have_identical_hosts() {
+        for region in [
+            "eu-faraway",
+            "cn-region",
+            "us-west-2",
+            "somewhere.azure",
+            "global",
+        ] {
+            let mut qualified = make_db();
+            qualified
+                .set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                    format!("account.{region}").into(),
+                )
+                .unwrap();
+            let mut separate = make_db();
+            separate
+                .set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                    "account".into(),
+                )
+                .unwrap();
+            separate
+                .set_option(OptionDatabase::Other(REGION.into()), region.into())
+                .unwrap();
+            assert_eq!(
+                connection_endpoint(&qualified).1,
+                connection_endpoint(&separate).1
+            );
+        }
+    }
+
+    #[test]
+    fn region_rejects_invalid_hostname_components() {
+        for region in [
+            "a..b", ".a", "a.", "a/b", "a@b", "a:b", "a b", "a\tb", "région",
+        ] {
+            let mut db = make_db();
+            assert_eq!(
+                db.set_option(OptionDatabase::Other(REGION.into()), region.into())
+                    .unwrap_err()
+                    .status,
+                Status::InvalidArguments,
+            );
+            assert_eq!(
+                db.apply_uri(&format!("account?region={region}"))
+                    .unwrap_err()
+                    .status,
+                Status::InvalidArguments,
+            );
+        }
+    }
+
+    #[test]
+    fn connection_account_override_replaces_uri_host_derivation() {
+        let mut db = make_db();
+        db.apply_uri("account.eu-faraway").unwrap();
+        let mut options = HashMap::from([("account".into(), Setting::String("other".into()))]);
+        db.apply_account_region(&mut options);
+        assert_eq!(
+            options.get("host"),
+            Some(&Setting::String(
+                "other.eu-faraway.snowflakecomputing.com".into()
+            )),
+        );
+        assert!(!options.contains_key(REGION));
+        assert!(!options.contains_key(URI_ACCOUNT));
+    }
+
+    #[test]
+    fn initial_explicit_region_and_account_override_uri_in_any_order() {
+        for (key, value, expected_account, expected_host) in [
+            (
+                REGION,
+                "eu-west-1",
+                "acct",
+                "acct.eu-west-1.snowflakecomputing.com",
+            ),
+            (
+                "adbc.snowflake.sql.account",
+                "other",
+                "other",
+                "other.snowflakecomputing.com",
+            ),
+        ] {
+            for reverse in [false, true] {
+                let mut options = [
+                    (
+                        OptionDatabase::Uri,
+                        OptionValue::String("snowflake://u:p@acct".into()),
+                    ),
+                    (
+                        OptionDatabase::Other(key.into()),
+                        OptionValue::String(value.into()),
+                    ),
+                ];
+                if reverse {
+                    options.reverse();
+                }
+                let mut db = make_db();
+                db.set_initial_options(options).unwrap();
+                assert_eq!(
+                    connection_endpoint(&db),
+                    (expected_account.into(), expected_host.into()),
+                );
+                assert_eq!(
+                    db.get_option_string(OptionDatabase::Other(key.into()))
+                        .unwrap(),
+                    value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uri_question_mark_password_does_not_capture_query_at_sign() {
+        for uri in [
+            "user:p?w@account",
+            "user:p?w@account/db/schema?QUERY_TAG=a@b",
+        ] {
+            let mut db = make_db();
+            db.apply_uri(uri).unwrap();
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Username).unwrap(),
+                "user"
+            );
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Password).unwrap(),
+                "p?w"
+            );
+            assert_eq!(connection_endpoint(&db).0, "account");
+        }
+        let mut db = make_db();
+        db.apply_uri("account?QUERY_TAG=a@b").unwrap();
+        assert_eq!(db.get_option_string(OptionDatabase::Username).unwrap(), "");
+        assert_eq!(db.session_parameters.get("QUERY_TAG").unwrap(), "a@b");
+        assert_eq!(connection_endpoint(&db).0, "account");
+    }
+
+    #[test]
+    fn host_derivation_preserves_profiles_and_core_account_defaults() {
+        for uri in [false, true] {
+            let mut db = make_db();
+            if uri {
+                db.apply_uri("user:pass@account").unwrap();
+            } else {
+                db.set_option(
+                    OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                    "account".into(),
+                )
+                .unwrap();
+            }
+            let mut options = HashMap::new();
+            db.apply_account_region(&mut options);
+            assert!(!options.contains_key("host"));
+        }
+        for profile_at_database in [false, true] {
+            let mut db = make_db();
+            db.set_option(
+                OptionDatabase::Other("adbc.snowflake.sql.account".into()),
+                "account".into(),
+            )
+            .unwrap();
+            db.set_option(OptionDatabase::Other(REGION.into()), "eu-west-1".into())
+                .unwrap();
+            let mut options = HashMap::new();
+            if profile_at_database {
+                db.set_option(
+                    OptionDatabase::Other("connection_name".into()),
+                    "profile".into(),
+                )
+                .unwrap();
+            } else {
+                options.insert("connection_name".into(), Setting::String("profile".into()));
+            }
+            db.apply_account_region(&mut options);
+            assert!(!options.contains_key("host"));
+        }
     }
 }

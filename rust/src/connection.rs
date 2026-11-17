@@ -70,6 +70,9 @@ pub struct Connection {
     pub(crate) inner: Arc<Inner>,
     pub(crate) conn_handle: Handle,
     pub(crate) autocommit: bool,
+    // Like Go's activeTransaction, this tracks successful BEGIN/COMMIT in
+    // set_autocommit independently of whether the following ALTER succeeds.
+    pub(crate) active_transaction: bool,
     pub(crate) trace_parent: Option<String>,
     pub(crate) match_exactly: bool,
     pub(crate) timestamp_precision: TimestampPrecision,
@@ -373,14 +376,19 @@ impl Connection {
 
     pub(crate) fn set_autocommit(&mut self, enabled: bool) -> Result<()> {
         let operation = self.begin_operation();
-        self.inner.execute_temporary_statement(
-            Some(&operation),
-            self.conn_handle,
-            format!("ALTER SESSION SET AUTOCOMMIT = {enabled}"),
-            None,
-        )?;
-        self.autocommit = enabled;
-        Ok(())
+        change_autocommit(
+            &mut self.autocommit,
+            &mut self.active_transaction,
+            enabled,
+            |sql| {
+                self.inner.execute_temporary_statement(
+                    Some(&operation),
+                    self.conn_handle,
+                    sql,
+                    None,
+                )
+            },
+        )
     }
 
     fn set_current_identifier(&self, kind: SessionIdentifierKind, name: &str) -> Result<()> {
@@ -419,6 +427,29 @@ impl Connection {
         }
         Ok(())
     }
+}
+
+fn change_autocommit(
+    autocommit: &mut bool,
+    active_transaction: &mut bool,
+    enabled: bool,
+    mut execute: impl FnMut(&'static str) -> Result<()>,
+) -> Result<()> {
+    if enabled {
+        if *active_transaction {
+            execute("COMMIT")?;
+            *active_transaction = false;
+        }
+        execute("ALTER SESSION SET AUTOCOMMIT = true")?;
+    } else {
+        if !*active_transaction {
+            execute("BEGIN")?;
+            *active_transaction = true;
+        }
+        execute("ALTER SESSION SET AUTOCOMMIT = false")?;
+    }
+    *autocommit = enabled;
+    Ok(())
 }
 
 /// Parse an autocommit option value, rejecting anything that is not an
@@ -747,6 +778,12 @@ impl adbc_core::Connection for Connection {
                     self.conn_handle,
                     "COMMIT",
                     None,
+                )?;
+                self.inner.execute_temporary_statement(
+                    Some(&operation),
+                    self.conn_handle,
+                    "BEGIN",
+                    None,
                 )
             },
         )
@@ -768,6 +805,12 @@ impl adbc_core::Connection for Connection {
                     Some(&operation),
                     self.conn_handle,
                     "ROLLBACK",
+                    None,
+                )?;
+                self.inner.execute_temporary_statement(
+                    Some(&operation),
+                    self.conn_handle,
+                    "BEGIN",
                     None,
                 )
             },
@@ -799,6 +842,7 @@ mod tests {
             inner: driver.inner.clone(),
             conn_handle: Handle { id: 0, magic: 0 },
             autocommit: true,
+            active_transaction: false,
             trace_parent: None,
             match_exactly: false,
             timestamp_precision: TimestampPrecision::Nanoseconds,
@@ -1118,6 +1162,85 @@ mod tests {
         conn.get_cancel_handle().try_cancel().unwrap();
         assert_eq!(conn.commit().unwrap_err().status, Status::InvalidState);
         assert_eq!(conn.rollback().unwrap_err().status, Status::InvalidState);
+    }
+
+    #[test]
+    fn autocommit_transitions_preserve_go_state_on_each_error_path() {
+        // (enabled, tracked transaction, requested mode, statements).
+        let cases: &[(bool, bool, bool, &[&str])] = &[
+            (
+                true,
+                false,
+                false,
+                &["BEGIN", "ALTER SESSION SET AUTOCOMMIT = false"],
+            ),
+            (
+                false,
+                true,
+                false,
+                &["ALTER SESSION SET AUTOCOMMIT = false"],
+            ),
+            (
+                false,
+                true,
+                true,
+                &["COMMIT", "ALTER SESSION SET AUTOCOMMIT = true"],
+            ),
+            (true, false, true, &["ALTER SESSION SET AUTOCOMMIT = true"]),
+            // A preceding ALTER failed after BEGIN or COMMIT succeeded.
+            (true, true, false, &["ALTER SESSION SET AUTOCOMMIT = false"]),
+            (false, false, true, &["ALTER SESSION SET AUTOCOMMIT = true"]),
+            (
+                true,
+                true,
+                true,
+                &["COMMIT", "ALTER SESSION SET AUTOCOMMIT = true"],
+            ),
+            (
+                false,
+                false,
+                false,
+                &["BEGIN", "ALTER SESSION SET AUTOCOMMIT = false"],
+            ),
+        ];
+        for &(initial_mode, initial_active, enabled, statements) in cases {
+            for fail_at in 0..=statements.len() {
+                let mut autocommit = initial_mode;
+                let mut active = initial_active;
+                let mut calls = Vec::new();
+                let result = change_autocommit(&mut autocommit, &mut active, enabled, |sql| {
+                    calls.push(sql);
+                    if calls.len() - 1 == fail_at {
+                        let mut error = adbc_core::error::Error::with_message_and_status(
+                            "transaction statement failed",
+                            Status::Internal,
+                        );
+                        error.vendor_code = 670;
+                        Err(error)
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert_eq!(calls, statements[..statements.len().min(fail_at + 1)]);
+                if fail_at == statements.len() {
+                    result.unwrap();
+                    assert_eq!(autocommit, enabled);
+                    assert_eq!(active, !enabled);
+                } else {
+                    assert_eq!(result.unwrap_err().vendor_code, 670);
+                    assert_eq!(autocommit, initial_mode, "ALTER has not succeeded");
+                    let expected_active = if statements.len() == 2 && fail_at == 1 {
+                        !enabled
+                    } else {
+                        initial_active
+                    };
+                    assert_eq!(
+                        active, expected_active,
+                        "only successful BEGIN/COMMIT update tracking"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

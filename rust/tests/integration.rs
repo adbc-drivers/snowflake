@@ -1775,8 +1775,8 @@ fn count_rows(conn: &mut adbc_driver_snowflake::Connection, table: &str) -> i64 
         .value(0)
 }
 
-/// Manual transactions without Go's explicit BEGIN: Snowflake starts one
-/// implicitly, and re-enabling autocommit commits it.
+/// Manual transactions explicitly BEGIN like Go; commit and rollback start the
+/// next transaction, and re-enabling autocommit commits the pending transaction.
 #[test]
 fn test_manual_transactions() {
     let Some(mut observer) = make_connection() else {
@@ -2553,4 +2553,214 @@ fn test_temporary_ingest_create_append_preserves_permanent_table() {
 #[test]
 fn test_temporary_ingest_replace_preserves_permanent_table() {
     temporary_ingest_preserves_permanent_table("replace");
+}
+
+fn transaction_query(
+    conn: &mut adbc_driver_snowflake::Connection,
+    sql: &str,
+) -> adbc_core::error::Result<arrow_array::RecordBatch> {
+    let mut stmt = conn.new_statement()?;
+    stmt.set_sql_query(sql)?;
+    let mut reader = stmt.execute()?;
+    Ok(reader
+        .next()
+        .expect("one result batch")
+        .expect("read batch"))
+}
+
+fn current_transaction(conn: &mut adbc_driver_snowflake::Connection) -> Option<String> {
+    let batch = transaction_query(conn, "SELECT CURRENT_TRANSACTION()::VARCHAR").unwrap();
+    let values = batch.column(0).as_string::<i32>();
+    (!values.is_null(0)).then(|| values.value(0).to_owned())
+}
+
+#[test]
+fn test_manual_transactions_restart_for_stored_procedures() {
+    let Some(mut observer) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+    let table = format!("TXN_PROC_TABLE_{suffix}");
+    let procedure = format!("TXN_PROC_{suffix}");
+    transaction_query(&mut observer, &format!("CREATE TABLE {table} (v INT)")).unwrap();
+    // Clean up even if the regression causes CALL or an assertion to fail.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        transaction_query(
+            &mut observer,
+            &format!(
+                "CREATE PROCEDURE {procedure}() RETURNS VARCHAR LANGUAGE SQL AS \
+                 $$ BEGIN INSERT INTO {table} VALUES (1); RETURN 'ok'; END; $$"
+            ),
+        )
+        .unwrap();
+        let mut conn = make_connection().unwrap();
+        assert!(current_transaction(&mut conn).is_none());
+        conn.set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .unwrap();
+
+        for commit in [true, false] {
+            if commit {
+                conn.commit().unwrap();
+            } else {
+                conn.rollback().unwrap();
+            }
+            assert!(
+                current_transaction(&mut conn).is_some(),
+                "commit={commit}: the next transaction must already be open"
+            );
+            let batch = transaction_query(&mut conn, &format!("CALL {procedure}()")).unwrap();
+            assert_eq!(batch.column(0).as_string::<i32>().value(0), "ok");
+            assert_eq!(count_rows(&mut conn, &table), 1);
+            assert_eq!(count_rows(&mut observer, &table), 0);
+            conn.rollback().unwrap();
+            assert!(current_transaction(&mut conn).is_some());
+            assert_eq!(count_rows(&mut conn, &table), 0, "CALL must roll back");
+        }
+    }));
+    transaction_query(
+        &mut observer,
+        &format!("DROP PROCEDURE IF EXISTS {procedure}()"),
+    )
+    .unwrap();
+    transaction_query(&mut observer, &format!("DROP TABLE {table}")).unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn test_manual_transactions_rollback_restarts_abort_on_error() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    transaction_query(
+        &mut conn,
+        "ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE",
+    )
+    .unwrap();
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("false".into()),
+    )
+    .unwrap();
+    conn.rollback().unwrap();
+    assert!(current_transaction(&mut conn).is_some());
+    assert!(transaction_query(&mut conn, "SELECT 1/0").is_err());
+    let error = transaction_query(&mut conn, "SELECT 1").unwrap_err();
+    assert_eq!(error.vendor_code, 624, "{error:?}");
+    conn.rollback().unwrap();
+    assert!(current_transaction(&mut conn).is_some());
+}
+
+#[test]
+fn test_manual_transactions_enable_autocommit_aborted_transaction() {
+    let Some(mut conn) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    transaction_query(
+        &mut conn,
+        "ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE",
+    )
+    .unwrap();
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("false".into()),
+    )
+    .unwrap();
+    conn.rollback().unwrap();
+    assert!(transaction_query(&mut conn, "SELECT 1/0").is_err());
+    let error = conn
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .unwrap_err();
+    assert_eq!(error.vendor_code, 670, "{error:?}");
+    assert!(
+        current_transaction(&mut conn).is_none(),
+        "failed COMMIT clears the aborted server transaction"
+    );
+    assert_eq!(
+        conn.get_option_string(OptionConnection::AutoCommit)
+            .unwrap(),
+        "false"
+    );
+    let batch =
+        transaction_query(&mut conn, "SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION").unwrap();
+    let value = batch.schema().index_of("value").unwrap();
+    assert_eq!(batch.column(value).as_string::<i32>().value(0), "false");
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("true".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        conn.get_option_string(OptionConnection::AutoCommit)
+            .unwrap(),
+        "true"
+    );
+}
+
+#[test]
+fn test_database_region_connects_to_current_aws_region() {
+    let Some(mut original) = make_connection() else {
+        eprintln!("Skipping: SNOWFLAKE_URI not set");
+        return;
+    };
+    let mut statement = original.new_statement().unwrap();
+    statement
+        .set_sql_query("SELECT CURRENT_ACCOUNT(), CURRENT_REGION()")
+        .unwrap();
+    let batch = statement.execute().unwrap().next().unwrap().unwrap();
+    let account = batch.column(0).as_string::<i32>().value(0);
+    let snowflake_region = batch.column(1).as_string::<i32>().value(0);
+    // Locator suffixes from Snowflake's account-identifier region table:
+    // https://docs.snowflake.com/en/user-guide/admin-account-identifier
+    // Newer AWS regions also require ".aws"; skip deployment-specific mappings.
+    let Some(aws_region) = snowflake_region.strip_prefix("AWS_") else {
+        eprintln!("Skipping: account region does not have the standard AWS mapping");
+        return;
+    };
+    let suffix = match aws_region {
+        "US_WEST_2" | "US_EAST_1" | "EU_WEST_1" | "EU_CENTRAL_1" | "AP_SOUTHEAST_1"
+        | "AP_SOUTHEAST_2" => "",
+        "US_EAST_2" | "CA_CENTRAL_1" | "SA_EAST_1" | "AF_SOUTH_1" | "EU_WEST_2" | "EU_WEST_3"
+        | "EU_CENTRAL_2" | "EU_NORTH_1" | "ME_CENTRAL_1" | "AP_NORTHEAST_1" | "AP_NORTHEAST_2"
+        | "AP_NORTHEAST_3" | "AP_SOUTHEAST_3" | "AP_SOUTHEAST_5" | "AP_SOUTHEAST_6"
+        | "AP_SOUTH_1" => ".aws",
+        _ => {
+            eprintln!("Skipping: account region requires a deployment-specific endpoint");
+            return;
+        }
+    };
+    let mut region = aws_region.to_ascii_lowercase().replace('_', "-");
+    region.push_str(suffix);
+    let mut db = make_db().unwrap();
+    for (key, value) in [
+        ("adbc.snowflake.sql.account", account),
+        ("adbc.snowflake.sql.region", region.as_str()),
+        ("adbc.snowflake.sql.uri.host", ""),
+    ] {
+        db.set_option(
+            OptionDatabase::Other(key.into()),
+            OptionValue::String(value.into()),
+        )
+        .unwrap();
+    }
+    let regional = db.new_connection();
+    assert!(regional.is_ok(), "region-qualified connection failed");
+    let mut regional = regional.unwrap();
+    let mut statement = regional.new_statement().unwrap();
+    statement.set_sql_query("SELECT CURRENT_REGION()").unwrap();
+    let result = statement.execute().unwrap().next().unwrap().unwrap();
+    assert!(
+        result.column(0).as_string::<i32>().value(0) == snowflake_region,
+        "region option connected to a different region",
+    );
 }
