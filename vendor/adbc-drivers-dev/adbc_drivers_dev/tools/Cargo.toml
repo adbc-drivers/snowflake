@@ -23,4 +23,4 @@ publish = false
 [dependencies]
 cargo-deny = "=0.20.2"
 cargo-about = "=0.9.2"
-pixi = { git = "https://github.com/prefix-dev/pixi", tag = "v0.82.0" }
+pixi = { git = "https://github.com/prefix-dev/pixi", tag = "v0.83.0" }

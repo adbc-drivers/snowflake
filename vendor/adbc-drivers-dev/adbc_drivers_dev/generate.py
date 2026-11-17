@@ -302,6 +302,12 @@ class GenerateConfig(BaseModel):
         "validate_by_alias": True,
     }
 
+    license_header: str | None = Field(
+        default=None,
+        alias="license-header",
+        description="A custom license header; do not include comment prefixes.",
+    )
+
     repository: str | None = Field(
         default=None,
         description="GitHub repository name (if different from driver name)",
@@ -454,11 +460,19 @@ gcloud = true"""
 
         return self
 
+    def get_license_header(self) -> str | None:
+        if self.license_header is None:
+            return None
+        return "\n".join(
+            f"# {line}" if line else "#" for line in self.license_header.splitlines()
+        )
+
     def to_dict(self) -> dict[str, typing.Any]:
         return {
             "driver": self.driver,
             "repository": self.repository,
             "private": self.private,
+            "license_header": self.get_license_header(),
             "concurrency_key": self.concurrency_key,
             "lang": self.lang,
             "secrets": self._processed_secrets,

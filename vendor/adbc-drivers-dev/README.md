@@ -18,7 +18,7 @@
 
 Source: <https://github.com/adbc-drivers/dev>
 
-Exact upstream revision: `1253650a6bbb64cc97e6d92d5b3335e4bb4a5e27`
+Exact upstream revision: `0c94e3235eee46cc3ace6aa63daa203f3abcf53d`
 
 License: Apache-2.0; the upstream license and notice are included as `LICENSE.txt` and `NOTICE.txt`.
 
@@ -31,3 +31,8 @@ Local modifications:
 3. `adbc_drivers_dev/templates/test.yaml` serializes Snowflake live validation jobs across Go and Rust with `snowflake-live-validation` and `cancel-in-progress: false`, because they share fixed table names. Snowflake Rust test, validation, and build matrices keep `fail-fast: false` and disable incremental compilation to limit CI cache pressure; Rust lint runs `cargo fmt --check` before Clippy.
 4. `adbc_drivers_dev/templates/pixi.toml` keeps Snowflake Go and Rust on the editable `../vendor/adbc-drivers-dev` package when generated, rather than resetting to upstream Git; other drivers retain the upstream Git dependency.
 5. `tests/test_make.py` asserts the Go and Rust cache variables appear in the actual inner `docker exec` command rather than only the outer Compose environment; `tests/test_workflow.py` checks the generated Pixi dependency source for Snowflake Go/Rust and other drivers.
+
+6. `adbc_drivers_dev/templates/test.yaml` extends Snowflake Rust unit-test and package-test matrices to Linux ARM64 and Windows ARM64, limits non-release test matrices to three concurrent jobs, and selects native ARM64 `dumpbin` on Windows ARM64. Upstream already supplies Windows ARM64 builds and package tests; its unit-test matrix and Linux ARM64 package-test coverage remain narrower.
+7. `adbc_drivers_dev/package.py` includes `aarch64-pc-windows-msvc` in the cargo-about license targets so the Windows ARM64 package attributes crates linked only on that target (for example `windows_aarch64_msvc`).
+
+Regenerate with `adbc-gen-workflow generate <repository>` from an environment using this vendored package. Keep the generated Rust workflows and `rust/pixi.toml`; do not replace the Go workflows as part of a Rust-only refresh. The Snowflake `LOCAL MODIFICATIONS` blocks live in the templates and survive regeneration. Refresh `rust/pixi.lock` with `pixi lock` from `rust/` after regenerating its manifest.

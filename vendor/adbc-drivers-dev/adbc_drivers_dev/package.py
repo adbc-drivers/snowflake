@@ -134,7 +134,9 @@ def generate_rust_license(license_template: Path) -> str:
             "--fail",
             "--locked",
             "--target",
-            "aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu",
+            # LOCAL MODIFICATIONS: attribute crates linked only into the
+            # Windows ARM64 package (e.g. windows_aarch64_msvc).
+            "aarch64-apple-darwin,aarch64-pc-windows-msvc,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu",
             str(license_template.absolute()),
         ],
         cwd=license_template.parent,

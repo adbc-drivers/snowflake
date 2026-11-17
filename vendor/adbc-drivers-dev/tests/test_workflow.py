@@ -13,14 +13,17 @@
 # limitations under the License.
 
 import json
+from argparse import Namespace
 from pathlib import Path
 
 import jinja2
 import pytest
 import tomlkit
 from pydantic import ValidationError
+from ruamel.yaml import YAML
 
 from adbc_drivers_dev.generate import GenerateConfig, LangConfig, LangTestConfig
+from adbc_drivers_dev.workflow import generate_workflows
 
 
 def test_model_default() -> None:
@@ -46,6 +49,7 @@ def test_model_default() -> None:
         "repository": "(unknown)",
         "concurrency_key": None,
         "private": False,
+        "license_header": None,
         "lang": {},
         "secrets": {
             "all": {},
@@ -401,3 +405,46 @@ def test_test_timeout_config() -> None:
 def test_test_timeout_invalid(timeout) -> None:
     with pytest.raises(ValidationError):
         LangTestConfig.model_validate({"timeout-minutes": timeout})
+
+
+@pytest.mark.parametrize("release", [False, True])
+def test_snowflake_rust_arm64_workflows(tmp_path: Path, release: bool) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "generate.toml").write_text('driver = "snowflake"\n[lang.rust]\n')
+    rust = tmp_path / "rust"
+    rust.mkdir()
+    (rust / "license.tpl").write_text("")
+
+    assert generate_workflows(Namespace(repository=tmp_path)) == 0
+    suffix = "release" if release else "test"
+    workflow = YAML(typ="safe").load(workflows / f"rust_{suffix}.yaml")
+    expected = [
+        ("linux", "amd64", "ubuntu-latest"),
+        ("macos", "arm64", "macos-latest"),
+        ("windows", "amd64", "windows-latest"),
+        ("linux", "arm64", "ubuntu-24.04-arm"),
+        ("windows", "arm64", "windows-11-vs2026-arm"),
+    ]
+    for job in ("test", "build", "test-packages"):
+        strategy = workflow["jobs"][job]["strategy"]
+        assert [
+            (entry["platform"], entry["arch"], entry["runner"])
+            for entry in strategy["matrix"]["include"]
+        ] == expected
+        assert strategy["fail-fast"] is False
+        if not release:
+            assert strategy["max-parallel"] == 3
+
+    build_steps = workflow["jobs"]["build"]["steps"]
+    dumpbin = next(step for step in build_steps if step.get("name") == "Add dumpbin to PATH")
+    assert r"Hostarm64\arm64\dumpbin.exe" in dumpbin["run"]
+    package_steps = workflow["jobs"]["test-packages"]["steps"]
+    load = next(step for step in package_steps if step.get("name") == "load package")
+    assert "pixi run pytest -vs ci/test_package.py" in load["run"]
+
+    manifest = tomlkit.parse((rust / "pixi.toml").read_text())
+    assert "win-arm64" in manifest["workspace"]["platforms"]
+    arm_dependencies = manifest["target"]["win-arm64"]["pypi-dependencies"]
+    assert set(arm_dependencies) == {"adbc-driver-manager", "pytest"}
+    assert "adbc-drivers-validation" not in manifest["pypi-dependencies"]

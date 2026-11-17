@@ -133,6 +133,7 @@ def generate_workflows(args) -> int:
         "rust": ("Rust", "rust"),
         "script": ("Custom", "src"),
     }
+    go_mod_path = None
 
     retcode = 0
     for lang, (lang_human, lang_subdir_default) in langs.items():

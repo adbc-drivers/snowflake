@@ -18,11 +18,26 @@ set -ex
 # The vendored manylinux image already includes the OpenSSL dependencies and
 # writable caches. Avoid changing it here: release builds require a clean tree.
 if [[ "$2" == "windows" ]]; then
-    choco install nasm -y --no-progress
-    nasm_dir="${ProgramFiles:-C:\\Program Files}\\NASM"
-    if [[ ! -f "$(cygpath -u "$nasm_dir")/nasm.exe" ]]; then
-        echo "NASM was not installed in $nasm_dir" >&2
-        exit 1
+    if [[ "$3" == "arm64" ]]; then
+        # AWS-LC requires clang-cl, not NASM, for aarch64-pc-windows-msvc:
+        # https://aws.github.io/aws-lc-rs/requirements/windows.html
+        # The Windows ARM runner image includes LLVM and the MSVC ARM64 tools.
+        # aws-lc-sys and ring select clang-cl/clang themselves once LLVM is on
+        # PATH, so no CC_* overrides (which only the build step would see).
+        tool_dir="${ProgramFiles:-C:\\Program Files}\\LLVM\\bin"
+        if [[ ! -f "$(cygpath -u "$tool_dir")/clang-cl.exe" ]]; then
+            echo "LLVM clang-cl was not found in $tool_dir" >&2
+            exit 1
+        fi
+    else
+        choco install nasm -y --no-progress
+        tool_dir="${ProgramFiles:-C:\\Program Files}\\NASM"
+        if [[ ! -f "$(cygpath -u "$tool_dir")/nasm.exe" ]]; then
+            echo "NASM was not installed in $tool_dir" >&2
+            exit 1
+        fi
     fi
-    printf '%s\n' "$nasm_dir" >> "$GITHUB_PATH"
+    printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"
+    # GITHUB_PATH takes effect next step; the caller also builds in this step.
+    printf 'export PATH=%q:$PATH\n' "$(cygpath -u "$tool_dir")" >> .env.build
 fi

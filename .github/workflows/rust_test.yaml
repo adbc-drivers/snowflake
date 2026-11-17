@@ -82,11 +82,15 @@ jobs:
     strategy:
       # LOCAL MODIFICATIONS: retain all Snowflake Rust matrix results.
       fail-fast: false
+      max-parallel: 3
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: windows, arch: amd64, runner: windows-latest }
+          # LOCAL MODIFICATIONS: exercise Rust on both ARM64 runners.
+          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
+          - { platform: windows, arch: arm64, runner: windows-11-vs2026-arm }
     environment: Snowflake CI
     # LOCAL MODIFICATIONS: avoid Rust incremental cache pressure in Snowflake CI.
     env:
@@ -124,9 +128,9 @@ jobs:
           cache: true
           components: "clippy"
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.82.0
+          pixi-version: v0.83.0
           run-install: false
 
 
@@ -270,9 +274,9 @@ jobs:
           cache: true
           components: "clippy"
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.82.0
+          pixi-version: v0.83.0
           run-install: false
 
 
@@ -383,12 +387,14 @@ jobs:
     strategy:
       # LOCAL MODIFICATIONS: retain all Snowflake Rust matrix results.
       fail-fast: false
+      max-parallel: 3
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
-          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: windows, arch: amd64, runner: windows-latest }
+          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
+          - { platform: windows, arch: arm64, runner: windows-11-vs2026-arm }
     environment: Snowflake CI
     permissions:
       contents: read
@@ -420,9 +426,9 @@ jobs:
           cache: true
           components: "clippy"
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.82.0
+          pixi-version: v0.83.0
           run-install: false
 
       - name: Install dev tools
@@ -442,7 +448,12 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          # LOCAL MODIFICATIONS: use the native ARM64 MSVC tools on ARM runners.
+          if ($env:RUNNER_ARCH -eq 'ARM64') {
+            $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostarm64\arm64\dumpbin.exe' | Select-Object -First 1
+          } else {
           $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          }
           if (-not $dumpbin) {
             throw "Could not find dumpbin.exe using vswhere"
           }
@@ -506,9 +517,9 @@ jobs:
           cache: true
           components: "clippy"
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.82.0
+          pixi-version: v0.83.0
           run-install: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
@@ -569,20 +580,24 @@ jobs:
       - package
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         include:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: windows, arch: amd64, runner: windows-latest }
+          # LOCAL MODIFICATIONS: also load packages on Linux ARM64.
+          - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm }
+          - { platform: windows, arch: arm64, runner: windows-11-vs2026-arm }
     steps:
       # for now, install dbc from main
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           cache: true
           go-version: 'stable'
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.82.0
+          pixi-version: v0.83.0
           run-install: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -632,7 +647,7 @@ jobs:
             source .env.ci
           fi
           set +a
-          pixi exec -s adbc-driver-manager -s pyarrow -s pytest python -m pytest -vs ci/test_package.py
+          pixi run pytest -vs ci/test_package.py
 
 
   release:
@@ -663,9 +678,9 @@ jobs:
           persist-credentials: false
           submodules: 'recursive'
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94  # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.82.0
+          pixi-version: v0.83.0
           run-install: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2

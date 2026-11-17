@@ -1,4 +1,6 @@
-<% if private %>
+<% if license_header is not none %>
+<{license_header}>
+<% elif private %>
 # Copyright (c) 2025-2026 Columnar Technologies Inc.  All rights reserved.
 <% else %>
 # Copyright (c) 2025-2026 ADBC Drivers Contributors

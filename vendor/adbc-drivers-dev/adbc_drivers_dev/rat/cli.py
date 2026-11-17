@@ -160,6 +160,11 @@ def main():
                 if not member.isfile():
                     continue
 
+                if any(
+                    fnmatch.fnmatch(member.name, exclusion) for exclusion in exclusions
+                ):
+                    continue
+
                 with tar.extractfile(member) as f:
                     lines = []
                     for _ in range(20):

@@ -332,6 +332,19 @@
   "additionalProperties": false,
   "description": "You can validate your generate.toml against this schema with tools like tombi (https://tombi-toml.github.io/tombi/docs/linter). Requires placing a `#:schema` directive at the top of your generate.toml file.",
   "properties": {
+    "license-header": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "A custom license header; do not include comment prefixes.",
+      "title": "License-Header"
+    },
     "repository": {
       "anyOf": [
         {
