@@ -27,10 +27,7 @@ use driverbase::error::ErrorHelper;
 use sf_core::apis::database_driver_v1::{
     Handle, ValidationIssue, ValidationSeverity, connection::WrapperIdentity,
 };
-use sf_core::config::param_registry::{
-    DEFAULT_LOGIN_TIMEOUT_SECS, DEFAULT_RETRY_TIMEOUT_SECS, Wrapper, param_names, registry,
-};
-use sf_core::config::rest_parameters::DEFAULT_JWT_TIMEOUT_SECS;
+use sf_core::config::param_registry::{Wrapper, param_names, registry};
 use sf_core::config::settings::Setting;
 use sf_core::sensitive::{Sensitive, SensitiveString};
 use zeroize::{Zeroize, Zeroizing};
@@ -57,6 +54,11 @@ const CLIENT_CONFIG_FILE: &str = "adbc.snowflake.sql.client_option.config_file";
 const PRIVATE_KEY_PASSWORD: &str =
     "adbc.snowflake.sql.client_option.jwt_private_key_pkcs8_password";
 const DEFAULT_APPLICATION: &str = "ADBC Snowflake Driver (Rust)";
+// gosnowflake's defaults (internal/config/dsn.go): DefaultLoginTimeout,
+// DefaultClientTimeout, DefaultJWTTimeout.
+const GO_LOGIN_TIMEOUT_SECS: i64 = 300;
+const GO_CLIENT_TIMEOUT_SECS: i64 = 900;
+const GO_JWT_TIMEOUT_SECS: i64 = 60;
 const MAX_TIMESTAMP_PRECISION: &str = "adbc.snowflake.sql.client_option.max_timestamp_precision";
 pub(crate) const GEOGRAPHY_OUTPUT_FORMAT: &str =
     "adbc.snowflake.sql.client_option.geography_output_format";
@@ -383,13 +385,13 @@ fn default_database_option(key: &str) -> Option<String> {
         | "adbc.snowflake.sql.client_option.ocsp_fail_open_mode" => "0",
         "adbc.snowflake.sql.client_option.request_timeout" => "0s",
         "adbc.snowflake.sql.client_option.login_timeout" => {
-            return Some(format!("{DEFAULT_LOGIN_TIMEOUT_SECS}s"));
+            return Some(format!("{GO_LOGIN_TIMEOUT_SECS}s"));
         }
         "adbc.snowflake.sql.client_option.client_timeout" => {
-            return Some(format!("{DEFAULT_RETRY_TIMEOUT_SECS}s"));
+            return Some(format!("{GO_CLIENT_TIMEOUT_SECS}s"));
         }
         "adbc.snowflake.sql.client_option.jwt_expire_timeout" => {
-            return Some(format!("{DEFAULT_JWT_TIMEOUT_SECS}s"));
+            return Some(format!("{GO_JWT_TIMEOUT_SECS}s"));
         }
         "adbc.snowflake.sql.client_option.app_name"
         | "adbc.snowflake.sql.client_option.application" => DEFAULT_APPLICATION,
@@ -458,13 +460,9 @@ fn adbc_db_opt_to_sf(key: &str, value: &OptionValue) -> Result<Option<(&'static 
         | "adbc.snowflake.sql.client_option.jwt_expire_timeout" => {
             match duration_setting(key, value)? {
                 Setting::Int(0) => Setting::Int(match key {
-                    "adbc.snowflake.sql.client_option.login_timeout" => {
-                        DEFAULT_LOGIN_TIMEOUT_SECS as i64
-                    }
-                    "adbc.snowflake.sql.client_option.client_timeout" => {
-                        DEFAULT_RETRY_TIMEOUT_SECS as i64
-                    }
-                    _ => DEFAULT_JWT_TIMEOUT_SECS,
+                    "adbc.snowflake.sql.client_option.login_timeout" => GO_LOGIN_TIMEOUT_SECS,
+                    "adbc.snowflake.sql.client_option.client_timeout" => GO_CLIENT_TIMEOUT_SECS,
+                    _ => GO_JWT_TIMEOUT_SECS,
                 }),
                 setting => setting,
             }
@@ -1363,6 +1361,9 @@ impl Database {
         for (param, default) in [
             (param_names::RETRY_MAX_ATTEMPTS, 8),
             (param_names::REQUEST_TIMEOUT, 0),
+            (param_names::LOGIN_TIMEOUT, GO_LOGIN_TIMEOUT_SECS),
+            (param_names::RETRY_TIMEOUT, GO_CLIENT_TIMEOUT_SECS),
+            (param_names::JWT_TIMEOUT, GO_JWT_TIMEOUT_SECS),
         ] {
             if use_go_defaults
                 && !self.sf_settings.contains_key(param.as_str())
@@ -2707,13 +2708,10 @@ mod tests {
             (MAX_RETRY_COUNT, "7"),
             (CACHE_MFA_TOKEN, "false"),
             (STORE_TEMP_CREDS, "false"),
-            ("adbc.snowflake.sql.client_option.login_timeout", "120s"),
+            ("adbc.snowflake.sql.client_option.login_timeout", "300s"),
             ("adbc.snowflake.sql.client_option.request_timeout", "0s"),
-            ("adbc.snowflake.sql.client_option.client_timeout", "300s"),
-            (
-                "adbc.snowflake.sql.client_option.jwt_expire_timeout",
-                "120s",
-            ),
+            ("adbc.snowflake.sql.client_option.client_timeout", "900s"),
+            ("adbc.snowflake.sql.client_option.jwt_expire_timeout", "60s"),
             (
                 "adbc.snowflake.sql.client_option.app_name",
                 "ADBC Snowflake Driver (Rust)",
@@ -3438,6 +3436,40 @@ mod tests {
     }
 
     #[test]
+    fn unset_timeouts_use_go_defaults_without_overriding_explicit_values() {
+        let mut db = make_db();
+        let mut options = HashMap::new();
+        db.apply_connection_defaults(&mut options, &HashMap::new(), false);
+        for (param, seconds) in [
+            (param_names::LOGIN_TIMEOUT, 300),
+            (param_names::RETRY_TIMEOUT, 900),
+            (param_names::JWT_TIMEOUT, 60),
+        ] {
+            assert_eq!(
+                options.get(param.as_str()),
+                Some(&Setting::Int(seconds)),
+                "{param}"
+            );
+        }
+        db.set_option(
+            OptionDatabase::Other("adbc.snowflake.sql.client_option.login_timeout".into()),
+            OptionValue::String("45s".into()),
+        )
+        .unwrap();
+        let mut options = HashMap::from([(param_names::JWT_TIMEOUT.to_string(), Setting::Int(30))]);
+        db.apply_connection_defaults(&mut options, &HashMap::new(), false);
+        assert!(!options.contains_key(param_names::LOGIN_TIMEOUT.as_str()));
+        assert_eq!(
+            db.sf_settings.get(param_names::LOGIN_TIMEOUT.as_str()),
+            Some(&Setting::Int(45)),
+        );
+        assert_eq!(
+            options.get(param_names::JWT_TIMEOUT.as_str()),
+            Some(&Setting::Int(30)),
+        );
+    }
+
+    #[test]
     fn connection_profiles_do_not_receive_go_defaults() {
         for profile in ["default", "database", "connection"] {
             let mut db = make_db();
@@ -3463,6 +3495,9 @@ mod tests {
             for key in [
                 param_names::RETRY_MAX_ATTEMPTS,
                 param_names::REQUEST_TIMEOUT,
+                param_names::LOGIN_TIMEOUT,
+                param_names::RETRY_TIMEOUT,
+                param_names::JWT_TIMEOUT,
                 param_names::CLIENT_STORE_TEMPORARY_CREDENTIAL,
             ] {
                 assert!(
@@ -3987,24 +4022,19 @@ mod tests {
             (jwt, param_names::JWT_TIMEOUT, "1m30s", 90),
             (jwt, param_names::JWT_TIMEOUT, "1500ms", 2),
             (jwt, param_names::JWT_TIMEOUT, "-1m30.25s", 91),
-            (
-                jwt,
-                param_names::JWT_TIMEOUT,
-                "0s",
-                DEFAULT_JWT_TIMEOUT_SECS,
-            ),
+            (jwt, param_names::JWT_TIMEOUT, "0s", GO_JWT_TIMEOUT_SECS),
             (
                 login,
                 param_names::LOGIN_TIMEOUT,
                 "0s",
-                DEFAULT_LOGIN_TIMEOUT_SECS as i64,
+                GO_LOGIN_TIMEOUT_SECS,
             ),
             (login, param_names::LOGIN_TIMEOUT, "500ms", 1),
             (
                 client,
                 param_names::RETRY_TIMEOUT,
                 "0",
-                DEFAULT_RETRY_TIMEOUT_SECS as i64,
+                GO_CLIENT_TIMEOUT_SECS,
             ),
             // Go's request_timeout default is no timeout, which sf_core spells 0.
             (request, param_names::REQUEST_TIMEOUT, "0s", 0),
