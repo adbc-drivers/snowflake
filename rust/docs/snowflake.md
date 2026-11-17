@@ -94,6 +94,8 @@ Examples:
 - `snowflake://service_user@myorg-account2/RAW_DATA_LAKE?authenticator=oauth&application=ADBC_APP`
 - `snowflake://sys_admin@private.network.com:443/OPS_MONITOR/DBA?account=vpc-id-1234&client_session_keep_alive=true` (Uses full hostname, requires explicit account parameter)
 
+With an `account` query parameter, the URI host is used as given even without a port; the Go driver instead appends `.snowflakecomputing.com` to a host given without a port. Without `account` or a port, a host that does not contain `.snowflakecomputing.` is read as `account[.region]`, as in Go.
+
 `insecureMode` is not a gosnowflake v2 configuration key, so both drivers send it to Snowflake as a session parameter; it does not change TLS verification. `client_session_keep_alive=true` is a login session parameter that starts background heartbeats, as in the Go driver; it differs from `serverSessionKeepAlive`, which keeps the server session alive after the connection closes.
 
 ## Options

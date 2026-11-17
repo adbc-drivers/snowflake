@@ -1443,12 +1443,14 @@ impl Database {
     /// Username/Password directly when credentials contain special characters.
     fn apply_uri(&mut self, uri: &str) -> Result<()> {
         let stripped = uri.strip_prefix("snowflake://").unwrap_or(uri);
+        // A `?key=value` before the `@` starts the query (`account?QUERY_TAG=a@b`)
+        // unless a `user:password` separator precedes it (`user:p?x=y@account`).
         let (user_info, rest) = stripped
             .split_once('@')
             .filter(|(info, _)| {
                 !info
                     .split_once('?')
-                    .is_some_and(|(_, query)| query.contains('='))
+                    .is_some_and(|(before, query)| !before.contains(':') && query.contains('='))
             })
             .map_or((None, stripped), |(info, rest)| (Some(info), rest));
 
@@ -1498,10 +1500,13 @@ impl Database {
                 Some((host, port)) => (host.to_owned(), Some(port.to_owned())),
                 None => (authority.into_owned(), None),
             };
-            // A Snowflake hostname or an authority with a port is explicit.
-            // Otherwise Go treats the authority as account[.region].
+            // A Snowflake hostname, an authority with a port, or any authority
+            // alongside `account=` is an explicit host. Otherwise Go treats the
+            // authority as account[.region]. Unlike Go, which appends the
+            // Snowflake domain to a custom host given without a port, a custom
+            // host with `account=` is used as is.
             let is_hostname = host.to_ascii_lowercase().contains(".snowflakecomputing.");
-            if is_hostname || port.is_some() {
+            if is_hostname || port.is_some() || explicit_account {
                 if is_hostname && !explicit_account {
                     let account = host.split('.').next().unwrap_or_default();
                     self.set_option(
@@ -5131,6 +5136,41 @@ mod tests {
         assert_eq!(db.get_option_string(OptionDatabase::Username).unwrap(), "");
         assert_eq!(db.session_parameters.get("QUERY_TAG").unwrap(), "a@b");
         assert_eq!(connection_endpoint(&db).0, "account");
+    }
+
+    #[test]
+    fn uri_password_with_query_like_text_and_custom_host_with_account() {
+        for uri in ["user:p?x=y@account", "user:p?x=y@account/db"] {
+            let mut db = make_db();
+            db.apply_uri(uri).unwrap();
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Username).unwrap(),
+                "user"
+            );
+            assert_eq!(
+                db.get_option_string(OptionDatabase::Password).unwrap(),
+                "p?x=y"
+            );
+            assert_eq!(connection_endpoint(&db).0, "account");
+        }
+        for (uri, expected) in [
+            (
+                "u:p@private.example/db?account=acct",
+                ("acct", "private.example"),
+            ),
+            (
+                "u:p@private.network.com/db?account=myacct&region=eu-west-1",
+                ("myacct", "private.network.com"),
+            ),
+        ] {
+            let mut db = make_db();
+            db.apply_uri(uri).unwrap();
+            assert_eq!(
+                connection_endpoint(&db),
+                (expected.0.into(), expected.1.into()),
+                "{uri}"
+            );
+        }
     }
 
     #[test]
