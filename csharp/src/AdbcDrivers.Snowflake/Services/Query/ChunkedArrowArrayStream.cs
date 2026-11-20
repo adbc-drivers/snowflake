@@ -88,7 +88,19 @@ internal sealed class ChunkedArrowArrayStream : Ipc.IArrowArrayStream
             throw new InvalidOperationException("Arrow result format was requested, but neither rowsetBase64 nor chunks were present.");
         }
 
-        var schema = firstReader.Schema;
+        Schema schema;
+        try
+        {
+            // GetSchema reads asynchronously and honors the token; the Schema property would block
+            // on the live HTTP body of the first chunk, where a stall couldn't be cancelled.
+            schema = await firstReader.GetSchema(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            try { firstReader.Dispose(); } finally { firstStream.Dispose(); }
+            throw;
+        }
+
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var bufferSize = Math.Min(chunkList.Count, prefetchConcurrency);
         var channel = Channel.CreateBounded<PrefetchedChunk>(new BoundedChannelOptions(Math.Max(bufferSize, 1))
@@ -165,10 +177,14 @@ internal sealed class ChunkedArrowArrayStream : Ipc.IArrowArrayStream
 
                 channel.Writer.TryComplete();
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException ex)
             {
                 cts.Cancel();
-                channel.Writer.TryComplete();
+                // Complete with the cancellation, not normally: a normal completion reads as the
+                // end of the result set, silently truncating it for anyone still reading. Dispose
+                // drains with TryRead, which this doesn't affect.
+                channel.Writer.TryComplete(new OperationCanceledException(
+                    "Result download was cancelled before all chunks were read.", ex, ex.CancellationToken));
             }
             catch (Exception ex)
             {

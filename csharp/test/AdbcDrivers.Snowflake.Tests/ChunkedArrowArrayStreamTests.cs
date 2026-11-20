@@ -67,7 +67,10 @@ public class ChunkedArrowArrayStreamTests
     /// </summary>
     private sealed class FakeChunkClient : IRestApiClient
     {
+        private readonly Func<int, Stream>? _serve;
         private int _downloads;
+
+        public FakeChunkClient(Func<int, Stream>? serve = null) => _serve = serve;
 
         public int Downloads => Volatile.Read(ref _downloads);
 
@@ -85,7 +88,7 @@ public class ChunkedArrowArrayStreamTests
         {
             Interlocked.Increment(ref _downloads);
             int index = int.Parse(url[(url.LastIndexOf('/') + 1)..]);
-            return Task.FromResult<Stream>(new MemoryStream(ArrowChunkBytes(index)));
+            return Task.FromResult(_serve?.Invoke(index) ?? new MemoryStream(ArrowChunkBytes(index)));
         }
     }
 
@@ -171,5 +174,79 @@ public class ChunkedArrowArrayStreamTests
         var dispose = Task.Run(stream.Dispose);
         Assert.True(await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(5))) == dispose,
             "Dispose did not complete within 5s — prefetch task is stuck.");
+    }
+
+    [Fact]
+    public async Task TokenCancelledMidRead_ThrowsInsteadOfEndingEarly()
+    {
+        // Given a stream whose prefetch is still running when its creation token is cancelled
+        var client = new FakeChunkClient();
+        using var cts = new CancellationTokenSource();
+        using var stream = await ChunkedArrowArrayStream.CreateAsync(
+            client, Token,
+            rowSetBase64: Convert.ToBase64String(ArrowChunkBytes(-1)),
+            Chunks(20), chunkHeaders: null, qrmk: null,
+            cts.Token, prefetchConcurrency: 2);
+
+        using (var first = await stream.ReadNextRecordBatchAsync())
+            Assert.NotNull(first);
+        cts.Cancel();
+
+        // Then draining it surfaces the cancellation; it must never look like a complete
+        // (but truncated) result set.
+        int read = 1;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            while (await stream.ReadNextRecordBatchAsync() is { } batch)
+            {
+                batch.Dispose();
+                read++;
+            }
+        });
+        Assert.True(read < 21, $"All {read} batches were read; the prefetch was not cancelled.");
+    }
+
+    [Fact]
+    public async Task StalledFirstChunkSchema_IsCancellableAndReleasesTheStream()
+    {
+        // Given a first chunk whose body sends nothing (the schema read stalls)
+        var body = new StallingStream();
+        var client = new FakeChunkClient(index => index == 0 ? body : new MemoryStream(ArrowChunkBytes(index)));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+        // When creation is cancelled while reading the schema
+        var create = ChunkedArrowArrayStream.CreateAsync(
+            client, Token, rowSetBase64: null, Chunks(3), chunkHeaders: null, qrmk: null, cts.Token);
+
+        // Then it fails with the cancellation (rather than hanging) and disposes the body
+        Assert.True(await Task.WhenAny(create, Task.Delay(TimeSpan.FromSeconds(5))) == create,
+            "CreateAsync did not observe cancellation within 5s.");
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => create);
+        Assert.True(body.Disposed);
+    }
+
+    /// <summary>A body that never yields data: async reads wait for cancellation; sync reads fail.</summary>
+    private sealed class StallingStream : Stream
+    {
+        public bool Disposed { get; private set; }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new InvalidOperationException("Synchronous read of a live body: uncancellable.");
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            return 0;
+        }
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing) { Disposed = true; base.Dispose(disposing); }
     }
 }

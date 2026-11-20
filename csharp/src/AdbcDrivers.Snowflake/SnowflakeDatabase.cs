@@ -110,7 +110,7 @@ public sealed class SnowflakeDatabase : AdbcDatabase
     /// Asynchronously create a new connection to the Snowflake database. The token cancels the
     /// wait for pool capacity and the login round trip.
     /// </summary>
-    public async Task<AdbcConnection> ConnectAsync(IReadOnlyDictionary<string, string>? parameters, CancellationToken cancellationToken = default)
+    public override async Task<AdbcConnection> ConnectAsync(IReadOnlyDictionary<string, string>? parameters, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var config = ConnectionStringParser.ParseParameters(parameters, _parameters);

@@ -15,8 +15,10 @@
 */
 
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Configuration;
+using AdbcDrivers.Snowflake.Services.Authentication;
 using AdbcDrivers.Snowflake.Services.ConnectionPool;
 using AdbcDrivers.Snowflake.Services.Query;
 using AdbcDrivers.Snowflake.Services.TypeConversion;
@@ -105,50 +107,42 @@ public sealed class SnowflakeStatement : AdbcStatement
     public override QueryResult ExecuteQuery()
     {
         // Use async-first pattern: sync version calls async with proper blocking
-        return ExecuteQueryAsync().AsTask().GetAwaiter().GetResult();
+        return ExecuteQueryAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
     }
 
     /// <summary>
     /// Executes the query asynchronously and returns a QueryResult.
     /// </summary>
     /// <returns>A QueryResult containing the query results.</returns>
-    public override async ValueTask<QueryResult> ExecuteQueryAsync()
+    public override ValueTask<QueryResult> ExecuteQueryAsync() => ExecuteQueryAsync(CancellationToken.None);
+
+    /// <summary>
+    /// Executes the query asynchronously and returns a QueryResult.
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Cancels execution: the client stops waiting and a best-effort abort is sent to the server.
+    /// The token covers execution only; once this returns, cancelling it does not affect reading
+    /// the returned stream. Cancellation surfaces as <see cref="OperationCanceledException"/>.
+    /// </param>
+    /// <returns>A QueryResult containing the query results.</returns>
+    public override async ValueTask<QueryResult> ExecuteQueryAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
 
         if (string.IsNullOrWhiteSpace(SqlQuery))
             throw new InvalidOperationException("SQL query must be set before execution.");
 
+        cancellationToken.ThrowIfCancellationRequested();
+
         try
         {
-            // Build query request
-            var request = new QueryRequest
-            {
-                Statement = SqlQuery,
-                Database = _config.Database,
-                Schema = _config.Schema,
-                Warehouse = _config.Warehouse,
-                Role = _config.Role,
-                QueryTag = _queryTag,
-                Timeout = _config.QueryTimeout,
-                PrefetchConcurrency = _config.PrefetchConcurrency,
-                RequestId = NewRequestId(),
-                AuthToken = _pooledConnection.AuthToken
-            };
-
-            // Add bound parameters if any
-            if (_boundParameters != null)
-            {
-                var parameterSet = _typeConverter.ConvertArrowBatchToParameters(_boundParameters);
-                foreach (var kvp in parameterSet.Parameters)
-                    request.Bindings[kvp.Key] = kvp.Value;
-            }
-
-            // Execute query
-            var result = await _queryExecutor.ExecuteQueryAsync(request).ConfigureAwait(false);
+            var result = await ExecuteRequestAsync(cancellationToken).ConfigureAwait(false);
 
             if (result.Status == QueryStatus.Cancelled)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
                 throw new AdbcException("Query was cancelled.", AdbcStatusCode.Cancelled);
+            }
 
             if (result.Status != QueryStatus.Success)
                 throw ToAdbcException("Query failed", result);
@@ -158,6 +152,10 @@ public sealed class SnowflakeStatement : AdbcStatement
             return new QueryResult(result.RowCount, result.ResultStream!);
         }
         catch (AdbcException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
@@ -174,50 +172,41 @@ public sealed class SnowflakeStatement : AdbcStatement
     public override UpdateResult ExecuteUpdate()
     {
         // Use async-first pattern: sync version calls async with proper blocking
-        return ExecuteUpdateAsync().GetAwaiter().GetResult();
+        return ExecuteUpdateAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 
     /// <summary>
     /// Executes an update query asynchronously and returns the number of affected rows.
     /// </summary>
     /// <returns>An UpdateResult containing the number of affected rows.</returns>
-    public override async Task<UpdateResult> ExecuteUpdateAsync()
+    public override Task<UpdateResult> ExecuteUpdateAsync() => ExecuteUpdateAsync(CancellationToken.None);
+
+    /// <summary>
+    /// Executes an update query asynchronously and returns the number of affected rows.
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Cancels execution: the client stops waiting and a best-effort abort is sent to the server.
+    /// Cancellation surfaces as <see cref="OperationCanceledException"/>.
+    /// </param>
+    /// <returns>An UpdateResult containing the number of affected rows.</returns>
+    public override async Task<UpdateResult> ExecuteUpdateAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
 
         if (string.IsNullOrWhiteSpace(SqlQuery))
             throw new InvalidOperationException("SQL query must be set before execution.");
 
+        cancellationToken.ThrowIfCancellationRequested();
+
         try
         {
-            // Build query request
-            var request = new QueryRequest
-            {
-                Statement = SqlQuery,
-                Database = _config.Database,
-                Schema = _config.Schema,
-                Warehouse = _config.Warehouse,
-                Role = _config.Role,
-                QueryTag = _queryTag,
-                Timeout = _config.QueryTimeout,
-                PrefetchConcurrency = _config.PrefetchConcurrency,
-                RequestId = NewRequestId(),
-                AuthToken = _pooledConnection.AuthToken
-            };
-
-            // Add bound parameters if any
-            if (_boundParameters != null)
-            {
-                var parameterSet = _typeConverter.ConvertArrowBatchToParameters(_boundParameters);
-                foreach (var kvp in parameterSet.Parameters)
-                    request.Bindings[kvp.Key] = kvp.Value;
-            }
-
-            // Execute update
-            var result = await _queryExecutor.ExecuteQueryAsync(request).ConfigureAwait(false);
+            var result = await ExecuteRequestAsync(cancellationToken).ConfigureAwait(false);
 
             if (result.Status == QueryStatus.Cancelled)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
                 throw new AdbcException("Update was cancelled.", AdbcStatusCode.Cancelled);
+            }
 
             if (result.Status != QueryStatus.Success)
                 throw ToAdbcException("Update failed", result);
@@ -233,6 +222,10 @@ public sealed class SnowflakeStatement : AdbcStatement
             return new UpdateResult(affectedRows);
         }
         catch (AdbcException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
@@ -262,6 +255,80 @@ public sealed class SnowflakeStatement : AdbcStatement
             return;
 
         await _queryExecutor.CancelQueryAsync(requestId, _pooledConnection.AuthToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds the request for the current SQL and bindings and runs it. When the caller's token
+    /// can be cancelled, cancellation also sends a best-effort server-side abort for this request
+    /// (the executor's token alone only stops the client from waiting). The executor sees a
+    /// token linked to the caller's and scoped to this call: the result stream links that token
+    /// into its chunk prefetch, and the caller's token should not reach past execution.
+    /// </summary>
+    private async Task<Services.Query.QueryResult> ExecuteRequestAsync(CancellationToken cancellationToken)
+    {
+        var requestId = NewRequestId();
+        var authToken = _pooledConnection.AuthToken;
+        var request = new QueryRequest
+        {
+            Statement = SqlQuery!,
+            Database = _config.Database,
+            Schema = _config.Schema,
+            Warehouse = _config.Warehouse,
+            Role = _config.Role,
+            QueryTag = _queryTag,
+            Timeout = _config.QueryTimeout,
+            PrefetchConcurrency = _config.PrefetchConcurrency,
+            RequestId = requestId,
+            AuthToken = authToken
+        };
+
+        if (_boundParameters != null)
+        {
+            var parameterSet = _typeConverter.ConvertArrowBatchToParameters(_boundParameters);
+            foreach (var kvp in parameterSet.Parameters)
+                request.Bindings[kvp.Key] = kvp.Value;
+        }
+
+        if (!cancellationToken.CanBeCanceled)
+            return await _queryExecutor.ExecuteQueryAsync(request).ConfigureAwait(false);
+
+        using var scope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        Services.Query.QueryResult result;
+        using (cancellationToken.Register(() => _ = AbortOnServerAsync(requestId, authToken)))
+        {
+            result = await _queryExecutor.ExecuteQueryAsync(request, scope.Token).ConfigureAwait(false);
+        }
+
+        // Unlink from the caller's token before deciding: once disposed (which waits out an
+        // in-flight link callback), the scope can no longer become cancelled. A cancellation
+        // that landed after the executor built the result stream, but before this point, has
+        // already cancelled that stream's prefetch, so the result must not be handed out.
+        scope.Dispose();
+        if (scope.IsCancellationRequested)
+        {
+            result.ResultStream?.Dispose();
+            throw new OperationCanceledException(cancellationToken);
+        }
+        return result;
+    }
+
+    // Long enough for a healthy abort round trip; bounds the request so a stalled response
+    // can't keep the task and its connection alive indefinitely.
+    internal static readonly TimeSpan AbortTimeout = TimeSpan.FromSeconds(30);
+
+    // Fire-and-forget from a cancellation callback: never block the cancelling thread, and never
+    // let a failed abort surface as an unobserved exception.
+    private async Task AbortOnServerAsync(string requestId, AuthenticationToken authToken)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(AbortTimeout);
+            await _queryExecutor.CancelQueryAsync(requestId, authToken, timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Best-effort, like Cancel: the query may already have finished.
+        }
     }
 
     // Generates and records the request id for the execution that is about to start, so a
