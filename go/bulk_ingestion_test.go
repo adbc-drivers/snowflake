@@ -27,6 +27,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -79,14 +81,44 @@ func TestIngestBatchedParquetWithFileLimit(t *testing.T) {
 
 	buf.Reset()
 	// Expected to read multiple records but then stop after targetFileSize, indicated by nil error
-	require.NoError(t, writeParquet(rdr.Schema(), &buf, records, targetFileSize, parquetProps, arrowProps))
+	require.NoError(t, writeParquet(rdr.Schema(), &buf, nil, records, targetFileSize, parquetProps, arrowProps))
 
 	// Expect to exceed the targetFileSize but by no more than the size of 1 row group
 	assert.Greater(t, buf.Len(), targetFileSize)
 	assert.Less(t, buf.Len(), targetFileSize+expectedRowGroupSize)
 
 	// Drain the remaining records with no limit on file size, expect EOF
-	require.ErrorIs(t, writeParquet(rdr.Schema(), &buf, records, -1, parquetProps, arrowProps), io.EOF)
+	require.ErrorIs(t, writeParquet(rdr.Schema(), &buf, nil, records, -1, parquetProps, arrowProps), io.EOF)
+}
+
+// Writers take a buffer only once they have a record, so a single record uses
+// one buffer however many writers run.
+func TestParallelParquetWritersTakeBuffersOnlyForRecords(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	ingestOpts := DefaultIngestOptions()
+	parquetProps, arrowProps := newWriterProps(mem, &ingestOpts)
+
+	var created atomic.Int32
+	pool := &bufferPool{&sync.Pool{New: func() any {
+		created.Add(1)
+		return new(bytes.Buffer)
+	}}}
+
+	rec := makeRec(mem, 3, 100)
+	in := make(chan arrow.RecordBatch, 1)
+	in <- rec
+	close(in)
+	out := make(chan *bytes.Buffer, 8)
+	require.NoError(t, runParallelParquetWriters(context.Background(), rec.Schema(), 1<<20, 8, parquetProps, arrowProps, pool, in, out))
+
+	var files int
+	for range out {
+		files++
+	}
+	assert.Equal(t, 1, files)
+	assert.EqualValues(t, 1, created.Load())
 }
 
 func TestQualifiedTableName(t *testing.T) {
