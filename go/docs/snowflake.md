@@ -123,16 +123,17 @@ Examples:
 
   How to authenticate to Snowflake.
 
-  | Auth Method        | Description                                                                                         |
-  |--------------------|-----------------------------------------------------------------------------------------------------|
-  | `auth_snowflake`   | username/password                                                                                   |
-  | `auth_oauth`       | OAuth                                                                                               |
-  | `auth_ext_browser` | use an external browser to access a FED and perform SSO auth                                        |
-  | `auth_okta`        | use a native OKTA URL to perform SSO authentication on Okta                                         |
-  | `auth_jwt`         | use a JWT                                                                                           |
-  | `auth_mfa`         | username/password with MFA                                                                          |
-  | `auth_pat`         | use a programmatic access token                                                                     |
-  | `auth_wif`         | use Workload Identity Federation; must specify `adbc.snowflake.sql.client_option.identity_provider` |
+  | Auth Method                     | Description                                                                                         |
+  |---------------------------------|-----------------------------------------------------------------------------------------------------|
+  | `auth_snowflake`                | username/password                                                                                   |
+  | `auth_oauth`                    | OAuth                                                                                               |
+  | `auth_oauth_authorization_code` | browser-based OAuth authorization code flow; requires `oauth_client_id` and `oauth_client_secret`   |
+  | `auth_ext_browser`              | use an external browser to access a FED and perform SSO auth                                        |
+  | `auth_okta`                     | use a native OKTA URL to perform SSO authentication on Okta                                         |
+  | `auth_jwt`                      | use a JWT                                                                                           |
+  | `auth_mfa`                      | username/password with MFA                                                                          |
+  | `auth_pat`                      | use a programmatic access token                                                                     |
+  | `auth_wif`                      | use Workload Identity Federation; must specify `adbc.snowflake.sql.client_option.identity_provider` |
 
 `adbc.snowflake.sql.client_option.app_name`
 : **Type:** string
@@ -143,6 +144,16 @@ Examples:
 : **Type:** string
 
   The auth token to use.
+
+`adbc.snowflake.sql.client_option.oauth_client_id`, `adbc.snowflake.sql.client_option.oauth_client_secret`
+: **Type:** string
+
+  The OAuth client id and secret. Required when `adbc.snowflake.sql.auth_type`
+  is `auth_oauth_authorization_code`. This flow also requires
+  `adbc.snowflake.sql.role` to be set.
+
+  To use Snowflake's built-in "OAuth for local applications" client, set both
+  to `LOCAL_APPLICATION`.
 
 `adbc.snowflake.sql.client_option.cache_mfa_token`
 : **Type:** boolean

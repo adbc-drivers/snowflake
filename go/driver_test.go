@@ -3584,6 +3584,85 @@ func TestJwtAuthenticationUnencryptedValueUnauthorized(t *testing.T) {
 	ConnectWithJwt(t, cfg, keyValue, "", false)
 }
 
+// TestOAuthAuthorizationCodeLive logs in against a real Snowflake account with
+// the browser-based OAuth authorization code flow, using Snowflake's built-in
+// "OAuth for local applications" client.
+//
+// gosnowflake validates that the client id and secret are non-empty for this
+// flow (error 260017) even though it falls back to LOCAL_APPLICATION internally
+// later on, so they are passed explicitly here. Drop them once gosnowflake
+// accepts empty values.
+// https://github.com/snowflakedb/gosnowflake/issues/1867
+//
+// It is interactive (it opens a browser and waits for you to log in), so it is
+// never run in CI (CI env variable is set by GitHub actions):
+//
+//	SNOWFLAKE_TEST_OAUTH_AUTH_CODE_ACCOUNT=ORG-ACCOUNT \
+//	SNOWFLAKE_TEST_OAUTH_AUTH_CODE_USER=you@example.com \
+//	SNOWFLAKE_TEST_OAUTH_AUTH_CODE_ROLE=YOUR_ROLE \
+//	go test -tags assert -run TestOAuthAuthorizationCodeLive -v .
+//
+// Optional: SNOWFLAKE_TEST_OAUTH_AUTH_CODE_WAREHOUSE and _HOST.
+func TestOAuthAuthorizationCodeLive(t *testing.T) {
+	if os.Getenv("CI") == "true" {
+		t.Skip("interactive OAuth authorization code test needs a browser, skip in CI")
+	}
+	account := os.Getenv("SNOWFLAKE_TEST_OAUTH_AUTH_CODE_ACCOUNT")
+	if account == "" {
+		t.Skip("no SNOWFLAKE_TEST_OAUTH_AUTH_CODE_ACCOUNT defined, skip interactive OAuth authorization code test")
+	}
+	user := os.Getenv("SNOWFLAKE_TEST_OAUTH_AUTH_CODE_USER")
+	if user == "" {
+		t.Skip("no SNOWFLAKE_TEST_OAUTH_AUTH_CODE_USER defined, skip interactive OAuth authorization code test")
+	}
+
+	// gosnowflake requests the scope "session:role:<role>"; with an empty role
+	// Snowflake rejects the authorization request ("The requested scope is invalid").
+	role := os.Getenv("SNOWFLAKE_TEST_OAUTH_AUTH_CODE_ROLE")
+	if role == "" {
+		t.Skip("no SNOWFLAKE_TEST_OAUTH_AUTH_CODE_ROLE defined, skip interactive OAuth authorization code test")
+	}
+
+	opts := map[string]string{
+		driver.OptionAccount:   account,
+		adbc.OptionKeyUsername: user,
+		driver.OptionRole:      role,
+		driver.OptionAuthType:  driver.OptionValueAuthOAuthAuthorizationCode,
+		// see the comment above: required by gosnowflake's config validation
+		driver.OptionOAuthClientID:     "LOCAL_APPLICATION",
+		driver.OptionOAuthClientSecret: "LOCAL_APPLICATION",
+	}
+	if wh := os.Getenv("SNOWFLAKE_TEST_OAUTH_AUTH_CODE_WAREHOUSE"); wh != "" {
+		opts[driver.OptionWarehouse] = wh
+	}
+	if host := os.Getenv("SNOWFLAKE_TEST_OAUTH_AUTH_CODE_HOST"); host != "" {
+		opts[driver.OptionHost] = host
+	}
+
+	ctx := context.Background()
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	db, err := driver.NewDriver(mem).NewDatabaseWithContext(ctx, opts)
+	require.NoError(t, err)
+	defer testutil.CheckedCloseWithContext(t, db, ctx)
+
+	cnxn, err := db.Open(ctx)
+	require.NoError(t, err)
+	defer testutil.CheckedCloseWithContext(t, cnxn, ctx)
+
+	stmt, err := cnxn.NewStatement(ctx)
+	require.NoError(t, err)
+	defer testutil.CheckedCloseWithContext(t, stmt, ctx)
+
+	require.NoError(t, stmt.SetSqlQuery(ctx, "SELECT CURRENT_USER()"))
+	rdr, _, err := stmt.ExecuteQuery(ctx)
+	require.NoError(t, err)
+	defer rdr.Release()
+
+	require.True(t, rdr.Next())
+	got := rdr.RecordBatch().Column(0).(*array.String).Value(0)
+	require.True(t, strings.EqualFold(user, got), "logged in as %q, expected %q", got, user)
+}
+
 func (suite *SnowflakeTests) TestGetStatisticNames() {
 	statsCnxn, ok := suite.cnxn.(adbc.ConnectionGetStatistics)
 	suite.Require().True(ok, "Snowflake must implement ConnectionGetStatistics")
