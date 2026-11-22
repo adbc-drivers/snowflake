@@ -292,18 +292,16 @@ public sealed class SnowflakeStatement : AdbcStatement
         if (!cancellationToken.CanBeCanceled)
             return await _queryExecutor.ExecuteQueryAsync(request).ConfigureAwait(false);
 
-        using var scope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         Services.Query.QueryResult result;
-        using (cancellationToken.Register(() => _ = AbortOnServerAsync(requestId, authToken)))
+        var scope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using (scope)
         {
-            result = await _queryExecutor.ExecuteQueryAsync(request, scope.Token).ConfigureAwait(false);
+            await using (cancellationToken.Register(() => _ = AbortOnServerAsync(requestId, authToken)))
+            {
+                result = await _queryExecutor.ExecuteQueryAsync(request, scope.Token).ConfigureAwait(false);
+            }
         }
 
-        // Unlink from the caller's token before deciding: once disposed (which waits out an
-        // in-flight link callback), the scope can no longer become cancelled. A cancellation
-        // that landed after the executor built the result stream, but before this point, has
-        // already cancelled that stream's prefetch, so the result must not be handed out.
-        scope.Dispose();
         if (scope.IsCancellationRequested)
         {
             result.ResultStream?.Dispose();

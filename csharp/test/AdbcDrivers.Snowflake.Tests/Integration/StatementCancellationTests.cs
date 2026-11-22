@@ -57,9 +57,9 @@ public class StatementCancellationTests
 
         // Given a query that would run for 30s, tagged so it can be found in the query history
         var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await driver.OpenAsync(parameters);
+        await using var connection = await database.ConnectAsync(new Dictionary<string, string>());
+        await using var statement = connection.CreateStatement();
         string marker = Guid.NewGuid().ToString("N");
         statement.SqlQuery = $"SELECT SYSTEM$WAIT(30), '{marker}'";
 
@@ -89,9 +89,9 @@ public class StatementCancellationTests
         // Given a result large enough to be served as many externally downloaded chunks
         const int rowCount = 500_000;
         var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await driver.OpenAsync(parameters);
+        await using var connection = await database.ConnectAsync(new Dictionary<string, string>());
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery =
             $"SELECT SEQ8() AS ID, RANDSTR(64, RANDOM()) AS S FROM TABLE(GENERATOR(ROWCOUNT => {rowCount}))";
 

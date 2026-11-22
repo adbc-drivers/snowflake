@@ -82,7 +82,7 @@ public class SnowflakeStatementCancellationTests
     public async Task ExecuteQueryAsync_TokenCancelledInFlight_ThrowsOperationCanceledAndAbortsOnServer()
     {
         ExecutorBlocksUntilCancelled();
-        using var statement = CreateStatement();
+        await using var statement = CreateStatement();
         using var cts = new CancellationTokenSource();
 
         var execute = statement.ExecuteQueryAsync(cts.Token).AsTask();
@@ -110,7 +110,7 @@ public class SnowflakeStatementCancellationTests
                 cts.Cancel();
                 return Task.FromResult(new Services.Query.QueryResult { Status = QueryStatus.Success, ResultStream = stream });
             });
-        using var statement = CreateStatement();
+        await using var statement = CreateStatement();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => statement.ExecuteQueryAsync(cts.Token).AsTask());
 
@@ -121,7 +121,7 @@ public class SnowflakeStatementCancellationTests
     public async Task ExecuteUpdateAsync_TokenCancelledInFlight_ThrowsOperationCanceledAndAbortsOnServer()
     {
         ExecutorBlocksUntilCancelled();
-        using var statement = CreateStatement();
+        await using var statement = CreateStatement();
         using var cts = new CancellationTokenSource();
 
         var execute = statement.ExecuteUpdateAsync(cts.Token);
@@ -135,7 +135,7 @@ public class SnowflakeStatementCancellationTests
     [Fact]
     public async Task ExecuteQueryAsync_TokenAlreadyCancelled_DoesNotSendQuery()
     {
-        using var statement = CreateStatement();
+        await using var statement = CreateStatement();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => statement.ExecuteQueryAsync(new CancellationToken(canceled: true)).AsTask());
@@ -149,7 +149,7 @@ public class SnowflakeStatementCancellationTests
         CancellationToken executorToken = default;
         _executor.ExecuteQueryAsync(Arg.Any<QueryRequest>(), Arg.Do<CancellationToken>(t => executorToken = t))
             .Returns(Success());
-        using var statement = CreateStatement();
+        await using var statement = CreateStatement();
         using var cts = new CancellationTokenSource();
 
         await statement.ExecuteQueryAsync(cts.Token);
@@ -168,7 +168,7 @@ public class SnowflakeStatementCancellationTests
         CancellationToken executorToken = new CancellationToken(canceled: true);
         _executor.ExecuteQueryAsync(Arg.Any<QueryRequest>(), Arg.Do<CancellationToken>(t => executorToken = t))
             .Returns(Success());
-        using var statement = CreateStatement();
+        await using var statement = CreateStatement();
 
         await statement.ExecuteQueryAsync();
 
