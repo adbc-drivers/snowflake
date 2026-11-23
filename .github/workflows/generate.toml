@@ -25,6 +25,14 @@ timeout-minutes = 40
 [[lang.go.validation.configs]]
 environment = "Snowflake CI"
 
+[lang.rust]
+
+[lang.rust.test]
+environment = "Snowflake CI"
+
+[[lang.rust.validation.configs]]
+environment = "Snowflake CI"
+
 [secrets]
 SNOWFLAKE_DATABASE = { secret = "SNOWFLAKE_DATABASE", contexts = ["test", "validate"] }
 SNOWFLAKE_SCHEMA = { secret = "SNOWFLAKE_SCHEMA", contexts = ["test", "validate"] }
