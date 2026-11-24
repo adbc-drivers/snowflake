@@ -41,9 +41,11 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ConnectionPoolManager> _logger;
     private readonly ConcurrentDictionary<string, ConnectionPoolEntry> _pools;
-    // Signals the background maintenance loop (idle eviction + keep-alive heartbeats) to stop; the
-    // Cancel() lives in Dispose(), and the CTS itself is disposed only after the loop has exited.
-    private readonly CancellationTokenSource _cleanupCts = new();
+    // Cancelled when disposal begins. Stops the background maintenance loop (idle eviction +
+    // keep-alive heartbeats) and wakes acquires waiting for capacity. Deliberately never disposed:
+    // a waiter may still be linking to its token as disposal runs, and a CTS without a timer holds
+    // nothing that disposal would release.
+    private readonly CancellationTokenSource _shutdownCts = new();
     private Task? _cleanupTask;
 
     // Serializes every change to which connections the pool holds (seating a new connection, taking
@@ -95,12 +97,18 @@ internal class ConnectionPoolManager : IConnectionPoolManager
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(config);
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-        EnsureCleanupStarted();
 
         var poolKey = GeneratePoolKey(config);
-        var poolEntry = _pools.GetOrAdd(poolKey, static (_, cfg) => new ConnectionPoolEntry(cfg), config);
+        ConnectionPoolEntry poolEntry;
+
+        // Atomic with teardown, so an acquire can't add an entry to a pool that was just cleared.
+        lock (_lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            poolEntry = _pools.GetOrAdd(poolKey, static (_, cfg) => new ConnectionPoolEntry(cfg), config);
+        }
+
+        EnsureCleanupStarted();
 
         await WaitForCapacityAsync(poolEntry, config, cancellationToken).ConfigureAwait(false);
 
@@ -142,14 +150,25 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     /// holds one permit — the right to one active connection — which is returned by
     /// <see cref="ReleaseConnection"/> (or by the acquire failure path). Throws
     /// <see cref="AdbcException"/> if the pool stays at capacity past the timeout; a cancelled token
-    /// propagates as <see cref="OperationCanceledException"/>. Neither a timeout nor a cancellation
-    /// consumes a permit.
+    /// propagates as <see cref="OperationCanceledException"/>, and disposing the pool ends the wait
+    /// with <see cref="ObjectDisposedException"/>. None of these consumes a permit.
     /// </summary>
-    private static async Task WaitForCapacityAsync(
+    private async Task WaitForCapacityAsync(
         ConnectionPoolEntry poolEntry, ConnectionConfig config, CancellationToken cancellationToken)
     {
-        bool entered = await poolEntry.CapacitySemaphore
-            .WaitAsync(config.PoolConfig.AcquireTimeout, cancellationToken).ConfigureAwait(false);
+        // Disposing a SemaphoreSlim doesn't wake its waiters, so the wait also observes the pool's
+        // shutdown token, which teardown cancels before it disposes the semaphores.
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
+        bool entered;
+        try
+        {
+            entered = await poolEntry.CapacitySemaphore
+                .WaitAsync(config.PoolConfig.AcquireTimeout, wait.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new ObjectDisposedException(GetType().FullName);
+        }
 
         if (!entered)
             throw new AdbcException(
@@ -271,18 +290,8 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     // Return the permit only after the connection is seated on the idle stack (or discarded),
     // so a waiter woken by this release always finds the capacity it was promised.
-    private static void ReturnPermit(ConnectionPoolEntry? poolEntry)
-    {
-        try
-        {
-            poolEntry?.CapacitySemaphore.Release();
-        }
-        catch (ObjectDisposedException)
-        {
-            // The pool was disposed while this release was discarding its connection (a bounded
-            // session close); there is no capacity left to return.
-        }
-    }
+    // The semaphores are never disposed (see CompleteDispose), so this is safe after teardown too.
+    private static void ReturnPermit(ConnectionPoolEntry? poolEntry) => poolEntry?.CapacitySemaphore.Release();
 
     /// <summary>
     /// Disposes the connection pool and all pooled connections.
@@ -332,23 +341,27 @@ internal class ConnectionPoolManager : IConnectionPoolManager
             Volatile.Write(ref _disposed, 1);
         }
 
-        _cleanupCts.Cancel();
+        _shutdownCts.Cancel();
         return true;
     }
 
     /// <summary>
     /// Runs once the maintenance loop has exited: detaches every pooled connection atomically with
-    /// respect to acquire and release, then disposes the CTS and permits. Returns the connections
-    /// for the caller to dispose (outside the lock).
+    /// respect to acquire and release, and returns them for the caller to dispose (outside the lock).
     /// </summary>
+    /// <remarks>
+    /// The capacity semaphores are deliberately not disposed. SemaphoreSlim.Dispose drops its list
+    /// of async waiters, so a capacity wait whose cancellation (by the shutdown token) is still
+    /// completing can no longer remove itself and would hang forever. The pool never touches
+    /// AvailableWaitHandle, so there is nothing for Dispose to release, and a late release returns
+    /// its permit harmlessly.
+    /// </remarks>
     private List<IPooledConnection> CompleteDispose()
     {
         var connections = new List<IPooledConnection>();
-        List<ConnectionPoolEntry> entries;
         lock (_lifecycleLock)
         {
-            entries = [.. _pools.Values];
-            foreach (var poolEntry in entries)
+            foreach (var poolEntry in _pools.Values)
             {
                 connections.AddRange(poolEntry.ActiveConnections.Values);
                 connections.AddRange(poolEntry.IdleConnections);
@@ -356,10 +369,6 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
             _pools.Clear();
         }
-
-        _cleanupCts.Dispose();
-        foreach (var poolEntry in entries)
-            poolEntry.CapacitySemaphore.Dispose();
 
         return connections;
     }
@@ -382,12 +391,13 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     private async Task CleanupLoopAsync(PeriodicTimer timer)
     {
-        CancellationToken token = _cleanupCts.Token;
+        CancellationToken token = _shutdownCts.Token;
         try
         {
-            // Shutdown is bounded: the timer and heartbeats observe the token, and the sweep's session
-            // closes run concurrently, each bounded by PooledConnection.SessionCloseTimeout. Teardown
-            // relies on this to wait for the loop without a timeout.
+            // Shutdown is bounded: the timer observes the token, an in-flight heartbeat gets at most
+            // HeartbeatShutdownTimeout to finish, and the sweep's session closes run concurrently,
+            // each bounded by PooledConnection.SessionCloseTimeout. Teardown relies on this to wait
+            // for the loop without a timeout.
             while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
             {
                 try
@@ -483,7 +493,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
         foreach (var poolEntry in _pools.Values)
             idle.AddRange(poolEntry.IdleConnections.ToArray());
 
-        return HeartbeatDueConnectionsAsync(idle, _sessionLifecycle.HeartbeatAsync, _timeProvider.GetUtcNow(), token, _logger);
+        return HeartbeatDueConnectionsAsync(idle, _sessionLifecycle.HeartbeatAsync, _timeProvider.GetUtcNow(), token, _logger, _timeProvider);
     }
 
     /// <summary>
@@ -492,12 +502,17 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     /// tested without the background timer. Best-effort: a failing heartbeat is swallowed so one bad
     /// connection doesn't stop the rest — it is recovered by reactive renewal on the next query.
     /// </summary>
+    // How long shutdown waits for a heartbeat that is still in flight; heartbeats honour their token,
+    // so in practice it returns almost at once.
+    internal static readonly TimeSpan HeartbeatShutdownTimeout = TimeSpan.FromSeconds(5);
+
     internal static async Task HeartbeatDueConnectionsAsync(
         IEnumerable<IPooledConnection> connections,
         Func<AuthenticationToken, ConnectionConfig, CancellationToken, Task> heartbeat,
         DateTimeOffset now,
         CancellationToken token,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        TimeProvider? timeProvider = null)
     {
         foreach (var connection in connections)
         {
@@ -506,14 +521,25 @@ internal class ConnectionPoolManager : IConnectionPoolManager
             if (connection.IsDisposed || !IsHeartbeatDue(connection, now))
                 continue;
 
+            Task inFlight = heartbeat(connection.AuthToken, connection.Config, token);
             try
             {
-                // WaitAsync bounds the wait to the token even if the heartbeat doesn't observe it.
-                await heartbeat(connection.AuthToken, connection.Config, token).WaitAsync(token).ConfigureAwait(false);
+                await inFlight.WaitAsync(token).ConfigureAwait(false);
                 connection.RecordHeartbeat();
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
+                // Shutting down. Teardown is about to close this session and the shared HttpClient,
+                // so give the heartbeat a bounded chance to observe its token and finish first, and
+                // observe its outcome so a late failure isn't left unobserved.
+                try
+                {
+                    await inFlight.WaitAsync(HeartbeatShutdownTimeout, timeProvider ?? TimeProvider.System).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // ignore — the pool is shutting down
+                }
                 return;
             }
             catch (Exception ex)

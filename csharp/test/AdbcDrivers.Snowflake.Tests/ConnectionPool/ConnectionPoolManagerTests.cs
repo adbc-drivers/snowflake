@@ -651,34 +651,109 @@ public class ConnectionPoolManagerTests
         }
     }
 
-    [Fact]
-    public async Task DisposeAsync_HeartbeatIgnoresCancellation_StillCompletesPromptly()
+    private static ConnectionConfig KeepAliveConfig() => new()
     {
-        // Teardown waits for the maintenance loop without a timeout, so the loop's shutdown must be
-        // bounded even when a heartbeat in flight never completes and never observes its token.
-        var fakeTime = new FakeTimeProvider();
+        Account = "test",
+        User = "user",
+        ClientSessionKeepAlive = true,
+        HeartbeatFrequency = TimeSpan.FromSeconds(30),
+    };
+
+    /// <summary>A pool whose one idle connection is mid-heartbeat; the heartbeat completes only via <paramref name="heartbeat"/>.</summary>
+    private static async Task<ConnectionPoolManager> PoolWithHeartbeatInFlight(
+        FakeTimeProvider fakeTime, ISessionLifecycle sessions, TaskCompletionSource heartbeat)
+    {
         var heartbeatStarted = new TaskCompletionSource();
-        var sessions = Substitute.For<ISessionLifecycle>();
         sessions.HeartbeatAsync(Arg.Any<AuthenticationToken>(), Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
                 heartbeatStarted.TrySetResult();
-                return new TaskCompletionSource().Task;
+                return heartbeat.Task;
             });
         var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions, fakeTime);
+        pool.ReleaseConnection(await pool.AcquireConnectionAsync(KeepAliveConfig()));
+
+        fakeTime.Advance(TimeSpan.FromSeconds(60));
+        await heartbeatStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        return pool;
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WaitsForAnInFlightHeartbeatBeforeClosingItsSession()
+    {
+        var fakeTime = new FakeTimeProvider();
+        var heartbeat = new TaskCompletionSource();
+        var sessions = Substitute.For<ISessionLifecycle>();
+        var pool = await PoolWithHeartbeatInFlight(fakeTime, sessions, heartbeat);
+
+        Task dispose = pool.DisposeAsync().AsTask();
+        await Task.Delay(200);
+
+        // Teardown must not close the session (or dispose the shared HttpClient) under the heartbeat.
+        Assert.False(dispose.IsCompleted);
+        await sessions.DidNotReceiveWithAnyArgs().CloseAsync(default!, default!, default);
+
+        heartbeat.SetResult();
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+        await sessions.ReceivedWithAnyArgs(1).CloseAsync(default!, default!, default);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_HeartbeatIgnoresCancellation_IsBoundedByTheShutdownTimeout()
+    {
+        // Teardown waits for the maintenance loop without a timeout of its own, so the loop's wait
+        // for a heartbeat that never completes and never observes its token must be bounded.
+        var fakeTime = new FakeTimeProvider();
+        var sessions = Substitute.For<ISessionLifecycle>();
+        var pool = await PoolWithHeartbeatInFlight(fakeTime, sessions, new TaskCompletionSource());
+
+        Task dispose = pool.DisposeAsync().AsTask();
+        await Task.Delay(200);
+        Assert.False(dispose.IsCompleted);
+
+        fakeTime.Advance(ConnectionPoolManager.HeartbeatShutdownTimeout);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WakesAcquiresWaitingForCapacity()
+    {
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), Substitute.For<ISessionLifecycle>());
         var config = new ConnectionConfig
         {
             Account = "test",
             User = "user",
-            ClientSessionKeepAlive = true,
-            HeartbeatFrequency = TimeSpan.FromSeconds(30),
+            PoolConfig = new ConnectionPoolConfig { MaxPoolSize = 1, AcquireTimeout = TimeSpan.FromMinutes(5) },
         };
-        pool.ReleaseConnection(await pool.AcquireConnectionAsync(config));
+        await pool.AcquireConnectionAsync(config);
+        Task<IPooledConnection> waiter = pool.AcquireConnectionAsync(config);
+        Assert.False(waiter.IsCompleted);
 
-        fakeTime.Advance(TimeSpan.FromSeconds(60));
-        await heartbeatStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await pool.DisposeAsync();
 
-        await pool.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        // Ends with ObjectDisposedException at once, not after the 5-minute acquire timeout.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => waiter.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AcquireConnectionAsync_CallerCancels_StillThrowsOperationCanceled()
+    {
+        // Linking the wait to the shutdown token must not turn a caller's own cancellation into
+        // ObjectDisposedException.
+        await using var pool = new ConnectionPoolManager(SubstituteAuthService(), Substitute.For<ISessionLifecycle>());
+        var config = new ConnectionConfig
+        {
+            Account = "test",
+            User = "user",
+            PoolConfig = new ConnectionPoolConfig { MaxPoolSize = 1, AcquireTimeout = TimeSpan.FromMinutes(5) },
+        };
+        await pool.AcquireConnectionAsync(config);
+        using var cts = new CancellationTokenSource();
+        Task<IPooledConnection> waiter = pool.AcquireConnectionAsync(config, cts.Token);
+
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiter.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
     [Fact]
