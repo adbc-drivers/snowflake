@@ -562,6 +562,26 @@ public class ConnectionPoolManagerTests
     }
 
     [Fact]
+    public async Task ReleaseConnectionAsync_PoolDisposedWhileDiscarding_DoesNotThrow()
+    {
+        // The faulted connection's close is still in flight when the pool is torn down, so the
+        // release returns its permit to an already-disposed semaphore.
+        var closeGate = new TaskCompletionSource();
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(default!, default!, default).ReturnsForAnyArgs(closeGate.Task);
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+        var faulted = await pool.AcquireConnectionAsync(SimpleConfig());
+        faulted.IsFaulted = true;
+
+        Task release = pool.ReleaseConnectionAsync(faulted).AsTask();
+        Assert.False(release.IsCompleted);
+        await pool.DisposeAsync();
+        closeGate.SetResult();
+
+        await release.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task Sync_ReleaseAndDispose_CloseDiscardedSessions()
     {
         var sessions = Substitute.For<ISessionLifecycle>();

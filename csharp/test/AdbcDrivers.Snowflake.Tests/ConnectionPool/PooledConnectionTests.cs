@@ -93,6 +93,24 @@ public class PooledConnectionTests
     }
 
     [Fact]
+    public async Task DisposeAsync_CloseIgnoresItsToken_StillCompletesAfterTheTimeout()
+    {
+        // A close that never completes and never observes cancellation must not hang disposal.
+        var fakeTime = new FakeTimeProvider();
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(default!, default!, default).ReturnsForAnyArgs(new TaskCompletionSource().Task);
+        var connection = new PooledConnection("id", "pool-key", new AuthenticationToken { SessionToken = "session" },
+            new ConnectionConfig { Account = "test" }, sessions, fakeTime);
+
+        Task dispose = connection.DisposeAsync().AsTask();
+        Assert.False(dispose.IsCompleted);
+
+        fakeTime.Advance(PooledConnection.SessionCloseTimeout);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(connection.IsDisposed);
+    }
+
+    [Fact]
     public async Task Sync_Dispose_ClosesTheSessionOnce()
     {
         var sessions = Substitute.For<ISessionLifecycle>();

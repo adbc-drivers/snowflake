@@ -110,9 +110,8 @@ internal class PooledConnection : IPooledConnection
         if (!TryMarkDisposed())
             return;
 
-        // The close cancels itself after the timeout; the bounded Wait also covers a close that
-        // doesn't observe its token promptly.
-        try { CloseSessionBestEffortAsync().Wait(SessionCloseTimeout); } catch { }
+        // The close is bounded by SessionCloseTimeout and swallows its own failures.
+        CloseSessionBestEffortAsync().GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -144,8 +143,11 @@ internal class PooledConnection : IPooledConnection
 
         try
         {
-            using var timeout = new CancellationTokenSource(SessionCloseTimeout);
-            await _sessionLifecycle.CloseAsync(AuthToken, Config, timeout.Token).ConfigureAwait(false);
+            // The token asks the close to stop; WaitAsync bounds the wait even if the close
+            // doesn't observe it, so disposal can never hang on an unresponsive server.
+            using var timeout = new CancellationTokenSource(SessionCloseTimeout, _timeProvider);
+            await _sessionLifecycle.CloseAsync(AuthToken, Config, timeout.Token)
+                .WaitAsync(SessionCloseTimeout, _timeProvider).ConfigureAwait(false);
         }
         catch
         {

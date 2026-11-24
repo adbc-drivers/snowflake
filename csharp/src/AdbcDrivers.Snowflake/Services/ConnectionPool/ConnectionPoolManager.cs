@@ -236,7 +236,18 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     // Return the permit only after the connection is seated on the idle stack (or discarded),
     // so a waiter woken by this release always finds the capacity it was promised.
-    private static void ReturnPermit(ConnectionPoolEntry? poolEntry) => poolEntry?.CapacitySemaphore.Release();
+    private static void ReturnPermit(ConnectionPoolEntry? poolEntry)
+    {
+        try
+        {
+            poolEntry?.CapacitySemaphore.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The pool was disposed while this release was discarding its connection (a bounded
+            // session close); there is no capacity left to return.
+        }
+    }
 
     /// <summary>
     /// Disposes the connection pool and all pooled connections.
