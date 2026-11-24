@@ -15,6 +15,8 @@
 */
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Configuration;
@@ -598,6 +600,85 @@ public class ConnectionPoolManagerTests
         pool.Dispose(); // a second, overlapping dispose is a no-op
         closeGate.SetResult();
         await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task AcquireConnectionAsync_PoolDisposedDuringLogin_ClosesTheNewSessionAndThrows()
+    {
+        // The acquire passes the disposed check, then waits on the login while the pool is torn down.
+        var login = new TaskCompletionSource<AuthenticationToken>();
+        var authService = Substitute.For<IAuthenticationService>();
+        authService.AuthenticateAsync(Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>()).Returns(login.Task);
+        var sessions = Substitute.For<ISessionLifecycle>();
+        var pool = new ConnectionPoolManager(authService, sessions);
+
+        Task<IPooledConnection> acquire = pool.AcquireConnectionAsync(SimpleConfig());
+        await pool.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        login.SetResult(new AuthenticationToken { SessionToken = "late", MasterExpiresAt = DateTimeOffset.UtcNow.AddHours(4) });
+
+        // The connection missed teardown's snapshot, so the acquire must close it rather than return it.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => acquire.WaitAsync(TimeSpan.FromSeconds(5)));
+        await sessions.Received(1).CloseAsync(
+            Arg.Is<AuthenticationToken>(t => t.SessionToken == "late"), Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task DisposeAsync_RacingReleases_DisposesEveryConnection()
+    {
+        // A release that moves a connection from active to idle between teardown's two snapshots
+        // would leave it in neither; race many to make that window likely to be hit.
+        for (int round = 0; round < 1000; round++)
+        {
+            var pool = new ConnectionPoolManager(SubstituteAuthService(), Substitute.For<ISessionLifecycle>());
+            var connections = new List<IPooledConnection>();
+            for (int i = 0; i < 8; i++)
+                connections.Add(await pool.AcquireConnectionAsync(SimpleConfig()));
+
+            using var start = new Barrier(connections.Count + 1);
+            var releases = connections.Select(c => Task.Run(async () =>
+            {
+                start.SignalAndWait();
+                await pool.ReleaseConnectionAsync(c);
+            })).ToList();
+            var dispose = Task.Run(async () =>
+            {
+                start.SignalAndWait();
+                await pool.DisposeAsync();
+            });
+            await Task.WhenAll(releases.Append(dispose));
+
+            Assert.All(connections, c => Assert.True(c.IsDisposed, $"round {round}: a connection escaped teardown"));
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_HeartbeatIgnoresCancellation_StillCompletesPromptly()
+    {
+        // Teardown waits for the maintenance loop without a timeout, so the loop's shutdown must be
+        // bounded even when a heartbeat in flight never completes and never observes its token.
+        var fakeTime = new FakeTimeProvider();
+        var heartbeatStarted = new TaskCompletionSource();
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.HeartbeatAsync(Arg.Any<AuthenticationToken>(), Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                heartbeatStarted.TrySetResult();
+                return new TaskCompletionSource().Task;
+            });
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions, fakeTime);
+        var config = new ConnectionConfig
+        {
+            Account = "test",
+            User = "user",
+            ClientSessionKeepAlive = true,
+            HeartbeatFrequency = TimeSpan.FromSeconds(30),
+        };
+        pool.ReleaseConnection(await pool.AcquireConnectionAsync(config));
+
+        fakeTime.Advance(TimeSpan.FromSeconds(60));
+        await heartbeatStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await pool.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     [Fact]
