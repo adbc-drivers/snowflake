@@ -51,7 +51,7 @@ public class SnowflakeDriverTests : IDisposable
         };
 
         // When the database is opened and a connection attempted
-        using SnowflakeDatabase database = (SnowflakeDatabase)_driver.Open(parameters);
+        await using var database = await _driver.OpenAsync(parameters);
 
         // Then ConnectAsync throws, complaining about the missing account
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => database.ConnectAsync(null!));
@@ -59,7 +59,7 @@ public class SnowflakeDriverTests : IDisposable
     }
 
     [Fact]
-    public void Open_WithValidParameters_ShouldReturnDatabase()
+    public async Task OpenAsync_WithValidParameters_ShouldReturnDatabase()
     {
         // Given valid connection parameters
         var parameters = new Dictionary<string, string>
@@ -70,7 +70,7 @@ public class SnowflakeDriverTests : IDisposable
         };
 
         // When the driver opens a database
-        using var database = _driver.Open(parameters);
+        await using var database = await _driver.OpenAsync(parameters);
 
         // Then a SnowflakeDatabase is returned
         database.Should().NotBeNull();
@@ -78,32 +78,26 @@ public class SnowflakeDriverTests : IDisposable
     }
 
     [Fact]
-    public void Open_WithNullParameters_ShouldThrowArgumentNullException()
+    public async Task OpenAsync_WithNullParameters_ShouldThrowArgumentNullException()
     {
-        // When / Then opening with null parameters throws ArgumentNullException
-        var exception = Assert.Throws<ArgumentNullException>(() => _driver.Open((IReadOnlyDictionary<string, string>)null!));
+        // When / Then opening with null parameters fails the task with ArgumentNullException
+        Task<AdbcDatabase> open = _driver.OpenAsync(null!);
+        var exception = await Assert.ThrowsAsync<ArgumentNullException>(() => open);
         exception.ParamName.Should().Be("parameters");
     }
 
     [Fact]
-    public void Open_WithInvalidParameters_ShouldThrowArgumentException()
+    public async Task OpenAsync_WithCancelledToken_IsCancelled()
     {
-        // Given invalid connection parameters
-        var parameters = new Dictionary<string, string>
-        {
-            ["invalid"] = "parameter"
-        };
+        using var cts = new System.Threading.CancellationTokenSource();
+        cts.Cancel();
 
-        // When the database is opened and a connection attempted
-        var database = _driver.Open(parameters);
-
-        // Then Connect throws, complaining about the missing account
-        var exception = Assert.Throws<ArgumentException>(() => database.Connect(null));
-        exception.Message.Should().Contain("account");
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _driver.OpenAsync(new Dictionary<string, string> { ["account"] = "testaccount" }, cts.Token));
     }
 
     [Fact]
-    public void Open_WithMissingRequiredParameters_ShouldThrowArgumentException()
+    public async Task OpenAsync_WithMissingRequiredParameters_ShouldThrowArgumentException()
     {
         // Given parameters missing the required account
         var parameters = new Dictionary<string, string>
@@ -113,11 +107,23 @@ public class SnowflakeDriverTests : IDisposable
         };
 
         // When the database is opened and a connection attempted
-        var database = _driver.Open(parameters);
+        await using var database = await _driver.OpenAsync(parameters);
 
-        // Then Connect throws, complaining about the missing account
-        var exception = Assert.Throws<ArgumentException>(() => database.Connect(null));
+        // Then ConnectAsync throws, complaining about the missing account
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() => database.ConnectAsync(null));
         exception.Message.Should().Contain("account");
+    }
+
+    [Fact]
+    public void Sync_OpenAndConnect_SurfaceTheSameErrors()
+    {
+        // The sync wrappers must rethrow the original exception, not an AggregateException.
+        var exception = Assert.Throws<ArgumentNullException>(() => _driver.Open((IReadOnlyDictionary<string, string>)null!));
+        exception.ParamName.Should().Be("parameters");
+
+        using var database = _driver.Open(new Dictionary<string, string> { ["invalid"] = "parameter" });
+        database.Should().BeOfType<SnowflakeDatabase>();
+        Assert.Throws<ArgumentException>(() => database.Connect(null)).Message.Should().Contain("account");
     }
 
     [Fact]

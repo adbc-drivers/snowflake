@@ -16,6 +16,7 @@
 
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Configuration;
 using AdbcDrivers.Snowflake.Services.Authentication;
 
@@ -97,30 +98,58 @@ internal class PooledConnection : IPooledConnection
     /// </summary>
     void IPooledConnection.RecordHeartbeat() => _lastHeartbeatAt = _timeProvider.GetUtcNow();
 
+    // Bounds the best-effort session close so a slow or hung close can't stall teardown; a
+    // failure or timeout just lets the server-side session expire on its own.
+    internal static readonly TimeSpan SessionCloseTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>
-    /// Disposes the connection.
+    /// Disposes the connection, closing the server-side session (best-effort, bounded).
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (!TryMarkDisposed())
             return;
 
+        // The close cancels itself after the timeout; the bounded Wait also covers a close that
+        // doesn't observe its token promptly.
+        try { CloseSessionBestEffortAsync().Wait(SessionCloseTimeout); } catch { }
+    }
+
+    /// <summary>
+    /// Asynchronously disposes the connection, closing the server-side session (best-effort, bounded).
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (!TryMarkDisposed())
+            return;
+
+        await CloseSessionBestEffortAsync().ConfigureAwait(false);
+    }
+
+    private bool TryMarkDisposed()
+    {
+        if (_disposed)
+            return false;
+
         _disposed = true;
-
-        // Best-effort: close the server-side session so it isn't orphaned until it times out.
-        // Bounded so a slow/hung close can't stall teardown; a failure just lets the session expire.
-        if (_sessionLifecycle != null)
-        {
-            try
-            {
-                _sessionLifecycle.CloseAsync(AuthToken, Config, CancellationToken.None).Wait(TimeSpan.FromSeconds(5));
-            }
-            catch
-            {
-                // ignore — closing the session is best-effort
-            }
-        }
-
         GC.SuppressFinalize(this);
+        return true;
+    }
+
+    // Best-effort: close the server-side session so it isn't orphaned until it times out.
+    private async Task CloseSessionBestEffortAsync()
+    {
+        if (_sessionLifecycle == null)
+            return;
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(SessionCloseTimeout);
+            await _sessionLifecycle.CloseAsync(AuthToken, Config, timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // ignore — closing the session is best-effort
+        }
     }
 }

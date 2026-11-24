@@ -16,8 +16,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using Apache.Arrow;
 using Apache.Arrow.Adbc;
 using Apache.Arrow.Adbc.Tests;
+using Xunit;
 
 namespace AdbcDrivers.Snowflake.Tests.Integration;
 
@@ -58,6 +61,38 @@ internal static class IntegrationTestingUtils
             Console.WriteLine(ex.Message);
             TestConfiguration = new IntegrationTestConfiguration();
         }
+    }
+
+    /// <summary>
+    /// Opens a database for <paramref name="testConfiguration"/> through the async API. The
+    /// functional suites use the async surface throughout; the synchronous surface is covered
+    /// once, end to end, by <see cref="SyncApiSmokeTests"/>.
+    /// </summary>
+    internal static Task<AdbcDatabase> OpenDatabaseAsync(IntegrationTestConfiguration testConfiguration)
+    {
+        var driver = GetSnowflakeAdbcDriver(testConfiguration, out var parameters);
+        return driver.OpenAsync(parameters);
+    }
+
+    /// <summary>
+    /// Opens a connection on <paramref name="database"/> with no connection-level overrides.
+    /// </summary>
+    internal static async Task<SnowflakeConnection> ConnectAsync(AdbcDatabase database) =>
+        (SnowflakeConnection)await database.ConnectAsync(new Dictionary<string, string>());
+
+    /// <summary>
+    /// Runs a single-value <c>COUNT(*)</c>-style query and returns the value.
+    /// </summary>
+    internal static async Task<long> ExecuteScalarInt64Async(AdbcStatement statement, string sql)
+    {
+        statement.SqlQuery = sql;
+        var result = await statement.ExecuteQueryAsync();
+        Assert.NotNull(result.Stream);
+        using var stream = result.Stream;
+        var batch = await stream.ReadNextRecordBatchAsync();
+        Assert.NotNull(batch);
+        using (batch)
+            return ((Int64Array)batch.Column(0)).GetValue(0)!.Value;
     }
 
     /// <summary>

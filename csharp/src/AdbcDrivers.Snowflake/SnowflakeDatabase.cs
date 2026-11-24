@@ -132,4 +132,20 @@ public sealed class SnowflakeDatabase : AdbcDatabase
         }
         base.Dispose();
     }
+
+    /// <summary>
+    /// Asynchronously disposes the database. The pooled sessions are closed concurrently and
+    /// without blocking a thread, rather than one bounded wait after another as in <see cref="Dispose"/>.
+    /// </summary>
+    public override async ValueTask DisposeAsync()
+    {
+        if (!_disposed)
+        {
+            // Pool first: its best-effort session closes still need a live client.
+            await _connectionPool.DisposeAsync().ConfigureAwait(false);
+            _httpClient.Dispose();
+            _disposed = true;
+        }
+        base.Dispose();
+    }
 }

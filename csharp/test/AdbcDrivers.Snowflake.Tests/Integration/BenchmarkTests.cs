@@ -52,10 +52,9 @@ public class BenchmarkTests
     {
         Skip.If(string.IsNullOrEmpty(_testConfig.Account), "Account not configured");
         Skip.If(string.IsNullOrWhiteSpace(_testConfig.Query), "No query configured");
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfig, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfig);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"{_testConfig.Query} LIMIT {limit}";
         var stopwatch = Stopwatch.StartNew();
         var result = await statement.ExecuteQueryAsync();

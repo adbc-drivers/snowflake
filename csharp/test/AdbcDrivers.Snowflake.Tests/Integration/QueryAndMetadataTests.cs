@@ -69,8 +69,9 @@ public class QueryAndMetadataTests
     public async Task Query_Region_ReturnsFiveKnownRows()
     {
         // Given a query against TPC-H REGION (which always has exactly 5 rows with these names)
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT R_NAME FROM {SampleDb}.{SampleSchema}.REGION ORDER BY R_NAME";
 
         // When the name column is read
@@ -88,8 +89,9 @@ public class QueryAndMetadataTests
     public async Task Query_Nation_ReturnsTwentyFiveRowsWithFourColumns()
     {
         // Given a SELECT * over TPC-H NATION
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT * FROM {SampleDb}.{SampleSchema}.NATION";
 
         // When the whole result is read
@@ -107,8 +109,9 @@ public class QueryAndMetadataTests
         // A zero-row SELECT still reports Arrow format, but the server sends no row data at
         // all — only rowtype metadata. The driver must surface an empty stream carrying the
         // result schema rather than fail with "no result stream was returned".
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT R_REGIONKEY, R_NAME FROM {SampleDb}.{SampleSchema}.REGION WHERE 1 = 0";
 
         var result = await statement.ExecuteQueryAsync();
@@ -134,8 +137,9 @@ public class QueryAndMetadataTests
     {
         // Given a query over CUSTOMER — 150,000 rows in SF1, large enough to be returned as
         // multiple Arrow chunks
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT C_CUSTKEY FROM {SampleDb}.{SampleSchema}.CUSTOMER";
 
         // When the entire stream is drained
@@ -150,27 +154,29 @@ public class QueryAndMetadataTests
     }
 
     [SkippableFact]
-    public void Query_InvalidSql_ThrowsAdbcException()
+    public async Task Query_InvalidSql_ThrowsAdbcException()
     {
         // Given a query referencing a non-existent table
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT * FROM {SampleDb}.{SampleSchema}.NO_SUCH_TABLE_XYZ";
 
         // When / Then executing it surfaces an AdbcException
-        Assert.Throws<AdbcException>(statement.ExecuteQuery);
+        await Assert.ThrowsAsync<AdbcException>(() => statement.ExecuteQueryAsync().AsTask());
     }
 
     // ---- Metadata: deterministic schema and object content ----
 
     [SkippableFact]
-    public void GetTableSchema_Nation_HasExpectedColumnsAndTypes()
+    public async Task GetTableSchema_Nation_HasExpectedColumnsAndTypes()
     {
         // Given a connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         // When the schema of NATION is described
-        Schema schema = connection.GetTableSchema(SampleDb, SampleSchema, "NATION");
+        Schema schema = await connection.GetTableSchemaAsync(SampleDb, SampleSchema, "NATION");
 
         // Then it is deterministic and agrees with the result decoder: the describe path sizes
         // NUMBER by precision (TPC-H keys are NUMBER(38,0) -> Decimal128), VARCHAR -> Utf8 string.
@@ -193,10 +199,11 @@ public class QueryAndMetadataTests
     public async Task GetTableTypes_ReturnsTableAndView()
     {
         // Given a connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         // When the table types are read
-        using var stream = connection.GetTableTypes();
+        using var stream = await connection.GetTableTypesAsync();
         List<string?> types = await ReadAllStringColumnAsync(stream, columnIndex: 0);
 
         // Then they include TABLE and VIEW
@@ -208,10 +215,11 @@ public class QueryAndMetadataTests
     public async Task GetInfo_ReportsSnowflakeVendorName()
     {
         // Given a connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         // When the vendor name is requested via GetInfo
-        using var stream = connection.GetInfo(new List<AdbcInfoCode> { AdbcInfoCode.VendorName });
+        using var stream = await connection.GetInfoAsync(new List<AdbcInfoCode> { AdbcInfoCode.VendorName });
         RecordBatch? batch = await stream.ReadNextRecordBatchAsync();
 
         // Then it reports "Snowflake" (on the string_value union branch, type id 0)
@@ -228,10 +236,11 @@ public class QueryAndMetadataTests
     public async Task GetObjects_All_ReturnsNationColumns()
     {
         // Given a connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         // When GetObjects is called at full depth for NATION
-        using var stream = connection.GetObjects(
+        using var stream = await connection.GetObjectsAsync(
             AdbcConnection.GetObjectsDepth.All,
             SampleDb,
             SampleSchema,
@@ -283,10 +292,11 @@ public class QueryAndMetadataTests
     public async Task GetObjects_Catalogs_ContainsSampleDatabase()
     {
         // Given a connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         // When GetObjects is called at catalog depth filtered to the sample database
-        using var stream = connection.GetObjects(
+        using var stream = await connection.GetObjectsAsync(
             AdbcConnection.GetObjectsDepth.Catalogs,
             SampleDb,
             null,
@@ -310,11 +320,12 @@ public class QueryAndMetadataTests
         // Given a catalog pattern carrying a SQL-injection payload — if it were interpolated into
         // SQL, the trailing "OR DATABASE_NAME='...'" would break out of the ILIKE literal and the
         // real sample DB would come back
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
         string payload = $"x' OR DATABASE_NAME='{SampleDb}";
 
         // When GetObjects is called with that pattern (server-side bound, not interpolated)
-        using var stream = connection.GetObjects(
+        using var stream = await connection.GetObjectsAsync(
             AdbcConnection.GetObjectsDepth.Catalogs,
             payload,
             null,
@@ -338,13 +349,6 @@ public class QueryAndMetadataTests
 
     // ---- Helpers ----
 
-    private SnowflakeConnection Connect()
-    {
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        var database = driver.Open(parameters);
-        var connection = database.Connect(new Dictionary<string, string>());
-        return (SnowflakeConnection)connection;
-    }
 
     /// <summary>Reads the whole result stream, returning total rows, column count, and batch count.</summary>
     private static async Task<(long Rows, int ColumnCount, int BatchCount)> ReadAllAsync(Apache.Arrow.Adbc.QueryResult result)

@@ -376,6 +376,13 @@ public sealed class SnowflakeStatement : AdbcStatement
     }
 
     /// <summary>
+    /// Asynchronously prepares the statement. Like <see cref="Prepare"/>, this only validates the
+    /// statement locally, so it completes synchronously.
+    /// </summary>
+    public override Task PrepareAsync(CancellationToken cancellationToken = default) =>
+        CompletedTasks.Run(Prepare, cancellationToken);
+
+    /// <summary>
     /// Gets the parameter schema for a prepared statement.
     /// </summary>
     /// <remarks>
@@ -388,6 +395,12 @@ public sealed class SnowflakeStatement : AdbcStatement
 
         throw AdbcException.NotImplemented("Snowflake does not provide a parameter schema.");
     }
+
+    /// <summary>
+    /// Not supported; see <see cref="GetParameterSchema"/>. Fails without leaving the calling thread.
+    /// </summary>
+    public override Task<Schema> GetParameterSchemaAsync(CancellationToken cancellationToken = default) =>
+        CompletedTasks.Run(GetParameterSchema, cancellationToken);
 
     /// <summary>
     /// Disposes the statement and releases any resources.

@@ -128,8 +128,8 @@ public class TypeMetadataTests
             _testConfiguration, out Dictionary<string, string> parameters);
         var config = ConnectionStringParser.ParseParameters(parameters);
 
-        var database = driver.Open(parameters);
-        using var connection = (SnowflakeConnection)database.Connect(new Dictionary<string, string>());
+        await using var database = await driver.OpenAsync(parameters);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         try
         {
@@ -193,7 +193,7 @@ public class TypeMetadataTests
 
     private static async Task ExecuteAsync(SnowflakeConnection connection, string sql)
     {
-        using var statement = connection.CreateStatement();
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = sql;
         await statement.ExecuteUpdateAsync();
     }
@@ -224,7 +224,7 @@ public class TypeMetadataTests
 
     private static async Task<Schema> ReadResultSchemaAsync(SnowflakeConnection connection, string table)
     {
-        using var statement = connection.CreateStatement();
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT * FROM {table}";
 
         var result = await statement.ExecuteQueryAsync();

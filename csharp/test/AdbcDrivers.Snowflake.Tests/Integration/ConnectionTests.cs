@@ -15,6 +15,7 @@
 */
 
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace AdbcDrivers.Snowflake.Tests.Integration;
@@ -47,37 +48,36 @@ public class ConnectionTests
     }
 
     [SkippableFact]
-    public void DisposingDatabase_ClosesSessionWithoutError()
+    public async Task DisposingDatabase_ClosesSessionWithoutError()
     {
         // Given a connected database (a live server-side session)
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        var database = driver.Open(parameters);
-        var connection = database.Connect(new Dictionary<string, string>());
-        connection.Dispose();   // returns the pooled connection to idle — session kept for reuse
+        var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await connection.DisposeAsync();   // returns the pooled connection to idle — session kept for reuse
 
         // When the database is disposed, the pool discards its pooled connections and best-effort
         // closes their server-side sessions (POST /session?delete=true).
         // Then it completes without throwing.
-        var exception = Record.Exception(database.Dispose);
+        var exception = await Record.ExceptionAsync(async () => await database.DisposeAsync());
         Assert.Null(exception);
     }
 
     [SkippableFact]
-    public void OpenAndConnect_Succeeds()
+    public async Task OpenAndConnect_Succeeds()
     {
         // Given driver parameters
         var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
+        await using var database = await driver.OpenAsync(parameters);
 
         // When a connection is opened
-        using var connection = database.Connect(new Dictionary<string, string>());
+        await using var connection = await database.ConnectAsync(new Dictionary<string, string>());
 
         // Then it succeeds
         Assert.NotNull(connection);
     }
 
     [SkippableFact]
-    public void OpenAndConnect_WithKeyPair_Succeeds()
+    public async Task OpenAndConnect_WithKeyPair_Succeeds()
     {
         // Requires an auth_jwt block in the test configuration (a user with an RSA public key
         // registered via ALTER USER ... SET RSA_PUBLIC_KEY and its private key on disk/inline).
@@ -98,12 +98,11 @@ public class ConnectionTests
         };
 
         // When a connection is opened and a query is run over the JWT-authenticated session
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(keyPairOnly, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(keyPairOnly);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1";
-        var result = statement.ExecuteQuery();
+        var result = await statement.ExecuteQueryAsync();
 
         // Then the login and the query both succeed
         Assert.NotNull(result.Stream);
@@ -111,7 +110,7 @@ public class ConnectionTests
     }
 
     [SkippableFact]
-    public void OpenAndConnect_WithPat_Succeeds()
+    public async Task OpenAndConnect_WithPat_Succeeds()
     {
         // Requires an auth_pat block in the test configuration: a programmatic access token
         // for a user that is subject to a network policy (Snowflake rejects PAT logins
@@ -130,12 +129,11 @@ public class ConnectionTests
         };
 
         // When a connection is opened and a query is run over the PAT-authenticated session
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(patOnly, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(patOnly);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1";
-        var result = statement.ExecuteQuery();
+        var result = await statement.ExecuteQueryAsync();
 
         // Then the login and the query both succeed
         Assert.NotNull(result.Stream);

@@ -23,7 +23,7 @@ namespace AdbcDrivers.Snowflake.Services.ConnectionPool;
 /// <summary>
 /// Represents a pooled connection.
 /// </summary>
-internal interface IPooledConnection : IDisposable
+internal interface IPooledConnection : IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// Gets the connection ID.

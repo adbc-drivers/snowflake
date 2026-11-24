@@ -60,55 +60,58 @@ public class SnowflakeConnectionTransactionTests
         _executor.Received(1).ExecuteQueryAsync(
             Arg.Is<QueryRequest>(r => r.Statement == statement), Arg.Any<CancellationToken>());
 
+    // ---- Async surface (the implementation; the sync methods block on it) ----
+
     [Fact]
-    public void Commit_WithAutocommitEnabled_Throws()
+    public async Task CommitAsync_WithAutocommitEnabled_Throws()
     {
-        var ex = Assert.Throws<AdbcException>(_sut.Commit);
+        var ex = await Assert.ThrowsAsync<AdbcException>(() => _sut.CommitAsync());
         Assert.Contains("autocommit", ex.Message);
-        _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
+        Assert.Equal(AdbcStatusCode.InvalidState, ex.Status);
+        await _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
     }
 
     [Fact]
-    public void Rollback_WithAutocommitEnabled_Throws()
+    public async Task RollbackAsync_WithAutocommitEnabled_Throws()
     {
-        Assert.Throws<AdbcException>(_sut.Rollback);
-        _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
+        await Assert.ThrowsAsync<AdbcException>(() => _sut.RollbackAsync());
+        await _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
     }
 
     [Fact]
-    public async Task SetOption_DisableAutocommit_AltersSession()
+    public async Task SetOptionAsync_DisableAutocommit_AltersSession()
     {
-        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
 
         await Executed("ALTER SESSION SET AUTOCOMMIT = FALSE");
     }
 
     [Fact]
-    public void SetOption_SameValue_IsNoOp()
+    public async Task SetOptionAsync_SameValue_IsNoOp()
     {
-        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Enabled);
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Enabled);
 
-        _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
+        await _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
     }
 
     [Fact]
-    public async Task CommitAndRollback_InTransactionScope_RunTheStatements()
+    public async Task CommitAsyncAndRollbackAsync_InTransactionScope_RunTheStatements()
     {
-        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
 
-        _sut.Commit();
+        await _sut.CommitAsync();
         await Executed("COMMIT");
 
-        _sut.Rollback();
+        await _sut.RollbackAsync();
         await Executed("ROLLBACK");
     }
 
     [Fact]
-    public async Task SetOption_ReenableAutocommit_CommitsPendingWorkFirst()
+    public async Task SetOptionAsync_ReenableAutocommit_CommitsPendingWorkFirst()
     {
-        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
 
-        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Enabled);
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Enabled);
 
         // The ADBC contract: turning autocommit back on commits the pending transaction.
         Received.InOrder(() =>
@@ -116,18 +119,103 @@ public class SnowflakeConnectionTransactionTests
             _executor.ExecuteQueryAsync(Arg.Is<QueryRequest>(r => r.Statement == "COMMIT"), Arg.Any<CancellationToken>());
             _executor.ExecuteQueryAsync(Arg.Is<QueryRequest>(r => r.Statement == "ALTER SESSION SET AUTOCOMMIT = TRUE"), Arg.Any<CancellationToken>());
         });
-        await Task.CompletedTask;
     }
 
     [Fact]
-    public void SetOption_UnknownKey_ThrowsNotImplemented()
+    public async Task SetOptionAsync_UnknownKey_ThrowsNotImplemented()
     {
-        var ex = Assert.Throws<AdbcException>(() => _sut.SetOption("adbc.connection.readonly", "true"));
+        var ex = await Assert.ThrowsAsync<AdbcException>(() => _sut.SetOptionAsync("adbc.connection.readonly", "true"));
+        Assert.Equal(AdbcStatusCode.NotImplemented, ex.Status);
         Assert.Contains("not supported", ex.Message);
     }
 
     [Fact]
-    public async Task Dispose_MidTransaction_RollsBackAndRestoresAutocommitBeforeRelease()
+    public async Task TransactionMethods_TokenAlreadyCancelled_SendNothing()
+    {
+        // The token is honored only before a session statement is sent: abandoning a COMMIT or an
+        // autocommit change mid-flight would leave the session's transaction state unknown.
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled, cts.Token));
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        _executor.ClearReceivedCalls();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _sut.CommitAsync(cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _sut.RollbackAsync(cts.Token));
+        await _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task SessionStatements_AreSentWithoutTheCallersToken()
+    {
+        using var cts = new CancellationTokenSource();
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled, cts.Token);
+        await _sut.CommitAsync(cts.Token);
+
+        await _executor.DidNotReceive().ExecuteQueryAsync(Arg.Any<QueryRequest>(), cts.Token);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_MidTransaction_RollsBackAndRestoresAutocommitBeforeRelease()
+    {
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+
+        await _sut.DisposeAsync();
+
+        Received.InOrder(() =>
+        {
+            _executor.ExecuteQueryAsync(Arg.Is<QueryRequest>(r => r.Statement == "ROLLBACK"), Arg.Any<CancellationToken>());
+            _executor.ExecuteQueryAsync(Arg.Is<QueryRequest>(r => r.Statement == "ALTER SESSION SET AUTOCOMMIT = TRUE"), Arg.Any<CancellationToken>());
+            _pool.ReleaseConnectionAsync(_pooled);
+        });
+        _pool.DidNotReceive().ReleaseConnection(Arg.Any<IPooledConnection>());
+        _pooled.DidNotReceive().IsFaulted = true;
+    }
+
+    [Fact]
+    public async Task DisposeAsync_TransactionResetFails_FaultsTheConnection()
+    {
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        _executor.ExecuteQueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>())
+            .Returns(Services.Query.QueryResult.Failed("EXECUTION_ERROR", "connection reset"));
+
+        await _sut.DisposeAsync();
+
+        // The session's transaction state is unknown; it must not be reused.
+        _pooled.Received().IsFaulted = true;
+        await _pool.Received(1).ReleaseConnectionAsync(_pooled);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_NoTransaction_DoesNotRunSessionStatements()
+    {
+        await _sut.DisposeAsync();
+        await _sut.DisposeAsync();
+
+        await _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
+        await _pool.Received(1).ReleaseConnectionAsync(_pooled);
+    }
+
+    // ---- Sync surface smoke: each wrapper reaches the async implementation ----
+
+    [Fact]
+    public async Task Sync_SetOptionCommitRollback_RunTheStatements()
+    {
+        Assert.Throws<AdbcException>(_sut.Commit);
+
+        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        _sut.Commit();
+        _sut.Rollback();
+
+        await Executed("ALTER SESSION SET AUTOCOMMIT = FALSE");
+        await Executed("COMMIT");
+        await Executed("ROLLBACK");
+    }
+
+    [Fact]
+    public async Task Sync_Dispose_MidTransaction_ResetsAndReleases()
     {
         _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
 
@@ -136,29 +224,6 @@ public class SnowflakeConnectionTransactionTests
         await Executed("ROLLBACK");
         await Executed("ALTER SESSION SET AUTOCOMMIT = TRUE");
         _pool.Received(1).ReleaseConnection(_pooled);
-        _pooled.DidNotReceive().IsFaulted = true;
-    }
-
-    [Fact]
-    public void Dispose_TransactionResetFails_FaultsTheConnection()
-    {
-        _sut.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
-        _executor.ExecuteQueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>())
-            .Returns(Services.Query.QueryResult.Failed("EXECUTION_ERROR", "connection reset"));
-
-        _sut.Dispose();
-
-        // The session's transaction state is unknown; it must not be reused.
-        _pooled.Received().IsFaulted = true;
-        _pool.Received(1).ReleaseConnection(_pooled);
-    }
-
-    [Fact]
-    public void Dispose_NoTransaction_DoesNotRunSessionStatements()
-    {
-        _sut.Dispose();
-
-        _executor.DidNotReceiveWithAnyArgs().ExecuteQueryAsync(default!, default);
-        _pool.Received(1).ReleaseConnection(_pooled);
+        await _pool.DidNotReceive().ReleaseConnectionAsync(Arg.Any<IPooledConnection>());
     }
 }

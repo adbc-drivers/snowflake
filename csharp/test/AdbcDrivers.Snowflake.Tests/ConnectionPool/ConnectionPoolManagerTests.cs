@@ -52,6 +52,7 @@ public class ConnectionPoolManagerTests
             LastHeartbeatAt = DateTimeOffset.UtcNow;
         }
         public void Dispose() { }
+        public ValueTask DisposeAsync() => default;
     }
 
     /// <summary>A keep-alive connection that has been idle long enough to be due at <paramref name="now"/>.</summary>
@@ -475,6 +476,107 @@ public class ConnectionPoolManagerTests
 
         Assert.True(faulted.IsDisposed);
         Assert.NotEqual(faulted.ConnectionId, next.ConnectionId);
+    }
+
+    // ---- Async release and disposal ----
+
+    private static ConnectionConfig SimpleConfig() => new() { Account = "test", User = "user" };
+
+    [Fact]
+    public async Task ReleaseConnectionAsync_WhenFaulted_ClosesTheSessionAndFreesCapacity()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        await using var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+        var config = new ConnectionConfig
+        {
+            Account = "test",
+            User = "user",
+            PoolConfig = new ConnectionPoolConfig { MaxPoolSize = 1, AcquireTimeout = TimeSpan.FromSeconds(30) },
+        };
+
+        var faulted = await pool.AcquireConnectionAsync(config);
+        Task<IPooledConnection> waiter = pool.AcquireConnectionAsync(config);
+        faulted.IsFaulted = true;
+
+        await pool.ReleaseConnectionAsync(faulted);
+
+        // The discarded connection's session is closed, and its permit wakes the waiter with a fresh one.
+        Assert.True(faulted.IsDisposed);
+        await sessions.Received(1).CloseAsync(faulted.AuthToken, Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>());
+        var next = await waiter.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotEqual(faulted.ConnectionId, next.ConnectionId);
+    }
+
+    [Fact]
+    public async Task ReleaseConnectionAsync_WhenValid_ReturnsToIdleWithoutClosing()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        await using var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+
+        var connection = await pool.AcquireConnectionAsync(SimpleConfig());
+        await pool.ReleaseConnectionAsync(connection);
+        await pool.ReleaseConnectionAsync(connection); // a double release is a no-op
+
+        var reused = await pool.AcquireConnectionAsync(SimpleConfig());
+        Assert.Equal(connection.ConnectionId, reused.ConnectionId);
+        await sessions.DidNotReceiveWithAnyArgs().CloseAsync(default!, default!, default);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_ClosesActiveAndIdleSessions()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+        var idle = await pool.AcquireConnectionAsync(SimpleConfig());
+        var active = await pool.AcquireConnectionAsync(SimpleConfig());
+        await pool.ReleaseConnectionAsync(idle);
+
+        await pool.DisposeAsync();
+        await pool.DisposeAsync();
+
+        Assert.True(idle.IsDisposed);
+        Assert.True(active.IsDisposed);
+        await sessions.Received(2).CloseAsync(Arg.Any<AuthenticationToken>(), Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task DisposeAsync_ClosesSessionsConcurrently()
+    {
+        // Each close waits for the other to start: sequential closes would deadlock until the
+        // bounded close timeout, concurrent ones finish immediately.
+        var started = new CountdownEvent(2);
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(Arg.Any<AuthenticationToken>(), Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                started.Signal();
+                return Task.Run(() => started.Wait(TimeSpan.FromSeconds(10)));
+            });
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+        await pool.AcquireConnectionAsync(SimpleConfig());
+        await pool.AcquireConnectionAsync(SimpleConfig());
+
+        await pool.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(4));
+
+        Assert.True(started.IsSet);
+    }
+
+    [Fact]
+    public async Task Sync_ReleaseAndDispose_CloseDiscardedSessions()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+        var faulted = await pool.AcquireConnectionAsync(SimpleConfig());
+        var idle = await pool.AcquireConnectionAsync(SimpleConfig());
+        faulted.IsFaulted = true;
+
+        pool.ReleaseConnection(faulted);
+        pool.ReleaseConnection(idle);
+        await sessions.Received(1).CloseAsync(faulted.AuthToken, Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>());
+
+        pool.Dispose();
+        Assert.True(idle.IsDisposed);
+        await sessions.Received(2).CloseAsync(Arg.Any<AuthenticationToken>(), Arg.Any<ConnectionConfig>(), Arg.Any<CancellationToken>());
     }
 
     // ---- GeneratePoolKey ----

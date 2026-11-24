@@ -181,43 +181,76 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     public void ReleaseConnection(IPooledConnection connection)
     {
-        ArgumentNullException.ThrowIfNull(connection);
+        var discarded = Release(connection, out var poolEntry);
+        try
+        {
+            discarded?.Dispose();
+        }
+        finally
+        {
+            ReturnPermit(poolEntry);
+        }
+    }
 
-        if (!_pools.TryGetValue(connection.PoolKey, out var poolEntry))
-            return;
+    public async ValueTask ReleaseConnectionAsync(IPooledConnection connection)
+    {
+        var discarded = Release(connection, out var poolEntry);
+        try
+        {
+            if (discarded != null)
+                await discarded.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            ReturnPermit(poolEntry);
+        }
+    }
+
+    /// <summary>
+    /// Moves an active connection back to the idle stack, or returns it to be discarded when it is
+    /// no longer valid. <paramref name="poolEntry"/> is set only when the connection held a permit
+    /// that <see cref="ReturnPermit"/> must return once any discard has finished.
+    /// </summary>
+    private IPooledConnection? Release(IPooledConnection connection, out ConnectionPoolEntry? poolEntry)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        poolEntry = null;
+
+        if (!_pools.TryGetValue(connection.PoolKey, out var entry))
+            return null;
 
         // The permit travels with the active connection; a connection that isn't active (double
         // release, or already discarded) has no permit to return.
-        if (!poolEntry.ActiveConnections.TryRemove(connection.ConnectionId, out _))
-            return;
+        if (!entry.ActiveConnections.TryRemove(connection.ConnectionId, out _))
+            return null;
 
+        poolEntry = entry;
         if (IsConnectionValid(connection, _timeProvider.GetUtcNow()))
-            poolEntry.IdleConnections.Push(connection);
-        else
-            connection.Dispose();
+        {
+            entry.IdleConnections.Push(connection);
+            return null;
+        }
 
-        // Return the permit only after the connection is seated on the idle stack (or discarded),
-        // so a waiter woken by this release always finds the capacity it was promised.
-        poolEntry.CapacitySemaphore.Release();
+        return connection;
     }
+
+    // Return the permit only after the connection is seated on the idle stack (or discarded),
+    // so a waiter woken by this release always finds the capacity it was promised.
+    private static void ReturnPermit(ConnectionPoolEntry? poolEntry) => poolEntry?.CapacitySemaphore.Release();
 
     /// <summary>
     /// Disposes the connection pool and all pooled connections.
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (!TryBeginDispose())
             return;
-
-        _disposed = true;
-
-        _cleanupCts.Cancel();
 
         if (_cleanupTask != null)
         {
             try
             {
-                _cleanupTask.Wait(TimeSpan.FromSeconds(5));
+                _cleanupTask.Wait(CleanupShutdownTimeout);
             }
             catch (AggregateException)
             {
@@ -225,20 +258,69 @@ internal class ConnectionPoolManager : IConnectionPoolManager
             }
         }
 
+        foreach (var connection in CompleteDispose())
+            connection.Dispose();
+    }
+
+    /// <summary>
+    /// Asynchronously disposes the connection pool and all pooled connections. The pooled
+    /// connections' server-side sessions are closed concurrently rather than one after another.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (!TryBeginDispose())
+            return;
+
+        if (_cleanupTask != null)
+        {
+            try
+            {
+                await _cleanupTask.WaitAsync(CleanupShutdownTimeout).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // The cleanup loop observed cancellation while shutting down — expected. (A timeout
+                // leaves the loop to finish on its own, as the synchronous Dispose does.)
+            }
+        }
+
+        var closes = new List<Task>();
+        foreach (var connection in CompleteDispose())
+            closes.Add(connection.DisposeAsync().AsTask());
+        await Task.WhenAll(closes).ConfigureAwait(false);
+    }
+
+    private static readonly TimeSpan CleanupShutdownTimeout = TimeSpan.FromSeconds(5);
+
+    private bool TryBeginDispose()
+    {
+        if (_disposed)
+            return false;
+
+        _disposed = true;
+        _cleanupCts.Cancel();
+        return true;
+    }
+
+    /// <summary>
+    /// Runs once the cleanup loop has stopped: disposes the CTS and permits and empties the pool,
+    /// returning every pooled connection for the caller to dispose.
+    /// </summary>
+    private List<IPooledConnection> CompleteDispose()
+    {
         // Dispose the CTS only after the cleanup loop has stopped using its token.
         _cleanupCts.Dispose();
 
+        var connections = new List<IPooledConnection>();
         foreach (var poolEntry in _pools.Values)
         {
-            foreach (var connection in poolEntry.ActiveConnections.Values)
-                connection.Dispose();
-            foreach (var connection in poolEntry.IdleConnections)
-                connection.Dispose();
-
+            connections.AddRange(poolEntry.ActiveConnections.Values);
+            connections.AddRange(poolEntry.IdleConnections);
             poolEntry.CapacitySemaphore.Dispose();
         }
 
         _pools.Clear();
+        return connections;
     }
 
     private void EnsureCleanupStarted()

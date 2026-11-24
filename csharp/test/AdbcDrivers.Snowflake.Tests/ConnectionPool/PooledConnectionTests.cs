@@ -15,10 +15,14 @@
 */
 
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Configuration;
 using AdbcDrivers.Snowflake.Services.Authentication;
 using AdbcDrivers.Snowflake.Services.ConnectionPool;
 using Microsoft.Extensions.Time.Testing;
+using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 using Xunit;
 
 namespace AdbcDrivers.Snowflake.Tests.ConnectionPool;
@@ -55,5 +59,50 @@ public class PooledConnectionTests
 
         fakeTime.Advance(TimeSpan.FromHours(2) + TimeSpan.FromMinutes(1)); // now past the 4h master
         Assert.True(connection.IsTokenExpired);
+    }
+
+    private static PooledConnection CreateConnection(ISessionLifecycle sessions) =>
+        new("id", "pool-key", new AuthenticationToken { SessionToken = "session" },
+            new ConnectionConfig { Account = "test" }, sessions);
+
+    [Fact]
+    public async Task DisposeAsync_ClosesTheSessionOnce_WithABoundedToken()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        var connection = CreateConnection(sessions);
+
+        await connection.DisposeAsync();
+        await connection.DisposeAsync();
+        connection.Dispose();
+
+        Assert.True(connection.IsDisposed);
+        await sessions.Received(1).CloseAsync(connection.AuthToken, connection.Config,
+            Arg.Is<CancellationToken>(t => t.CanBeCanceled));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_CloseFails_IsSwallowed()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(default!, default!, default).ReturnsForAnyArgs(Task.FromException(new InvalidOperationException("network down")));
+        var connection = CreateConnection(sessions);
+
+        await connection.DisposeAsync();
+
+        Assert.True(connection.IsDisposed);
+    }
+
+    [Fact]
+    public async Task Sync_Dispose_ClosesTheSessionOnce()
+    {
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(default!, default!, default).ThrowsAsyncForAnyArgs(new InvalidOperationException("network down"));
+        var connection = CreateConnection(sessions);
+
+        connection.Dispose();
+        await connection.DisposeAsync();
+
+        Assert.True(connection.IsDisposed);
+        await sessions.Received(1).CloseAsync(connection.AuthToken, connection.Config, Arg.Any<CancellationToken>());
     }
 }

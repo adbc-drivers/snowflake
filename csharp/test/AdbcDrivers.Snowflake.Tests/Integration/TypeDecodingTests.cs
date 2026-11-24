@@ -87,8 +87,9 @@ public class TypeDecodingTests
         Skip.If(NotYetDecoded.TryGetValue(sqlLiteral, out string? reason), reason);
 
         // Given a query of a single typed literal
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT {sqlLiteral} AS V";
 
         // When the result schema is read
@@ -107,8 +108,9 @@ public class TypeDecodingTests
     {
         // Given a scaled NUMBER query — Snowflake sends it as an integer (999) with the scale in
         // field metadata, so the driver must rescale it to a Decimal128 to recover 9.99
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 9.99::NUMBER(10,2) AS V";
 
         // When the first batch is read
@@ -136,8 +138,9 @@ public class TypeDecodingTests
     public async Task ScaleZeroNumber_ReportsDeclaredPrecisionInMetadata(string sqlLiteral, int expectedPrecision)
     {
         // Given a query of a precision-qualified NUMBER literal
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT {sqlLiteral} AS V";
 
         // When the result field metadata is read
@@ -161,8 +164,9 @@ public class TypeDecodingTests
     {
         // Given a 20-digit NUMBER(38,0) — larger than Int64.MaxValue (9,223,372,036,854,775,807),
         // so sizing it to Int64 would overflow; it must decode to Decimal128 with the value intact
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         const string literal = "12345678901234567890";
         statement.SqlQuery = $"SELECT {literal}::NUMBER(38,0) AS V";
 
@@ -189,8 +193,9 @@ public class TypeDecodingTests
     public async Task Time_DecodesToNanosecondsOfDay(string sqlLiteral)
     {
         // Given a TIME query
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT {sqlLiteral} AS V";
 
         // When the first batch is read
@@ -219,8 +224,9 @@ public class TypeDecodingTests
     public async Task Timestamp_DecodesToUtcInstant(string sqlLiteral, long expectedNanos, string? expectedTimezone)
     {
         // Given a TIMESTAMP query
-        using var connection = Connect();
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT {sqlLiteral} AS V";
 
         // When the result schema and first batch are read
@@ -237,11 +243,4 @@ public class TypeDecodingTests
         Assert.Equal(expectedNanos, column.Values[0]);
     }
 
-    private SnowflakeConnection Connect()
-    {
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        var database = driver.Open(parameters);
-        var connection = database.Connect(new Dictionary<string, string>());
-        return (SnowflakeConnection)connection;
-    }
 }
