@@ -45,7 +45,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     private readonly CancellationTokenSource _cleanupCts = new();
     private readonly object _cleanupStartLock = new();
     private Task? _cleanupTask;
-    private bool _disposed;
+    private int _disposed; // 0 = live, 1 = disposal started (set atomically)
 
     /// <summary>
     /// Separates the fields of a composite credential before it is hashed, so that different
@@ -89,6 +89,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(config);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         EnsureCleanupStarted();
 
@@ -305,10 +306,9 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     private bool TryBeginDispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return false;
 
-        _disposed = true;
         _cleanupCts.Cancel();
         return true;
     }
@@ -319,8 +319,11 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     /// </summary>
     private List<IPooledConnection> CompleteDispose()
     {
-        // Dispose the CTS only after the cleanup loop has stopped using its token.
-        _cleanupCts.Dispose();
+        // Dispose the CTS only once the cleanup loop has stopped using its token. If the loop is
+        // still finishing a sweep after the shutdown wait, leave the CTS to it: it holds no timer,
+        // so skipping Dispose leaks nothing, and the loop finds the pool empty from here on.
+        if (_cleanupTask == null || _cleanupTask.IsCompleted)
+            _cleanupCts.Dispose();
 
         var connections = new List<IPooledConnection>();
         foreach (var poolEntry in _pools.Values)
@@ -374,7 +377,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     private void Cleanup()
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) != 0)
             return;
 
         foreach (var poolEntry in _pools.Values)

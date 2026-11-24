@@ -582,6 +582,25 @@ public class ConnectionPoolManagerTests
     }
 
     [Fact]
+    public async Task AcquireConnectionAsync_AfterDisposeStarted_ThrowsObjectDisposed()
+    {
+        // The session close is still in flight, so disposal has started but not finished.
+        var closeGate = new TaskCompletionSource();
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(default!, default!, default).ReturnsForAnyArgs(closeGate.Task);
+        var pool = new ConnectionPoolManager(SubstituteAuthService(), sessions);
+        await pool.AcquireConnectionAsync(SimpleConfig());
+
+        Task dispose = pool.DisposeAsync().AsTask();
+        Assert.False(dispose.IsCompleted);
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => pool.AcquireConnectionAsync(SimpleConfig()));
+        pool.Dispose(); // a second, overlapping dispose is a no-op
+        closeGate.SetResult();
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task Sync_ReleaseAndDispose_CloseDiscardedSessions()
     {
         var sessions = Substitute.For<ISessionLifecycle>();

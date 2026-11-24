@@ -44,7 +44,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     private readonly IConnectionPoolManager _connectionPool;
     private IPooledConnection? _pooledConnection;
     private readonly IQueryExecutor? _queryExecutor;
-    private bool _disposed;
+    private int _disposed; // 0 = live, 1 = disposal started (set atomically, before the first await)
     private bool _autocommit = true;
     private readonly ILogger<SnowflakeConnection> _logger;
 
@@ -469,7 +469,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     /// </summary>
     public override void Dispose()
     {
-        if (!_disposed)
+        if (TryBeginDispose())
         {
             if (_pooledConnection != null)
             {
@@ -479,7 +479,6 @@ public sealed partial class SnowflakeConnection : AdbcConnection
                 _connectionPool.ReleaseConnection(_pooledConnection);
                 _pooledConnection = null;
             }
-            MarkDisposed();
         }
         base.Dispose();
     }
@@ -490,7 +489,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     /// </summary>
     public override async ValueTask DisposeAsync()
     {
-        if (!_disposed)
+        if (TryBeginDispose())
         {
             if (_pooledConnection != null)
             {
@@ -500,15 +499,22 @@ public sealed partial class SnowflakeConnection : AdbcConnection
                 await _connectionPool.ReleaseConnectionAsync(_pooledConnection).ConfigureAwait(false);
                 _pooledConnection = null;
             }
-            MarkDisposed();
         }
         base.Dispose();
     }
 
-    private void MarkDisposed()
+    /// <summary>
+    /// Atomically claims disposal, before any reset or release is awaited: public operations are
+    /// rejected from this point on, and a concurrent second dispose does nothing. The reset and
+    /// release that follow use the session directly and don't check this flag.
+    /// </summary>
+    private bool TryBeginDispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return false;
+
         _logger.LogDebug("Disposing SnowflakeConnection for account {Account}", _config.Account);
-        _disposed = true;
+        return true;
     }
 
     /// <summary>
@@ -534,6 +540,6 @@ public sealed partial class SnowflakeConnection : AdbcConnection
 
     private void ThrowIfDisposed()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }

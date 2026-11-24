@@ -198,6 +198,29 @@ public class SnowflakeConnectionTransactionTests
         await _pool.Received(1).ReleaseConnectionAsync(_pooled);
     }
 
+    [Fact]
+    public async Task DisposeAsync_WhileResetInFlight_RejectsNewWorkAndIgnoresASecondDispose()
+    {
+        await _sut.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        var rollback = new TaskCompletionSource<Services.Query.QueryResult>();
+        _executor.ExecuteQueryAsync(Arg.Is<QueryRequest>(r => r.Statement == "ROLLBACK"), Arg.Any<CancellationToken>())
+            .Returns(rollback.Task);
+
+        Task first = _sut.DisposeAsync().AsTask();
+        Assert.False(first.IsCompleted);
+
+        // Disposal is claimed before the reset is awaited: new work is rejected, and a concurrent
+        // second dispose neither resets nor releases the session again.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => _sut.CommitAsync());
+        await _sut.DisposeAsync();
+        await _pool.DidNotReceive().ReleaseConnectionAsync(Arg.Any<IPooledConnection>());
+
+        rollback.SetResult(new Services.Query.QueryResult { Status = QueryStatus.Success });
+        await first;
+        await _executor.Received(1).ExecuteQueryAsync(Arg.Is<QueryRequest>(r => r.Statement == "ROLLBACK"), Arg.Any<CancellationToken>());
+        await _pool.Received(1).ReleaseConnectionAsync(_pooled);
+    }
+
     // ---- Sync surface smoke: each wrapper reaches the async implementation ----
 
     [Fact]

@@ -15,6 +15,7 @@
 */
 
 using System;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Configuration;
@@ -108,6 +109,37 @@ public class PooledConnectionTests
         fakeTime.Advance(PooledConnection.SessionCloseTimeout);
         await dispose.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(connection.IsDisposed);
+    }
+
+    [Fact]
+    public async Task ConcurrentDisposes_CloseEachSessionOnce()
+    {
+        // The window between checking and setting the flag is tiny, so race many connections:
+        // a non-atomic transition lets some of them close their session twice.
+        const int Connections = 500;
+        int closes = 0;
+        var sessions = Substitute.For<ISessionLifecycle>();
+        sessions.CloseAsync(default!, default!, default).ReturnsForAnyArgs(_ =>
+        {
+            Interlocked.Increment(ref closes);
+            return Task.CompletedTask;
+        });
+
+        for (int n = 0; n < Connections; n++)
+        {
+            var connection = CreateConnection(sessions);
+            using var start = new Barrier(4);
+            await Task.WhenAll(Enumerable.Range(0, 4).Select(i => Task.Run(async () =>
+            {
+                start.SignalAndWait();
+                if (i % 2 == 0)
+                    connection.Dispose();
+                else
+                    await connection.DisposeAsync();
+            })));
+        }
+
+        Assert.Equal(Connections, closes);
     }
 
     [Fact]

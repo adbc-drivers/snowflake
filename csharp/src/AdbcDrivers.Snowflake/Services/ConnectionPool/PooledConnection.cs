@@ -29,7 +29,7 @@ internal class PooledConnection : IPooledConnection
 {
     private DateTimeOffset _lastUsedAt;
     private DateTimeOffset _lastHeartbeatAt;
-    private bool _disposed;
+    private int _disposed; // 0 = live, 1 = disposed (set atomically, so the session is closed once)
     private readonly ISessionLifecycle? _sessionLifecycle;
     private readonly TimeProvider _timeProvider;
 
@@ -79,7 +79,7 @@ internal class PooledConnection : IPooledConnection
 
     public DateTimeOffset LastHeartbeatAt => _lastHeartbeatAt;
 
-    public bool IsDisposed => _disposed;
+    public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     // Keyed on the master-token expiry (not the ~1h session), because a session-expired connection is
     // still usable via reactive renewal until the master lapses — so the pool should only discard it
@@ -127,10 +127,11 @@ internal class PooledConnection : IPooledConnection
 
     private bool TryMarkDisposed()
     {
-        if (_disposed)
+        // Atomic: the pool's cleanup sweep and its own teardown can dispose the same connection
+        // concurrently, and only one of them may send the session close.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return false;
 
-        _disposed = true;
         GC.SuppressFinalize(this);
         return true;
     }
