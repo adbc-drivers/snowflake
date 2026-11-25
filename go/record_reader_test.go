@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -63,6 +64,74 @@ func TestGetArrowTimestampFromTimePrecision(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, arrow.Timestamp(value.UnixMilli()), got)
 		})
+	}
+}
+
+func TestTimeTransformerScales(t *testing.T) {
+	// 13:45:30.123456789, 00:00:00 and 23:59:59.999999999 in nanoseconds
+	values := []int64{49530123456789, 0, 86399999999999}
+	units := []arrow.TimeUnit{
+		arrow.Second,
+		arrow.Millisecond, arrow.Millisecond, arrow.Millisecond,
+		arrow.Microsecond, arrow.Microsecond, arrow.Microsecond,
+		arrow.Nanosecond, arrow.Nanosecond, arrow.Nanosecond,
+	}
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(context.Background(), mem)
+
+	for scale, unit := range units {
+		dt := getArrowTimeType(int64(scale))
+		require.Equal(t, unit, dt.TimeUnit(), "scale %d", scale)
+		if unit <= arrow.Millisecond {
+			require.Equal(t, arrow.TIME32, dt.ID(), "scale %d", scale)
+		} else {
+			require.Equal(t, arrow.TIME64, dt.ID(), "scale %d", scale)
+		}
+
+		// Snowflake sends 10^-scale seconds; the Arrow unit keeps every digit.
+		wire := make([]int64, len(values))
+		want := make([]int64, len(values))
+		for i, v := range values {
+			wire[i] = v / int64(math.Pow10(9-scale))
+			want[i] = v / int64(math.Pow10(9-3*int(unit))) / int64(math.Pow10(3*int(unit)-scale)) * int64(math.Pow10(3*int(unit)-scale))
+		}
+
+		for _, width := range []arrow.DataType{arrow.PrimitiveTypes.Int32, arrow.PrimitiveTypes.Int64} {
+			if width.ID() == arrow.INT32 && scale > 4 {
+				continue // values of these scales do not fit in an Int32
+			}
+			t.Run(fmt.Sprintf("scale=%d/%s", scale, width), func(t *testing.T) {
+				b := array.NewBuilder(mem, width)
+				defer b.Release()
+				for _, v := range wire {
+					switch b := b.(type) {
+					case *array.Int32Builder:
+						b.Append(int32(v))
+					case *array.Int64Builder:
+						b.Append(v)
+					}
+				}
+				b.AppendNull()
+				in := b.NewArray()
+				defer in.Release()
+
+				out, err := timeTransformer(dt, int64(scale))(ctx, in)
+				require.NoError(t, err)
+				defer out.Release()
+				require.True(t, arrow.TypeEqual(dt, out.DataType()))
+				require.Equal(t, len(want)+1, out.Len())
+				for i, w := range want {
+					switch out := out.(type) {
+					case *array.Time32:
+						assert.Equal(t, arrow.Time32(w), out.Value(i), "row %d", i)
+					case *array.Time64:
+						assert.Equal(t, arrow.Time64(w), out.Value(i), "row %d", i)
+					}
+				}
+				assert.True(t, out.IsNull(len(want)))
+			})
+		}
 	}
 }
 

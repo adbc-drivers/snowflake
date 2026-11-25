@@ -415,16 +415,9 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 				}
 			}
 		case "TIME":
-			var dt arrow.DataType
-			if srcMeta.Scale < 6 {
-				dt = &arrow.Time32Type{Unit: arrow.TimeUnit(srcMeta.Scale / 3)}
-			} else {
-				dt = &arrow.Time64Type{Unit: arrow.TimeUnit(srcMeta.Scale / 3)}
-			}
+			dt := getArrowTimeType(srcMeta.Scale)
 			f.Type = dt
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				return compute.CastArray(ctx, a, compute.SafeCastOptions(dt))
-			}
+			transformers[i] = timeTransformer(dt, srcMeta.Scale)
 		case "TIMESTAMP_NTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
@@ -583,6 +576,65 @@ func getArrowTimeUnit(scale int64, maxTimestampPrecision MaxTimestampPrecision) 
 		return arrow.Microsecond
 	}
 	return unit
+}
+
+// getArrowTimeType returns the Arrow type of TIME values with the given
+// scale. Like timestamps, it uses the coarsest unit that holds every
+// fractional digit of the scale. TIME is not capped by
+// max_timestamp_precision.
+func getArrowTimeType(scale int64) arrow.TemporalWithUnit {
+	unit := getArrowTimeUnit(scale, Nanoseconds)
+	if unit <= arrow.Millisecond {
+		return &arrow.Time32Type{Unit: unit}
+	}
+	return &arrow.Time64Type{Unit: unit}
+}
+
+// timeTransformer converts Snowflake TIME values to dt. Snowflake sends
+// them as integer counts of 10^-scale seconds since midnight, as Int32 or
+// Int64 depending on the scale. The unit of dt holds every fractional digit
+// of the scale, so the values only need to be scaled up.
+func timeTransformer(dt arrow.TemporalWithUnit, scale int64) colTransformer {
+	multiplier := int64(math.Pow10(3*int(dt.TimeUnit()) - int(scale)))
+	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
+		var value func(i int) int64
+		switch a := a.(type) {
+		case *array.Int32:
+			value = func(i int) int64 { return int64(a.Value(i)) }
+		case *array.Int64:
+			value = a.Value
+		default:
+			return nil, errToAdbcErr(adbc.StatusInternal, fmt.Errorf("unexpected Arrow type %s for a TIME column", a.DataType()))
+		}
+
+		pool := compute.GetAllocator(ctx)
+		switch dt := dt.(type) {
+		case *arrow.Time32Type:
+			b := array.NewTime32Builder(pool, dt)
+			defer b.Release()
+			b.Reserve(a.Len())
+			for i := range a.Len() {
+				if a.IsNull(i) {
+					b.UnsafeAppendBoolToBitmap(false)
+					continue
+				}
+				b.UnsafeAppend(arrow.Time32(value(i) * multiplier))
+			}
+			return b.NewArray(), nil
+		default:
+			b := array.NewTime64Builder(pool, dt.(*arrow.Time64Type))
+			defer b.Release()
+			b.Reserve(a.Len())
+			for i := range a.Len() {
+				if a.IsNull(i) {
+					b.UnsafeAppendBoolToBitmap(false)
+					continue
+				}
+				b.UnsafeAppend(arrow.Time64(value(i) * multiplier))
+			}
+			return b.NewArray(), nil
+		}
+	}
 }
 
 func scaledTimestampToTime(value, scaleDivisor, fractionMultiplier int64) time.Time {
