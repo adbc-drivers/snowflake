@@ -258,7 +258,7 @@ func (s *SnowflakeQuirks) GetMetadata(code adbc.InfoCode) any {
 	case adbc.InfoDriverVersion:
 		return "(unknown or development build)"
 	case adbc.InfoDriverArrowVersion:
-		return "v18.8.0"
+		return "v18.9.0"
 	case adbc.InfoVendorVersion:
 		return s.vendorVersion
 	case adbc.InfoVendorArrowVersion:
