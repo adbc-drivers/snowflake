@@ -42,15 +42,15 @@ func TestGetArrowTimestampFromTimePrecision(t *testing.T) {
 	}
 	for _, value := range values {
 		t.Run(value.Format(time.RFC3339Nano), func(t *testing.T) {
-			got, err := getArrowTimestampFromTime(value, arrow.Microsecond, arrow.Nanosecond, Microseconds)
+			got, err := getArrowTimestampFromTime(value, arrow.Microsecond, Microseconds)
 			require.NoError(t, err)
 			assert.Equal(t, arrow.Timestamp(value.UnixMicro()), got)
 
-			got, err = getArrowTimestampFromTime(value, arrow.Nanosecond, arrow.Nanosecond, Nanoseconds)
+			got, err = getArrowTimestampFromTime(value, arrow.Nanosecond, Nanoseconds)
 			require.NoError(t, err)
 			assert.Equal(t, arrow.Timestamp(value.UnixNano()), got)
 
-			got, err = getArrowTimestampFromTime(value, arrow.Nanosecond, arrow.Nanosecond, NanosecondsNoOverflow)
+			got, err = getArrowTimestampFromTime(value, arrow.Nanosecond, NanosecondsNoOverflow)
 			if value.Year() == 2025 {
 				require.NoError(t, err)
 				assert.Equal(t, arrow.Timestamp(value.UnixNano()), got)
@@ -59,7 +59,7 @@ func TestGetArrowTimestampFromTimePrecision(t *testing.T) {
 			}
 
 			// A nanosecond precision limit must not promote lower-precision values.
-			got, err = getArrowTimestampFromTime(value, arrow.Millisecond, arrow.Millisecond, Nanoseconds)
+			got, err = getArrowTimestampFromTime(value, arrow.Millisecond, Nanoseconds)
 			require.NoError(t, err)
 			assert.Equal(t, arrow.Timestamp(value.UnixMilli()), got)
 		})
