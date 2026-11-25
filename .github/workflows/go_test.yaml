@@ -116,7 +116,7 @@ jobs:
           persist-credentials: false
           submodules: 'recursive'
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           cache: true
           cache-dependency-path: go/go.sum
@@ -125,7 +125,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.83.0
+          pixi-version: v0.84.2
           run-install: false
 
 
@@ -253,7 +253,7 @@ jobs:
           persist-credentials: false
           submodules: 'recursive'
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           cache: true
           cache-dependency-path: go/go.sum
@@ -262,7 +262,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.83.0
+          pixi-version: v0.84.2
           run-install: false
 
 
@@ -403,7 +403,7 @@ jobs:
           persist-credentials: false
           submodules: 'recursive'
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           cache: true
           cache-dependency-path: go/go.sum
@@ -411,7 +411,7 @@ jobs:
           go-version-file: go/go.mod
 
       # CGO requires a GCC-like frontend, provide this via MSYS Clang
-      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2.33.0
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c  # v2.34.0
         id: msys2
         if: matrix.platform == 'windows' && matrix.arch == 'arm64'
         with:
@@ -430,7 +430,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.83.0
+          pixi-version: v0.84.2
           run-install: false
 
       - name: Install dev tools
@@ -510,7 +510,7 @@ jobs:
           persist-credentials: false
           submodules: 'recursive'
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           cache: true
           check-latest: true
@@ -518,7 +518,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.83.0
+          pixi-version: v0.84.2
           run-install: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
@@ -593,13 +593,13 @@ jobs:
           - { platform: windows, arch: arm64, runner: windows-11-vs2026-arm }
     steps:
       # for now, install dbc from main
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           cache: true
           go-version: 'stable'
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.83.0
+          pixi-version: v0.84.2
           run-install: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -683,7 +683,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e  # v0.11.3
         with:
-          pixi-version: v0.83.0
+          pixi-version: v0.84.2
           run-install: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2

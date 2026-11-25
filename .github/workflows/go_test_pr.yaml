@@ -48,6 +48,8 @@ jobs:
   setup:
     name: configure job
     runs-on: ubuntu-slim
+    permissions:
+      pull-requests: write
     outputs:
       repository: ${{ steps.get_repo.outputs.repository }}
     steps:
@@ -58,6 +60,23 @@ jobs:
           PR: ${{ inputs.pr }}
         run: |
           echo repository=$(gh pr --repo ${{ github.repository }} view "${PR}" --json headRepository,headRepositoryOwner --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name)"') | tee -a $GITHUB_OUTPUT
+
+      - name: comment on PR when testing starts
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+          REPOSITORY: ${{ steps.get_repo.outputs.repository }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const { pr, ref } = JSON.parse(process.env.INPUTS);
+            const repository = process.env.REPOSITORY;
+            await github.rest.issues.createComment({
+              issue_number: Number(pr),
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `**Test started:** ${repository}@${ref}\nWorkflow run: ${process.env.WORKFLOW_RUN_URL}`
+            });
 
       - name: set job summary
         env:
