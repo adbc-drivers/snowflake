@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Threading.Tasks;
 using AdbcDrivers.Snowflake;
 using Xunit;
 using Xunit.Abstractions;
@@ -36,7 +37,7 @@ namespace AdbcDrivers.Snowflake.Tests.Integration;
 /// the parts that <i>only</i> the client layer runs:
 /// <list type="bullet">
 ///   <item>connection-string parsing into driver parameters,</item>
-///   <item>the <c>DbDataReader</c> row/column iteration model (<c>Read</c>, ordinals, <c>FieldCount</c>),</item>
+///   <item>the <c>DbDataReader</c> row/column iteration model (<c>ReadAsync</c>, ordinals, <c>FieldCount</c>),</item>
 ///   <item>conversion of Arrow arrays into boxed CLR values across column types.</item>
 /// </list>
 ///
@@ -72,23 +73,23 @@ public class ClientTests
     }
 
     /// <summary>
-    /// The reader walks every row of a multi-row result via <c>Read()</c> and returns them in the
+    /// The reader walks every row of a multi-row result via <c>ReadAsync()</c> and returns them in the
     /// queried ORDER BY sequence. (CLR string conversion itself is covered by the type-contract
     /// theory; this test is about row iteration and ordering.)
     /// </summary>
     [SkippableFact]
-    public void Reader_IteratesAllRowsInOrder()
+    public async Task Reader_IteratesAllRowsInOrder()
     {
         // Given a two-row table queried with an explicit order
-        using var connection = OpenClientConnection();
-        string table = CreateAndPopulateTempTable(connection);
-        using var command = connection.CreateCommand();
+        await using var connection = await OpenClientConnectionAsync();
+        string table = await CreateAndPopulateTempTableAsync(connection);
+        await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT NAME FROM {table} ORDER BY ID";
 
         // When every row is read in sequence
-        using var reader = command.ExecuteReader();
+        await using var reader = await command.ExecuteReaderAsync();
         var names = new List<string?>();
-        while (reader.Read())
+        while (await reader.ReadAsync())
             names.Add(reader.GetString(0));
 
         // Then they come back in the queried order
@@ -100,16 +101,16 @@ public class ClientTests
     /// by ordinal).
     /// </summary>
     [SkippableFact]
-    public void Reader_ExposesColumnMetadata()
+    public async Task Reader_ExposesColumnMetadata()
     {
         // Given a five-column result
-        using var connection = OpenClientConnection();
-        string table = CreateAndPopulateTempTable(connection);
-        using var command = connection.CreateCommand();
+        await using var connection = await OpenClientConnectionAsync();
+        string table = await CreateAndPopulateTempTableAsync(connection);
+        await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT ID, NAME, ACTIVE, AMOUNT, PRICE FROM {table}";
 
         // When the reader is opened
-        using var reader = command.ExecuteReader();
+        await using var reader = await command.ExecuteReaderAsync();
 
         // Then it exposes the column count and names
         Assert.Equal(5, reader.FieldCount);
@@ -121,25 +122,25 @@ public class ClientTests
     }
 
     [SkippableFact]
-    public void Reader_CountStar_ReturnsRowCount()
+    public async Task Reader_CountStar_ReturnsRowCount()
     {
         // Given a two-row table (AdbcCommand.ExecuteScalar throws NotImplementedException in the
         // client layer, so the single aggregate value is read via the reader instead)
-        using var connection = OpenClientConnection();
-        string table = CreateAndPopulateTempTable(connection);
-        using var command = connection.CreateCommand();
+        await using var connection = await OpenClientConnectionAsync();
+        string table = await CreateAndPopulateTempTableAsync(connection);
+        await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT COUNT(*) FROM {table}";
 
         // When the COUNT(*) is read
-        using var reader = command.ExecuteReader();
+        await using var reader = await command.ExecuteReaderAsync();
 
         // Then it returns the row count
-        Assert.True(reader.Read());
+        Assert.True(await reader.ReadAsync());
         Assert.Equal(2, Convert.ToInt32(reader.GetValue(0)));
     }
 
     [SkippableFact]
-    public void ConnectionString_OpensAndQueries()
+    public async Task ConnectionString_OpensAndQueries()
     {
         // Given driver parameters round-tripped through a connection string (rather than passed
         // directly) — this is what exercises the client's connection-string parsing path
@@ -149,37 +150,37 @@ public class ClientTests
             builder[kvp.Key] = kvp.Value;
 
         // When a connection is opened from that string and queried
-        using var connection = new AdbcClient.AdbcConnection(builder.ConnectionString) { AdbcDriver = driver };
-        connection.Open();
-        string table = CreateAndPopulateTempTable(connection);
-        using var command = connection.CreateCommand();
+        await using var connection = new AdbcClient.AdbcConnection(builder.ConnectionString) { AdbcDriver = driver };
+        await connection.OpenAsync();
+        string table = await CreateAndPopulateTempTableAsync(connection);
+        await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT COUNT(*) FROM {table}";
-        using var reader = command.ExecuteReader();
+        await using var reader = await command.ExecuteReaderAsync();
 
         // Then it connects and returns results
-        Assert.True(reader.Read());
+        Assert.True(await reader.ReadAsync());
         Assert.Equal(2, Convert.ToInt32(reader.GetValue(0)));
     }
 
     /// <summary>
-    /// <c>ExecuteNonQuery</c> runs DML and returns the affected-row count (2 inserted rows here).
+    /// <c>ExecuteNonQueryAsync</c> runs DML and returns the affected-row count (2 inserted rows here).
     /// </summary>
     [SkippableFact]
-    public void ExecuteNonQuery_RunsDml()
+    public async Task ExecuteNonQuery_RunsDml()
     {
         // Given an empty temporary table
-        using var connection = OpenClientConnection();
+        await using var connection = await OpenClientConnectionAsync();
         string table = $"{_testConfiguration.Metadata.Catalog}.{_testConfiguration.Metadata.Schema}.CLIENT_DML_{Guid.NewGuid():N}";
-        using (var create = connection.CreateCommand())
+        await using (var create = connection.CreateCommand())
         {
             create.CommandText = $"CREATE TEMPORARY TABLE {table} (id INT)";
-            create.ExecuteNonQuery();
+            await create.ExecuteNonQueryAsync();
         }
 
         // When two rows are inserted via ExecuteNonQuery
-        using var insert = connection.CreateCommand();
+        await using var insert = connection.CreateCommand();
         insert.CommandText = $"INSERT INTO {table} (id) VALUES (1), (2)";
-        int affected = insert.ExecuteNonQuery();
+        int affected = await insert.ExecuteNonQueryAsync();
 
         // Then it reports the affected-row count
         _output.WriteLine($"ExecuteNonQuery reported {affected} affected rows");
@@ -205,26 +206,26 @@ public class ClientTests
     [InlineData("'x'::VARCHAR", typeof(string))]
     [InlineData("TRUE::BOOLEAN", typeof(bool))]
     [InlineData("1.5::FLOAT", typeof(double))]
-    public void Reader_YieldsExpectedClrTypePerSnowflakeType(string sqlLiteral, Type expectedClrType)
+    public async Task Reader_YieldsExpectedClrTypePerSnowflakeType(string sqlLiteral, Type expectedClrType)
     {
         // Given a single typed literal
-        using var connection = OpenClientConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = await OpenClientConnectionAsync();
+        await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT {sqlLiteral} AS V";
 
         // When it is read through the client
-        using var reader = command.ExecuteReader();
-        Assert.True(reader.Read());
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
 
         // Then the CLR value has the expected type
         Assert.Equal(expectedClrType, reader.GetValue(0).GetType());
     }
 
-    private AdbcClient.AdbcConnection OpenClientConnection()
+    private async Task<AdbcClient.AdbcConnection> OpenClientConnectionAsync()
     {
         var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
         var connection = new AdbcClient.AdbcConnection(driver, parameters, new Dictionary<string, string>());
-        connection.Open();
+        await connection.OpenAsync();
         return connection;
     }
 
@@ -233,24 +234,24 @@ public class ClientTests
     /// rows of data, returning the fully-qualified table name. Self-contained: the temporary
     /// table is visible only on this connection's session and is dropped when it closes.
     /// </summary>
-    private string CreateAndPopulateTempTable(AdbcClient.AdbcConnection connection)
+    private async Task<string> CreateAndPopulateTempTableAsync(AdbcClient.AdbcConnection connection)
     {
         string table = $"{_testConfiguration.Metadata.Catalog}.{_testConfiguration.Metadata.Schema}.CLIENT_T_{Guid.NewGuid():N}";
 
-        using (var create = connection.CreateCommand())
+        await using (var create = connection.CreateCommand())
         {
             create.CommandText =
                 $"CREATE TEMPORARY TABLE {table} " +
                 "(ID NUMBER(38,0), NAME VARCHAR, ACTIVE BOOLEAN, AMOUNT FLOAT, PRICE NUMBER(10,2))";
-            create.ExecuteNonQuery();
+            await create.ExecuteNonQueryAsync();
         }
 
-        using (var insert = connection.CreateCommand())
+        await using (var insert = connection.CreateCommand())
         {
             insert.CommandText =
                 $"INSERT INTO {table} (ID, NAME, ACTIVE, AMOUNT, PRICE) VALUES " +
                 "(1, 'alpha', TRUE, 3.5, 9.99), (2, 'beta', FALSE, 7.25, 0.01)";
-            insert.ExecuteNonQuery();
+            await insert.ExecuteNonQueryAsync();
         }
 
         return table;

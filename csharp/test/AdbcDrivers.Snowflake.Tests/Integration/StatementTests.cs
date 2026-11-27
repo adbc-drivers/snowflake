@@ -51,10 +51,9 @@ public class StatementTests
     public async Task CanExecuteQuery()
     {
         // Given a simple two-column query
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1 AS X, 'two' AS Y";
 
         // When it is executed and the first batch is read
@@ -70,17 +69,16 @@ public class StatementTests
     }
 
     [SkippableFact]
-    public void ExecuteUpdateOnSelectReturnsNoRowCount()
+    public async Task ExecuteUpdateOnSelectReturnsNoRowCount()
     {
         // Given a statement holding a SELECT (which affects no rows)
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1";
 
         // When it is run as an update
-        var result = statement.ExecuteUpdate();
+        var result = await statement.ExecuteUpdateAsync();
 
         // Then the driver reports -1 (unknown) per the ADBC contract
         _output.WriteLine($"ExecuteUpdate on SELECT reported {result.AffectedRows} affected rows");
@@ -88,17 +86,16 @@ public class StatementTests
     }
 
     [SkippableFact]
-    public void GetParameterSchema_IsNotSupported()
+    public async Task GetParameterSchema_IsNotSupported()
     {
         // Given a fresh statement
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
 
         // When / Then GetParameterSchema throws AdbcException(NotImplemented): Snowflake's protocol
         // does not report bind-parameter types, so it is unsupported regardless of whether Prepare ran.
-        var ex = Assert.Throws<AdbcException>(statement.GetParameterSchema);
+        var ex = await Assert.ThrowsAsync<AdbcException>(() => statement.GetParameterSchemaAsync());
         Assert.Equal(AdbcStatusCode.NotImplemented, ex.Status);
     }
 
@@ -106,12 +103,11 @@ public class StatementTests
     public async Task CanPrepareAndExecute()
     {
         // Given a prepared statement
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1 AS X";
-        statement.Prepare();
+        await statement.PrepareAsync();
 
         // When it is executed and the first batch is read
         var result = await statement.ExecuteQueryAsync();
@@ -142,10 +138,9 @@ public class StatementTests
     /// </summary>
     private async Task AssertBoundValueMatches(string predicate, IArrowArray value)
     {
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = $"SELECT 'ok' AS V WHERE {predicate}";
         var schema = new Schema([new Field("p", value.Data.DataType, true)], null);
         using var batch = new RecordBatch(schema, [value], value.Length);
@@ -165,14 +160,14 @@ public class StatementTests
     public async Task CanCancelRunningQuery()
     {
         // Given a query that runs long enough to be cancelled mid-flight
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT SYSTEM$WAIT(10)";
 
-        // When it is started on a background thread and cancelled after it has begun running
-        var queryTask = Task.Run(statement.ExecuteQuery);
+        // When it is started and then cancelled through the explicit ADBC Cancel after it has
+        // begun running (token-driven cancellation is covered by StatementCancellationTests)
+        var queryTask = statement.ExecuteQueryAsync().AsTask();
         await Task.Delay(1000);
         statement.Cancel();
 
@@ -183,26 +178,25 @@ public class StatementTests
     }
 
     [SkippableFact]
-    public void ExecuteUpdateOnDmlReturnsAffectedRowCount()
+    public async Task ExecuteUpdateOnDmlReturnsAffectedRowCount()
     {
         // Given a temporary table (requires a writable metadata.catalog / metadata.schema)
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         string table = string.Format(
             "{0}.{1}.CSHARP_UPD_{2}",
             _testConfiguration.Metadata.Catalog,
             _testConfiguration.Metadata.Schema,
             Guid.NewGuid().ToString("N"));
         statement.SqlQuery = $"CREATE TEMPORARY TABLE {table} (id INT)";
-        statement.ExecuteUpdate();
+        await statement.ExecuteUpdateAsync();
 
         // When two rows are inserted and then deleted
         statement.SqlQuery = $"INSERT INTO {table} (id) VALUES (1), (2)";
-        var result = statement.ExecuteUpdate();
+        var result = await statement.ExecuteUpdateAsync();
         statement.SqlQuery = $"DELETE FROM {table} WHERE id IN (1,2)";
-        var result2 = statement.ExecuteUpdate();
+        var result2 = await statement.ExecuteUpdateAsync();
 
         // Then each reports its affected-row count, parsed from the JSON RowSet (or -1 if a
         // driver/server version cannot determine it). Both affect 2 rows while the payload's
@@ -213,21 +207,20 @@ public class StatementTests
     }
 
     [SkippableFact]
-    public void ExecuteUpdate_MultiRowBind_InsertsEveryRow()
+    public async Task ExecuteUpdate_MultiRowBind_InsertsEveryRow()
     {
         // Array binding (executemany): one INSERT with a 3-row bound batch inserts 3 rows,
         // including a null cell.
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         string table = string.Format(
             "{0}.{1}.CSHARP_ARR_{2}",
             _testConfiguration.Metadata.Catalog,
             _testConfiguration.Metadata.Schema,
             Guid.NewGuid().ToString("N"));
         statement.SqlQuery = $"CREATE TEMPORARY TABLE {table} (id INT, name VARCHAR)";
-        statement.ExecuteUpdate();
+        await statement.ExecuteUpdateAsync();
 
         var schema = new Schema(
         [
@@ -240,40 +233,39 @@ public class StatementTests
 
         statement.SqlQuery = $"INSERT INTO {table} (id, name) VALUES (?, ?)";
         statement.Bind(batch, schema);
-        var result = statement.ExecuteUpdate();
+        var result = await statement.ExecuteUpdateAsync();
 
         _output.WriteLine($"Array-bind insert reported {result.AffectedRows} affected rows");
         Assert.Equal(3, result.AffectedRows);
 
         // A fresh statement: the original still carries the bound batch, which must not ride
         // along with the verification query.
-        using var countStatement = connection.CreateStatement();
-        Assert.Equal(3, CountRows(countStatement, table));
+        await using var countStatement = connection.CreateStatement();
+        Assert.Equal(3, await CountRowsAsync(countStatement, table));
 
         // Bindings persist across executions (ADBC semantics, matching gosnowflake): executing
         // the same statement again re-binds the same batch and inserts three more rows.
-        var again = statement.ExecuteUpdate();
+        var again = await statement.ExecuteUpdateAsync();
         Assert.Equal(3, again.AffectedRows);
-        Assert.Equal(6, CountRows(countStatement, table));
+        Assert.Equal(6, await CountRowsAsync(countStatement, table));
     }
 
     [SkippableFact]
-    public void ExecuteUpdate_MultiRowBind_EncodesTypedValuesPerRow()
+    public async Task ExecuteUpdate_MultiRowBind_EncodesTypedValuesPerRow()
     {
         // Array binds reuse the scalar per-value wire formats (DATE = ms since epoch,
         // BINARY = hex, DECIMAL = plain string, ...). This proves the server decodes them in
         // array form too — including a null cell per column — by reading the values back.
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         string table = string.Format(
             "{0}.{1}.CSHARP_ARRT_{2}",
             _testConfiguration.Metadata.Catalog,
             _testConfiguration.Metadata.Schema,
             Guid.NewGuid().ToString("N"));
         statement.SqlQuery = $"CREATE TEMPORARY TABLE {table} (d DATE, num NUMBER(10,2), flag BOOLEAN, bin BINARY, s VARCHAR)";
-        statement.ExecuteUpdate();
+        await statement.ExecuteUpdateAsync();
 
         var schema = new Schema(
         [
@@ -295,35 +287,24 @@ public class StatementTests
 
         statement.SqlQuery = $"INSERT INTO {table} (d, num, flag, bin, s) VALUES (?, ?, ?, ?, ?)";
         statement.Bind(batch, schema);
-        var result = statement.ExecuteUpdate();
+        var result = await statement.ExecuteUpdateAsync();
         Assert.Equal(2, result.AffectedRows);
 
         // Row 1 must match on every typed value; row 2 must be all-null except the string.
-        using var verify = connection.CreateStatement();
-        verify.SqlQuery = $"SELECT COUNT(*) FROM {table} WHERE d = DATE '2024-01-15' AND num = 12.34 AND flag AND bin = TO_BINARY('DEAD', 'HEX') AND s = 'row1'";
-        Assert.Equal(1, ExecuteScalarCount(verify));
-        verify.SqlQuery = $"SELECT COUNT(*) FROM {table} WHERE d IS NULL AND num IS NULL AND flag IS NULL AND bin IS NULL AND s = 'row2'";
-        Assert.Equal(1, ExecuteScalarCount(verify));
+        await using var verify = connection.CreateStatement();
+        Assert.Equal(1, await IntegrationTestingUtils.ExecuteScalarInt64Async(verify,
+            $"SELECT COUNT(*) FROM {table} WHERE d = DATE '2024-01-15' AND num = 12.34 AND flag AND bin = TO_BINARY('DEAD', 'HEX') AND s = 'row1'"));
+        Assert.Equal(1, await IntegrationTestingUtils.ExecuteScalarInt64Async(verify,
+            $"SELECT COUNT(*) FROM {table} WHERE d IS NULL AND num IS NULL AND flag IS NULL AND bin IS NULL AND s = 'row2'"));
     }
 
-    private static long ExecuteScalarCount(AdbcStatement statement)
-    {
-        var result = statement.ExecuteQuery();
-        Assert.NotNull(result.Stream);
-        using var stream = result.Stream;
-        var batch = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
-        Assert.NotNull(batch);
-        using (batch)
-            return ((Int64Array)batch.Column(0)).GetValue(0)!.Value;
-    }
 
     [SkippableFact]
-    public void Transactions_RollbackDiscardsAndCommitPersists()
+    public async Task Transactions_RollbackDiscardsAndCommitPersists()
     {
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
 
         // DDL implicitly commits in Snowflake, so create the table BEFORE opening the scope.
         string table = string.Format(
@@ -332,36 +313,28 @@ public class StatementTests
             _testConfiguration.Metadata.Schema,
             Guid.NewGuid().ToString("N"));
         statement.SqlQuery = $"CREATE TABLE {table} (id INT)";
-        statement.ExecuteUpdate();
+        await statement.ExecuteUpdateAsync();
 
-        connection.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
+        await connection.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Disabled);
 
         // An insert that is rolled back leaves no rows...
         statement.SqlQuery = $"INSERT INTO {table} (id) VALUES (1)";
-        statement.ExecuteUpdate();
-        connection.Rollback();
-        Assert.Equal(0, CountRows(statement, table));
+        await statement.ExecuteUpdateAsync();
+        await connection.RollbackAsync();
+        Assert.Equal(0, await CountRowsAsync(statement, table));
 
         // ...and one that is committed persists.
         statement.SqlQuery = $"INSERT INTO {table} (id) VALUES (2)";
-        statement.ExecuteUpdate();
-        connection.Commit();
-        Assert.Equal(1, CountRows(statement, table));
+        await statement.ExecuteUpdateAsync();
+        await connection.CommitAsync();
+        Assert.Equal(1, await CountRowsAsync(statement, table));
 
-        connection.SetOption(AdbcOptions.Connection.Autocommit, AdbcOptions.Enabled);
+        await connection.SetOptionAsync(AdbcOptions.Connection.Autocommit, AdbcOptions.Enabled);
     }
 
-    private static long CountRows(AdbcStatement statement, string table)
-    {
-        statement.SqlQuery = $"SELECT COUNT(*) FROM {table}";
-        var result = statement.ExecuteQuery();
-        Assert.NotNull(result.Stream);
-        using var stream = result.Stream;
-        var batch = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
-        Assert.NotNull(batch);
-        using (batch)
-            return ((Int64Array)batch.Column(0)).GetValue(0)!.Value;
-    }
+    private static Task<long> CountRowsAsync(AdbcStatement statement, string table) =>
+        IntegrationTestingUtils.ExecuteScalarInt64Async(statement, $"SELECT COUNT(*) FROM {table}");
+
 
     [SkippableFact]
     [Trait("Category", "Slow")]
@@ -373,10 +346,9 @@ public class StatementTests
         // makes the test itself take ~50s, so it only runs when explicitly enabled.
         Skip.IfNot(IntegrationTestingUtils.RunSlowTests,
             $"Slow test (~50s wall clock); set {IntegrationTestingUtils.RunSlowTestsVariable}=1 to run.");
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT SYSTEM$WAIT(50)";
 
         var result = await statement.ExecuteQueryAsync();
@@ -398,10 +370,9 @@ public class StatementTests
     {
         // Non-SELECT statements run through ExecuteQuery must return their JSON summary as a
         // result set (parity with the Go driver), not fail for lack of an Arrow stream.
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        using var database = driver.Open(parameters);
-        using var connection = database.Connect(new Dictionary<string, string>());
-        using var statement = connection.CreateStatement();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
+        await using var statement = connection.CreateStatement();
         string table = string.Format(
             "{0}.{1}.CSHARP_QRY_{2}",
             _testConfiguration.Metadata.Catalog,

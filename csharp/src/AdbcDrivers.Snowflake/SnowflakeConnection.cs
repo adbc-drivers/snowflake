@@ -44,7 +44,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     private readonly IConnectionPoolManager _connectionPool;
     private IPooledConnection? _pooledConnection;
     private readonly IQueryExecutor? _queryExecutor;
-    private bool _disposed;
+    private int _disposed; // 0 = live, 1 = disposal started (set atomically, before the first await)
     private bool _autocommit = true;
     private readonly ILogger<SnowflakeConnection> _logger;
 
@@ -159,13 +159,31 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     }
 
     /// <summary>
+    /// Asynchronously gets the supported table types. The list is fixed, so this completes synchronously.
+    /// </summary>
+    public override Task<IArrowArrayStream> GetTableTypesAsync(CancellationToken cancellationToken = default) =>
+        CompletedTasks.Run(GetTableTypes, cancellationToken);
+
+    /// <summary>
     /// Gets the Arrow schema for a specific table.
     /// </summary>
     /// <param name="catalog">The catalog name (database).</param>
     /// <param name="dbSchema">The schema name.</param>
     /// <param name="tableName">The table name.</param>
     /// <returns>The Arrow schema for the table.</returns>
-    public override Schema GetTableSchema(string? catalog, string? dbSchema, string tableName)
+    public override Schema GetTableSchema(string? catalog, string? dbSchema, string tableName) =>
+        GetTableSchemaAsync(catalog, dbSchema, tableName).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Asynchronously gets the Arrow schema for a specific table.
+    /// </summary>
+    /// <param name="catalog">The catalog name (database).</param>
+    /// <param name="dbSchema">The schema name.</param>
+    /// <param name="tableName">The table name.</param>
+    /// <param name="cancellationToken">Stops waiting for the describe round trip.</param>
+    /// <returns>The Arrow schema for the table.</returns>
+    public override async Task<Schema> GetTableSchemaAsync(string? catalog, string? dbSchema, string tableName,
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -193,7 +211,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
             AuthToken = _pooledConnection.AuthToken
         };
 
-        PreparedStatement prepared = _queryExecutor.DescribeAsync(request).GetAwaiter().GetResult();
+        PreparedStatement prepared = await _queryExecutor.DescribeAsync(request, cancellationToken).ConfigureAwait(false);
 
         return prepared.ResultSchema
             ?? throw new AdbcException(
@@ -329,12 +347,32 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     }
 
     /// <summary>
+    /// Asynchronously gets metadata about the driver and database. Every reported value is known
+    /// locally, so this completes synchronously.
+    /// </summary>
+    public override Task<IArrowArrayStream> GetInfoAsync(IReadOnlyList<AdbcInfoCode> codes, CancellationToken cancellationToken = default) =>
+        CompletedTasks.Run(() => GetInfo(codes), cancellationToken);
+
+    /// <summary>
     /// Sets a connection option. Supported: <see cref="AdbcOptions.Connection.Autocommit"/>.
     /// Snowflake sessions default to autocommit on; disabling it opens a transaction scope
     /// that <see cref="Commit"/> / <see cref="Rollback"/> end. Re-enabling autocommit first
     /// commits any pending work (the ADBC contract).
     /// </summary>
-    public override void SetOption(string key, string value)
+    public override void SetOption(string key, string value) =>
+        SetOptionAsync(key, value).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Asynchronously sets a connection option; see <see cref="SetOption"/>.
+    /// </summary>
+    /// <param name="key">The option name.</param>
+    /// <param name="value">The option value.</param>
+    /// <param name="cancellationToken">
+    /// Honored only before the change starts: changing autocommit can commit pending work, so once
+    /// the session statements are sent they run to completion rather than leave the session's
+    /// transaction state unknown.
+    /// </param>
+    public override async Task SetOptionAsync(string key, string value, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -345,31 +383,50 @@ public sealed partial class SnowflakeConnection : AdbcConnection
         if (enable == _autocommit)
             return;
 
-        if (enable)
-            ExecuteSessionStatement("COMMIT");
+        cancellationToken.ThrowIfCancellationRequested();
 
-        ExecuteSessionStatement($"ALTER SESSION SET AUTOCOMMIT = {(enable ? "TRUE" : "FALSE")}");
+        if (enable)
+            await ExecuteSessionStatementAsync("COMMIT").ConfigureAwait(false);
+
+        await ExecuteSessionStatementAsync($"ALTER SESSION SET AUTOCOMMIT = {(enable ? "TRUE" : "FALSE")}").ConfigureAwait(false);
         _autocommit = enable;
     }
 
     /// <summary>
     /// Commits the current transaction. Valid only while autocommit is disabled.
     /// </summary>
-    public override void Commit()
-    {
-        ThrowIfDisposed();
-        ThrowIfAutocommit();
-        ExecuteSessionStatement("COMMIT");
-    }
+    public override void Commit() => CommitAsync().GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Asynchronously commits the current transaction. Valid only while autocommit is disabled.
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Honored only before the COMMIT is sent; once sent it runs to completion, since abandoning
+    /// it would leave the outcome of the transaction unknown.
+    /// </param>
+    public override Task CommitAsync(CancellationToken cancellationToken = default) =>
+        EndTransactionAsync("COMMIT", cancellationToken);
 
     /// <summary>
     /// Rolls back the current transaction. Valid only while autocommit is disabled.
     /// </summary>
-    public override void Rollback()
+    public override void Rollback() => RollbackAsync().GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Asynchronously rolls back the current transaction. Valid only while autocommit is disabled.
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Honored only before the ROLLBACK is sent; once sent it runs to completion.
+    /// </param>
+    public override Task RollbackAsync(CancellationToken cancellationToken = default) =>
+        EndTransactionAsync("ROLLBACK", cancellationToken);
+
+    private async Task EndTransactionAsync(string sql, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         ThrowIfAutocommit();
-        ExecuteSessionStatement("ROLLBACK");
+        cancellationToken.ThrowIfCancellationRequested();
+        await ExecuteSessionStatementAsync(sql).ConfigureAwait(false);
     }
 
     private void ThrowIfAutocommit()
@@ -382,10 +439,10 @@ public sealed partial class SnowflakeConnection : AdbcConnection
 
     /// <summary>
     /// Runs a session-scoped statement (COMMIT/ROLLBACK/ALTER SESSION) and throws on failure.
-    /// Sync-over-async at the ADBC boundary (SetOption/Commit/Rollback have no async forms);
-    /// safe to block — the async core awaits with ConfigureAwait(false) throughout.
+    /// Deliberately takes no cancellation token: these change the session's transaction state,
+    /// and abandoning one mid-flight would leave that state unknown.
     /// </summary>
-    private void ExecuteSessionStatement(string sql)
+    private async Task ExecuteSessionStatementAsync(string sql)
     {
         if (_pooledConnection == null || _queryExecutor == null)
             throw new AdbcException("Connection is not properly initialized.", AdbcStatusCode.InvalidState);
@@ -397,7 +454,7 @@ public sealed partial class SnowflakeConnection : AdbcConnection
             AuthToken = _pooledConnection.AuthToken
         };
 
-        var result = _queryExecutor.ExecuteQueryAsync(request).GetAwaiter().GetResult();
+        var result = await _queryExecutor.ExecuteQueryAsync(request).ConfigureAwait(false);
         result.ResultStream?.Dispose();
 
         if (result.Status != QueryStatus.Success)
@@ -408,24 +465,56 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     }
 
     /// <summary>
-    /// Disposes the connection and releases any resources.
+    /// Disposes the connection and returns its session to the pool.
     /// </summary>
     public override void Dispose()
     {
-        if (!_disposed)
+        if (TryBeginDispose())
         {
             if (_pooledConnection != null)
             {
                 if (!_autocommit)
-                    ResetTransactionStateBestEffort();
+                    ResetTransactionStateBestEffortAsync().GetAwaiter().GetResult();
 
                 _connectionPool.ReleaseConnection(_pooledConnection);
                 _pooledConnection = null;
             }
-            _logger.LogDebug("Disposing SnowflakeConnection for account {Account}", _config.Account);
-            _disposed = true;
         }
         base.Dispose();
+    }
+
+    /// <summary>
+    /// Asynchronously disposes the connection and returns its session to the pool. Unlike
+    /// <see cref="Dispose"/>, the transaction reset and any session close don't block a thread.
+    /// </summary>
+    public override async ValueTask DisposeAsync()
+    {
+        if (TryBeginDispose())
+        {
+            if (_pooledConnection != null)
+            {
+                if (!_autocommit)
+                    await ResetTransactionStateBestEffortAsync().ConfigureAwait(false);
+
+                await _connectionPool.ReleaseConnectionAsync(_pooledConnection).ConfigureAwait(false);
+                _pooledConnection = null;
+            }
+        }
+        base.Dispose();
+    }
+
+    /// <summary>
+    /// Atomically claims disposal, before any reset or release is awaited: public operations are
+    /// rejected from this point on, and a concurrent second dispose does nothing. The reset and
+    /// release that follow use the session directly and don't check this flag.
+    /// </summary>
+    private bool TryBeginDispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return false;
+
+        _logger.LogDebug("Disposing SnowflakeConnection for account {Account}", _config.Account);
+        return true;
     }
 
     /// <summary>
@@ -434,12 +523,12 @@ public sealed partial class SnowflakeConnection : AdbcConnection
     /// autocommit, and discard the connection if that fails (matching gosnowflake's
     /// release behavior).
     /// </summary>
-    private void ResetTransactionStateBestEffort()
+    private async Task ResetTransactionStateBestEffortAsync()
     {
         try
         {
-            ExecuteSessionStatement("ROLLBACK");
-            ExecuteSessionStatement("ALTER SESSION SET AUTOCOMMIT = TRUE");
+            await ExecuteSessionStatementAsync("ROLLBACK").ConfigureAwait(false);
+            await ExecuteSessionStatementAsync("ALTER SESSION SET AUTOCOMMIT = TRUE").ConfigureAwait(false);
             _autocommit = true;
         }
         catch (Exception ex)
@@ -451,6 +540,6 @@ public sealed partial class SnowflakeConnection : AdbcConnection
 
     private void ThrowIfDisposed()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }

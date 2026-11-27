@@ -17,6 +17,8 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading;
+using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Services.Query;
 using AdbcDrivers.Snowflake.Services.Transport;
 using Apache.Arrow.Ipc;
@@ -41,18 +43,29 @@ public sealed partial class SnowflakeConnection
     /// KEY_COLUMN_USAGE -- that needs SHOW PRIMARY/UNIQUE/IMPORTED KEYS + RESULT_SCAN).
     /// </remarks>
     public override IArrowArrayStream GetObjects(GetObjectsDepth depth, string? catalogPattern, string? dbSchemaPattern,
-        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern)
+        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern) =>
+        GetObjectsAsync(depth, catalogPattern, dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern)
+            .GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Asynchronously gets database objects; see <see cref="GetObjects"/>.
+    /// </summary>
+    /// <param name="cancellationToken">Stops waiting for the metadata queries.</param>
+    public override async Task<IArrowArrayStream> GetObjectsAsync(GetObjectsDepth depth, string? catalogPattern,
+        string? dbSchemaPattern, string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern,
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
-        IArrowArray[] dataArrays = GetCatalogs(
-            depth, catalogPattern, dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern);
+        IArrowArray[] dataArrays = await GetCatalogsAsync(
+            depth, catalogPattern, dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern, cancellationToken)
+            .ConfigureAwait(false);
 
         return new InMemoryArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
     }
 
-    private IArrowArray[] GetCatalogs(GetObjectsDepth depth, string? catalogPattern, string? dbSchemaPattern,
-        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern)
+    private async Task<IArrowArray[]> GetCatalogsAsync(GetObjectsDepth depth, string? catalogPattern, string? dbSchemaPattern,
+        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern, CancellationToken cancellationToken)
     {
         var catalogNameBuilder = new StringArray.Builder();
         var catalogDbSchemasValues = new List<IArrowArray?>();
@@ -66,7 +79,7 @@ public sealed partial class SnowflakeConnection
         }
         sql += " ORDER BY DATABASE_NAME";
 
-        foreach (Dictionary<string, string?> row in RunMetadataQuery(sql, binds))
+        foreach (Dictionary<string, string?> row in await RunMetadataQueryAsync(sql, binds, cancellationToken).ConfigureAwait(false))
         {
             string? catalog = row["name"];
             if (catalog == null)
@@ -75,7 +88,8 @@ public sealed partial class SnowflakeConnection
             catalogNameBuilder.Append(catalog);
             catalogDbSchemasValues.Add(depth == GetObjectsDepth.Catalogs
                 ? null
-                : GetDbSchemas(depth, catalog, dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern));
+                : await GetDbSchemasAsync(depth, catalog, dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern, cancellationToken)
+                    .ConfigureAwait(false));
         }
 
         return
@@ -85,8 +99,8 @@ public sealed partial class SnowflakeConnection
         ];
     }
 
-    private StructArray GetDbSchemas(GetObjectsDepth depth, string catalog, string? dbSchemaPattern,
-        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern)
+    private async Task<StructArray> GetDbSchemasAsync(GetObjectsDepth depth, string catalog, string? dbSchemaPattern,
+        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern, CancellationToken cancellationToken)
     {
         var dbSchemaNameBuilder = new StringArray.Builder();
         var dbSchemaTablesValues = new List<IArrowArray?>();
@@ -102,7 +116,7 @@ public sealed partial class SnowflakeConnection
         }
         sql += " ORDER BY SCHEMA_NAME";
 
-        foreach (Dictionary<string, string?> row in RunMetadataQuery(sql, binds))
+        foreach (Dictionary<string, string?> row in await RunMetadataQueryAsync(sql, binds, cancellationToken).ConfigureAwait(false))
         {
             string? schemaName = row["name"];
             if (schemaName == null)
@@ -114,7 +128,8 @@ public sealed partial class SnowflakeConnection
 
             dbSchemaTablesValues.Add(depth == GetObjectsDepth.DbSchemas
                 ? null
-                : GetTableSchemas(depth, catalog, schemaName, tableNamePattern, tableTypes, columnNamePattern));
+                : await GetTableSchemasAsync(depth, catalog, schemaName, tableNamePattern, tableTypes, columnNamePattern, cancellationToken)
+                    .ConfigureAwait(false));
         }
 
         IArrowArray[] dataArrays =
@@ -126,8 +141,8 @@ public sealed partial class SnowflakeConnection
         return new StructArray(new StructType(StandardSchemas.DbSchemaSchema), length, dataArrays, nullBitmap.Build());
     }
 
-    private StructArray GetTableSchemas(GetObjectsDepth depth, string catalog, string dbSchema,
-        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern)
+    private async Task<StructArray> GetTableSchemasAsync(GetObjectsDepth depth, string catalog, string dbSchema,
+        string? tableNamePattern, IReadOnlyList<string>? tableTypes, string? columnNamePattern, CancellationToken cancellationToken)
     {
         var tableNameBuilder = new StringArray.Builder();
         var tableTypeBuilder = new StringArray.Builder();
@@ -147,7 +162,7 @@ public sealed partial class SnowflakeConnection
         }
         sql += " ORDER BY TABLE_NAME";
 
-        foreach (Dictionary<string, string?> row in RunMetadataQuery(sql, binds))
+        foreach (Dictionary<string, string?> row in await RunMetadataQueryAsync(sql, binds, cancellationToken).ConfigureAwait(false))
         {
             string? tableName = row["name"];
             if (tableName == null)
@@ -164,10 +179,10 @@ public sealed partial class SnowflakeConnection
 
             // Columns and constraints are populated at All depth.
             tableColumnsValues.Add(depth == GetObjectsDepth.All
-                ? GetColumns(catalog, dbSchema, tableName, columnNamePattern)
+                ? await GetColumnsAsync(catalog, dbSchema, tableName, columnNamePattern, cancellationToken).ConfigureAwait(false)
                 : null);
             tableConstraintsValues.Add(depth == GetObjectsDepth.All
-                ? GetConstraints(catalog, dbSchema, tableName)
+                ? await GetConstraintsAsync(catalog, dbSchema, tableName, cancellationToken).ConfigureAwait(false)
                 : null);
         }
 
@@ -182,7 +197,8 @@ public sealed partial class SnowflakeConnection
         return new StructArray(new StructType(StandardSchemas.TableSchema), length, dataArrays, nullBitmap.Build());
     }
 
-    private StructArray GetColumns(string catalog, string dbSchema, string tableName, string? columnNamePattern)
+    private async Task<StructArray> GetColumnsAsync(string catalog, string dbSchema, string tableName, string? columnNamePattern,
+        CancellationToken cancellationToken)
     {
         var columnNameBuilder = new StringArray.Builder();
         var ordinalPositionBuilder = new Int32Array.Builder();
@@ -222,7 +238,7 @@ public sealed partial class SnowflakeConnection
         }
         sql += " ORDER BY ORDINAL_POSITION";
 
-        foreach (Dictionary<string, string?> row in RunMetadataQuery(sql, binds))
+        foreach (Dictionary<string, string?> row in await RunMetadataQueryAsync(sql, binds, cancellationToken).ConfigureAwait(false))
         {
             string? columnName = row["column_name"];
             if (columnName == null)
@@ -278,7 +294,8 @@ public sealed partial class SnowflakeConnection
         return new StructArray(new StructType(StandardSchemas.ColumnSchema), length, dataArrays, nullBitmap.Build());
     }
 
-    private StructArray GetConstraints(string catalog, string dbSchema, string tableName)
+    private async Task<StructArray> GetConstraintsAsync(string catalog, string dbSchema, string tableName,
+        CancellationToken cancellationToken)
     {
         var constraintNameBuilder = new StringArray.Builder();
         var constraintTypeBuilder = new StringArray.Builder();
@@ -297,7 +314,7 @@ public sealed partial class SnowflakeConnection
             + "WHERE TABLE_SCHEMA ILIKE ? AND TABLE_NAME ILIKE ? "
             + "ORDER BY CONSTRAINT_NAME";
 
-        foreach (Dictionary<string, string?> row in RunMetadataQuery(sql, binds))
+        foreach (Dictionary<string, string?> row in await RunMetadataQueryAsync(sql, binds, cancellationToken).ConfigureAwait(false))
         {
             string? name = row["constraint_name"];
             if (name == null)
@@ -352,7 +369,8 @@ public sealed partial class SnowflakeConnection
     /// Runs a metadata query (whose columns are all cast to VARCHAR) and materializes
     /// the result rows as string dictionaries keyed by column name (case-insensitive).
     /// </summary>
-    private List<Dictionary<string, string?>> RunMetadataQuery(string sql, IReadOnlyList<string?>? bindValues = null)
+    private async Task<List<Dictionary<string, string?>>> RunMetadataQueryAsync(string sql, IReadOnlyList<string?>? bindValues,
+        CancellationToken cancellationToken)
     {
         if (_queryExecutor == null || _pooledConnection == null)
             throw new AdbcException("Connection is not properly initialized.", AdbcStatusCode.InvalidState);
@@ -378,7 +396,13 @@ public sealed partial class SnowflakeConnection
             }
         }
 
-        var result = _queryExecutor.ExecuteQueryAsync(request).GetAwaiter().GetResult();
+        var result = await _queryExecutor.ExecuteQueryAsync(request, cancellationToken).ConfigureAwait(false);
+        if (result.Status == QueryStatus.Cancelled)
+        {
+            result.ResultStream?.Dispose();
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new AdbcException("Metadata query was cancelled.", AdbcStatusCode.Cancelled);
+        }
         if (result.Status == QueryStatus.Failed)
         {
             string message = result.Errors.Count > 0 ? result.Errors[0].Message : "Unknown error";
@@ -394,7 +418,7 @@ public sealed partial class SnowflakeConnection
 
         while (true)
         {
-            RecordBatch? batch = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
+            RecordBatch? batch = await stream.ReadNextRecordBatchAsync(cancellationToken).ConfigureAwait(false);
             if (batch == null)
                 break;
 

@@ -37,7 +37,7 @@ public sealed class SnowflakeDatabase : AdbcDatabase
     private readonly IConnectionPoolManager _connectionPool;
     private readonly HttpClient _httpClient;
     private readonly ILoggerFactory? _loggerFactory;
-    private bool _disposed;
+    private int _disposed; // 0 = live, 1 = disposal started (set atomically, before any teardown)
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SnowflakeDatabase"/> class.
@@ -102,7 +102,7 @@ public sealed class SnowflakeDatabase : AdbcDatabase
     /// <returns>An AdbcConnection instance.</returns>
     public override AdbcConnection Connect(IReadOnlyDictionary<string, string>? parameters)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowIfDisposed();
         return ConnectAsync(parameters).GetAwaiter().GetResult();
     }
 
@@ -112,7 +112,7 @@ public sealed class SnowflakeDatabase : AdbcDatabase
     /// </summary>
     public override async Task<AdbcConnection> ConnectAsync(IReadOnlyDictionary<string, string>? parameters, CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowIfDisposed();
         var config = ConnectionStringParser.ParseParameters(parameters, _parameters);
         return await SnowflakeConnection.CreateAsync(config, _httpClient, _connectionPool, _loggerFactory, cancellationToken).ConfigureAwait(false);
     }
@@ -123,13 +123,33 @@ public sealed class SnowflakeDatabase : AdbcDatabase
     /// </summary>
     public override void Dispose()
     {
-        if (!_disposed)
+        // Claim disposal before tearing anything down, so a concurrent Connect is rejected
+        // rather than handed a connection from a pool that is being cleared.
+        if (TryBeginDispose())
         {
             // Pool first: its best-effort session closes still need a live client.
             _connectionPool.Dispose();
             _httpClient.Dispose();
-            _disposed = true;
         }
         base.Dispose();
     }
+
+    /// <summary>
+    /// Asynchronously disposes the database. The pooled sessions are closed concurrently and
+    /// without blocking a thread, rather than one bounded wait after another as in <see cref="Dispose"/>.
+    /// </summary>
+    public override async ValueTask DisposeAsync()
+    {
+        if (TryBeginDispose())
+        {
+            // Pool first: its best-effort session closes still need a live client.
+            await _connectionPool.DisposeAsync().ConfigureAwait(false);
+            _httpClient.Dispose();
+        }
+        base.Dispose();
+    }
+
+    private bool TryBeginDispose() => Interlocked.Exchange(ref _disposed, 1) == 0;
+
+    private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 }

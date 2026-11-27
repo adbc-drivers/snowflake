@@ -16,6 +16,7 @@
 
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 using AdbcDrivers.Snowflake.Configuration;
 using AdbcDrivers.Snowflake.Services.Authentication;
 
@@ -28,7 +29,7 @@ internal class PooledConnection : IPooledConnection
 {
     private DateTimeOffset _lastUsedAt;
     private DateTimeOffset _lastHeartbeatAt;
-    private bool _disposed;
+    private int _disposed; // 0 = live, 1 = disposed (set atomically, so the session is closed once)
     private readonly ISessionLifecycle? _sessionLifecycle;
     private readonly TimeProvider _timeProvider;
 
@@ -78,7 +79,7 @@ internal class PooledConnection : IPooledConnection
 
     public DateTimeOffset LastHeartbeatAt => _lastHeartbeatAt;
 
-    public bool IsDisposed => _disposed;
+    public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     // Keyed on the master-token expiry (not the ~1h session), because a session-expired connection is
     // still usable via reactive renewal until the master lapses — so the pool should only discard it
@@ -97,30 +98,61 @@ internal class PooledConnection : IPooledConnection
     /// </summary>
     void IPooledConnection.RecordHeartbeat() => _lastHeartbeatAt = _timeProvider.GetUtcNow();
 
+    // Bounds the best-effort session close so a slow or hung close can't stall teardown; a
+    // failure or timeout just lets the server-side session expire on its own.
+    internal static readonly TimeSpan SessionCloseTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>
-    /// Disposes the connection.
+    /// Disposes the connection, closing the server-side session (best-effort, bounded).
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (!TryMarkDisposed())
             return;
 
-        _disposed = true;
+        // The close is bounded by SessionCloseTimeout and swallows its own failures.
+        CloseSessionBestEffortAsync().GetAwaiter().GetResult();
+    }
 
-        // Best-effort: close the server-side session so it isn't orphaned until it times out.
-        // Bounded so a slow/hung close can't stall teardown; a failure just lets the session expire.
-        if (_sessionLifecycle != null)
-        {
-            try
-            {
-                _sessionLifecycle.CloseAsync(AuthToken, Config, CancellationToken.None).Wait(TimeSpan.FromSeconds(5));
-            }
-            catch
-            {
-                // ignore — closing the session is best-effort
-            }
-        }
+    /// <summary>
+    /// Asynchronously disposes the connection, closing the server-side session (best-effort, bounded).
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (!TryMarkDisposed())
+            return;
+
+        await CloseSessionBestEffortAsync().ConfigureAwait(false);
+    }
+
+    private bool TryMarkDisposed()
+    {
+        // Atomic: the pool's cleanup sweep and its own teardown can dispose the same connection
+        // concurrently, and only one of them may send the session close.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return false;
 
         GC.SuppressFinalize(this);
+        return true;
+    }
+
+    // Best-effort: close the server-side session so it isn't orphaned until it times out.
+    private async Task CloseSessionBestEffortAsync()
+    {
+        if (_sessionLifecycle == null)
+            return;
+
+        try
+        {
+            // The token asks the close to stop; WaitAsync bounds the wait even if the close
+            // doesn't observe it, so disposal can never hang on an unresponsive server.
+            using var timeout = new CancellationTokenSource(SessionCloseTimeout, _timeProvider);
+            await _sessionLifecycle.CloseAsync(AuthToken, Config, timeout.Token)
+                .WaitAsync(SessionCloseTimeout, _timeProvider).ConfigureAwait(false);
+        }
+        catch
+        {
+            // ignore — closing the session is best-effort
+        }
     }
 }

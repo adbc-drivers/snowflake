@@ -48,7 +48,8 @@ public class SessionRenewalTests
     public async Task RenewSession_IssuesADifferentWorkingSessionToken()
     {
         // Given an open connection with a live session token
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
         string? before = connection.AuthToken?.SessionToken;
         Assert.False(string.IsNullOrEmpty(before), "expected a session token after connect");
 
@@ -61,7 +62,7 @@ public class SessionRenewalTests
         Assert.False(string.IsNullOrEmpty(after));
         Assert.NotEqual(before, after);
 
-        using var statement = connection.CreateStatement();
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1 AS X";
         var result = await statement.ExecuteQueryAsync();
         using var stream = result.Stream!;
@@ -74,7 +75,8 @@ public class SessionRenewalTests
     public async Task RenewedToken_IsUsedBySubsequentQueries()
     {
         // Given an open connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
         var token = connection.AuthToken!;
 
         // When the session is renewed and several queries run afterwards
@@ -85,7 +87,7 @@ public class SessionRenewalTests
         // token is shared in place, so every later statement picks it up)
         for (int i = 0; i < 3; i++)
         {
-            using var statement = connection.CreateStatement();
+            await using var statement = connection.CreateStatement();
             statement.SqlQuery = $"SELECT {i} AS X";
             var result = await statement.ExecuteQueryAsync();
             using var stream = result.Stream!;
@@ -100,13 +102,14 @@ public class SessionRenewalTests
     public async Task Heartbeat_KeepsTheSessionUsable()
     {
         // Given an open connection
-        using var connection = Connect();
+        await using var database = await IntegrationTestingUtils.OpenDatabaseAsync(_testConfiguration);
+        await using var connection = await IntegrationTestingUtils.ConnectAsync(database);
 
         // When the session is heartbeated (the real /session/heartbeat call)
         await connection.HeartbeatAsync();
 
         // Then the session is still usable for a query
-        using var statement = connection.CreateStatement();
+        await using var statement = connection.CreateStatement();
         statement.SqlQuery = "SELECT 1 AS X";
         var result = await statement.ExecuteQueryAsync();
         using var stream = result.Stream!;
@@ -115,11 +118,4 @@ public class SessionRenewalTests
         Assert.Equal(1, batch!.Length);
     }
 
-    private SnowflakeConnection Connect()
-    {
-        var driver = IntegrationTestingUtils.GetSnowflakeAdbcDriver(_testConfiguration, out var parameters);
-        var database = driver.Open(parameters);
-        var connection = database.Connect(new Dictionary<string, string>());
-        return (SnowflakeConnection)connection;
-    }
 }

@@ -16,6 +16,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using Apache.Arrow.Adbc;
 
 namespace AdbcDrivers.Snowflake;
@@ -36,4 +38,11 @@ public sealed class SnowflakeDriver : AdbcDriver
         ArgumentNullException.ThrowIfNull(parameters);
         return new SnowflakeDatabase(parameters);
     }
+
+    /// <summary>
+    /// Asynchronously opens a database. Opening only parses parameters and builds the HTTP client
+    /// and pool (no network I/O happens until the first connection), so this completes synchronously.
+    /// </summary>
+    public override Task<AdbcDatabase> OpenAsync(IReadOnlyDictionary<string, string> parameters, CancellationToken cancellationToken = default) =>
+        CompletedTasks.Run(() => Open(parameters), cancellationToken);
 }

@@ -24,7 +24,7 @@ namespace AdbcDrivers.Snowflake.Services.ConnectionPool;
 /// <summary>
 /// Manages connection pooling for Snowflake connections.
 /// </summary>
-internal interface IConnectionPoolManager : IDisposable
+internal interface IConnectionPoolManager : IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// Acquires a connection from the pool.
@@ -41,4 +41,11 @@ internal interface IConnectionPoolManager : IDisposable
     /// </summary>
     /// <param name="connection">The connection to release.</param>
     void ReleaseConnection(IPooledConnection connection);
+
+    /// <summary>
+    /// Asynchronously releases a connection back to the pool. A connection that is no longer
+    /// valid is discarded, and its server-side session is closed without blocking the caller.
+    /// </summary>
+    /// <param name="connection">The connection to release.</param>
+    ValueTask ReleaseConnectionAsync(IPooledConnection connection);
 }

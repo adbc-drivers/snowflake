@@ -37,6 +37,14 @@ dotnet test                                   # everything (integration skips if
 **Adding a test:** put offline tests in the root and tag them `Category=Unit`; put tests
 that need a live account under `Integration/` and tag them `Category=Integration`.
 
+**Async first.** The driver implements each ADBC operation asynchronously; the synchronous
+methods block on their async counterparts. So functional tests use the async API (`OpenAsync`,
+`ConnectAsync`, `ExecuteQueryAsync`, `GetObjectsAsync`, `CommitAsync`, `await using`, ...), and
+the synchronous surface gets **smoke tests** only — enough to prove each blocking wrapper reaches
+the async implementation and rethrows the original exception (not an `AggregateException`):
+`Integration/SyncApiSmokeTests.cs` live, and the `Sync_*` tests in the unit suites offline. Write
+new functional tests against the async API.
+
 ---
 
 ## What is tested
@@ -50,6 +58,8 @@ that need a live account under `Integration/` and tag them `Category=Integration
 | `SnowflakeAccountUrlTests.cs` | ~8 | Account → base-URL building: plain account vs. full hostname (no double-append, case-insensitive), and `NetworkConfig` host/port/protocol overrides. |
 | `QueryExecutorTests.cs` | ~5 | DML affected-row detection (`TryGetDmlAffectedRows`): INSERT count, MERGE summing across count columns, reads the row-count summary (not the payload `Returned`), non-DML / empty → false. |
 | `Configuration/ConnectionStringParserTests.cs` | ~12 | Connection-string / parameter parsing and required-parameter / invalid-authenticator validation. |
+| `SnowflakeAsyncSurfaceTests.cs` | ~15 | The async metadata overrides (`GetTableSchemaAsync`/`GetObjectsAsync` pass the caller's token through and surface cancellation as `OperationCanceledException`; `GetInfoAsync`/`GetTableTypesAsync` complete without leaving the calling thread) and the statement's local-only `PrepareAsync`/`GetParameterSchemaAsync`, each with a sync smoke test. |
+| `SnowflakeConnectionTransactionTests.cs` | ~15 | `SetOptionAsync`(autocommit)/`CommitAsync`/`RollbackAsync`, honoring the token only before a session statement is sent, and `DisposeAsync` resetting a mid-transaction session before returning it to the pool; sync smoke for each. |
 | `SnowflakeDriverTests.cs` | ~7 | `Open` parameter validation (missing/invalid/null → `ArgumentException`/`ArgumentNullException`) and idempotent `Dispose` — offline; the *live* connect path is `ConnectionTests`. |
 
 These assert pure logic against in-memory inputs, so they're the fast feedback loop and
@@ -67,6 +77,7 @@ ADBC API (`Driver`/`Database`/`Connection`/`Statement` returning Arrow) or the A
 | `QueryAndMetadataTests.cs` | Arrow-native | **Content-asserting** query execution + the metadata methods, against the shared read-only `SNOWFLAKE_SAMPLE_DATA` (TPC-H SF1). Because that data has fixed cardinalities/contents in every account, these verify *real values*: REGION's 5 names, NATION = 25 rows/4 cols, CUSTOMER = full 150,000-row chunk streaming, invalid-SQL → `AdbcException`, deterministic `GetTableSchema` types, `GetTableTypes` = TABLE/VIEW, `GetInfo` vendor = "Snowflake", and `GetObjects` navigated through the nested Arrow down to NATION's columns. |
 | `TypeDecodingTests.cs` | Arrow-native | The over-the-wire **result type-decode matrix**: for each Snowflake type, `SELECT <literal>` and assert the Arrow type the result stream produces — plus exact values for NUMBER precision sizing (Int32/Int64/Decimal128), TIME, and TIMESTAMP UTC instants. |
 | `ClientTests.cs` | ADO.NET client | The driver used as a `System.Data.Common` provider (`Apache.Arrow.Adbc.Client`): `DbDataReader` row iteration, column metadata, connection-string parsing, `ExecuteNonQuery` DML, and the end-to-end Arrow→CLR type contract. |
+| `SyncApiSmokeTests.cs` | Arrow-native (sync) | **One live smoke test per synchronous entry point** — `Open`/`Connect`/`ExecuteQuery`/`ExecuteUpdate`/`Prepare`/`Dispose`, the metadata methods, `SetOption`/`Commit`/`Rollback`, and `Cancel` of a blocking `ExecuteQuery` from another thread. Uses only SQL literals and INFORMATION_SCHEMA, so it needs no sample data or writable schema. Every other suite uses the async API. |
 | `BenchmarkTests.cs` | Arrow-native | **Performance**: result-fetch throughput across row-count sizes against the sample data. |
 
 > **Note on result-set types.** Query result-set Arrow types come from Snowflake's

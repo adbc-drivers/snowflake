@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -40,12 +41,19 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ConnectionPoolManager> _logger;
     private readonly ConcurrentDictionary<string, ConnectionPoolEntry> _pools;
-    // Signals the background maintenance loop (idle eviction + keep-alive heartbeats) to stop; the
-    // Cancel() lives in Dispose(), and the CTS itself is disposed only after the loop has exited.
-    private readonly CancellationTokenSource _cleanupCts = new();
-    private readonly object _cleanupStartLock = new();
+    // Cancelled when disposal begins. Stops the background maintenance loop (idle eviction +
+    // keep-alive heartbeats) and wakes acquires waiting for capacity. Deliberately never disposed:
+    // a waiter may still be linking to its token as disposal runs, and a CTS without a timer holds
+    // nothing that disposal would release.
+    private readonly CancellationTokenSource _shutdownCts = new();
     private Task? _cleanupTask;
-    private bool _disposed;
+
+    // Serializes every change to which connections the pool holds (seating a new connection, taking
+    // an idle one, returning one to idle, the maintenance sweep) with teardown's one-time detach, so
+    // a connection is always either in the snapshot teardown disposes or refused and disposed by the
+    // caller. Held only for in-memory bookkeeping: no I/O and no connection disposal under it.
+    private readonly object _lifecycleLock = new();
+    private int _disposed; // 0 = live, 1 = disposal started; written under _lifecycleLock
 
     /// <summary>
     /// Separates the fields of a composite credential before it is hashed, so that different
@@ -90,10 +98,17 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     {
         ArgumentNullException.ThrowIfNull(config);
 
-        EnsureCleanupStarted();
-
         var poolKey = GeneratePoolKey(config);
-        var poolEntry = _pools.GetOrAdd(poolKey, static (_, cfg) => new ConnectionPoolEntry(cfg), config);
+        ConnectionPoolEntry poolEntry;
+
+        // Atomic with teardown, so an acquire can't add an entry to a pool that was just cleared.
+        lock (_lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            poolEntry = _pools.GetOrAdd(poolKey, static (_, cfg) => new ConnectionPoolEntry(cfg), config);
+        }
+
+        EnsureCleanupStarted();
 
         await WaitForCapacityAsync(poolEntry, config, cancellationToken).ConfigureAwait(false);
 
@@ -103,12 +118,28 @@ internal class ConnectionPoolManager : IConnectionPoolManager
                 return idleConnection!;
 
             var newConnection = await CreateConnectionAsync(poolKey, config, cancellationToken).ConfigureAwait(false);
-            poolEntry.ActiveConnections.TryAdd(newConnection.ConnectionId, newConnection);
+
+            // The login is a long await: the pool may have been disposed meanwhile, in which case
+            // teardown's snapshot is already taken and this connection is ours to close.
+            bool seated;
+            lock (_lifecycleLock)
+            {
+                seated = !IsDisposed;
+                if (seated)
+                    poolEntry.ActiveConnections.TryAdd(newConnection.ConnectionId, newConnection);
+            }
+
+            if (!seated)
+            {
+                await newConnection.DisposeAsync().ConfigureAwait(false);
+                throw new ObjectDisposedException(GetType().FullName);
+            }
+
             return newConnection;
         }
         catch
         {
-            poolEntry.CapacitySemaphore.Release();
+            ReturnPermit(poolEntry);
             throw;
         }
     }
@@ -119,14 +150,25 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     /// holds one permit — the right to one active connection — which is returned by
     /// <see cref="ReleaseConnection"/> (or by the acquire failure path). Throws
     /// <see cref="AdbcException"/> if the pool stays at capacity past the timeout; a cancelled token
-    /// propagates as <see cref="OperationCanceledException"/>. Neither a timeout nor a cancellation
-    /// consumes a permit.
+    /// propagates as <see cref="OperationCanceledException"/>, and disposing the pool ends the wait
+    /// with <see cref="ObjectDisposedException"/>. None of these consumes a permit.
     /// </summary>
-    private static async Task WaitForCapacityAsync(
+    private async Task WaitForCapacityAsync(
         ConnectionPoolEntry poolEntry, ConnectionConfig config, CancellationToken cancellationToken)
     {
-        bool entered = await poolEntry.CapacitySemaphore
-            .WaitAsync(config.PoolConfig.AcquireTimeout, cancellationToken).ConfigureAwait(false);
+        // Disposing a SemaphoreSlim doesn't wake its waiters, so the wait also observes the pool's
+        // shutdown token, which teardown cancels before it disposes the semaphores.
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
+        bool entered;
+        try
+        {
+            entered = await poolEntry.CapacitySemaphore
+                .WaitAsync(config.PoolConfig.AcquireTimeout, wait.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new ObjectDisposedException(GetType().FullName);
+        }
 
         if (!entered)
             throw new AdbcException(
@@ -154,17 +196,24 @@ internal class ConnectionPoolManager : IConnectionPoolManager
         List<IPooledConnection>? stale = null;
         idleConnection = null;
 
-        while (poolEntry.IdleConnections.TryPop(out var connection))
+        // Pop and seat under the lock, so teardown can't snapshot while a connection is in neither
+        // the idle stack nor the active set.
+        lock (_lifecycleLock)
         {
-            if (IsConnectionValid(connection, now))
-            {
-                connection.UpdateLastUsedAt();
-                poolEntry.ActiveConnections.TryAdd(connection.ConnectionId, connection);
-                idleConnection = connection;
-                break;
-            }
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
 
-            (stale ??= []).Add(connection);
+            while (poolEntry.IdleConnections.TryPop(out var connection))
+            {
+                if (IsConnectionValid(connection, now))
+                {
+                    connection.UpdateLastUsedAt();
+                    poolEntry.ActiveConnections.TryAdd(connection.ConnectionId, connection);
+                    idleConnection = connection;
+                    break;
+                }
+
+                (stale ??= []).Add(connection);
+            }
         }
 
         // Dispose after the drain rather than inside it: Dispose best-effort closes the server-side
@@ -181,87 +230,184 @@ internal class ConnectionPoolManager : IConnectionPoolManager
 
     public void ReleaseConnection(IPooledConnection connection)
     {
-        ArgumentNullException.ThrowIfNull(connection);
-
-        if (!_pools.TryGetValue(connection.PoolKey, out var poolEntry))
-            return;
-
-        // The permit travels with the active connection; a connection that isn't active (double
-        // release, or already discarded) has no permit to return.
-        if (!poolEntry.ActiveConnections.TryRemove(connection.ConnectionId, out _))
-            return;
-
-        if (IsConnectionValid(connection, _timeProvider.GetUtcNow()))
-            poolEntry.IdleConnections.Push(connection);
-        else
-            connection.Dispose();
-
-        // Return the permit only after the connection is seated on the idle stack (or discarded),
-        // so a waiter woken by this release always finds the capacity it was promised.
-        poolEntry.CapacitySemaphore.Release();
+        var discarded = Release(connection, out var poolEntry);
+        try
+        {
+            discarded?.Dispose();
+        }
+        finally
+        {
+            ReturnPermit(poolEntry);
+        }
     }
+
+    public async ValueTask ReleaseConnectionAsync(IPooledConnection connection)
+    {
+        var discarded = Release(connection, out var poolEntry);
+        try
+        {
+            if (discarded != null)
+                await discarded.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            ReturnPermit(poolEntry);
+        }
+    }
+
+    /// <summary>
+    /// Moves an active connection back to the idle stack, or returns it to be discarded when it is
+    /// no longer valid. <paramref name="poolEntry"/> is set only when the connection held a permit
+    /// that <see cref="ReturnPermit"/> must return once any discard has finished.
+    /// </summary>
+    private IPooledConnection? Release(IPooledConnection connection, out ConnectionPoolEntry? poolEntry)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        poolEntry = null;
+
+        // Atomic with teardown: once the pool is detached the entry is gone and the connection was
+        // in teardown's snapshot, so there is nothing to move and no permit to return.
+        lock (_lifecycleLock)
+        {
+            if (!_pools.TryGetValue(connection.PoolKey, out var entry))
+                return null;
+
+            // The permit travels with the active connection; a connection that isn't active (double
+            // release, or already discarded) has no permit to return.
+            if (!entry.ActiveConnections.TryRemove(connection.ConnectionId, out _))
+                return null;
+
+            poolEntry = entry;
+            if (IsConnectionValid(connection, _timeProvider.GetUtcNow()))
+            {
+                entry.IdleConnections.Push(connection);
+                return null;
+            }
+
+            return connection;
+        }
+    }
+
+    // Return the permit only after the connection is seated on the idle stack (or discarded),
+    // so a waiter woken by this release always finds the capacity it was promised.
+    // The semaphores are never disposed (see CompleteDispose), so this is safe after teardown too.
+    private static void ReturnPermit(ConnectionPoolEntry? poolEntry) => poolEntry?.CapacitySemaphore.Release();
 
     /// <summary>
     /// Disposes the connection pool and all pooled connections.
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (!TryBeginDispose())
             return;
 
-        _disposed = true;
+        // Every step of the loop's shutdown is bounded (see CleanupLoopAsync), so this wait is too.
+        try { _cleanupTask?.Wait(); } catch (AggregateException) { }
 
-        _cleanupCts.Cancel();
+        foreach (var connection in CompleteDispose())
+            connection.Dispose();
+    }
+
+    /// <summary>
+    /// Asynchronously disposes the connection pool and all pooled connections. The pooled
+    /// connections' server-side sessions are closed concurrently rather than one after another.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (!TryBeginDispose())
+            return;
 
         if (_cleanupTask != null)
         {
-            try
-            {
-                _cleanupTask.Wait(TimeSpan.FromSeconds(5));
-            }
-            catch (AggregateException)
-            {
-                // The cleanup loop observed cancellation while shutting down — expected.
-            }
+            try { await _cleanupTask.ConfigureAwait(false); } catch (Exception) { }
         }
 
-        // Dispose the CTS only after the cleanup loop has stopped using its token.
-        _cleanupCts.Dispose();
+        await Task.WhenAll(CompleteDispose().Select(c => c.DisposeAsync().AsTask())).ConfigureAwait(false);
+    }
 
-        foreach (var poolEntry in _pools.Values)
+    private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+    /// <summary>
+    /// Claims disposal and stops the maintenance loop. Under the lifecycle lock, so no acquire can
+    /// start the loop (or seat a connection) after this returns.
+    /// </summary>
+    private bool TryBeginDispose()
+    {
+        lock (_lifecycleLock)
         {
-            foreach (var connection in poolEntry.ActiveConnections.Values)
-                connection.Dispose();
-            foreach (var connection in poolEntry.IdleConnections)
-                connection.Dispose();
+            if (IsDisposed)
+                return false;
 
-            poolEntry.CapacitySemaphore.Dispose();
+            Volatile.Write(ref _disposed, 1);
         }
 
-        _pools.Clear();
+        _shutdownCts.Cancel();
+        return true;
+    }
+
+    /// <summary>
+    /// Runs once the maintenance loop has exited: detaches every pooled connection atomically with
+    /// respect to acquire and release, and returns them for the caller to dispose (outside the lock).
+    /// </summary>
+    /// <remarks>
+    /// The capacity semaphores are deliberately not disposed. SemaphoreSlim.Dispose drops its list
+    /// of async waiters, so a capacity wait whose cancellation (by the shutdown token) is still
+    /// completing can no longer remove itself and would hang forever. The pool never touches
+    /// AvailableWaitHandle, so there is nothing for Dispose to release, and a late release returns
+    /// its permit harmlessly.
+    /// </remarks>
+    private List<IPooledConnection> CompleteDispose()
+    {
+        var connections = new List<IPooledConnection>();
+        lock (_lifecycleLock)
+        {
+            foreach (var poolEntry in _pools.Values)
+            {
+                connections.AddRange(poolEntry.ActiveConnections.Values);
+                connections.AddRange(poolEntry.IdleConnections);
+            }
+
+            _pools.Clear();
+        }
+
+        return connections;
     }
 
     private void EnsureCleanupStarted()
     {
         if (_cleanupTask != null) return;
-        lock (_cleanupStartLock)
+        lock (_lifecycleLock)
         {
-            _cleanupTask ??= CleanupLoopAsync();
+            // Never start the loop once disposal has claimed it: teardown would not wait for it.
+            if (IsDisposed || _cleanupTask != null)
+                return;
+
+            // The timer is created here, so the schedule starts from this acquire; the loop itself
+            // runs via Task.Run so none of its body executes on this thread while the lock is held.
+            var timer = new PeriodicTimer(TimeSpan.FromSeconds(60), _timeProvider);
+            _cleanupTask = Task.Run(() => CleanupLoopAsync(timer));
         }
     }
 
-    private async Task CleanupLoopAsync()
+    private async Task CleanupLoopAsync(PeriodicTimer timer)
     {
-        var timer = new PeriodicTimer(TimeSpan.FromSeconds(60), _timeProvider);
-        CancellationToken token = _cleanupCts.Token;
+        CancellationToken token = _shutdownCts.Token;
         try
         {
+            // Shutdown is bounded: the timer observes the token, an in-flight heartbeat gets at most
+            // HeartbeatShutdownTimeout to finish, and the sweep's session closes run concurrently,
+            // each bounded by PooledConnection.SessionCloseTimeout. Teardown relies on this to wait
+            // for the loop without a timeout.
             while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
             {
                 try
                 {
-                    Cleanup();
+                    await CleanupAsync().ConfigureAwait(false);
                     await HeartbeatIdleConnectionsAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
@@ -279,39 +425,41 @@ internal class ConnectionPoolManager : IConnectionPoolManager
         }
     }
 
-    private void Cleanup()
+    private Task CleanupAsync()
     {
-        if (_disposed)
-            return;
+        var connectionsToRemove = new List<IPooledConnection>();
 
-        foreach (var poolEntry in _pools.Values)
+        // The pop-and-repush runs under the lifecycle lock so teardown can't snapshot the idle stack
+        // while it is drained. It is in-memory and at most MaxPoolSize per entry, so acquires wait
+        // for it only briefly.
+        lock (_lifecycleLock)
         {
-            var now = _timeProvider.GetUtcNow();
-            var connectionsToKeep = new List<IPooledConnection>();
-            var connectionsToRemove = new List<IPooledConnection>();
+            if (IsDisposed)
+                return Task.CompletedTask;
 
-            // The stack is briefly emptier than it will end up, so an acquire landing here can
-            // create a connection it did not need. That costs one login, is bounded by the pool's
-            // capacity semaphore, and the extra connection is reaped by a later sweep - cheaper
-            // than serialising every acquire behind this sweep.
-            while (poolEntry.IdleConnections.TryPop(out var connection))
+            foreach (var poolEntry in _pools.Values)
             {
-                var idleTime = now - connection.LastUsedAt;
-                if (!IsConnectionValid(connection, now) ||
-                    idleTime > poolEntry.Config.PoolConfig.IdleTimeout)
-                    connectionsToRemove.Add(connection);
-                else
-                    connectionsToKeep.Add(connection);
-            }
+                var now = _timeProvider.GetUtcNow();
+                var connectionsToKeep = new List<IPooledConnection>();
 
-            foreach (IPooledConnection pooledConnection in connectionsToKeep)
-            {
-                poolEntry.IdleConnections.Push(pooledConnection);
-            }
+                while (poolEntry.IdleConnections.TryPop(out var connection))
+                {
+                    var idleTime = now - connection.LastUsedAt;
+                    if (!IsConnectionValid(connection, now) ||
+                        idleTime > poolEntry.Config.PoolConfig.IdleTimeout)
+                        connectionsToRemove.Add(connection);
+                    else
+                        connectionsToKeep.Add(connection);
+                }
 
-            foreach (var connection in connectionsToRemove)
-                connection.Dispose();
+                foreach (IPooledConnection pooledConnection in connectionsToKeep)
+                    poolEntry.IdleConnections.Push(pooledConnection);
+            }
         }
+
+        // The evicted connections are out of the pool and owned by this sweep alone; close their
+        // sessions concurrently, outside the lock.
+        return Task.WhenAll(connectionsToRemove.Select(c => c.DisposeAsync().AsTask()));
     }
 
     /// <summary>
@@ -345,7 +493,7 @@ internal class ConnectionPoolManager : IConnectionPoolManager
         foreach (var poolEntry in _pools.Values)
             idle.AddRange(poolEntry.IdleConnections.ToArray());
 
-        return HeartbeatDueConnectionsAsync(idle, _sessionLifecycle.HeartbeatAsync, _timeProvider.GetUtcNow(), token, _logger);
+        return HeartbeatDueConnectionsAsync(idle, _sessionLifecycle.HeartbeatAsync, _timeProvider.GetUtcNow(), token, _logger, _timeProvider);
     }
 
     /// <summary>
@@ -354,12 +502,17 @@ internal class ConnectionPoolManager : IConnectionPoolManager
     /// tested without the background timer. Best-effort: a failing heartbeat is swallowed so one bad
     /// connection doesn't stop the rest — it is recovered by reactive renewal on the next query.
     /// </summary>
+    // How long shutdown waits for a heartbeat that is still in flight; heartbeats honour their token,
+    // so in practice it returns almost at once.
+    internal static readonly TimeSpan HeartbeatShutdownTimeout = TimeSpan.FromSeconds(5);
+
     internal static async Task HeartbeatDueConnectionsAsync(
         IEnumerable<IPooledConnection> connections,
         Func<AuthenticationToken, ConnectionConfig, CancellationToken, Task> heartbeat,
         DateTimeOffset now,
         CancellationToken token,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        TimeProvider? timeProvider = null)
     {
         foreach (var connection in connections)
         {
@@ -368,10 +521,26 @@ internal class ConnectionPoolManager : IConnectionPoolManager
             if (connection.IsDisposed || !IsHeartbeatDue(connection, now))
                 continue;
 
+            Task inFlight = heartbeat(connection.AuthToken, connection.Config, token);
             try
             {
-                await heartbeat(connection.AuthToken, connection.Config, token).ConfigureAwait(false);
+                await inFlight.WaitAsync(token).ConfigureAwait(false);
                 connection.RecordHeartbeat();
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // Shutting down. Teardown is about to close this session and the shared HttpClient,
+                // so give the heartbeat a bounded chance to observe its token and finish first, and
+                // observe its outcome so a late failure isn't left unobserved.
+                try
+                {
+                    await inFlight.WaitAsync(HeartbeatShutdownTimeout, timeProvider ?? TimeProvider.System).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // ignore — the pool is shutting down
+                }
+                return;
             }
             catch (Exception ex)
             {
